@@ -1,0 +1,19 @@
+[package]
+name = "cyber-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cyber"
+path = "src/main.rs"
+
+[dependencies]
+cyber-core = { workspace = true }
+cyber-agent = { workspace = true }
+cyber-tui = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

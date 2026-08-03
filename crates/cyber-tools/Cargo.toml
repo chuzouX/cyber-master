@@ -1,0 +1,8 @@
+[package]
+name = "cyber-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# P6 接入：cyber-core, tokio, serde

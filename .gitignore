@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/target/
+**/*.rs.bk
+
+# Cargo lock (keep for binary crates, ignore for libraries — keep for app)
+# Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary / backup files
+*.tmp
+*.bak
+*.tmp.toml
+
+# Reference / example code not part of the project
+/example/
+
+# Local environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Trae IDE internal docs (optional — comment out to keep)
+# /.trae/

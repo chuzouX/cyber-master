@@ -1,0 +1,8 @@
+[package]
+name = "cyber-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# P4 接入：cyber-core, tokio, serde

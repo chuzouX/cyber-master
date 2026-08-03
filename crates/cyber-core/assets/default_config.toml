@@ -1,0 +1,26 @@
+# Cyber Master 全局配置（首次启动自动生成）
+
+[ui]
+theme = "cyberpunk"          # catppuccin | tokyo-night | dracula | gruvbox | nord | cyberpunk
+default_mode = "chat"        # chat | workflow | dashboard
+animations = true
+mouse = true
+frame_rate = 60
+
+[agent]
+default_provider = "openai"  # 见 providers.toml
+auto_tool_call = true
+max_steps = 25               # agent loop 最大步数
+
+[workflow]
+max_parallel_nodes = 8
+default_timeout_secs = 1800
+checkpoint = true            # 启用断点续跑
+
+[tools]
+prefer_docker = false        # 工具缺失时是否用 docker 镜像兜底
+extra_path = []              # 额外工具路径
+
+[storage]
+history_retention_days = 90
+log_level = "info"

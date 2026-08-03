@@ -1,0 +1,8 @@
+[package]
+name = "cyber-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# P3 接入：cyber-core, tokio, reqwest, serde

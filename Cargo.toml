@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cyber-app",
+    "crates/cyber-core",
+    "crates/cyber-tui",
+    "crates/cyber-agent",
+    "crates/cyber-workflow",
+    "crates/cyber-mcp",
+    "crates/cyber-skills",
+    "crates/cyber-tools",
+    "crates/cyber-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Cyber Master"]
+
+[workspace.dependencies]
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+# 错误
+thiserror = "2"
+color-eyre = "0.6"
+anyhow = "1"
+# 系统
+dirs = "5"
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 异步
+tokio = { version = "1", features = ["full"] }
+# HTTP / 流式（P2 Chat）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures = "0.3"
+bytes = "1"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# TUI
+ratatui = "0.30"
+# event-stream：P2 起用 crossterm::event::EventStream 接入 tokio select!
+crossterm = { version = "0.28", features = ["event-stream"] }
+# 多行输入框；原 tui-textarea 0.7 pin ratatui ^0.29，与 0.30 不兼容，故用维护 fork tui-textarea-2。
+tui-textarea = { package = "tui-textarea-2", version = "0.12" }
+
+# 内部 crate 互引
+cyber-core = { path = "crates/cyber-core" }
+cyber-tui = { path = "crates/cyber-tui" }
+cyber-agent = { path = "crates/cyber-agent" }
+cyber-workflow = { path = "crates/cyber-workflow" }
+cyber-mcp = { path = "crates/cyber-mcp" }
+cyber-skills = { path = "crates/cyber-skills" }
+cyber-tools = { path = "crates/cyber-tools" }
+cyber-storage = { path = "crates/cyber-storage" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

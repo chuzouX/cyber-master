@@ -1,0 +1,66 @@
+use std::path::{Path, PathBuf};
+
+use tracing::{debug, error};
+
+use crate::error::{CoreError, Result};
+
+/// 全局 `~/.cyber` 下所有关键路径的缓存。
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub cyber_home: PathBuf,
+    pub config_file: PathBuf,
+    pub providers_file: PathBuf,
+    pub skills_dir: PathBuf,
+    pub mcp_dir: PathBuf,
+    pub mcp_servers_file: PathBuf,
+    pub workflows_dir: PathBuf,
+    pub sessions_dir: PathBuf,
+    pub logs_dir: PathBuf,
+    pub reports_dir: PathBuf,
+    pub reports_templates_dir: PathBuf,
+    pub history_db: PathBuf,
+    pub assets_db: PathBuf,
+}
+
+impl Paths {
+    /// 定位 `~/.cyber`，不保证目录已存在（首次启动时尚未创建）。
+    pub fn detect() -> Result<Self> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            error!("无法定位用户 home 目录（USERPROFILE / FOLDERID_Profile 均不可用）");
+            CoreError::NoHomeDir
+        })?;
+        debug!(home = %home.display(), "定位到用户 home 目录");
+        Self::at(home.join(".cyber"))
+    }
+
+    /// 在指定位置构造路径集合（便于测试）。
+    pub fn at(cyber_home: PathBuf) -> Result<Self> {
+        let mcp_dir = cyber_home.join("mcp");
+        let reports_dir = cyber_home.join("reports");
+        Ok(Self {
+            config_file: cyber_home.join("config.toml"),
+            providers_file: cyber_home.join("providers.toml"),
+            skills_dir: cyber_home.join("skills"),
+            mcp_servers_file: mcp_dir.join("servers.toml"),
+            workflows_dir: cyber_home.join("workflows"),
+            sessions_dir: cyber_home.join("sessions"),
+            logs_dir: cyber_home.join("logs"),
+            reports_templates_dir: reports_dir.join("templates"),
+            history_db: cyber_home.join("history.db"),
+            assets_db: cyber_home.join("assets.db"),
+            mcp_dir,
+            reports_dir,
+            cyber_home,
+        })
+    }
+
+    /// 项目级 `.cyber/` 目录（CWD 下），可能不存在。
+    pub fn project_local_dir(cwd: &Path) -> PathBuf {
+        cwd.join(".cyber")
+    }
+
+    /// 项目级 `.cyber.md` 文件路径（CWD 下）。
+    pub fn project_md_file(cwd: &Path) -> PathBuf {
+        cwd.join(".cyber.md")
+    }
+}

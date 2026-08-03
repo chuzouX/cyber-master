@@ -1,0 +1,27 @@
+# LLM 提供商配置（多家并存，用户在 [agent].default_provider 切换）
+
+default_provider = "openai"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-4o"
+max_tokens = 4096
+temperature = 0.7
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+model = "claude-sonnet-4-5"
+max_tokens = 4096
+temperature = 0.7
+
+[providers.ollama]
+kind = "ollama"
+base_url = "http://localhost:11434"
+api_key = ""
+model = "qwen2.5:32b"
+max_tokens = 4096
+temperature = 0.7

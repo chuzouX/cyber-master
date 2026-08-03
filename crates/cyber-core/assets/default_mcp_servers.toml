@@ -1,0 +1,16 @@
+# MCP server 注册表
+#
+# 示例（stdio 本地 server）:
+# [[servers]]
+# name = "filesystem"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#
+# 示例（HTTP 远程 server）:
+# [[servers]]
+# name = "custom-scanner"
+# transport = "http"
+# url = "https://scanner.internal/mcp"
+# [servers.headers]
+# Authorization = "Bearer ${MCP_TOKEN}"
