@@ -15,7 +15,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -35,10 +35,13 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use cyber_agent::{
-    context_remaining_percent, fetch_models, run_compact_stream, run_stream, AgentEvent, Message,
-    ToolRegistry, Usage,
+    context_remaining_percent, fetch_models, run_compact_stream, run_stream, run_writeup_stream,
+    AgentEvent, Message, ToolRegistry, Usage,
 };
-use cyber_core::{save_config, save_providers, Config, ProjectContext, ProvidersConfig};
+use cyber_core::{
+    save_config, save_providers, Config, CtfCategory, CtfChallenge, ProjectContext,
+    ProvidersConfig,
+};
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
 
@@ -47,7 +50,9 @@ use crate::event::{chat_key_to_action, key_to_action, Action, ChatAction};
 use crate::history::{SessionIndex, SessionMeta};
 use crate::slash::{parse as parse_slash, SlashCommand, HELP_TEXT as SLASH_HELP};
 use crate::theme::Theme;
+use crate::ctf_store;
 use crate::views;
+use crate::views::ctf_panel;
 use crate::views::mcp_form::{McpFormAction, McpFormState};
 use crate::views::providers::{FormAction, ProviderFormState};
 use crate::views::settings::{LiveApply, SettingsState};
@@ -96,6 +101,8 @@ pub struct AppPaths {
     pub log_file: PathBuf,
     pub history_dir: PathBuf,
     pub cwd: PathBuf,
+    pub ctf_dir: PathBuf,
+    pub ctf_writeup_dir: PathBuf,
 }
 
 /// 异步模型拉取结果（经 mpsc 通道回传主循环第 4 路 select! 分支）。
@@ -117,6 +124,8 @@ pub struct AppRegistries {
     pub skills: Arc<SkillRegistry>,
     /// MCP 连接注册表（`/mcp` 展示 + 退出 shutdown）。mock 模式或无 server 时为 None。
     pub mcp: Option<Arc<McpRegistry>>,
+    /// CTF 题目共享状态（工具与 App 共享）。
+    pub ctf_challenges: Option<Arc<Mutex<Vec<CtfChallenge>>>>,
 }
 
 impl std::fmt::Debug for AppRegistries {
@@ -125,6 +134,10 @@ impl std::fmt::Debug for AppRegistries {
             .field("tools", &self.tools.schemas().len())
             .field("skills", &self.skills.len())
             .field("mcp", &self.mcp.as_ref().map(|m| m.len()))
+            .field(
+                "ctf_challenges",
+                &self.ctf_challenges.as_ref().map(|c| c.lock().map(|g| g.len()).unwrap_or(0)),
+            )
             .finish()
     }
 }
@@ -136,6 +149,7 @@ impl AppRegistries {
             tools: Arc::new(ToolRegistry::with_builtins()),
             skills: Arc::new(SkillRegistry::new()),
             mcp: None,
+            ctf_challenges: None,
         }
     }
 }
@@ -352,6 +366,26 @@ pub struct App {
     /// 是否正在执行上下文压缩（手动 `/compact` 或自动触发）。
     /// 压缩期间阻止提交/切换等操作（与 streaming 期一致）。
     compacting: bool,
+    /// CTF 模式是否开启（`/ctf enable` 开启）。
+    ctf_enabled: bool,
+    /// 题目面板是否可见（Ctrl+T 切换）。
+    ctf_panel_visible: bool,
+    /// 题目面板是否聚焦（聚焦时按键由面板消费）。
+    ctf_panel_focused: bool,
+    /// 题目面板是否全屏展开（Ctrl+Left 展开，Ctrl+Right/Esc 恢复）。
+    ctf_panel_fullscreen: bool,
+    /// CTF 题目列表（与 CtfChallengeTool 共享，Arc<Mutex>）。
+    ctf_challenges: Arc<Mutex<Vec<CtfChallenge>>>,
+    /// 面板内选中索引。
+    ctf_selected: usize,
+    /// 面板内视图：false=列表, true=详情。
+    ctf_detail_view: bool,
+    /// 面板内详情视图滚动偏移。
+    ctf_detail_scroll: usize,
+    /// Writeup 生成中：待写入的题目名称（None = 未在生成 writeup）。
+    ctf_writeup_pending: Option<String>,
+    /// Writeup 生成中：累积的流式 token（Done 时整体写入文件）。
+    ctf_writeup_buffer: String,
     /// 日志查看器状态（Ctrl+L 打开，Esc 关闭）。
     log_viewer: LogViewerState,
     /// `/model` 面板状态（双栏选 provider + model）。
@@ -381,6 +415,12 @@ impl App {
         registries: AppRegistries,
     ) -> Self {
         let theme = Theme::resolve(&config.ui.theme);
+        // 取出 bootstrap 构建的共享 ctf_challenges（与 CtfChallengeTool 共享同一 Arc）。
+        // ctf_challenges 初始化为空，run() 中按当前 session 加载。
+        let ctf_challenges = registries
+            .ctf_challenges
+            .clone()
+            .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
         Self {
             config_at_entry: config.clone(),
             providers_at_entry: providers.clone(),
@@ -414,6 +454,16 @@ impl App {
             usage: UsageStats::default(),
             context_usage: ContextUsage::default(),
             compacting: false,
+            ctf_enabled: false,
+            ctf_panel_visible: false,
+            ctf_panel_focused: false,
+            ctf_panel_fullscreen: false,
+            ctf_challenges,
+            ctf_selected: 0,
+            ctf_detail_view: false,
+            ctf_detail_scroll: 0,
+            ctf_writeup_pending: None,
+            ctf_writeup_buffer: String::new(),
             log_viewer: LogViewerState::default(),
             model_picker: ModelPickerState::default(),
             mouse_capture: true,
@@ -445,6 +495,12 @@ impl App {
         }
         // 从已加载的 User 条目派生输入历史，使 ↑/↓ 可跨会话呼出历史指令。
         self.chat.seed_input_history();
+        // 加载当前 session 的 CTF 题目
+        let session_challenges =
+            ctf_store::load_session_challenges(&self.paths.ctf_dir, &self.sessions.current);
+        if let Ok(mut list) = self.ctf_challenges.lock() {
+            *list = session_challenges;
+        }
         let mut terminal: DefaultTerminal = ratatui::init();
         // 鼠标捕获开关：true 时启用滚轮翻页（默认），false 时不启用（可拖拽选区复制）。
         // F9 在 Chat 模式下随时切换。
@@ -482,6 +538,17 @@ impl App {
             &mut self.sessions,
             &self.chat.entries,
         );
+        // 同步保存当前 session 的 CTF 题目
+        let challenges: Vec<_> = self
+            .ctf_challenges
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+        ctf_store::save_session_challenges(
+            &self.paths.ctf_dir,
+            &self.sessions.current,
+            &challenges,
+        );
     }
 
     async fn main_loop(
@@ -518,6 +585,14 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {}
+            }
+            // 排空所有待处理的 agent 事件，合并为一次重绘（避免逐 token 触发 draw 卡顿）。
+            while let Ok((gen, ae)) = agent_rx.try_recv() {
+                self.handle_agent_event(gen, ae);
+            }
+            // 同理排空 fetch 事件。
+            while let Ok(fr) = fetch_rx.try_recv() {
+                self.handle_fetch_result(fr);
             }
             if self.should_quit {
                 break;
@@ -563,6 +638,14 @@ impl App {
         // 斜杠补全菜单打开时：Up/Down/Enter/Tab/Esc 由菜单消费，不触发其他动作
         if self.chat.slash_menu_key(k) {
             return;
+        }
+        // CTF 面板聚焦时：拦截导航键交面板处理
+        if self.ctf_panel_focused {
+            if let Some(consumed) = self.handle_ctf_panel_key(k) {
+                if consumed {
+                    return;
+                }
+            }
         }
         match chat_key_to_action(k) {
             ChatAction::Submit => {
@@ -616,6 +699,7 @@ impl App {
             ChatAction::ToggleLogs => self.toggle_log_viewer(),
             ChatAction::ToggleMouse => self.toggle_mouse_capture(),
             ChatAction::ToggleToolResult => self.chat.toggle_last_tool_result_expansion(),
+            ChatAction::ToggleCtfPanel => self.toggle_ctf_panel(),
             ChatAction::Quit => {
                 self.save_history();
                 self.should_quit = true;
@@ -673,8 +757,17 @@ impl App {
                 // streaming 已由 submit 置 true；Started 仅作信号
             }
             AgentEvent::Token(t) => {
-                if self.chat.streaming {
+                if self.ctf_writeup_pending.is_some() {
+                    // writeup 模式：token 累积到 writeup buffer 而非 chat
+                    self.ctf_writeup_buffer.push_str(&t);
                     self.chat.streaming_buffer.push_str(&t);
+                } else if self.chat.streaming {
+                    self.chat.streaming_buffer.push_str(&t);
+                }
+            }
+            AgentEvent::Reasoning(t) => {
+                if self.chat.streaming {
+                    self.chat.thinking_buffer.push_str(&t);
                 }
             }
             AgentEvent::ToolCall { id, name, arguments } => {
@@ -693,6 +786,50 @@ impl App {
                 }
             }
             AgentEvent::Done => {
+                // writeup 生成完成：保存文件 + 更新题目状态
+                if let Some(name) = self.ctf_writeup_pending.take() {
+                    let writeup_text = std::mem::take(&mut self.ctf_writeup_buffer);
+                    self.chat.streaming = false;
+                    self.chat.streaming_buffer.clear();
+                    self.chat.thinking_buffer.clear();
+                    self.agent_handle = None;
+                    if writeup_text.trim().is_empty() {
+                        self.chat.entries.push(ChatEntry::System(format!(
+                            "writeup 生成失败：未生成有效内容（题目 {name}）"
+                        )));
+                        return;
+                    }
+                    // 保存 writeup 到项目级 .cyber/ctf/{category}/{name}/
+                    let proj_ctf_dir = self.paths.cwd.join(".cyber").join("ctf");
+                    let saved_path = if let Ok(mut list) = self.ctf_challenges.lock() {
+                        if let Some(c) = list.iter_mut().find(|c| c.name == name) {
+                            c.writeup = Some(writeup_text.clone());
+                            let path = ctf_store::save_writeup(
+                                &proj_ctf_dir,
+                                c,
+                                &writeup_text,
+                            );
+                            ctf_store::save_session_challenges(
+                                &self.paths.ctf_dir,
+                                &self.sessions.current,
+                                &list,
+                            );
+                            path
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    self.chat.entries.push(ChatEntry::System(format!(
+                        "题目 {} 的 writeup 已生成{}",
+                        name,
+                        saved_path
+                            .map(|p| format!("：{}", p.display()))
+                            .unwrap_or_default()
+                    )));
+                    return;
+                }
                 if self.chat.streaming {
                     self.chat.finalize_stream();
                     // 任务自然结束，清理句柄（abort 对已完成任务是 no-op，置 None 更整洁）
@@ -746,6 +883,18 @@ impl App {
                 )));
             }
             AgentEvent::Error(m) => {
+                // writeup 生成失败：清理状态
+                if self.ctf_writeup_pending.take().is_some() {
+                    self.ctf_writeup_buffer.clear();
+                    self.chat.streaming = false;
+                    self.chat.streaming_buffer.clear();
+                    self.chat.thinking_buffer.clear();
+                    self.agent_handle = None;
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("writeup 生成失败: {m}")));
+                    return;
+                }
                 if self.chat.streaming {
                     self.chat.finalize_stream();
                     self.save_history();
@@ -1043,8 +1192,13 @@ impl App {
         let mock = self.mock;
         let cwd = self.paths.cwd.clone();
         let registry = self.registries.tools.clone();
+        let ctf_enabled = self.ctf_enabled;
         let handle = tokio::spawn(async move {
-            run_stream(config, providers, project, text, history, tx, gen, mock, cwd, registry).await;
+            run_stream(
+                config, providers, project, text, history, tx, gen, mock, cwd, registry,
+                ctf_enabled,
+            )
+            .await;
         });
         self.agent_handle = Some(handle);
     }
@@ -1072,6 +1226,87 @@ impl App {
         self.agent_handle = Some(handle);
     }
 
+    /// 拉起一次 writeup 生成任务（`/ctf writeup <name>` 或面板 'w' 键）。
+    ///
+    /// 与 `spawn_compact` 类似：abort 旧任务 + bump generation。
+    /// 置 `ctf_writeup_pending = Some(name)` 标记 writeup 模式，
+    /// `handle_agent_event` 据此将 Token 事件导入 buffer 而非 chat。
+    fn spawn_writeup(&mut self, challenge: &CtfChallenge) {
+        // 查找 ctf-writeup skill body（撰写指南作为 system prompt）
+        let skill_body = self
+            .registries
+            .skills
+            .find("ctf-writeup")
+            .map(|s| s.body.clone())
+            .unwrap_or_else(|| {
+                "# Writeup 撰写\n\n请为以下 CTF 题目撰写一篇结构清晰的 writeup，包含题目信息、解题过程、关键知识点。".into()
+            });
+
+        // 构造题目上下文
+        let mut ctx = format!(
+            "请为以下 CTF 题目撰写 writeup：\n\n\
+             题目名称：{}\n\
+             分类：{}\n\
+             描述：{}\n",
+            challenge.name,
+            challenge.category.label(),
+            if challenge.description.is_empty() {
+                "（无描述）"
+            } else {
+                &challenge.description
+            },
+        );
+        if let Some(target) = &challenge.target {
+            ctx.push_str(&format!("靶机：{target}\n"));
+        }
+        if let Some(flag) = &challenge.flag {
+            ctx.push_str(&format!("Flag：{flag}\n"));
+        }
+        if !challenge.tags.is_empty() {
+            ctx.push_str(&format!("标签：{}\n", challenge.tags.join("、")));
+        }
+        if let Some(kp) = &challenge.key_points {
+            ctx.push_str(&format!("关键知识点/卡点：{kp}\n"));
+        }
+        ctx.push_str(&format!(
+            "开始时间：{}  结束时间：{}\n",
+            challenge.start_time,
+            challenge.end_time.as_deref().unwrap_or("--"),
+        ));
+        if let Some(dur) = challenge.duration_str() {
+            ctx.push_str(&format!("用时：{dur}\n"));
+        }
+        ctx.push_str(&format!(
+            "\n请根据以上信息撰写一篇完整的 writeup（Markdown 格式）。\n\
+             注意：writeup 中的代码应简洁可复现。如有 exp 脚本，可在 writeup 中引用，\n\
+             exp 文件路径为 .cyber/ctf/{}/{}/exp.py（或其他扩展名，放在项目级 .cyber 目录）。",
+            challenge.category.as_str(),
+            challenge.name,
+        ));
+
+        // abort 旧任务 + bump generation
+        if let Some(h) = self.agent_handle.take() {
+            h.abort();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let gen = self.generation;
+        let config = self.config.clone();
+        let providers = self.providers.clone();
+        let tx = self.agent_tx.clone();
+        let mock = self.mock;
+
+        self.ctf_writeup_pending = Some(challenge.name.clone());
+        self.ctf_writeup_buffer.clear();
+        self.chat.streaming = true;
+        self.chat.streaming_buffer.clear();
+        self.chat.thinking_buffer.clear();
+
+        let handle = tokio::spawn(async move {
+            run_writeup_stream(config, providers, skill_body, ctx, tx, gen, mock).await;
+        });
+        self.agent_handle = Some(handle);
+    }
+
     // ── Session 管理（/new + /sessions + 面板） ───────────────────────────
 
     /// 切换到指定 session：保存当前 → 加载目标 entries → 重置 chat → 更新 current。
@@ -1085,7 +1320,7 @@ impl App {
             self.toast = Some(format!("未知会话：{id}"));
             return;
         }
-        // 保存当前 session
+        // 保存当前 session（含 CTF 题目）
         self.save_history();
         // 加载目标 session
         let entries =
@@ -1095,6 +1330,16 @@ impl App {
         self.chat.seed_input_history();
         self.usage = UsageStats::default();
         self.sessions.current = id.to_string();
+        // 加载目标 session 的 CTF 题目
+        let new_challenges =
+            ctf_store::load_session_challenges(&self.paths.ctf_dir, id);
+        if let Ok(mut list) = self.ctf_challenges.lock() {
+            *list = new_challenges;
+        }
+        // 重置面板选中状态
+        self.ctf_selected = 0;
+        self.ctf_detail_view = false;
+        self.ctf_detail_scroll = 0;
         crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
         let title = self
             .sessions
@@ -1113,6 +1358,13 @@ impl App {
         self.sessions.current = new_id.clone();
         self.chat = ChatState::new();
         self.usage = UsageStats::default();
+        // 新 session 无题目
+        if let Ok(mut list) = self.ctf_challenges.lock() {
+            list.clear();
+        }
+        self.ctf_selected = 0;
+        self.ctf_detail_view = false;
+        self.ctf_detail_scroll = 0;
         crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
         crate::history::save_entries(
             &self.paths.history_dir,
@@ -1131,6 +1383,8 @@ impl App {
             return false;
         }
         let was_current = id == self.sessions.current;
+        // 删除 session 的 CTF 题目文件
+        ctf_store::delete_session_challenges(&self.paths.ctf_dir, id);
         let _remaining = crate::history::delete_session(
             &self.paths.history_dir,
             &self.paths.cwd,
@@ -1148,6 +1402,15 @@ impl App {
             self.chat = ChatState::new();
             self.chat.entries.extend(entries);
             self.chat.seed_input_history();
+            // 加载新 current session 的 CTF 题目
+            let new_challenges =
+                ctf_store::load_session_challenges(&self.paths.ctf_dir, &self.sessions.current);
+            if let Ok(mut list) = self.ctf_challenges.lock() {
+                *list = new_challenges;
+            }
+            self.ctf_selected = 0;
+            self.ctf_detail_view = false;
+            self.ctf_detail_scroll = 0;
         }
         self.toast = Some("会话已删除".into());
         true
@@ -1341,6 +1604,110 @@ impl App {
         } else {
             Some("鼠标已禁用：可拖拽选区复制（F9 切回滚轮模式）".into())
         };
+    }
+
+    /// 切换 CTF 题目面板可见性 / 聚焦（Ctrl+T）。
+    /// 三态循环：不可见 → 可见+聚焦 → 隐藏；可见但不聚焦 → 聚焦。
+    fn toggle_ctf_panel(&mut self) {
+        if !self.ctf_enabled {
+            self.toast = Some("CTF 模式未开启（/ctf enable）".into());
+            return;
+        }
+        if self.ctf_panel_visible && self.ctf_panel_focused {
+            // 面板可见且聚焦 → 隐藏面板
+            self.ctf_panel_visible = false;
+            self.ctf_panel_focused = false;
+            self.ctf_panel_fullscreen = false;
+        } else if self.ctf_panel_visible {
+            // 面板可见但不聚焦 → 聚焦面板
+            self.ctf_panel_focused = true;
+        } else {
+            // 面板不可见 → 显示并聚焦
+            self.ctf_panel_visible = true;
+            self.ctf_panel_focused = true;
+        }
+    }
+
+    /// 处理 CTF 面板按键。返回 true 表示已消费（不传给 chat）。
+    fn handle_ctf_panel_key(&mut self, k: KeyEvent) -> Option<bool> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Ctrl+Left: 面板全屏展开
+        if k.code == KeyCode::Left && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.ctf_panel_fullscreen = true;
+            return Some(true);
+        }
+        // Ctrl+Right: 恢复面板大小
+        if k.code == KeyCode::Right && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.ctf_panel_fullscreen = false;
+            return Some(true);
+        }
+        match k.code {
+            KeyCode::Esc => {
+                if self.ctf_panel_fullscreen {
+                    // 全屏 → 先恢复面板大小
+                    self.ctf_panel_fullscreen = false;
+                } else if self.ctf_detail_view {
+                    // 详情视图 → 返回列表
+                    self.ctf_detail_view = false;
+                    self.ctf_detail_scroll = 0;
+                } else {
+                    // 列表视图 → 取消聚焦（面板保持可见）
+                    self.ctf_panel_focused = false;
+                }
+                Some(true)
+            }
+            KeyCode::Up => {
+                if !self.ctf_detail_view && self.ctf_selected > 0 {
+                    self.ctf_selected -= 1;
+                } else if self.ctf_detail_view {
+                    self.ctf_detail_scroll = self.ctf_detail_scroll.saturating_sub(1);
+                }
+                Some(true)
+            }
+            KeyCode::Down => {
+                if !self.ctf_detail_view {
+                    let len = self.ctf_challenges.lock().map(|l| l.len()).unwrap_or(0);
+                    if self.ctf_selected + 1 < len {
+                        self.ctf_selected += 1;
+                    }
+                } else {
+                    self.ctf_detail_scroll += 1;
+                }
+                Some(true)
+            }
+            KeyCode::Enter => {
+                if !self.ctf_detail_view {
+                    // 列表 → 进入详情
+                    let len = self.ctf_challenges.lock().map(|l| l.len()).unwrap_or(0);
+                    if self.ctf_selected < len {
+                        self.ctf_detail_view = true;
+                        self.ctf_detail_scroll = 0;
+                    }
+                }
+                Some(true)
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                // 在详情视图中按 w 触发 writeup 生成
+                if self.ctf_detail_view {
+                    // 先取出题目名（释放锁后再调用可变方法，避免借用冲突）
+                    let name_to_write = self
+                        .ctf_challenges
+                        .lock()
+                        .ok()
+                        .and_then(|list| {
+                            list.get(self.ctf_selected)
+                                .filter(|c| c.is_solved() && !c.has_writeup())
+                                .map(|c| c.name.clone())
+                        });
+                    if let Some(name) = name_to_write {
+                        self.handle_ctf_slash(&format!("writeup {name}"));
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            _ => None, // 未识别键 → 不消费，交 chat 处理
+        }
     }
 
     /// LogViewer 按键：Esc/Ctrl+L 关闭，Up/Down/PageUp/PageDown 翻滚。
@@ -1568,9 +1935,128 @@ impl App {
             SlashCommand::Sessions(args) => {
                 self.handle_sessions_slash(&args);
             }
+            SlashCommand::Ctf(args) => {
+                self.handle_ctf_slash(&args);
+            }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
                     "未知命令：{name}（输入 /help 查看可用命令）"
+                )));
+            }
+        }
+    }
+
+    /// 处理 `/ctf <subcommand>`：enable / disable / add / list / writeup / status。
+    fn handle_ctf_slash(&mut self, args: &str) {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").trim();
+        let rest = parts.next().unwrap_or("").trim();
+        match sub.to_lowercase().as_str() {
+            "enable" => {
+                self.ctf_enabled = true;
+                self.chat.entries.push(ChatEntry::System(
+                    "CTF 模式已开启（Ctrl+T 切换题目面板，/ctf add 添加题目）".into(),
+                ));
+            }
+            "disable" => {
+                    self.ctf_enabled = false;
+                    self.ctf_panel_visible = false;
+                    self.ctf_panel_focused = false;
+                    self.ctf_panel_fullscreen = false;
+                    self.chat.entries.push(ChatEntry::System("CTF 模式已关闭".into()));
+                }
+            "add" => {
+                // /ctf add <name> <category>
+                let mut p = rest.splitn(2, char::is_whitespace);
+                let name = p.next().unwrap_or("").trim();
+                let cat_str = p.next().unwrap_or("").trim();
+                if name.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "用法：/ctf add <题目名称> <分类(misc/web/reverse/pwn/crypto)>".into(),
+                    ));
+                    return;
+                }
+                let category = CtfCategory::from_str(cat_str).unwrap_or_default();
+                let challenge = CtfChallenge::new(name.into(), category);
+                if let Ok(mut list) = self.ctf_challenges.lock() {
+                    list.push(challenge);
+                    ctf_store::save_challenges(&self.paths.ctf_dir, &list);
+                }
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "已添加题目 [{}] {}",
+                    category, name
+                )));
+            }
+            "list" => {
+                if let Ok(list) = self.ctf_challenges.lock() {
+                    if list.is_empty() {
+                        self.chat.entries.push(ChatEntry::System("当前无 CTF 题目".into()));
+                    } else {
+                        let mut lines = String::from("CTF 题目列表：");
+                        for (i, c) in list.iter().enumerate() {
+                            lines.push_str(&format!(
+                                "\n  {}. [{}] {} — {}",
+                                i + 1,
+                                c.category,
+                                c.name,
+                                c.status.label()
+                            ));
+                        }
+                        self.chat.entries.push(ChatEntry::System(lines));
+                    }
+                }
+            }
+            "writeup" => {
+                if rest.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "用法：/ctf writeup <题目名称>".into(),
+                    ));
+                    return;
+                }
+                if self.chat.streaming || self.compacting || self.ctf_writeup_pending.is_some() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "当前有任务进行中，无法生成 writeup（先 /cancel）".into(),
+                    ));
+                    return;
+                }
+                // 查找题目并检查状态
+                let challenge = if let Ok(list) = self.ctf_challenges.lock() {
+                    list.iter().find(|c| c.name == rest).cloned()
+                } else {
+                    None
+                };
+                match challenge {
+                    Some(c) if c.is_solved() => {
+                        self.chat.entries.push(ChatEntry::System(format!(
+                            "正在为题目 {} 生成 writeup…",
+                            c.name
+                        )));
+                        self.spawn_writeup(&c);
+                    }
+                    Some(_) => {
+                        self.chat.entries.push(ChatEntry::System(format!(
+                            "题目 {} 尚未解出，无法生成 writeup",
+                            rest
+                        )));
+                    }
+                    None => {
+                        self.chat.entries.push(ChatEntry::System(format!(
+                            "题目 {} 不存在",
+                            rest
+                        )));
+                    }
+                }
+            }
+            "" | "status" => {
+                let status = if self.ctf_enabled { "已开启" } else { "已关闭" };
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "CTF 模式：{}（/ctf enable|disable 切换）",
+                    status
+                )));
+            }
+            other => {
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "未知 CTF 子命令：{other}（可用：enable/disable/add/list/writeup）"
                 )));
             }
         }
@@ -2289,17 +2775,66 @@ impl App {
                     .providers
                     .get(&self.config.agent.default_provider)
                     .and_then(|p| p.effective_price());
-                views::chat::render(
-                    frame,
-                    area,
-                    &self.theme,
-                    &self.chat,
-                    self.project.as_ref(),
-                    &provider_label,
-                    &self.usage,
-                    effective_price,
-                    &self.context_usage,
-                )
+                // 检查是否显示 CTF 面板
+                if self.ctf_enabled && self.ctf_panel_visible {
+                    let challenges = self
+                        .ctf_challenges
+                        .lock()
+                        .map(|l| l.clone())
+                        .unwrap_or_default();
+                    if self.ctf_panel_fullscreen {
+                        // 全屏模式：面板占满整个区域，不渲染 chat
+                        ctf_panel::render(
+                            frame,
+                            area,
+                            &self.theme,
+                            &challenges,
+                            self.ctf_selected,
+                            self.ctf_detail_view,
+                            self.ctf_detail_scroll,
+                            self.ctf_panel_focused,
+                        );
+                    } else {
+                        let chunks = Layout::horizontal([
+                            Constraint::Min(0),
+                            Constraint::Length(ctf_panel::CTF_PANEL_WIDTH),
+                        ])
+                        .split(area);
+                        views::chat::render(
+                            frame,
+                            chunks[0],
+                            &self.theme,
+                            &self.chat,
+                            self.project.as_ref(),
+                            &provider_label,
+                            &self.usage,
+                            effective_price,
+                            &self.context_usage,
+                        );
+                        ctf_panel::render(
+                            frame,
+                            chunks[1],
+                            &self.theme,
+                            &challenges,
+                            self.ctf_selected,
+                            self.ctf_detail_view,
+                            self.ctf_detail_scroll,
+                            self.ctf_panel_focused,
+                        );
+                    }
+                } else {
+                    views::chat::render(
+                        frame,
+                        area,
+                        &self.theme,
+                        &self.chat,
+                        self.project.as_ref(),
+                        &provider_label,
+                        &self.usage,
+                        effective_price,
+                        &self.context_usage,
+                    );
+                }
             }
             Mode::Workflow => views::chat::render_placeholder(
                 frame,
@@ -2324,6 +2859,7 @@ impl App {
                 &self.config,
                 &self.providers,
                 &self.mcp_config,
+                self.registries.mcp.as_deref(),
                 &self.registries.skills,
                 &self.settings,
                 self.has_project_config,
@@ -2581,6 +3117,8 @@ mod tests {
                     .join(format!("cyber_test_log_{seed}.log")),
                 history_dir: history_dir.clone(),
                 cwd: cwd.clone(),
+                ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
+                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
             },
             false,
             false,
@@ -2767,6 +3305,8 @@ mod tests {
                 log_file: std::env::temp_dir().join("cyber_test_log2.log"),
                 history_dir: std::env::temp_dir(),
                 cwd: std::env::temp_dir(),
+                ctf_dir: std::env::temp_dir().join("cyber_test_ctf2"),
+                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf2").join("writeup"),
             },
             true,
             false,
@@ -2818,6 +3358,8 @@ mod tests {
                 log_file: std::env::temp_dir().join("cyber_test_log3.log"),
                 history_dir: std::env::temp_dir(),
                 cwd: std::env::temp_dir(),
+                ctf_dir: std::env::temp_dir().join("cyber_test_ctf2"),
+                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf2").join("writeup"),
             },
             false,
             true, // mock
@@ -2985,6 +3527,8 @@ mod tests {
                 log_file: std::env::temp_dir().join("cyber_test_log4.log"),
                 history_dir: hist_dir.clone(),
                 cwd: cwd.clone(),
+                ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
+                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
             },
             false,
             false,
@@ -3039,6 +3583,8 @@ mod tests {
                 log_file: std::env::temp_dir().join("cyber_test_log5.log"),
                 history_dir: hist_dir.clone(),
                 cwd: cwd.clone(),
+                ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
+                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
             },
             false,
             false,
@@ -3269,7 +3815,7 @@ mod tests {
     fn max_steps_rejects_out_of_range() {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.handle_slash_command("/max_steps 9999");
-        assert_eq!(app.config.agent.max_steps, 50, "超范围不应更新");
+        assert_eq!(app.config.agent.max_steps, 500, "超范围不应更新");
         let last = app.chat.entries.last().unwrap();
         assert!(
             matches!(last, ChatEntry::System(t) if t.contains("1-1000")),
@@ -3281,7 +3827,7 @@ mod tests {
     fn max_steps_rejects_non_number() {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.handle_slash_command("/max_steps abc");
-        assert_eq!(app.config.agent.max_steps, 50, "非数字不应更新");
+        assert_eq!(app.config.agent.max_steps, 500, "非数字不应更新");
         let last = app.chat.entries.last().unwrap();
         assert!(
             matches!(last, ChatEntry::System(t) if t.contains("无效参数")),

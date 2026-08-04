@@ -22,7 +22,7 @@ use crate::compact::{
     auto_compact_threshold, compact_messages, estimate_messages_tokens,
 };
 use crate::error::{AgentError, Result};
-use crate::prompt::build_system_prompt;
+use crate::prompt::{build_system_prompt, CTF_PROMPT};
 use crate::provider::{provider_factory, Provider, StreamRequest};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Usage};
@@ -91,6 +91,7 @@ pub async fn run_stream(
     mock: bool,
     cwd: PathBuf,
     registry: Arc<ToolRegistry>,
+    ctf_enabled: bool,
 ) {
     let _ = tx.send((gen, AgentEvent::Started));
     let res = run_inner(
@@ -104,6 +105,7 @@ pub async fn run_stream(
         mock,
         cwd,
         registry,
+        ctf_enabled,
     )
     .await;
     if let Err(e) = res {
@@ -124,6 +126,7 @@ async fn run_inner(
     mock: bool,
     cwd: PathBuf,
     registry: Arc<ToolRegistry>,
+    ctf_enabled: bool,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
@@ -132,7 +135,10 @@ async fn run_inner(
     debug!(provider = %name, kind = %cfg.kind, mock, gen, "启动 agent loop");
 
     let provider = provider_factory(cfg, mock)?;
-    let system = build_system_prompt(project);
+    let mut system = build_system_prompt(project);
+    if ctf_enabled {
+        system.push_str(CTF_PROMPT);
+    }
 
     // 工具上下文 + 注册表
     let rules = project.map(|p| p.rules().to_vec()).unwrap_or_default();
@@ -373,6 +379,81 @@ pub async fn run_compact_stream(
     let _ = tx.send((gen, AgentEvent::Done));
 }
 
+/// 生成 CTF 题目 writeup（`/ctf writeup` 入口）。
+///
+/// 与 `run_compact_stream` 类似的无工具文本生成流程，但：
+/// - system prompt = ctf-writeup skill body（撰写指南）
+/// - user message = 题目上下文（名称/分类/描述/靶机/flag/标签/用时/关键知识点）
+/// - 不进入 agent loop，仅一次流式生成
+///
+/// 流式 token 经 `AgentEvent::Token` 转发，TUI 收集后拼成完整 writeup。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_writeup_stream(
+    config: Config,
+    providers: ProvidersConfig,
+    skill_body: String,
+    challenge_context: String,
+    tx: UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    mock: bool,
+) {
+    let _ = tx.send((gen, AgentEvent::Started));
+    let res = run_writeup_inner(
+        &config,
+        &providers,
+        &skill_body,
+        &challenge_context,
+        &tx,
+        gen,
+        mock,
+    )
+    .await;
+    if let Err(e) = res {
+        warn!(error = %e, "run_writeup_stream 失败");
+        let _ = tx.send((gen, AgentEvent::Error(e.to_string())));
+    }
+    let _ = tx.send((gen, AgentEvent::Done));
+}
+
+async fn run_writeup_inner(
+    config: &Config,
+    providers: &ProvidersConfig,
+    skill_body: &str,
+    challenge_context: &str,
+    tx: &UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    mock: bool,
+) -> Result<()> {
+    let name = &config.agent.default_provider;
+    let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
+        AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
+    })?;
+    let provider = provider_factory(cfg, mock)?;
+
+    let req = StreamRequest::new(vec![Message::user(challenge_context)])
+        .with_system(skill_body.to_string());
+    let mut stream = provider.stream(req);
+    while let Some(ev) = stream.next().await {
+        match ev {
+            StreamEvent::Delta(t) => {
+                if tx.send((gen, AgentEvent::Token(t))).is_err() {
+                    debug!("TUI 通道已关闭，writeup 生成终止");
+                    return Ok(());
+                }
+            }
+            StreamEvent::Usage(u) => {
+                let _ = tx.send((gen, AgentEvent::Usage(u)));
+            }
+            StreamEvent::Done => break,
+            StreamEvent::Error(m) => {
+                return Err(AgentError::Provider(format!("writeup 生成失败: {m}")));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn run_compact_inner(
     config: &Config,
     providers: &ProvidersConfig,
@@ -424,6 +505,12 @@ async fn accumulate_stream(
             StreamEvent::Delta(t) => {
                 text.push_str(&t);
                 if tx.send((gen, AgentEvent::Token(t))).is_err() {
+                    debug!("TUI 通道已关闭，agent 累积终止");
+                    return (text, calls, usage);
+                }
+            }
+            StreamEvent::Reasoning(t) => {
+                if tx.send((gen, AgentEvent::Reasoning(t))).is_err() {
                     debug!("TUI 通道已关闭，agent 累积终止");
                     return (text, calls, usage);
                 }

@@ -9,10 +9,10 @@
 //! 降级为仅可用部分（builtins + 成功的 skills/mcp）。errors 经 toast 展示给用户。
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use cyber_agent::ToolRegistry;
-use cyber_core::Paths;
+use cyber_agent::{CtfChallengeTool, ToolRegistry};
+use cyber_core::{CtfChallenge, Paths};
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::{SkillRegistry, SkillTool};
 use tracing::warn;
@@ -49,6 +49,15 @@ pub async fn build_registries(
         tool_reg.register(Box::new(SkillTool::new(skill.clone())));
     }
 
+    // CTF 题目共享状态（工具与 App 共享）
+    let ctf_challenges: Arc<Mutex<Vec<CtfChallenge>>> = Arc::new(Mutex::new(
+        crate::ctf_store::load_challenges(&paths.ctf_dir),
+    ));
+    tool_reg.register(Box::new(CtfChallengeTool::new(
+        Arc::clone(&ctf_challenges),
+        paths.ctf_dir.clone(),
+    )));
+
     // 3. MCP：非 mock 时加载 servers.toml + 并行连接
     let mcp = if !mock {
         let mcp_config = match McpServersConfig::load(&paths.mcp_servers_file) {
@@ -77,6 +86,7 @@ pub async fn build_registries(
             tools: Arc::new(tool_reg),
             skills: Arc::new(skills),
             mcp,
+            ctf_challenges: Some(ctf_challenges),
         },
         errors,
     )

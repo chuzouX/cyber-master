@@ -110,6 +110,8 @@ impl Message {
 pub enum StreamEvent {
     /// 增量 token（已是完整 UTF-8 字符，见 `sse::LineBuf` 的字节边界处理）。
     Delta(String),
+    /// 思考过程增量（DeepSeek reasoning_content / Claude thinking）。
+    Reasoning(String),
     /// 工具调用 delta 片段（参数分片到达，由 agent loop 累积）。
     ToolCallDelta(ToolCallDelta),
     /// 流末尾的 token 用量（需请求 `stream_options: include_usage`）。
@@ -146,6 +148,8 @@ pub enum AgentEvent {
     /// 任务已启动（TUI 据此切到 streaming 态）。
     Started,
     Token(String),
+    /// 思考过程增量（DeepSeek reasoning_content / Claude thinking）。
+    Reasoning(String),
     /// agent 即将执行一次工具调用（已累积完整的 name+arguments）。
     ToolCall {
         id: String,

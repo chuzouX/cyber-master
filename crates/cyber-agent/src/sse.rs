@@ -61,6 +61,7 @@ impl LineBuf {
 
 /// OpenAI SSE 行解析。返回 0..N 个事件：
 /// - `delta.content` → `Delta`
+/// - `delta.reasoning_content` → `Reasoning`（DeepSeek 思考过程）
 /// - `delta.tool_calls[]` → 每项一个 `ToolCallDelta`（首片带 id+name，后续只带 arguments 片段）
 /// - `data: [DONE]` → `Done`
 ///
@@ -99,6 +100,12 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
     let mut out = Vec::new();
     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
         out.push(StreamEvent::Delta(content.to_string()));
+    }
+    // DeepSeek reasoning_content（思考过程增量）
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+        if !reasoning.is_empty() {
+            out.push(StreamEvent::Reasoning(reasoning.to_string()));
+        }
     }
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {

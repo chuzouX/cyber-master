@@ -317,6 +317,11 @@ pub fn read_session_text(history_dir: &Path, cwd: &Path, id: &str) -> Option<Str
                 out.push_str(t);
                 out.push('\n');
             }
+            ChatEntry::Thinking(t) => {
+                out.push_str("💭 ");
+                out.push_str(t);
+                out.push('\n');
+            }
             ChatEntry::System(t) => {
                 out.push_str("ℹ️ ");
                 out.push_str(t);

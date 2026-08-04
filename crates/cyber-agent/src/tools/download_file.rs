@@ -245,7 +245,7 @@ fn resolve_output_path(output: &str, url: &str, cwd: &std::path::Path) -> Result
     }
 }
 
-/// 从 URL 提取文件名（取路径最后一段，去掉 query string）。
+/// 从 URL 提取文件名（取路径最后一段，去掉 query string 和 fragment）。
 fn extract_filename_from_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let path = parsed.path();

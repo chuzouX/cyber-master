@@ -39,6 +39,7 @@ fn spawn_run(
         mock,
         cwd,
         registry,
+        false, // ctf_enabled
     ));
     (handle, rx)
 }
@@ -213,6 +214,7 @@ async fn mock_tool_loop_roundtrip() {
             AgentEvent::ContextUpdate { .. }
             | AgentEvent::Compacting { .. }
             | AgentEvent::Compacted { .. } => {}
+            AgentEvent::Reasoning(_) => {}
             AgentEvent::Error(m) => panic!("tool-loop 不应产生错误: {m}"),
         }
     }
@@ -260,6 +262,7 @@ async fn mock_tool_loop_not_loop_detected() {
             AgentEvent::ContextUpdate { .. }
             | AgentEvent::Compacting { .. }
             | AgentEvent::Compacted { .. } => {}
+            AgentEvent::Reasoning(_) => {}
             AgentEvent::Error(m) => panic!("不应产生错误: {m}"),
         }
     }
@@ -317,6 +320,7 @@ async fn mock_max_steps_exhaustion_does_graceful_summary() {
             AgentEvent::ContextUpdate { .. }
             | AgentEvent::Compacting { .. }
             | AgentEvent::Compacted { .. } => {}
+            AgentEvent::Reasoning(_) => {}
             AgentEvent::Error(m) => panic!("max_steps 耗尽不应产生 Error（应优雅收尾）: {m}"),
         }
     }
@@ -356,6 +360,7 @@ async fn mock_tool_loop_respects_generation_tag() {
         true,
         cwd,
         registry,
+        false, // ctf_enabled
     ));
 
     let mut gens = Vec::new();

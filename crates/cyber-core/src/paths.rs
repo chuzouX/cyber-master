@@ -22,6 +22,10 @@ pub struct Paths {
     /// 对话历史 JSON 目录（P2.2：按 cwd hash 存 `{cwd_hash}.json`）。
     pub history_dir: PathBuf,
     pub assets_db: PathBuf,
+    /// CTF 题目数据目录（`~/.cyber/ctf/`）。
+    pub ctf_dir: PathBuf,
+    /// CTF writeup 输出目录（`~/.cyber/ctf/writeup/`）。
+    pub ctf_writeup_dir: PathBuf,
 }
 
 impl Paths {
@@ -39,6 +43,7 @@ impl Paths {
     pub fn at(cyber_home: PathBuf) -> Result<Self> {
         let mcp_dir = cyber_home.join("mcp");
         let reports_dir = cyber_home.join("reports");
+        let ctf_dir = cyber_home.join("ctf");
         Ok(Self {
             config_file: cyber_home.join("config.toml"),
             providers_file: cyber_home.join("providers.toml"),
@@ -51,8 +56,10 @@ impl Paths {
             history_db: cyber_home.join("history.db"),
             history_dir: cyber_home.join("history"),
             assets_db: cyber_home.join("assets.db"),
+            ctf_writeup_dir: ctf_dir.join("writeup"),
             mcp_dir,
             reports_dir,
+            ctf_dir,
             cyber_home,
         })
     }

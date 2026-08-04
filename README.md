@@ -12,12 +12,13 @@
 
 - [特性](#特性)
 - [架构概览](#架构概览)
-- [快速开始](#快速开始)
+- [安装](#安装)
 - [配置](#配置)
 - [CLI 用法](#cli-用法)
 - [Workspace 结构](#workspace-结构)
 - [开发路线图](#开发路线图)
 - [开发指南](#开发指南)
+- [发布流程](#发布流程)
 - [技术栈](#技术栈)
 - [许可证](#许可证)
 
@@ -63,28 +64,64 @@
 
 ---
 
-## 快速开始
+## 安装
 
-### 前置条件
+支持 Windows、macOS（Intel / Apple Silicon）、Linux（x86_64 / ARM64）。
 
-- **Rust 1.96+**（推荐用 [rustup](https://rustup.rs/) 安装 stable 工具链）
-- 支持 Windows / macOS / Linux
+### 一键安装（推荐）
 
-### 构建与运行
+**macOS / Linux**（自动识别架构，安装到 `~/.local/bin`）：
 
 ```bash
-# 克隆仓库
-git clone git@github.com:chuzouX/cyber-master.git
+curl -fsSL https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.sh | sh
+```
+
+**Windows**（PowerShell 5.1+，安装到 `%USERPROFILE%\.local\bin` 并自动加入用户 PATH）：
+
+```powershell
+irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
+```
+
+脚本会：
+
+1. 查询 GitHub Releases 最新版本（可用 `CYBER_VERSION=v0.1.0` 或 `-Version` 指定）
+2. 按 OS/架构下载对应预编译二进制（含 `.sha256` 校验）
+3. 解压到安装目录并赋予可执行权限
+4. 提示 PATH 配置（Windows 自动写入用户 PATH，Unix 给出对应的 shell 配置命令）
+
+### 安装指定版本
+
+```bash
+# Unix
+curl -fsSL https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.sh | sh -s -- --version v0.1.0
+
+# Windows
+$env:CYBER_VERSION='v0.1.0'; irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
+```
+
+### 备选：从源码构建（需 Rust 1.96+）
+
+```bash
+# 直接从 git 安装到 ~/.cargo/bin
+cargo install --git https://github.com/chuzouX/cyber-master --locked cyber-app
+
+# 或克隆后本地构建
+git clone https://github.com/chuzouX/cyber-master.git
 cd cyber-master
-
-# Debug 构建
-cargo run
-
-# Release 构建（启用 LTO + strip）
 cargo run --release
 ```
 
 首次运行会在 `~/.cyber/` 自动创建默认配置文件，然后渲染 TUI 启动页。
+
+### 支持的预编译目标
+
+| 平台 | Rust target | 安装方式 |
+| --- | --- | --- |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `install.ps1` |
+| macOS Intel | `x86_64-apple-darwin` | `install.sh` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `install.sh` |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `install.sh` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `install.sh` |
 
 ---
 
@@ -262,6 +299,61 @@ cargo fmt --all -- --check
 2. 在 `Mode` 枚举追加变体
 3. 在 `event.rs` 补充键位映射
 4. 在主 render 分发
+
+---
+
+## 发布流程
+
+预编译二进制通过 GitHub Actions 自动发布到 [Releases](https://github.com/chuzouX/cyber-master/releases)。
+
+### 触发一次发布
+
+```bash
+# 1. 确保 main 分支干净、Cargo.lock 与版本号已更新
+git checkout main
+git pull
+
+# 2. 打 tag（必须以 v 开头，触发 release.yml）
+git tag v0.1.0
+git push origin v0.1.0
+
+# 3. 等 Actions 跑完（5 个 target 并行构建 ~10 min）
+#    Release 页面会出现：
+#      cyber-x86_64-pc-windows-msvc.zip + .sha256
+#      cyber-x86_64-apple-darwin.tar.gz + .sha256
+#      cyber-aarch64-apple-darwin.tar.gz + .sha256
+#      cyber-x86_64-unknown-linux-gnu.tar.gz + .sha256
+#      cyber-aarch64-unknown-linux-gnu.tar.gz + .sha256
+```
+
+也可以在 Actions 页面手动触发 `workflow_dispatch` 并填入 tag。
+
+### 工作流覆盖矩阵
+
+| Runner | Target | 产物 |
+| --- | --- | --- |
+| `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | `cyber-<target>.tar.gz` |
+| `ubuntu-22.04-arm` | `aarch64-unknown-linux-gnu` | `cyber-<target>.tar.gz` |
+| `macos-13` (Intel) | `x86_64-apple-darwin` | `cyber-<target>.tar.gz` |
+| `macos-14` (Apple Silicon) | `aarch64-apple-darwin` | `cyber-<target>.tar.gz` |
+| `windows-2022` | `x86_64-pc-windows-msvc` | `cyber-<target>.zip` |
+
+每个产物都附带 `.sha256` 校验文件，`install.sh` / `install.ps1` 会自动下载并校验。
+
+### 安装脚本与工作流的契约
+
+为保证安装脚本能正确下载，发布产物的文件名必须严格遵循：
+
+```
+cyber-<rust-target>.<tar.gz|zip>
+cyber-<rust-target>.<tar.gz|zip>.sha256
+```
+
+新增 target 时需同时更新：
+
+1. `.github/workflows/release.yml` 的 matrix
+2. `install.sh` 的平台/架构检测分支
+3. README「支持的预编译目标」表
 
 ---
 

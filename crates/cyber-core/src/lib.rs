@@ -3,6 +3,7 @@
 //! P1 范围：配置层加载（全局 `~/.cyber` + 项目级 `.cyber/` + `.cyber.md`）。
 
 pub mod config;
+pub mod ctf;
 pub mod error;
 pub mod fsutil;
 pub mod init;
@@ -12,6 +13,7 @@ pub mod project;
 pub mod providers;
 
 pub use config::Config;
+pub use ctf::{CtfCategory, CtfChallenge, CtfStatus};
 pub use error::{CoreError, Result};
 pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};
 pub use paths::Paths;

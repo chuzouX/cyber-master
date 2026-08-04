@@ -12,6 +12,7 @@
 pub mod app;
 pub mod bootstrap;
 pub mod chat;
+pub mod ctf_store;
 pub mod event;
 pub mod history;
 pub mod markdown;

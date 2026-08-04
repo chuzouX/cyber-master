@@ -77,6 +77,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "手动压缩上下文（可选自定义摘要指令）",
     },
     CommandSpec {
+        name: "/ctf",
+        usage: "/ctf <enable|disable|add|list|writeup>",
+        desc: "CTF 模式管理（enable/disable 开关，add 添加题目，list 列出，writeup 生成报告）",
+    },
+    CommandSpec {
         name: "/max_steps",
         usage: "/max_steps <N>",
         desc: "查看或设置工具调用步数上限（1-1000）",
@@ -132,6 +137,9 @@ pub enum SlashCommand {
     /// `/compact [instructions]` — 手动压缩上下文。
     /// 空串 = 无自定义指令；非空 = 自定义摘要指令。
     Compact(String),
+    /// `/ctf <enable|disable|add|list|writeup>` — CTF 模式管理。
+    /// enable/disable 开关；add <name> <category> 添加题目；list 列出；writeup <name> 生成报告。
+    Ctf(String),
     /// `/max_steps <N>` — 查看或设置工具调用步数上限。空串 = 查看当前值。
     MaxSteps(String),
     /// `/new` — 新建会话（保存当前 → 切到空会话）。
@@ -164,6 +172,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/mcp" => SlashCommand::Mcp(args.to_string()),
         "/cancel" => SlashCommand::Cancel,
         "/compact" => SlashCommand::Compact(args.to_string()),
+        "/ctf" => SlashCommand::Ctf(args.to_string()),
         "/max_steps" => SlashCommand::MaxSteps(args.to_string()),
         "/new" => SlashCommand::New,
         "/sessions" => SlashCommand::Sessions(args.to_string()),

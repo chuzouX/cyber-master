@@ -40,6 +40,8 @@ use crate::theme::Theme;
 pub enum ChatEntry {
     User(String),
     Assistant(String),
+    /// 思考过程（DeepSeek reasoning_content）。默认折叠为最新 3 行，Ctrl+O 展开。
+    Thinking(String),
     /// 工具调用（agent 即将执行）。`arguments` 为 JSON 字符串。
     ToolCall {
         id: String,
@@ -139,6 +141,9 @@ pub struct ChatState {
     pub streaming: bool,
     /// 当前流式响应的累积 buffer；Done 时转为 assistant 条目。
     pub streaming_buffer: String,
+    /// 当前流式思考过程的累积 buffer（DeepSeek reasoning_content）；
+    /// Done 时转为 Thinking 条目（位于对应 Assistant 条目之前）。
+    pub thinking_buffer: String,
     /// 已完成条目的渲染行缓存（不含流式 tail 与空态引导）。
     /// 仅当 `entries.len()` 变化或 `cache_dirty`（如 theme 切换）时重建，
     /// 避免每帧重新 tokenize 全部条目。流式 tail 由 view 每帧追加（量小）。
@@ -178,8 +183,8 @@ pub struct ChatState {
 struct WrappedCache {
     /// 已折行的单行 `Line`（entries + tail）。
     lines: Vec<Line<'static>>,
-    /// 缓存键：(entries.len, streaming_buffer.len, width)。
-    key: (usize, usize, u16),
+    /// 缓存键：(entries.len, streaming_buffer.len, thinking_buffer.len, width)。
+    key: (usize, usize, usize, u16),
     /// 是否有效（theme 切换等 entries.len 不变但样式需刷新时置 false）。
     valid: bool,
 }
@@ -194,6 +199,7 @@ impl ChatState {
             input,
             streaming: false,
             streaming_buffer: String::new(),
+            thinking_buffer: String::new(),
             cached_history: Vec::new(),
             cached_entries_len: 0,
             cache_dirty: true,
@@ -294,7 +300,12 @@ impl ChatState {
     pub fn wrapped_lines(&self, theme: &Theme, width: u16) -> std::cell::Ref<'_, Vec<Line<'static>>> {
         {
             let mut wc = self.wrapped.borrow_mut();
-            let key = (self.entries.len(), self.streaming_buffer.len(), width);
+            let key = (
+                self.entries.len(),
+                self.streaming_buffer.len(),
+                self.thinking_buffer.len(),
+                width,
+            );
             if !wc.valid || wc.key != key {
                 let unwrapped = self.build_render_lines(theme, width);
                 wc.lines = wrap_lines(&unwrapped, width as usize);
@@ -321,7 +332,11 @@ impl ChatState {
             lines.extend_from_slice(cached);
         }
         if self.streaming {
-            lines.extend(build_streaming_tail(&self.streaming_buffer, theme));
+            lines.extend(build_streaming_tail(
+                &self.streaming_buffer,
+                &self.thinking_buffer,
+                theme,
+            ));
         }
         lines
     }
@@ -502,6 +517,7 @@ impl ChatState {
         self.entries.push(ChatEntry::User(text.clone()));
         self.streaming = true;
         self.streaming_buffer.clear();
+        self.thinking_buffer.clear();
         self.scroll_to_bottom(); // 新提交：跟随新响应
         self.slash_menu.close();
         Some((text, history))
@@ -510,6 +526,11 @@ impl ChatState {
     /// 把当前 `streaming_buffer` 定稿为一条 assistant 条目（仅 buffer 非空时 push），
     /// **不**改变 streaming 态。用于 ToolCall 到达前先把已累积的 assistant 文本落盘。
     pub fn flush_streaming_to_assistant(&mut self) {
+        // 先 flush 思考过程（位于 Assistant 条目之前）
+        if !self.thinking_buffer.is_empty() {
+            let content = std::mem::take(&mut self.thinking_buffer);
+            self.entries.push(ChatEntry::Thinking(content));
+        }
         if !self.streaming_buffer.is_empty() {
             let content = std::mem::take(&mut self.streaming_buffer);
             self.entries.push(ChatEntry::Assistant(content));
@@ -528,17 +549,15 @@ impl ChatState {
             .push(ChatEntry::ToolResult { id, name, output, is_error });
     }
 
-    /// 切换最后一个工具结果的展开/折叠状态（Ctrl+O）。
+    /// 切换最后一个可折叠条目（工具结果或思考过程）的展开/折叠状态（Ctrl+O）。
     ///
-    /// 工具结果输出行数超过 `TOOL_RESULT_FOLD_THRESHOLD` 时默认折叠（仅显示最后 N 行），
-    /// 调用此方法切换。索引以 `entries` 下标为准（条目只追加不插入，下标稳定）。
-    /// 无工具结果时 no-op。切换后 `invalidate_cache` 强制重渲染。
+    /// 从 entries 末尾向前找第一个 ToolResult 或 Thinking 条目。索引以 `entries`
+    /// 下标为准（条目只追加不插入，下标稳定）。无可折叠条目时 no-op。
+    /// 切换后 `invalidate_cache` 强制重渲染。
     pub fn toggle_last_tool_result_expansion(&mut self) {
-        if let Some(idx) = self
-            .entries
-            .iter()
-            .rposition(|e| matches!(e, ChatEntry::ToolResult { .. }))
-        {
+        if let Some(idx) = self.entries.iter().rposition(|e| {
+            matches!(e, ChatEntry::ToolResult { .. } | ChatEntry::Thinking(_))
+        }) {
             if self.expanded_tool_results.contains(&idx) {
                 self.expanded_tool_results.remove(&idx);
             } else {
@@ -558,6 +577,7 @@ impl ChatState {
     /// 取消流式（Esc）：丢弃 buffer，不追加 assistant 条目，退出 streaming 态。
     pub fn cancel_stream(&mut self) {
         self.streaming_buffer.clear();
+        self.thinking_buffer.clear();
         self.streaming = false;
     }
 
@@ -565,6 +585,7 @@ impl ChatState {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.streaming_buffer.clear();
+        self.thinking_buffer.clear();
         self.scroll_to_bottom();
         self.slash_menu.close();
         self.expanded_tool_results.clear();
@@ -624,6 +645,10 @@ pub fn render_entries(
             ChatEntry::Assistant(content) => {
                 push_assistant_lines(&mut lines, theme, content);
             }
+            ChatEntry::Thinking(content) => {
+                let is_expanded = expanded.contains(&i);
+                push_thinking_lines(&mut lines, theme, content, is_expanded);
+            }
             ChatEntry::System(content) => {
                 push_role_lines(&mut lines, "[system]", theme.muted, content, theme);
             }
@@ -655,8 +680,14 @@ pub fn render_entries(
 /// 不完整 markdown（未闭合 `**` / 围栏），`markdown::render` 会把未闭合格式降级为
 /// 纯文本。空 buffer 显示标签行 + 等待光标。由 `build_render_lines` 调用并入预折行
 /// 缓存（量小，每帧随 buffer 变化重建）。
-fn build_streaming_tail(buffer: &str, theme: &Theme) -> Vec<Line<'static>> {
+///
+/// 若 `thinking_buffer` 非空，在 assistant 标签前渲染思考过程（最新 3 行 + 折叠提示）。
+fn build_streaming_tail(buffer: &str, thinking: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // 思考过程（最新 3 行）
+    if !thinking.is_empty() {
+        push_thinking_lines_streaming(&mut lines, theme, thinking);
+    }
     lines.push(Line::from(Span::styled(
         "[assistant]",
         Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
@@ -678,6 +709,34 @@ fn build_streaming_tail(buffer: &str, theme: &Theme) -> Vec<Line<'static>> {
         .push(Span::styled("▌", Style::default().fg(theme.accent)));
     lines.extend(md_lines);
     lines
+}
+
+/// 流式期间渲染思考过程：只显示最新 3 行 + 折叠提示。
+fn push_thinking_lines_streaming(lines: &mut Vec<Line<'static>>, theme: &Theme, text: &str) {
+    let all_lines: Vec<&str> = text.lines().collect();
+    lines.push(Line::from(vec![
+        Span::styled("💭 ", Style::default()),
+        Span::styled(
+            "思考过程",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::DIM),
+        ),
+    ]));
+    let show_count = 3.min(all_lines.len());
+    let start = all_lines.len().saturating_sub(show_count);
+    for line in &all_lines[start..] {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {line}"),
+            Style::default().fg(theme.muted),
+        )]));
+    }
+    if all_lines.len() > 3 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ⋮ +{} 行 · Ctrl+O 展开", all_lines.len() - 3),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        )]));
+    }
 }
 
 /// 把未折行的 `Line` 列表按 `width` 拆成单行 `Line`（贪婪字符宽度填充，CJK 占 2 列）。
@@ -812,6 +871,69 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, theme: &Theme, name: &str, arg
         Style::default().fg(theme.muted),
     ));
     lines.push(Line::from(spans));
+}
+
+/// 渲染思考过程条目：标题行 + 内容行。
+///
+/// 折叠态（默认）：仅显示最新 3 行 + `⋮ +M 行已折叠 · Ctrl+O 展开` 提示。
+/// 展开态：显示全部行 + `⋮ 共 N 行 · Ctrl+O 折叠` 提示。
+/// ≤3 行时照常全显，无折叠提示。
+fn push_thinking_lines(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    content: &str,
+    expanded: bool,
+) {
+    let all_lines: Vec<&str> = content.lines().collect();
+    let count = all_lines.len();
+    lines.push(Line::from(vec![
+        Span::styled("💭 ", Style::default()),
+        Span::styled(
+            "思考过程",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD | Modifier::DIM),
+        ),
+    ]));
+    let folded = count > TOOL_RESULT_FOLD_THRESHOLD && !expanded;
+    if folded {
+        let show = TOOL_RESULT_FOLD_THRESHOLD;
+        let hidden = count - show;
+        let start = count - show;
+        for line in &all_lines[start..] {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.muted),
+            )]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  ⋮ ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("+{hidden} 行已折叠 · Ctrl+O 展开"),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
+    } else {
+        for line in &all_lines {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.muted),
+            )]));
+        }
+        if count > TOOL_RESULT_FOLD_THRESHOLD {
+            lines.push(Line::from(vec![
+                Span::styled("  ⋮ ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    format!("共 {count} 行 · Ctrl+O 折叠"),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
 }
 
 /// 渲染工具结果：成功 `    → output`（muted/fg），错误 `    ✗ output`（红色）。

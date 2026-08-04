@@ -118,6 +118,8 @@ async fn main() -> color_eyre::Result<()> {
         mcp_servers_file: ctx.paths.mcp_servers_file.clone(),
         log_file: log_file.clone(),
         history_dir: ctx.paths.history_dir.clone(),
+        ctf_dir: ctx.paths.ctf_dir.clone(),
+        ctf_writeup_dir: ctx.paths.ctf_writeup_dir.clone(),
         cwd,
     };
 

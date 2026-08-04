@@ -8,6 +8,16 @@ pub const BASE_PROMPT: &str = "你是 Cyber Master，一个网络安全智能体
 禁止破坏性操作（删库、DoS、未授权入侵）。回答简洁、可执行。\
 使用工具收集到足够信息后应直接给出结论，避免无意义地反复调用同一工具。";
 
+/// CTF 模式附加系统提示词。
+///
+/// 指示 agent 使用 `ctf_challenge` 工具自动注册/更新题目状态。
+pub const CTF_PROMPT: &str = "\n\n# CTF 模式\n\
+当前已开启 CTF 竞赛模式。请使用 `ctf_challenge` 工具管理题目：\n\
+- 分析题目时调用 `ctf_challenge`（action=register）注册题目名称、分类、描述、靶机地址和标签\n\
+- 解出题目（获得 flag）时调用 `ctf_challenge`（action=solve）标记已解出并记录 flag 和关键知识点\n\
+- 可随时调用 `ctf_challenge`（action=list）查看所有题目状态\n\
+题目状态会实时显示在 TUI 题目面板中。";
+
 /// 组装系统提示词：base + 项目上下文 + rules 护栏段。
 ///
 /// `body`（.cyber.md 正文）暂不注入，避免上下文膨胀（留 P2.2 按需引用）。

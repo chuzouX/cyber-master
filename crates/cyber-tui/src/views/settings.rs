@@ -6,7 +6,7 @@
 //! Esc 双击回退到进入时的快照（见 `app.rs` 的 `config_at_entry`）。
 
 use cyber_core::{Config, ProvidersConfig};
-use cyber_mcp::{McpServersConfig, McpTransport};
+use cyber_mcp::{McpRegistry, McpServersConfig, McpTransport};
 use cyber_skills::{Skill, SkillRegistry, SkillSource};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -636,6 +636,7 @@ pub fn render(
     config: &Config,
     providers: &ProvidersConfig,
     mcp_config: &McpServersConfig,
+    mcp_registry: Option<&McpRegistry>,
     skills: &SkillRegistry,
     state: &SettingsState,
     has_project_config: bool,
@@ -688,7 +689,7 @@ pub fn render(
 
     let cols = Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
     render_sidebar(frame, cols[0], theme, state);
-    render_fields(frame, cols[1], theme, config, providers, mcp_config, skills, state);
+    render_fields(frame, cols[1], theme, config, providers, mcp_config, mcp_registry, skills, state);
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, theme: &Theme, state: &SettingsState) {
@@ -718,6 +719,7 @@ fn render_fields(
     config: &Config,
     providers: &ProvidersConfig,
     mcp_config: &McpServersConfig,
+    mcp_registry: Option<&McpRegistry>,
     skills: &SkillRegistry,
     state: &SettingsState,
 ) {
@@ -818,7 +820,7 @@ fn render_fields(
         lines.push(Line::from(hint).style(hint_style));
     } else if state.on_mcp_section() {
         // MCP 段：交互式（a 新增 / e 编辑 / d 删除 / ↑↓ 选择）
-        render_mcp_lines(&mut lines, theme, mcp_config, state);
+        render_mcp_lines(&mut lines, theme, mcp_config, mcp_registry, state);
         // 保存按钮行
         lines.push(Line::from(""));
         let on_save = state.mcp_on_save;
@@ -949,11 +951,12 @@ fn render_providers_lines(
     }
 }
 
-/// 渲染 MCP servers 列表（名称 / 传输 / 命令或 URL / 超时）。
+/// 渲染 MCP servers 列表（名称 / 传输 / 命令或 URL / 超时 / 连接状态）。
 fn render_mcp_lines(
     lines: &mut Vec<Line>,
     theme: &Theme,
     mcp_config: &McpServersConfig,
+    mcp_registry: Option<&McpRegistry>,
     state: &SettingsState,
 ) {
     if mcp_config.servers.is_empty() {
@@ -962,6 +965,9 @@ fn render_mcp_lines(
         );
         return;
     }
+    let connected_names: Vec<&str> = mcp_registry
+        .map(|r| r.server_names())
+        .unwrap_or_default();
     for (i, spec) in mcp_config.servers.iter().enumerate() {
         let selected = i == state.mcp_selected && !state.mcp_on_save;
         let pending_delete = state.mcp_pending_delete_idx == Some(i);
@@ -988,6 +994,14 @@ fn render_mcp_lines(
                 spec.url.as_deref().unwrap_or("(未设置 url)").to_string()
             }
         };
+        // 连接状态：已连接 / 连接失败 / 未启用（mock 模式）
+        let (status_text, status_color) = if mcp_registry.is_none() {
+            ("未启用", theme.muted)
+        } else if connected_names.contains(&spec.name.as_str()) {
+            ("已连接", theme.title)
+        } else {
+            ("连接失败", theme.accent)
+        };
         lines.push(
             Line::from(vec![
                 Span::raw(marker.to_string()),
@@ -996,9 +1010,15 @@ fn render_mcp_lines(
                     Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
-                    "  [{}] {} · timeout={}s{}",
-                    spec.transport, transport_summary, spec.timeout_secs, delete_tag,
+                    "  [{}] {} · timeout={}s",
+                    spec.transport, transport_summary, spec.timeout_secs,
                 )),
+                Span::raw(format!("  · ")),
+                Span::styled(
+                    format!("[{}]", status_text),
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(delete_tag.to_string()),
             ])
             .style(row_style),
         );
@@ -1296,6 +1316,7 @@ mod tests {
                     &cfg,
                     &providers,
                     &McpServersConfig::default(),
+                    None,
                     &SkillRegistry::new(),
                     &st,
                     false,
@@ -1322,6 +1343,7 @@ mod tests {
                     &cfg,
                     &providers,
                     &McpServersConfig::default(),
+                    None,
                     &SkillRegistry::new(),
                     &st,
                     false,
@@ -1373,6 +1395,7 @@ mod tests {
                     &cfg,
                     &providers,
                     &McpServersConfig::default(),
+                    None,
                     &SkillRegistry::new(),
                     &st,
                     false,

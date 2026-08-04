@@ -58,6 +58,8 @@ pub enum ChatAction {
     ToggleMouse,
     /// 切换最近工具结果的展开/折叠（Ctrl+O）。
     ToggleToolResult,
+    /// 切换 CTF 题目面板（Ctrl+T）。
+    ToggleCtfPanel,
     /// 退出（Ctrl+C / Ctrl+Q；Chat 内 `q` 是打字字符，不退出）。
     Quit,
     /// 历史区上滚一页（PageUp）。
@@ -161,6 +163,10 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
     // Ctrl+O 切换最近工具结果展开/折叠
     if k.code == KeyCode::Char('o') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return ChatAction::ToggleToolResult;
+    }
+    // Ctrl+T 切换 CTF 题目面板
+    if k.code == KeyCode::Char('t') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return ChatAction::ToggleCtfPanel;
     }
     match k.code {
         KeyCode::Enter => {
