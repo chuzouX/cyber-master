@@ -345,7 +345,16 @@ pub struct SettingsState {
     pub dirty: bool,
     /// 首次 Esc（dirty 时）置 true，二次 Esc 触发回退。
     pub pending_discard: bool,
+    /// Providers 段有未保存改动（与 `dirty` 分离：dirty 跟踪 config，dirty_providers 跟踪 providers）。
+    pub dirty_providers: bool,
+    /// Providers 段 cursor（在排序后的 provider 名列表中）。
+    pub provider_selected: usize,
+    /// 双击 `d` 删除确认：首次 `d` 置 `Some(idx)`，二次 `d` 执行删除，任一其他键清除。
+    pub pending_delete_idx: Option<usize>,
 }
+
+/// Providers 段在 SECTIONS 中的索引。
+pub const PROVIDERS_SECTION_IDX: usize = 5;
 
 impl SettingsState {
     pub fn new() -> Self {
@@ -366,9 +375,32 @@ impl SettingsState {
         s.editable && self.selected >= s.fields.len()
     }
 
-    /// 段是否可编辑（Providers 段只读）。
+    /// 段是否可编辑（Providers 段只读，由 App 侧特殊分派 a/e/d）。
     pub fn is_editable(&self) -> bool {
         self.cur_section().editable
+    }
+
+    /// 当前是否在 Providers 段（特殊交互段）。
+    pub fn on_providers_section(&self) -> bool {
+        self.section == PROVIDERS_SECTION_IDX
+    }
+
+    /// Providers 段 cursor 下移（clamp，空列表 no-op）。
+    pub fn next_provider(&mut self, len: usize) {
+        if len == 0 {
+            self.provider_selected = 0;
+            return;
+        }
+        self.provider_selected = (self.provider_selected + 1).min(len - 1);
+    }
+
+    /// Providers 段 cursor 上移（clamp，空列表 no-op）。
+    pub fn prev_provider(&mut self, len: usize) {
+        if len == 0 {
+            self.provider_selected = 0;
+            return;
+        }
+        self.provider_selected = self.provider_selected.saturating_sub(1);
     }
 
     pub fn next_field(&mut self) {
@@ -481,7 +513,7 @@ pub fn render(
     state: &SettingsState,
     has_project_config: bool,
 ) {
-    let dirty_marker = if state.dirty { " *" } else { "" };
+    let dirty_marker = if state.dirty || state.dirty_providers { " *" } else { "" };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -575,7 +607,7 @@ fn render_fields(
         // 保存按钮行
         let on_save = state.on_save_row();
         let save_marker = if on_save { "▸ " } else { "  " };
-        let save_label = if state.dirty { "保存设置 *" } else { "保存设置" };
+        let save_label = if state.dirty || state.dirty_providers { "保存设置 *" } else { "保存设置" };
         let save_style = if on_save {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -591,7 +623,7 @@ fn render_fields(
             .style(save_style),
         );
         lines.push(Line::from(""));
-        if state.dirty {
+        if state.dirty || state.dirty_providers {
             lines.push(
                 Line::from("有未保存改动：Enter 保存 / 再按 Esc 丢弃")
                     .style(Style::default().fg(theme.muted)),
@@ -600,12 +632,22 @@ fn render_fields(
             lines.push(Line::from("Enter 编辑字段  ←→ 调整  Esc 返回").style(Style::default().fg(theme.muted)));
         }
     } else {
-        render_providers_lines(&mut lines, theme, providers, config);
+        // Providers 段：交互式（a 新增 / e 编辑 / d 删除 / Enter 设默认）
+        render_providers_lines(&mut lines, theme, providers, config, state);
         lines.push(Line::from(""));
-        lines.push(
-            Line::from("Providers 只读：编辑 ~/.cyber/providers.toml")
-                .style(Style::default().fg(theme.muted)),
-        );
+        let hint = if let Some(idx) = state.pending_delete_idx {
+            let names = providers.sorted_names();
+            let name = names.get(idx).map(|s| s.as_str()).unwrap_or("?");
+            format!(" 再按 d 确认删除 '{name}' · 其他键取消")
+        } else {
+            " a 新增  e 编辑  d 删除  Enter 设默认  ↑↓ 选择".to_string()
+        };
+        let hint_style = if state.pending_delete_idx.is_some() {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        lines.push(Line::from(hint).style(hint_style));
     }
 
     frame.render_widget(
@@ -633,29 +675,43 @@ fn render_providers_lines(
     theme: &Theme,
     providers: &ProvidersConfig,
     config: &Config,
+    state: &SettingsState,
 ) {
-    let mut names: Vec<&String> = providers.providers.keys().collect();
-    names.sort();
+    let names = providers.sorted_names();
     if names.is_empty() {
         lines.push(
-            Line::from("（无 provider）").style(Style::default().fg(theme.muted)),
+            Line::from("（无 provider，按 a 新增）").style(Style::default().fg(theme.muted)),
         );
         return;
     }
-    for name in names {
+    for (i, name) in names.iter().enumerate() {
         let p = &providers.providers[name];
         let is_default = name.as_str() == config.agent.default_provider;
         let star = if is_default { " ★默认" } else { "" };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{name}{star}"),
-                Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  [{}] {} · {}", p.kind, p.base_url, p.model)),
-        ]));
+        let selected = i == state.provider_selected;
+        let pending_delete = state.pending_delete_idx == Some(i);
+        let marker = if selected { "▸ " } else { "  " };
+        let delete_tag = if pending_delete { "  [待删除!]" } else { "" };
+        let row_style = if selected {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        let name_color = if pending_delete { theme.accent } else { theme.title };
         lines.push(
-            Line::from(format!("    api_key: {}", mask_key(&p.api_key)))
-                .style(Style::default().fg(theme.muted)),
+            Line::from(vec![
+                Span::raw(marker.to_string()),
+                Span::styled(
+                    format!("{name}{star}"),
+                    Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  [{}] {} · {}{}", p.kind, p.base_url, p.model, delete_tag)),
+            ])
+            .style(row_style),
+        );
+        let key_line = format!("    api_key: {}", mask_key(&p.api_key));
+        lines.push(
+            Line::from(key_line).style(Style::default().fg(theme.muted)),
         );
     }
 }
@@ -796,6 +852,93 @@ mod tests {
         };
         assert!(!st.is_editable());
         assert!(!st.on_save_row(), "只读段不应停在保存行");
+    }
+
+    #[test]
+    fn on_providers_section_detects_correctly() {
+        let mut st = SettingsState::new();
+        assert!(!st.on_providers_section());
+        st.section = PROVIDERS_SECTION_IDX;
+        assert!(st.on_providers_section());
+    }
+
+    #[test]
+    fn next_prev_provider_clamp() {
+        let mut st = SettingsState::new();
+        st.section = PROVIDERS_SECTION_IDX;
+        // 3 个 provider
+        st.next_provider(3);
+        assert_eq!(st.provider_selected, 1);
+        st.next_provider(3);
+        assert_eq!(st.provider_selected, 2);
+        st.next_provider(3); // clamp 到 2
+        assert_eq!(st.provider_selected, 2);
+        st.prev_provider(3);
+        assert_eq!(st.provider_selected, 1);
+        st.prev_provider(3);
+        assert_eq!(st.provider_selected, 0);
+        st.prev_provider(3); // saturating_sub 到 0
+        assert_eq!(st.provider_selected, 0);
+    }
+
+    #[test]
+    fn next_prev_provider_empty_list() {
+        let mut st = SettingsState::new();
+        st.section = PROVIDERS_SECTION_IDX;
+        st.provider_selected = 5;
+        st.next_provider(0);
+        assert_eq!(st.provider_selected, 0);
+        st.provider_selected = 5;
+        st.prev_provider(0);
+        assert_eq!(st.provider_selected, 0);
+    }
+
+    #[test]
+    fn interactive_providers_render_does_not_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut st = SettingsState::new();
+        st.section = PROVIDERS_SECTION_IDX;
+        st.provider_selected = 1;
+        st.pending_delete_idx = Some(0);
+        let cfg = Config::default();
+        let providers = ProvidersConfig::default_template();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &crate::theme::Theme::resolve("cyberpunk"),
+                    &cfg,
+                    &providers,
+                    &st,
+                    false,
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn empty_providers_render_does_not_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut st = SettingsState::new();
+        st.section = PROVIDERS_SECTION_IDX;
+        let cfg = Config::default();
+        let providers = ProvidersConfig::default(); // 空
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &crate::theme::Theme::resolve("cyberpunk"),
+                    &cfg,
+                    &providers,
+                    &st,
+                    false,
+                )
+            })
+            .unwrap();
     }
 
     #[test]

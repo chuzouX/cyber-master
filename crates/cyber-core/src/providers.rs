@@ -2,6 +2,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// 支持的 provider kind（format）。TUI 表单的 kind 字段在此循环；
+/// `provider_factory` 接受前三种（openai/anthropic/ollama），
+/// `openai-compatible` 复用 openai 的 SSE 解析路径。
+pub const PROVIDER_KINDS: &[&str] = &["openai", "anthropic", "ollama", "openai-compatible"];
+
 /// 对应 `~/.cyber/providers.toml`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,12 +80,37 @@ impl ProvidersConfig {
             providers,
         }
     }
+
+    /// 排序后的 provider 名列表（供 TUI 渲染与 cursor 索引复用，保证顺序稳定）。
+    pub fn sorted_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.providers.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// 新增或覆盖（按 name 作 key）。同时规范化 `ProviderConfig`（去 base_url 尾斜杠）。
+    pub fn upsert(&mut self, name: &str, mut cfg: ProviderConfig) {
+        cfg.normalize();
+        self.providers.insert(name.to_string(), cfg);
+    }
+
+    /// 按 name 删除，返回被删的旧配置（不存在则 None）。
+    pub fn remove(&mut self, name: &str) -> Option<ProviderConfig> {
+        self.providers.remove(name)
+    }
 }
 
 impl ProviderConfig {
     /// 解析自身 `api_key`：`${ENV_VAR}` 引用展开为环境变量值，明文原样返回。
     pub fn resolved_api_key(&self) -> String {
         resolve_api_key(&self.api_key)
+    }
+
+    /// 就地规范化：trim `base_url` 并去尾部 `/`（参考 wepclaude `normalizeBaseUrl`）。
+    pub fn normalize(&mut self) {
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.model = self.model.trim().to_string();
     }
 }
 
@@ -154,5 +184,68 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p2.resolved_api_key(), "sk-plain");
+    }
+
+    #[test]
+    fn provider_kinds_has_four_entries() {
+        assert_eq!(PROVIDER_KINDS.len(), 4);
+        assert!(PROVIDER_KINDS.contains(&"openai"));
+        assert!(PROVIDER_KINDS.contains(&"openai-compatible"));
+    }
+
+    #[test]
+    fn normalize_strips_trailing_slash_and_trims() {
+        let mut p = ProviderConfig {
+            base_url: "  https://api.openai.com/v1/  ".into(),
+            api_key: "  sk-x  ".into(),
+            model: "  gpt-4o  ".into(),
+            ..Default::default()
+        };
+        p.normalize();
+        assert_eq!(p.base_url, "https://api.openai.com/v1");
+        assert_eq!(p.api_key, "sk-x");
+        assert_eq!(p.model, "gpt-4o");
+    }
+
+    #[test]
+    fn sorted_names_returns_sorted() {
+        let cfg = ProvidersConfig::default_template();
+        let names = cfg.sorted_names();
+        assert_eq!(names, vec!["anthropic", "ollama", "openai"]);
+    }
+
+    #[test]
+    fn upsert_inserts_and_overrides() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.upsert(
+            "foo",
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: "https://x/".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers["foo"].base_url, "https://x"); // normalize 去尾 /
+
+        cfg.upsert(
+            "foo",
+            ProviderConfig {
+                kind: "anthropic".into(),
+                base_url: "https://y".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.providers.len(), 1, "同名应覆盖");
+        assert_eq!(cfg.providers["foo"].kind, "anthropic");
+    }
+
+    #[test]
+    fn remove_returns_old_or_none() {
+        let mut cfg = ProvidersConfig::default_template();
+        let removed = cfg.remove("openai");
+        assert!(removed.is_some());
+        assert!(!cfg.providers.contains_key("openai"));
+        assert!(cfg.remove("nope").is_none());
     }
 }

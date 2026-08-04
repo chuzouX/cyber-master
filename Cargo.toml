@@ -46,7 +46,10 @@ ratatui = "0.30"
 # event-stream：P2 起用 crossterm::event::EventStream 接入 tokio select!
 crossterm = { version = "0.28", features = ["event-stream"] }
 # 多行输入框；原 tui-textarea 0.7 pin ratatui ^0.29，与 0.30 不兼容，故用维护 fork tui-textarea-2。
-tui-textarea = { package = "tui-textarea-2", version = "0.12" }
+# 关键：tui-textarea-2 默认 crossterm feature 绑定 crossterm 0.29，与本项目 0.28 冲突
+#（两份 crossterm → KeyEvent 类型不匹配，textarea.input(key) 编译失败）。
+# 故禁用 default、显式启用 crossterm_0_28 feature 复用本项目 crossterm 0.28。
+tui-textarea = { package = "tui-textarea-2", version = "0.12", default-features = false, features = ["crossterm_0_28"] }
 
 # 内部 crate 互引
 cyber-core = { path = "crates/cyber-core" }

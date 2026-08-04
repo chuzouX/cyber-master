@@ -493,6 +493,8 @@ dependencies = [
  "cyber-core",
  "futures",
  "ratatui",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tui-textarea-2",
@@ -2737,7 +2739,7 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4296a13cbcb20abd7b62f96154cad81053eb82ee8d24db3d7fdca16b31f118e9"
 dependencies = [
- "crossterm 0.29.0",
+ "crossterm 0.28.1",
  "portable-atomic",
  "ratatui-core",
  "ratatui-widgets",

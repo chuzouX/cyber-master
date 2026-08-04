@@ -81,7 +81,8 @@ cyber_master/
 ├── workflows/               # 保存的工作流模板（.cyberflow）
 │   └── src-full-flow.cyberflow
 ├── sessions/                # 会话状态快照（可恢复）
-├── history.db               # SQLite：聊天/命令历史
+├── history/                 # 聊天历史 JSON（P2.2：按 cwd hash 存 {cwd_hash}.json）
+├── history.db               # SQLite：聊天/命令历史（P5 计划，P2.2 暂用 history/ JSON 兜底）
 ├── assets.db                # SQLite：发现的资产/漏洞
 ├── logs/                    # 应用日志 + 工作流日志（按日期分文件）
 └── reports/                 # 生成的报告（md/html/json）
@@ -209,7 +210,8 @@ log_level = "info"
 
 - **流式输出**：token-by-token 渲染（SSE/流式 API）
 - **工具调用内联展示**：工具名、参数摘要、状态、耗时、结果计数；可展开看详情
-- **斜杠命令**：`/help /workflow /skill /mcp /model /clear /save /load /report /targets /scan /dashboard`
+- **斜杠命令**：`/help /workflow /skill /mcp /model /provider /clear /save /load /report /targets /scan /dashboard`
+- **服务商管理**：`/provider list|add|edit|use|remove` 在对话中增删改查 LLM 服务商，无需退出到配置文件；表单内「拉取模型」按钮异步 `GET {base}/models` 拉取模型列表供选择（详见 §9.5）
 - **项目上下文感知**：`.cyber.md` 自动注入；`@file` 引用文件；`/add` 添加目录到上下文
 - **文件编辑 diff**：agent 修改文件时以 diff 块展示，确认后落盘
 - **多行输入**：`tui-textarea`，Shift+Enter 换行，Enter 发送
@@ -494,9 +496,14 @@ subfinder, amass, assetfinder, httpx, naabu, dnsx, nmap, masscan, nuclei, xray, 
 | Space | 选中节点（Workflow） |
 | e | 编辑节点参数 |
 | l | 查看节点日志 |
-| Enter | 确认 / 进入（Settings 内：编辑字段 / 保存设置） |
-| ←/→ | Settings 内调整字段值（bool 切换 / enum 循环 / number ±step） |
-| ↑/↓ | 导航（Welcome 选项 / Settings 字段行） |
+| Enter | 确认 / 进入（Settings 内：编辑字段 / 保存设置 / Providers 段设默认） |
+| ←/→ | Settings 内调整字段值（bool 切换 / enum 循环 / number ±step）；Provider Form 内切换 kind |
+| ↑/↓ | 导航（Welcome 选项 / Settings 字段行 / Provider Form 字段） |
+| a | Settings Providers 段：新增服务商（打开 Provider Form） |
+| e | Settings Providers 段：编辑当前服务商 |
+| d | Settings Providers 段：删除当前服务商（双击 `d` 确认） |
+
+> **Chat 输入态键位差异（P2）**：Chat 是文本输入模式，`s`/`q`/`/` 等均为打字字符，不触发上表动作。Chat 专属键：`Enter` 发送、`Shift+Enter`/`Alt+Enter`/`Ctrl+J` 换行、`Ctrl+,` 打开设置（替代 `s`）、`Ctrl+C`/`Ctrl+Q` 退出（替代 `q`）、`Esc` 取消流式或返回。其余模式仍用上表全局键位。
 
 ### 9.3 主题与动画
 
@@ -508,7 +515,7 @@ subfinder, amass, assetfinder, httpx, naabu, dnsx, nmap, masscan, nuclei, xray, 
 
 P1 阶段实现的配置查看 / 编辑 / 持久化入口。用 `Mode::Settings` 模拟模态层：全局 `s` 或 Welcome 第 4 项进入，`Esc` 返回 `prev_mode`。
 
-**布局**：左侧段侧边栏（6 段）+ 右侧字段表。Providers 段只读（编辑 `~/.cyber/providers.toml`），其余 5 段可编辑。
+**布局**：左侧段侧边栏（6 段）+ 右侧字段表。Providers 段可交互（`a`/`e`/`d`/`Enter` 增删改设默认，详见 §9.5），其余 5 段按 `FieldKind` 编辑。
 
 **字段编辑模型**：`SECTIONS` 用 fn 指针访问 `Config` 字段，按 `FieldKind` 派发：
 
@@ -541,14 +548,46 @@ P1 阶段实现的配置查看 / 编辑 / 持久化入口。用 `Mode::Settings`
 | Tools | extra_path | ReadOnly | —（编辑配置文件） |
 | Storage | history_retention_days | Number | P5 |
 | Storage | log_level | ReadOnly | —（编辑配置文件 / RUST_LOG） |
-| Providers | （整段只读） | — | 编辑 `~/.cyber/providers.toml` |
+| Providers | （整段可交互） | — | `a`/`e`/`d`/`Enter` 管理（详见 §9.5）；Settings 入口延迟随「保存设置」写盘，Chat `/provider` 入口立即写盘 |
 
 **安全机制**：
 
-- **Esc 双击回退**：有未保存改动时，首次 `Esc` 提示「再按 Esc 丢弃」并置 `pending_discard`；二次 `Esc` 用进入时的快照 `config_at_entry` 回滚 `config` 并 live-apply 复位主题/鼠标，再返回 `prev_mode`。无改动时单次 `Esc` 直接返回。
-- **dirty 标记**：标题 `Settings *` + 保存行 `保存设置 *` + 底部提示行三处可见。
+- **Esc 双击回退**：有未保存改动时，首次 `Esc` 提示「再按 Esc 丢弃」并置 `pending_discard`；二次 `Esc` 用进入时的快照 `config_at_entry` 回滚 `config`、`providers_at_entry` 回滚 `providers`，并 live-apply 复位主题/鼠标，再返回 `prev_mode`。无改动时单次 `Esc` 直接返回。
+- **dirty 标记**：标题 `Settings *` + 保存行 `保存设置 *` + 底部提示行三处可见；providers 段有改动时单独标 `dirty_providers`（与 config 的 `dirty` 分离追踪）。
 - **项目级覆盖警告**：检测到 `.cyber/config.toml` 时顶部横幅提示「保存仅写全局，被覆盖字段重启后回弹」（deep-merge 在加载时仍会把项目级覆盖叠加上去）。
 - **已知限制**：toml crate 不保行内注释；项目级覆盖字段保存后重启仍被覆盖。
+
+### 9.5 Provider Form 模态层
+
+P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`）或 Chat（`/provider add|edit <name>`）两路进入，作为顶层 `Mode::ProviderForm` 渲染居中模态表单。参考 `example/wepclaude` 的 customProviders 逻辑：provider = `{name, kind, base_url, api_key, model, max_tokens, temperature}`，支持新增/编辑/删除/设默认 + 异步拉取模型列表。
+
+**字段**（↑/↓ 导航，Enter 进入编辑）：
+
+| # | 字段 | 编辑方式 |
+| --- | --- | --- |
+| 0 | name | 文本（Enter 进 textarea 编辑 → Enter 提交 / Esc 取消） |
+| 1 | kind | Enum（←/→ 在 `PROVIDER_KINDS` = openai/anthropic/ollama/openai-compatible 间循环） |
+| 2 | base_url | 文本（自动 trim + 去尾 `/`） |
+| 3 | api_key | 文本 |
+| 4 | model | 文本（可手填或经「拉取模型」按钮 picker 选中回填） |
+| 5 | max_tokens | 文本（parse 为 u32，失败校验报错） |
+| 6 | temperature | 文本（parse 为 f32，失败校验报错） |
+| 7 | 拉取模型 | 按钮（Enter 触发异步 fetch） |
+| 8 | 保存 | 按钮（Enter 触发校验 + 持久化） |
+| 9 | 取消 | 按钮（Enter / Esc 丢弃表单返回 `prev_mode`） |
+
+**拉取模型（async fetch）**：「拉取模型」按钮 bump `fetch_id`（防 stale）+ 置 `fetching` 态，spawn `cyber_agent::fetch_models` 任务。按 kind 试 `{base}/models` 与 `{base}/v1/models`（anthropic 先 v1，其余先 /models），headers 按 kind（anthropic→`x-api-key`+`anthropic-version`；openai/compatible→`Authorization: Bearer`；ollama→无 auth）。结果经 `mpsc::UnboundedSender<FetchResult>` 回传主循环第 4 路 `select!` 分支 → `deliver_fetch`（`fetch_id` 不匹配则丢弃）。成功弹出 picker（↑/↓ 选模型 → Enter 回填 model 字段）；失败显示错误文案。
+
+**持久化双轨**：
+
+- **Settings 入口**：Save 只改内存 `self.providers` + 标 `dirty_providers`，**不立即写盘**；统一在 Settings 的「保存设置」行 `Enter` 触发 `save_config` + `save_providers` 一并写 `~/.cyber/`。Esc 双击用 `providers_at_entry` 快照回滚（与 `config_at_entry` 同步）。
+- **Chat 入口**（`/provider add|edit`）：Save 立即 `save_providers` 写盘（Chat 无 Settings 的保存触发点）。
+
+**校验**：name 非空 + 不与现有重名（编辑自身除外）+ base_url 非空 + max_tokens/temperature 可 parse。失败保留表单 + toast 提示，不退出。
+
+**删除确认**：Settings Providers 段 `d` 双击（首次置 `pending_delete_idx` + 行内 `[待删除!]` 标记，任一其他键清除；二次 `d` 执行删除）。删除/重命名触及 `default_provider` 时自动回退到排序后首个剩余 / 同步改名，并 toast。
+
+**default_provider 防悬空**：删除当前默认 provider → 回退到排序后首个剩余；重命名当前默认 → 同步改名。两者均标 dirty 触发持久化。
 
 ---
 

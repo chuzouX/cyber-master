@@ -19,6 +19,8 @@ pub struct Paths {
     pub reports_dir: PathBuf,
     pub reports_templates_dir: PathBuf,
     pub history_db: PathBuf,
+    /// 对话历史 JSON 目录（P2.2：按 cwd hash 存 `{cwd_hash}.json`）。
+    pub history_dir: PathBuf,
     pub assets_db: PathBuf,
 }
 
@@ -47,6 +49,7 @@ impl Paths {
             logs_dir: cyber_home.join("logs"),
             reports_templates_dir: reports_dir.join("templates"),
             history_db: cyber_home.join("history.db"),
+            history_dir: cyber_home.join("history"),
             assets_db: cyber_home.join("assets.db"),
             mcp_dir,
             reports_dir,

@@ -33,6 +33,7 @@ fn create_global_layout(paths: &Paths) -> Result<()> {
         paths.logs_dir.as_path(),
         paths.reports_dir.as_path(),
         paths.reports_templates_dir.as_path(),
+        paths.history_dir.as_path(),
     ] {
         debug!(dir = %dir.display(), "创建目录");
         std::fs::create_dir_all(dir).map_err(|e| {

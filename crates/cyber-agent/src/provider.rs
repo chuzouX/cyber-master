@@ -16,17 +16,50 @@ use tracing::warn;
 use cyber_core::ProviderConfig;
 
 use crate::error::Result;
-use crate::types::StreamEvent;
+use crate::tool::ToolSchema;
+use crate::types::{Message, StreamEvent};
+
+/// 一次流式请求的完整入参（前向兼容 + 自文档）。
+///
+/// - `messages`：历史 + 本次 user（agent loop 还会追加 assistant(tool_calls) 与 tool 结果）
+/// - `system`：系统提示词（Anthropic 顶层字段；OpenAI/Ollama 由 provider 翻成 messages 首条）
+/// - `tools`：工具 schema 列表；空 = 不发 `tools` 字段（等同无工具调用能力）
+#[derive(Debug, Clone, Default)]
+pub struct StreamRequest {
+    pub messages: Vec<Message>,
+    pub system: Option<String>,
+    pub tools: Vec<ToolSchema>,
+}
+
+impl StreamRequest {
+    pub fn new(messages: Vec<Message>) -> Self {
+        Self {
+            messages,
+            system: None,
+            tools: Vec::new(),
+        }
+    }
+
+    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Vec<ToolSchema>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn tools_is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
 
 /// LLM 提供方抽象。`Send` 以便 `Box<dyn Provider>` 跨 tokio task。
 pub trait Provider: Send {
-    /// 发起流式对话。`messages` 含历史 + 本次 user；`system` 为系统提示词（Anthropic 顶层字段）。
-    /// 返回 `'static` 流（impl 持有 owned reqwest::Client），可直接 `tokio::spawn` 驱动。
-    fn stream(
-        &self,
-        messages: Vec<crate::types::Message>,
-        system: Option<String>,
-    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
+    /// 发起流式对话。返回 `'static` 流（impl 持有 owned reqwest::Client），
+    /// 可直接 `tokio::spawn` 驱动。`req.tools` 空 = 不发 tools 字段。
+    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
 }
 
 /// 按 `kind` 分发；`mock=true` 或 `kind=="mock"` 时返回 MockProvider。
@@ -63,13 +96,16 @@ enum HttpState {
 }
 
 /// 通用 HTTP 流：`req` 发出 → 按 `parser` 逐行解析 → 产出 `StreamEvent`。
+///
+/// parser 无状态 `fn(&str) -> Vec<StreamEvent>`：一行可能产出多个事件
+/// （如 OpenAI 一行可同时含 `delta.content` 与多个 `delta.tool_calls[]`）。
 pub(crate) struct HttpStream {
     state: HttpState,
-    parser: fn(&str) -> Option<StreamEvent>,
+    parser: fn(&str) -> Vec<StreamEvent>,
 }
 
 impl HttpStream {
-    pub(crate) fn new(req: reqwest::RequestBuilder, parser: fn(&str) -> Option<StreamEvent>) -> Self {
+    pub(crate) fn new(req: reqwest::RequestBuilder, parser: fn(&str) -> Vec<StreamEvent>) -> Self {
         Self {
             state: HttpState::Init { req },
             parser,
@@ -131,9 +167,7 @@ impl Stream for HttpStream {
                     match body.as_mut().poll_next(cx) {
                         Poll::Ready(Some(Ok(chunk))) => {
                             for line in lines.push_bytes(&chunk) {
-                                if let Some(ev) = (this.parser)(&line) {
-                                    pending.push_back(ev);
-                                }
+                                pending.extend((this.parser)(&line));
                             }
                             this.state = HttpState::Streaming { body, lines, pending };
                             continue; // 可能立刻有 pending，或继续读下一块
@@ -148,9 +182,7 @@ impl Stream for HttpStream {
                         Poll::Ready(None) => {
                             // 流结束：flush 残留半行，再补一个 Done
                             if let Some(last) = lines.flush_remaining() {
-                                if let Some(ev) = (this.parser)(&last) {
-                                    pending.push_back(ev);
-                                }
+                                pending.extend((this.parser)(&last));
                             }
                             pending.push_back(StreamEvent::Done);
                             this.state = HttpState::Done { pending };
@@ -195,23 +227,29 @@ mod tests {
 
     #[test]
     fn factory_anthropic_without_key_errors() {
-        let mut cfg = ProviderConfig::default();
-        cfg.kind = "anthropic".into();
+        let cfg = ProviderConfig {
+            kind: "anthropic".into(),
+            ..Default::default()
+        };
         assert!(provider_factory(&cfg, false).is_err());
     }
 
     #[test]
     fn factory_ollama_no_key_ok() {
-        let mut cfg = ProviderConfig::default();
-        cfg.kind = "ollama".into();
-        cfg.base_url = "http://localhost:11434".into();
+        let cfg = ProviderConfig {
+            kind: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            ..Default::default()
+        };
         assert!(provider_factory(&cfg, false).is_ok());
     }
 
     #[test]
     fn factory_unknown_kind_errors() {
-        let mut cfg = ProviderConfig::default();
-        cfg.kind = "unknown".into();
+        let cfg = ProviderConfig {
+            kind: "unknown".into(),
+            ..Default::default()
+        };
         assert!(provider_factory(&cfg, false).is_err());
     }
 }

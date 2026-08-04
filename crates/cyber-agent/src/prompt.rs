@@ -90,6 +90,8 @@ mod tests {
     fn empty_frontmatter_shows_placeholder() {
         let s = build_system_prompt(Some(&ctx(ProjectFrontmatter::default())));
         assert!(s.contains("frontmatter 无结构化字段"));
-        assert!(!s.contains("安全护栏"));
+        // BASE_PROMPT 本身含"安全护栏"字样；此处仅校验 rules 段未追加。
+        assert!(!s.contains("# 安全护栏"));
+        assert!(!s.contains("（必须遵守）"));
     }
 }

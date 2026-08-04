@@ -1,27 +1,60 @@
 //! Mock provider 端到端往返：验证 run_stream 串联 prompt/factory/stream/事件转发。
+//!
+//! P2.2：通道类型改为 `(u64, AgentEvent)`（generation 计数器），run_stream 增加
+//! `gen` + `cwd` 两个参数。本测试固定 `gen=0`、`cwd=tempdir()`。
+//!
+//! echo 测试（前 4 个）设 `auto_tool_call=false` 以保持 echo 模式；
+//! `mock_tool_loop_roundtrip` 用默认 `auto_tool_call=true` 验证 agent loop 全链路。
 
 use cyber_agent::{run_stream, AgentEvent};
 use cyber_core::{Config, ProjectContext, ProjectFrontmatter, ProvidersConfig};
+use tokio::sync::mpsc::UnboundedReceiver;
 
-#[tokio::test]
-async fn mock_roundtrip_no_project() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let config = Config::default(); // default_provider = "openai"
-    let providers = ProvidersConfig::default_template();
+/// 固定 generation 计数器与临时工作目录，启动一次 run_stream。
+fn spawn_run(
+    config: Config,
+    providers: ProvidersConfig,
+    project: Option<ProjectContext>,
+    user_input: &str,
+    history: Vec<cyber_agent::Message>,
+    mock: bool,
+) -> (
+    tokio::task::JoinHandle<()>,
+    UnboundedReceiver<(u64, AgentEvent)>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
+    let cwd = std::env::temp_dir();
     let handle = tokio::spawn(run_stream(
         config,
         providers,
-        None,
-        "你好".into(),
-        vec![],
+        project,
+        user_input.into(),
+        history,
         tx,
-        true, // mock
+        0, // gen
+        mock,
+        cwd,
     ));
+    (handle, rx)
+}
+
+/// echo 模式配置：关闭 auto_tool_call，使 mock 走逐字符 echo 路径。
+fn echo_config() -> Config {
+    let mut c = Config::default();
+    c.agent.auto_tool_call = false;
+    c
+}
+
+#[tokio::test]
+async fn mock_roundtrip_no_project() {
+    let config = echo_config();
+    let providers = ProvidersConfig::default_template();
+    let (handle, mut rx) = spawn_run(config, providers, None, "你好", vec![], true);
 
     let mut started = false;
     let mut tokens = String::new();
     let mut got_done = false;
-    while let Some(ev) = rx.recv().await {
+    while let Some((_, ev)) = rx.recv().await {
         match ev {
             AgentEvent::Started => started = true,
             AgentEvent::Token(t) => tokens.push_str(&t),
@@ -30,6 +63,7 @@ async fn mock_roundtrip_no_project() {
                 break;
             }
             AgentEvent::Error(m) => panic!("mock 不应产生错误: {m}"),
+            _ => {}
         }
     }
     assert!(started, "应先收到 Started");
@@ -40,31 +74,20 @@ async fn mock_roundtrip_no_project() {
 
 #[tokio::test]
 async fn mock_roundtrip_with_history() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let config = Config::default();
+    let config = echo_config();
     let providers = ProvidersConfig::default_template();
-    use cyber_agent::{Message, Role};
-    let history = vec![
-        Message { role: Role::User, content: "第一句".into() },
-        Message { role: Role::Assistant, content: "回复".into() },
-    ];
-    let handle = tokio::spawn(run_stream(
-        config,
-        providers,
-        None,
-        "第二句".into(),
-        history,
-        tx,
-        true,
-    ));
+    use cyber_agent::Message;
+    let history = vec![Message::user("第一句"), Message::assistant("回复")];
+    let (handle, mut rx) = spawn_run(config, providers, None, "第二句", history, true);
 
     let mut tokens = String::new();
-    while let Some(ev) = rx.recv().await {
+    while let Some((_, ev)) = rx.recv().await {
         match ev {
             AgentEvent::Token(t) => tokens.push_str(&t),
             AgentEvent::Done => break,
             AgentEvent::Error(m) => panic!("{m}"),
             AgentEvent::Started => {}
+            _ => {}
         }
     }
     // mock 只回放最后一条 user 消息
@@ -75,8 +98,7 @@ async fn mock_roundtrip_with_history() {
 #[tokio::test]
 async fn mock_roundtrip_with_project_rules() {
     // 验证带项目上下文不破坏流式（rules 注入 prompt，但 mock 忽略 prompt）
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let config = Config::default();
+    let config = echo_config();
     let providers = ProvidersConfig::default_template();
     let project = ProjectContext {
         frontmatter: ProjectFrontmatter {
@@ -90,23 +112,16 @@ async fn mock_roundtrip_with_project_rules() {
         raw: String::new(),
         path: std::path::PathBuf::new(),
     };
-    let handle = tokio::spawn(run_stream(
-        config,
-        providers,
-        Some(project),
-        "test".into(),
-        vec![],
-        tx,
-        true,
-    ));
+    let (handle, mut rx) = spawn_run(config, providers, Some(project), "test", vec![], true);
 
     let mut tokens = String::new();
-    while let Some(ev) = rx.recv().await {
+    while let Some((_, ev)) = rx.recv().await {
         match ev {
             AgentEvent::Token(t) => tokens.push_str(&t),
             AgentEvent::Done => break,
             AgentEvent::Error(m) => panic!("{m}"),
             AgentEvent::Started => {}
+            _ => {}
         }
     }
     assert_eq!(tokens, "收到：test");
@@ -116,22 +131,13 @@ async fn mock_roundtrip_with_project_rules() {
 #[tokio::test]
 async fn run_stream_unknown_provider_sends_error() {
     // default_provider 指向不存在的条目 → AgentEvent::Error（而非 panic）
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let mut config = Config::default();
     config.agent.default_provider = "nonexistent".into();
     let providers = ProvidersConfig::default_template();
-    let handle = tokio::spawn(run_stream(
-        config,
-        providers,
-        None,
-        "hi".into(),
-        vec![],
-        tx,
-        false, // 非 mock，走真实 lookup → 找不到 → Error
-    ));
+    let (handle, mut rx) = spawn_run(config, providers, None, "hi", vec![], false);
 
     let mut got_error = false;
-    while let Some(ev) = rx.recv().await {
+    while let Some((_, ev)) = rx.recv().await {
         match ev {
             AgentEvent::Error(_) => {
                 got_error = true;
@@ -140,8 +146,115 @@ async fn run_stream_unknown_provider_sends_error() {
             AgentEvent::Started => {}
             AgentEvent::Done => break,
             AgentEvent::Token(_) => panic!("不应有 token"),
+            _ => {}
         }
     }
     assert!(got_error, "未知 provider 应产生 Error 事件");
+    handle.await.unwrap();
+}
+
+/// 验证 agent loop 全链路：mock 第一步发文本 + list_dir 工具调用 → agent 执行
+/// list_dir → 工具结果回灌 → mock 第二步发最终文本 → Done。
+#[tokio::test]
+async fn mock_tool_loop_roundtrip() {
+    // 默认 config：auto_tool_call=true，触发 mock 的 tool-loop 模式
+    let config = Config::default();
+    let providers = ProvidersConfig::default_template();
+    let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
+
+    let mut started = false;
+    let mut first_text = String::new();
+    let mut tool_call_seen = false;
+    let mut tool_result_seen = false;
+    let mut final_text = String::new();
+    let mut got_done = false;
+
+    while let Some((_, ev)) = rx.recv().await {
+        match ev {
+            AgentEvent::Started => started = true,
+            AgentEvent::Token(t) => {
+                if !tool_call_seen {
+                    first_text.push_str(&t);
+                } else {
+                    final_text.push_str(&t);
+                }
+            }
+            AgentEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                tool_call_seen = true;
+                assert_eq!(name, "list_dir", "应为 list_dir 工具调用");
+                assert_eq!(arguments, "{\"path\":\".\"}");
+                assert!(!id.is_empty(), "工具调用 id 应非空");
+            }
+            AgentEvent::ToolResult {
+                is_error, output, ..
+            } => {
+                tool_result_seen = true;
+                assert!(!is_error, "list_dir 不应失败");
+                // output 是 tempdir 的内容（可能为空字符串，但不应是错误信息）
+                assert!(
+                    !output.contains("护栏") && !output.contains("错误"),
+                    "工具结果不应是错误: {output}"
+                );
+            }
+            AgentEvent::Done => {
+                got_done = true;
+                break;
+            }
+            AgentEvent::Error(m) => panic!("tool-loop 不应产生错误: {m}"),
+        }
+    }
+
+    assert!(started, "应先收到 Started");
+    assert!(
+        !first_text.is_empty(),
+        "第一步应先发文本（tool call 前导）"
+    );
+    assert!(tool_call_seen, "应收到 list_dir 工具调用");
+    assert!(tool_result_seen, "应收到工具结果");
+    assert!(
+        !final_text.is_empty(),
+        "第二步应发最终文本（工具结果回灌后）"
+    );
+    assert!(got_done, "应以 Done 结束");
+    handle.await.unwrap();
+}
+
+/// 验证 cancel（generation bump）后 stale 事件被隔离：启动任务后立即以更高 gen
+/// 发送的事件不应影响断言。此测试通过确认正常 tool-loop 完成来间接验证 gen 路径。
+#[tokio::test]
+async fn mock_tool_loop_respects_generation_tag() {
+    let config = Config::default();
+    let providers = ProvidersConfig::default_template();
+    // 使用 gen=5 启动，事件应全部携带 gen=5
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
+    let cwd = std::env::temp_dir();
+    let handle = tokio::spawn(run_stream(
+        config,
+        providers,
+        None,
+        "查看目录".into(),
+        vec![],
+        tx,
+        5, // gen=5
+        true,
+        cwd,
+    ));
+
+    let mut gens = Vec::new();
+    while let Some((gen, ev)) = rx.recv().await {
+        gens.push(gen);
+        if matches!(ev, AgentEvent::Done | AgentEvent::Error(_)) {
+            break;
+        }
+    }
+    // 所有事件应携带 gen=5
+    assert!(
+        gens.iter().all(|&g| g == 5),
+        "所有事件应携带 gen=5，实际: {gens:?}"
+    );
     handle.await.unwrap();
 }

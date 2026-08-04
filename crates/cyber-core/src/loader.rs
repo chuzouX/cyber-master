@@ -110,6 +110,20 @@ pub fn save_config(config: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 把 providers 写回 `~/.cyber/providers.toml`（原子写 + `.bak` 备份）。
+///
+/// 与 `save_config` 同限制：toml crate 不保注释，原文件行内注释会丢失。
+/// 在 TUI Provider CRUD（Settings 保存 / Chat 立即持久化）时调用。
+pub fn save_providers(providers: &ProvidersConfig, path: &Path) -> Result<()> {
+    let toml_str = toml::to_string_pretty(providers).map_err(|e| {
+        warn!(error = %e, "providers 序列化失败（内部错误，请报告 bug）");
+        CoreError::TomlSer(e.to_string())
+    })?;
+    atomic_write(path, toml_str.as_bytes())?;
+    info!(path = %path.display(), "providers 已保存");
+    Ok(())
+}
+
 /// 原子写：写 `.tmp` → 备份旧文件为 `.bak` → rename `.tmp` 覆盖目标。
 ///
 /// 主 rename 失败时尝试从 `.bak` 恢复，避免写坏原文件。
@@ -157,6 +171,7 @@ fn merge_tables(mut base: Value, over: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderConfig;
 
     #[test]
     fn merge_tables_overrides_scalars_and_recurses() {
@@ -258,6 +273,64 @@ mod tests {
         assert_eq!(bak_cfg.ui.theme, "nord", ".bak 应保留首次版本");
         let cur_cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cur_cfg.ui.theme, "gruvbox", "当前文件应为新版本");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_providers_roundtrip_preserves_values() {
+        let dir = temp_dir_unique("save_prov_rt");
+        let path = dir.join("providers.toml");
+        let mut providers = ProvidersConfig::default_template();
+        providers.default_provider = "ollama".into();
+        providers.upsert(
+            "custom",
+            ProviderConfig {
+                kind: "openai-compatible".into(),
+                base_url: "https://gateway.local/v1/".into(),
+                api_key: "${CUSTOM_KEY}".into(),
+                model: "gpt-4o-mini".into(),
+                max_tokens: 8192,
+                temperature: 0.5,
+            },
+        );
+
+        save_providers(&providers, &path).unwrap();
+        assert!(path.exists(), "保存后 providers.toml 应存在");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let loaded: ProvidersConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(loaded.default_provider, "ollama");
+        assert!(loaded.providers.contains_key("custom"));
+        assert_eq!(loaded.providers["custom"].kind, "openai-compatible");
+        assert_eq!(loaded.providers["custom"].base_url, "https://gateway.local/v1");
+        assert_eq!(loaded.providers["custom"].api_key, "${CUSTOM_KEY}");
+        assert_eq!(loaded.providers["custom"].max_tokens, 8192);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_providers_creates_bak_on_overwrite() {
+        let dir = temp_dir_unique("save_prov_bak");
+        let path = dir.join("providers.toml");
+        let bak = path.with_extension("toml.bak");
+
+        let p1 = ProvidersConfig::default_template();
+        save_providers(&p1, &path).unwrap();
+        assert!(!bak.exists(), "首次保存不应产生 .bak");
+
+        let mut p2 = ProvidersConfig::default();
+        p2.upsert(
+            "only",
+            ProviderConfig {
+                kind: "ollama".into(),
+                base_url: "http://x".into(),
+                ..Default::default()
+            },
+        );
+        save_providers(&p2, &path).unwrap();
+        assert!(bak.exists(), "二次保存应创建 .bak 备份");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

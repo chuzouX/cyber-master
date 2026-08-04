@@ -2,14 +2,13 @@
 //!
 //! 三家协议：
 //! - **OpenAI**：SSE，`data: {json}` 行，`choices[0].delta.content` 为 token；`data: [DONE]` 终止。
-//! - **Anthropic**：SSE，`event:` + `data:` 行；靠 `data` 内 `type` 字段判断
-//!  （`content_block_delta`→`delta.text`，`message_stop`→Done），无需跨行状态。
+//! - **Anthropic**：SSE，`event:` + `data:` 行；靠 `data` 内 `type` 字段判断（`content_block_delta`→`delta.text`，`message_stop`→Done），无需跨行状态。
 //! - **Ollama**：NDJSON（非 SSE），每行一个 JSON，`message.content` 为 token，`done==true` 终止。
 //!
 //! 用 `LineBuf` 在字节层按 `\n` 切行（ASCII 安全，不会切在多字节 UTF-8 中间），
 //! 半行留到下次，避免分片边界丢数据。
 
-use crate::types::StreamEvent;
+use crate::types::{StreamEvent, ToolCallDelta};
 
 /// 字节级行缓冲：喂任意分片，按 `\n` 切出完整行（去行尾 `\r\n`）。
 ///
@@ -60,61 +59,188 @@ impl LineBuf {
     }
 }
 
-/// OpenAI SSE 行解析。
-pub fn parse_openai_line(line: &str) -> Option<StreamEvent> {
+/// OpenAI SSE 行解析。返回 0..N 个事件：
+/// - `delta.content` → `Delta`
+/// - `delta.tool_calls[]` → 每项一个 `ToolCallDelta`（首片带 id+name，后续只带 arguments 片段）
+/// - `data: [DONE]` → `Done`
+///
+/// 注意：`finish_reason=="tool_calls"` **不**发 Done（避免 double-Done），Done 仅由 `[DONE]` 行触发。
+pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
     let line = line.trim();
     if line.is_empty() || line.starts_with(':') {
-        return None; // 空行 / 注释心跳
+        return Vec::new(); // 空行 / 注释心跳
     }
-    let data = line.strip_prefix("data:")?.trim_start();
+    let data = match line.strip_prefix("data:") {
+        Some(d) => d.trim_start(),
+        None => return Vec::new(),
+    };
     if data == "[DONE]" {
-        return Some(StreamEvent::Done);
+        return vec![StreamEvent::Done];
     }
-    let v: serde_json::Value = serde_json::from_str(data).ok()?;
-    // delta.content 缺失（role-only / tool-call delta）→ None 跳过
-    let content = v
-        .get("choices")?
-        .get(0)?
-        .get("delta")?
-        .get("content")?
-        .as_str()?;
-    Some(StreamEvent::Delta(content.to_string()))
+    let v: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let delta = match v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+    {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+        out.push(StreamEvent::Delta(content.to_string()));
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tool_calls {
+            let index = tc
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .unwrap_or(0) as u32;
+            let function = tc.get("function");
+            let id = tc.get("id").and_then(|i| i.as_str()).map(str::to_owned);
+            let name = function
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_owned);
+            let arguments_fragment = function
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_owned();
+            out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_fragment,
+            }));
+        }
+    }
+    out
 }
 
-/// Anthropic SSE 行解析（靠 `data` 内 `type` 字段，跳过 `event:` 行）。
-pub fn parse_anthropic_line(line: &str) -> Option<StreamEvent> {
+/// Anthropic SSE 行解析（靠 `data` 内 `type` 字段，跳过 `event:` 行）。返回 0..N 个事件：
+/// - `content_block_start` 且 block.type=tool_use → `ToolCallDelta{index,id,name,""}`（text 块 start 为 no-op）
+/// - `content_block_delta` text_delta → `Delta`；input_json_delta → `ToolCallDelta{index,None,None,partial_json}`
+/// - `message_stop` → `Done`
+///
+/// 不变量：text 块与 tool_use 块共享同一个 `index` 命名空间，但靠事件类型
+/// （text_delta vs input_json_delta）路由隔离，累积器按事件类型分发即可。
+pub fn parse_anthropic_line(line: &str) -> Vec<StreamEvent> {
     let line = line.trim();
     if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
-        return None;
+        return Vec::new();
     }
-    let data = line.strip_prefix("data:")?.trim_start();
-    let v: serde_json::Value = serde_json::from_str(data).ok()?;
-    match v.get("type")?.as_str()? {
-        "content_block_delta" => {
-            let text = v.get("delta")?.get("text")?.as_str()?;
-            Some(StreamEvent::Delta(text.to_string()))
+    let data = match line.strip_prefix("data:") {
+        Some(d) => d.trim_start(),
+        None => return Vec::new(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("content_block_start") => {
+            if let Some(block) = v.get("content_block") {
+                let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = block.get("id").and_then(|i| i.as_str()).map(str::to_owned);
+                    let name = block.get("name").and_then(|n| n.as_str()).map(str::to_owned);
+                    out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments_fragment: String::new(),
+                    }));
+                }
+                // text 块 start：无事件（文本在后续 text_delta 中到达）
+            }
         }
-        "message_stop" => Some(StreamEvent::Done),
-        _ => None, // message_start / content_block_start / ping 等
+        Some("content_block_delta") => {
+            let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+            if let Some(delta) = v.get("delta") {
+                match delta.get("type").and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            out.push(StreamEvent::Delta(text.to_string()));
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
+                            index,
+                            id: None,
+                            name: None,
+                            arguments_fragment: partial,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("message_stop") => out.push(StreamEvent::Done),
+        _ => {} // message_start / ping / content_block_stop 等
     }
+    out
 }
 
-/// Ollama NDJSON 行解析。
-pub fn parse_ollama_line(line: &str) -> Option<StreamEvent> {
+/// Ollama NDJSON 行解析。返回 0..N 个事件：
+/// - `message.content` 非空 → `Delta`
+/// - `message.tool_calls[]` 非空（best-effort，非标准流式）→ 每项一个完整 `ToolCallDelta`
+/// - `done==true` → `Done`
+///
+/// Ollama 工具调用流式支持非标准（多数模型一次性返回完整 tool_calls），
+/// 此处 best-effort 解析；顺序：content/tool_calls 先于 Done，避免丢数据。
+pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
     let line = line.trim();
     if line.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(msg) = v.get("message") {
+        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+            if !content.is_empty() {
+                out.push(StreamEvent::Delta(content.to_string()));
+            }
+        }
+        if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+            for (i, tc) in tool_calls.iter().enumerate() {
+                let index = i as u32;
+                let id = tc.get("id").and_then(|i| i.as_str()).map(str::to_owned);
+                let function = tc.get("function");
+                let name = function
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned);
+                let arguments_fragment = function
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments_fragment,
+                }));
+            }
+        }
+    }
     if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-        return Some(StreamEvent::Done);
+        out.push(StreamEvent::Done);
     }
-    let content = v.get("message")?.get("content")?.as_str()?;
-    if content.is_empty() {
-        None
-    } else {
-        Some(StreamEvent::Delta(content.to_string()))
-    }
+    out
 }
 
 #[cfg(test)]
@@ -167,38 +293,139 @@ mod tests {
     #[test]
     fn openai_parses_delta_and_done() {
         let delta = r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert!(matches!(parse_openai_line(delta), Some(StreamEvent::Delta(t)) if t == "Hello"));
-        assert!(matches!(parse_openai_line("data: [DONE]"), Some(StreamEvent::Done)));
-        assert!(parse_openai_line(": keep-alive").is_none());
-        assert!(parse_openai_line("").is_none());
-        // role-only delta（无 content）→ None
+        let r = parse_openai_line(delta);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0], StreamEvent::Delta(t) if t == "Hello"));
+
+        let r = parse_openai_line("data: [DONE]");
+        assert_eq!(r.len(), 1);
+        assert!(matches!(r[0], StreamEvent::Done));
+
+        assert!(parse_openai_line(": keep-alive").is_empty());
+        assert!(parse_openai_line("").is_empty());
+        // role-only delta（无 content，无 tool_calls）→ 空
         let role_only = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
-        assert!(parse_openai_line(role_only).is_none());
+        assert!(parse_openai_line(role_only).is_empty());
+    }
+
+    #[test]
+    fn openai_parses_tool_call_delta() {
+        // 首片：带 index+id+name+空 arguments
+        let first = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_dir","arguments":""}}]}}]}"#;
+        let r = parse_openai_line(first);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 0);
+                assert_eq!(d.id.as_deref(), Some("call_1"));
+                assert_eq!(d.name.as_deref(), Some("list_dir"));
+                assert!(d.arguments_fragment.is_empty());
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+        // 后续片：仅 arguments 片段
+        let frag = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#;
+        let r = parse_openai_line(frag);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 0);
+                assert!(d.id.is_none());
+                assert!(d.name.is_none());
+                assert_eq!(d.arguments_fragment, "{\"pa");
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_parses_content_and_tool_in_one_line() {
+        // 一行可同时含 content + tool_calls（理论情况）
+        let line = r#"data: {"choices":[{"delta":{"content":"hi","tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#;
+        let r = parse_openai_line(line);
+        assert_eq!(r.len(), 2);
+        assert!(matches!(&r[0], StreamEvent::Delta(t) if t == "hi"));
+        assert!(matches!(&r[1], StreamEvent::ToolCallDelta(_)));
     }
 
     #[test]
     fn anthropic_parses_delta_and_stop() {
         let d = r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#;
-        assert!(matches!(parse_anthropic_line(d), Some(StreamEvent::Delta(t)) if t == "Hi"));
-        assert!(matches!(
-            parse_anthropic_line(r#"data: {"type":"message_stop"}"#),
-            Some(StreamEvent::Done)
-        ));
-        assert!(parse_anthropic_line("event: content_block_delta").is_none());
-        assert!(parse_anthropic_line(r#"data: {"type":"message_start"}"#).is_none());
-        assert!(parse_anthropic_line(r#"data: {"type":"ping"}"#).is_none());
+        let r = parse_anthropic_line(d);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0], StreamEvent::Delta(t) if t == "Hi"));
+
+        let r = parse_anthropic_line(r#"data: {"type":"message_stop"}"#);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(r[0], StreamEvent::Done));
+
+        assert!(parse_anthropic_line("event: content_block_delta").is_empty());
+        assert!(parse_anthropic_line(r#"data: {"type":"message_start"}"#).is_empty());
+        assert!(parse_anthropic_line(r#"data: {"type":"ping"}"#).is_empty());
+    }
+
+    #[test]
+    fn anthropic_parses_tool_use_block() {
+        // content_block_start type=tool_use → 首片带 id+name+空 arguments
+        let start = r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"read_file","input":{}}}"#;
+        let r = parse_anthropic_line(start);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 1);
+                assert_eq!(d.id.as_deref(), Some("toolu_abc"));
+                assert_eq!(d.name.as_deref(), Some("read_file"));
+                assert!(d.arguments_fragment.is_empty());
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+        // input_json_delta → 后续 arguments 片段
+        let frag = r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#;
+        let r = parse_anthropic_line(frag);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 1);
+                assert!(d.id.is_none());
+                assert!(d.name.is_none());
+                assert_eq!(d.arguments_fragment, "{\"path\":\"a\"}");
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+        // text 块 start 为 no-op
+        let text_start = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        assert!(parse_anthropic_line(text_start).is_empty());
     }
 
     #[test]
     fn ollama_parses_delta_and_done() {
         let d = r#"{"message":{"role":"assistant","content":"Hi"},"done":false}"#;
-        assert!(matches!(parse_ollama_line(d), Some(StreamEvent::Delta(t)) if t == "Hi"));
-        assert!(matches!(
-            parse_ollama_line(r#"{"done":true}"#),
-            Some(StreamEvent::Done)
-        ));
-        // 空 content chunk → None
-        assert!(parse_ollama_line(r#"{"message":{"content":""},"done":false}"#).is_none());
-        assert!(parse_ollama_line("").is_none());
+        let r = parse_ollama_line(d);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0], StreamEvent::Delta(t) if t == "Hi"));
+
+        let r = parse_ollama_line(r#"{"done":true}"#);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(r[0], StreamEvent::Done));
+
+        // 空 content chunk → 空
+        assert!(parse_ollama_line(r#"{"message":{"content":""},"done":false}"#).is_empty());
+        assert!(parse_ollama_line("").is_empty());
+    }
+
+    #[test]
+    fn ollama_parses_tool_calls_best_effort() {
+        let d = r#"{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]},"done":false}"#;
+        let r = parse_ollama_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 0);
+                assert_eq!(d.id.as_deref(), Some("c1"));
+                assert_eq!(d.name.as_deref(), Some("list_dir"));
+                assert_eq!(d.arguments_fragment, "{\"path\":\".\"}");
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
     }
 }

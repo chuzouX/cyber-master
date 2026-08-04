@@ -8,10 +8,13 @@ license.workspace = true
 cyber-core = { workspace = true }
 # P2 Chat：App 在 tui 内，需调 run_stream + 共享 AgentEvent/Message
 cyber-agent = { workspace = true }
-ratatui = { workspace = true }
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 tui-textarea = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
+# P2.2 历史持久化：ChatEntry 序列化为 JSON
+serde = { workspace = true }
+serde_json = { workspace = true }
