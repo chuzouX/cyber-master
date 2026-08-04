@@ -1,0 +1,28 @@
+# MCP servers 配置示例
+# 实际路径：~/.cyber/mcp/servers.toml
+# 也可在 TUI 设置页 MCP 段用 a/e/d 增删改
+
+# stdio 示例：本地子进程
+[[servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { }
+timeout_secs = 5
+
+# http 示例：Streamable HTTP（POST + Mcp-Session-Id）
+[[servers]]
+name = "remote-scanner"
+transport = "http"
+url = "https://scanner.internal/mcp"
+headers = { Authorization = "Bearer token" }
+timeout_secs = 10
+
+# sse 示例：legacy SSE（长 GET event-stream + POST endpoint）
+[[servers]]
+name = "legacy-sse"
+transport = "sse"
+url = "https://legacy.example.com/sse"
+headers = { }
+timeout_secs = 10

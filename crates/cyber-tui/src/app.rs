@@ -15,35 +15,43 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind, MouseEventKind,
+};
 use crossterm::execute;
 use futures::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::Line,
-    widgets::Paragraph,
+    widgets::{Block, Borders, Paragraph},
     DefaultTerminal, Frame,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use cyber_agent::{fetch_models, run_stream, AgentEvent, Message, ToolRegistry};
+use cyber_agent::{fetch_models, run_stream, AgentEvent, Message, ToolRegistry, Usage};
 use cyber_core::{save_config, save_providers, Config, ProjectContext, ProvidersConfig};
+use cyber_mcp::{McpRegistry, McpServersConfig};
+use cyber_skills::SkillRegistry;
 
 use crate::chat::{ChatEntry, ChatState};
 use crate::event::{chat_key_to_action, key_to_action, Action, ChatAction};
+use crate::history::{SessionIndex, SessionMeta};
 use crate::slash::{parse as parse_slash, SlashCommand, HELP_TEXT as SLASH_HELP};
 use crate::theme::Theme;
 use crate::views;
+use crate::views::mcp_form::{McpFormAction, McpFormState};
 use crate::views::providers::{FormAction, ProviderFormState};
 use crate::views::settings::{LiveApply, SettingsState};
 
 /// 顶层模式 / 屏幕。Welcome 为启动入口屏，Settings 为模态设置层，ProviderForm 为
-/// 服务商新增/编辑模态层（从 Settings 或 Chat 两路进入），其余三个对应 DESIGN §9。
+/// 服务商新增/编辑模态层（从 Settings 或 Chat 两路进入），Sessions 为会话管理面板
+/// （`/sessions` 或 `/new` 触发），其余三个对应 DESIGN §9。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Welcome,
@@ -52,6 +60,9 @@ pub enum Mode {
     Dashboard,
     Settings,
     ProviderForm,
+    McpForm,
+    Sessions,
+    LogViewer,
 }
 
 impl Mode {
@@ -63,15 +74,20 @@ impl Mode {
             Mode::Dashboard => "Dashboard",
             Mode::Settings => "Settings",
             Mode::ProviderForm => "Provider Form",
+            Mode::McpForm => "MCP Form",
+            Mode::Sessions => "Sessions",
+            Mode::LogViewer => "Logs",
         }
     }
 }
 
-/// 打包 4 个路径参数，避免 `App::new` 的 `too_many_arguments` 进一步恶化。
+/// 打包路径参数，避免 `App::new` 的 `too_many_arguments` 进一步恶化。
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_file: PathBuf,
     pub providers_file: PathBuf,
+    pub mcp_servers_file: PathBuf,
+    pub log_file: PathBuf,
     pub history_dir: PathBuf,
     pub cwd: PathBuf,
 }
@@ -81,6 +97,123 @@ pub struct AppPaths {
 pub struct FetchResult {
     pub fetch_id: u64,
     pub result: std::result::Result<Vec<String>, String>,
+}
+
+/// 统一工具表 + Skill / MCP 注册表。
+///
+/// `tools` 是 `Arc<ToolRegistry>`，跨 agent turn 共享（MCP 连接长存，不每轮重连）。
+/// `skills` 供 `/skill` 命令查找；`mcp` 供 `/mcp` 命令展示状态与退出时 `shutdown_all`。
+/// 由 `bootstrap::build_registries` 启动时构建一次，`App::new` 接收后不再变更。
+pub struct AppRegistries {
+    /// 统一工具表（builtins + Skills + MCP tools），agent 经此调工具。
+    pub tools: Arc<ToolRegistry>,
+    /// Skill 注册表（`/skill` 查找 + 展示用）。
+    pub skills: Arc<SkillRegistry>,
+    /// MCP 连接注册表（`/mcp` 展示 + 退出 shutdown）。mock 模式或无 server 时为 None。
+    pub mcp: Option<Arc<McpRegistry>>,
+}
+
+impl std::fmt::Debug for AppRegistries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppRegistries")
+            .field("tools", &self.tools.schemas().len())
+            .field("skills", &self.skills.len())
+            .field("mcp", &self.mcp.as_ref().map(|m| m.len()))
+            .finish()
+    }
+}
+
+impl AppRegistries {
+    /// 测试用：仅内置工具 + 空 skills + 无 MCP。
+    pub fn with_builtins() -> Self {
+        Self {
+            tools: Arc::new(ToolRegistry::with_builtins()),
+            skills: Arc::new(SkillRegistry::new()),
+            mcp: None,
+        }
+    }
+}
+
+/// session 内累计 token 用量统计（TUI 底部状态栏显示缓存命中率 + 成本）。
+#[derive(Debug, Clone, Default)]
+pub struct UsageStats {
+    /// 累计缓存命中 token。
+    pub cache_hit: u64,
+    /// 累计缓存未命中 token。
+    pub cache_miss: u64,
+    /// 累计输出 token。
+    pub completion: u64,
+}
+
+impl UsageStats {
+    /// 累加单轮 usage。
+    fn add(&mut self, u: &Usage) {
+        self.cache_hit += u.cache_hit_tokens;
+        self.cache_miss += u.cache_miss_tokens;
+        self.completion += u.completion_tokens;
+    }
+
+    /// 缓存命中率（0.0-1.0）。无输入时返回 0。
+    pub(crate) fn hit_rate(&self) -> f64 {
+        let total = self.cache_hit + self.cache_miss;
+        if total == 0 {
+            0.0
+        } else {
+            self.cache_hit as f64 / total as f64
+        }
+    }
+
+    /// 计算成本（美元）。需提供价格配置。
+    pub(crate) fn cost(&self, price: &cyber_core::PriceConfig) -> f64 {
+        let miss_cost = price.input_per_m.unwrap_or(0.0) * self.cache_miss as f64 / 1_000_000.0;
+        let hit_cost = price
+            .cache_hit_per_m
+            .or(price.input_per_m)
+            .unwrap_or(0.0)
+            * self.cache_hit as f64
+            / 1_000_000.0;
+        let out_cost = price.output_per_m.unwrap_or(0.0) * self.completion as f64 / 1_000_000.0;
+        miss_cost + hit_cost + out_cost
+    }
+}
+
+/// `/sessions` 面板状态：选中索引 + 待删除确认 + 进入时刷新的列表快照。
+///
+/// `list` 是进入面板时从 `SessionIndex.sessions` 克隆的快照，面板内导航/删除均
+/// 操作此快照；切换/新建/删除时同步更新 `App.sessions` 并刷新 `list`。
+#[derive(Debug, Default, Clone)]
+pub struct SessionsPanelState {
+    /// 当前选中项索引（在 `list` 内）。
+    pub selected: usize,
+    /// 待删除确认：`d` 首次按下记录索引，二次确认执行删除，其它键清除。
+    pub pending_delete: Option<usize>,
+    /// 进入面板时快照的 session 列表（标题/计数/id/当前标记）。
+    pub list: Vec<SessionMeta>,
+}
+
+impl SessionsPanelState {
+    /// 从 SessionIndex 刷新快照：克隆 sessions + selected 指向 current。
+    pub fn refresh(&mut self, idx: &SessionIndex) {
+        self.list = idx.sessions.clone();
+        self.selected = idx
+            .sessions
+            .iter()
+            .position(|s| s.id == idx.current)
+            .unwrap_or(0);
+        self.pending_delete = None;
+    }
+}
+
+/// 日志查看器状态（Ctrl+L 打开，Esc 关闭）。
+///
+/// 进入时从 `log_file` 读取尾部 N 行缓存到 `lines`，之后滚动纯操作 `scroll`。
+/// 日志文件可能很大，只保留最后 1000 行避免内存膨胀。
+#[derive(Debug, Default, Clone)]
+pub struct LogViewerState {
+    /// 已缓存的日志行（从文件尾部读取，最多 1000 行）。
+    pub lines: Vec<String>,
+    /// 当前滚动偏移（0 = 尾部最末，增大向上翻）。
+    pub scroll: usize,
 }
 
 pub struct App {
@@ -100,6 +233,10 @@ pub struct App {
     config_at_entry: Config,
     /// 进入 Settings 时的 providers 快照，供 Esc 双击回退（与 config_at_entry 同步）。
     providers_at_entry: ProvidersConfig,
+    /// MCP servers 配置（~/.cyber/mcp/servers.toml），设置页可编辑。
+    mcp_config: McpServersConfig,
+    /// 进入 Settings 时的 MCP 配置快照，供 Esc 双击回退。
+    mcp_config_at_entry: McpServersConfig,
     paths: AppPaths,
     has_project_config: bool,
     // P2 Chat 状态
@@ -114,8 +251,20 @@ pub struct App {
     fetch_tx: UnboundedSender<FetchResult>,
     /// Provider 表单状态（Mode::ProviderForm 时 Some）。
     provider_form: Option<ProviderFormState>,
+    /// MCP server 表单状态（Mode::McpForm 时 Some）。
+    mcp_form: Option<McpFormState>,
     /// 是否强制使用 MockProvider（离线冒烟）。
     mock: bool,
+    /// 统一工具表 + Skill / MCP 注册表（P3：跨 agent turn 共享）。
+    registries: AppRegistries,
+    /// 多 session 索引（current + sessions 元数据），同 cwd 内多会话。
+    sessions: SessionIndex,
+    /// `/sessions` 面板状态（selected + pending_delete + list 快照）。
+    sessions_panel: SessionsPanelState,
+    /// session 内累计 token 用量（TUI 状态栏显示命中率 + 成本）。
+    usage: UsageStats,
+    /// 日志查看器状态（Ctrl+L 打开，Esc 关闭）。
+    log_viewer: LogViewerState,
 }
 
 const WELCOME_OPTIONS: usize = 4;
@@ -125,6 +274,7 @@ impl App {
     pub fn new(
         config: Config,
         providers: ProvidersConfig,
+        mcp_config: McpServersConfig,
         project: Option<ProjectContext>,
         initial: Mode,
         first_run: bool,
@@ -133,13 +283,16 @@ impl App {
         mock: bool,
         agent_tx: UnboundedSender<(u64, AgentEvent)>,
         fetch_tx: UnboundedSender<FetchResult>,
+        registries: AppRegistries,
     ) -> Self {
         let theme = Theme::resolve(&config.ui.theme);
         Self {
             config_at_entry: config.clone(),
             providers_at_entry: providers.clone(),
+            mcp_config_at_entry: mcp_config.clone(),
             config,
             providers,
+            mcp_config,
             project,
             theme,
             mode: initial,
@@ -157,8 +310,19 @@ impl App {
             generation: 0,
             fetch_tx,
             provider_form: None,
+            mcp_form: None,
             mock,
+            registries,
+            sessions: SessionIndex::default(),
+            sessions_panel: SessionsPanelState::default(),
+            usage: UsageStats::default(),
+            log_viewer: LogViewerState::default(),
         }
+    }
+
+    /// 设置 toast 消息（启动时展示 boot_errors 用）。
+    pub fn set_toast(&mut self, msg: String) {
+        self.toast = Some(msg);
     }
 
     /// 启动 TUI 异步主循环。终端初始化与恢复由 `ratatui::init/restore` 负责。
@@ -170,13 +334,17 @@ impl App {
         mut agent_rx: UnboundedReceiver<(u64, AgentEvent)>,
         mut fetch_rx: UnboundedReceiver<FetchResult>,
     ) -> color_eyre::Result<()> {
-        // 启动时加载该 cwd 的历史对话（按 cwd hash 索引，互不干扰）。
-        let saved = crate::history::load(&self.paths.history_dir, &self.paths.cwd);
+        // 启动时加载该 cwd 的多 session 索引 + 当前 session 的对话条目。
+        // 无历史时 load_index 自动建默认空 session 并写盘；旧单文件历史自动迁移。
+        let (index, saved) = crate::history::load_current(&self.paths.history_dir, &self.paths.cwd);
+        self.sessions = index;
         if !saved.is_empty() {
             info!(count = saved.len(), "恢复历史对话");
             self.chat.entries.extend(saved);
             // prepare_render 会在首帧通过 len 变化自动重建缓存，无需手动 invalidate。
         }
+        // 从已加载的 User 条目派生输入历史，使 ↑/↓ 可跨会话呼出历史指令。
+        self.chat.seed_input_history();
         let mut terminal: DefaultTerminal = ratatui::init();
         if self.config.ui.mouse {
             execute!(io::stdout(), EnableMouseCapture)?;
@@ -191,6 +359,10 @@ impl App {
         if let Some(h) = self.agent_handle.take() {
             h.abort();
         }
+        // 关闭所有 MCP 连接（发 Shutdown + await actor 退出，回收子进程）
+        if let Some(mcp) = self.registries.mcp.as_ref() {
+            mcp.shutdown_all().await;
+        }
         // 无条件禁用鼠标捕获（幂等），避免中途开启鼠标后退出泄漏。
         let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
@@ -199,10 +371,15 @@ impl App {
         Ok(())
     }
 
-    /// 持久化当前对话历史到 `~/.cyber/history/{cwd_hash}.json`。
+    /// 持久化当前 session：写 entries 文件 + 刷新 meta（message_count/updated_at/title 派生）+ 写 index。
     /// 失败仅记日志（不影响会话）。在 Done/Error/cancel/clear/quit 及退出时调用。
-    fn save_history(&self) {
-        crate::history::save(&self.paths.history_dir, &self.paths.cwd, &self.chat.entries);
+    fn save_history(&mut self) {
+        crate::history::save_current(
+            &self.paths.history_dir,
+            &self.paths.cwd,
+            &mut self.sessions,
+            &self.chat.entries,
+        );
     }
 
     async fn main_loop(
@@ -247,20 +424,31 @@ impl App {
         Ok(())
     }
 
-    /// 处理一个 crossterm 事件：仅 Press；按模式分发到 Chat / ProviderForm / 非 Chat 路径。
+    /// 处理一个 crossterm 事件：按键仅 Press；Chat 模式额外处理鼠标滚轮滚动历史。
     fn handle_event(&mut self, ev: Event) {
-        let Event::Key(k) = ev else {
-            return;
-        };
-        if k.kind != KeyEventKind::Press {
-            return;
-        }
-        match self.mode {
-            Mode::Chat => self.handle_chat_key(k),
-            Mode::ProviderForm => self.handle_provider_form_key(k),
-            Mode::Welcome | Mode::Workflow | Mode::Dashboard | Mode::Settings => {
-                self.handle_action(key_to_action(k));
+        match ev {
+            Event::Key(k) => {
+                if k.kind != KeyEventKind::Press {
+                    return;
+                }
+                match self.mode {
+                    Mode::Chat => self.handle_chat_key(k),
+                    Mode::ProviderForm => self.handle_provider_form_key(k),
+                    Mode::McpForm => self.handle_mcp_form_key(k),
+                    Mode::Sessions => self.handle_sessions_key(k),
+                    Mode::LogViewer => self.handle_log_viewer_key(k),
+                    Mode::Welcome | Mode::Workflow | Mode::Dashboard | Mode::Settings => {
+                        self.handle_action(key_to_action(k));
+                    }
+                }
             }
+            // Chat 模式：鼠标滚轮滚动历史区（鼠标捕获在 config.ui.mouse 时启用）
+            Event::Mouse(m) if self.mode == Mode::Chat => match m.kind {
+                MouseEventKind::ScrollUp => self.chat.scroll_history(-3),
+                MouseEventKind::ScrollDown => self.chat.scroll_history(3),
+                _ => {}
+            },
+            _ => {}
         }
     }
 
@@ -269,12 +457,17 @@ impl App {
         if self.toast.is_some() {
             self.toast = None;
         }
+        // 斜杠补全菜单打开时：Up/Down/Enter/Tab/Esc 由菜单消费，不触发其他动作
+        if self.chat.slash_menu_key(k) {
+            return;
+        }
         match chat_key_to_action(k) {
             ChatAction::Submit => {
                 // 斜杠命令拦截：输入以 `/` 开头时不发 agent，转命令处理
                 let peek: String = self.chat.input.lines().join("\n");
                 if peek.trim_start().starts_with('/') {
                     let text = self.chat.take_input();
+                    self.chat.update_slash_menu(); // 输入已清空 → 关闭菜单
                     self.handle_slash_command(&text);
                 } else if let Some((text, history)) = self.chat.submit() {
                     self.spawn_agent(text, history);
@@ -284,6 +477,7 @@ impl App {
                 // Shift/Alt+Enter 或 Ctrl+J：透传给 textarea 插入换行
                 if !self.chat.streaming {
                     self.chat.input.input(k);
+                    self.chat.update_slash_menu();
                 }
             }
             ChatAction::Back => {
@@ -311,17 +505,48 @@ impl App {
                     self.prev_mode = self.mode;
                     self.config_at_entry = self.config.clone();
                     self.providers_at_entry = self.providers.clone();
+                    self.mcp_config_at_entry = self.mcp_config.clone();
                     self.settings.pending_discard = false;
                     self.mode = Mode::Settings;
                 }
             }
+            ChatAction::ToggleLogs => self.toggle_log_viewer(),
             ChatAction::Quit => {
                 self.save_history();
                 self.should_quit = true;
             }
+            ChatAction::ScrollPageUp => {
+                let page = self.chat.last_visible_height_get() as i32;
+                self.chat.scroll_history(-page.max(1));
+            }
+            ChatAction::ScrollPageDown => {
+                let page = self.chat.last_visible_height_get() as i32;
+                self.chat.scroll_history(page.max(1));
+            }
+            ChatAction::ScrollLineUp => self.chat.scroll_history(-1),
+            ChatAction::ScrollLineDown => self.chat.scroll_history(1),
+            ChatAction::HistoryPrev => {
+                // 空输入框时呼出更早的已发送消息；未呼出（非空/无历史）→ 交 textarea 移光标
+                if !self.chat.streaming {
+                    if !self.chat.history_prev() {
+                        self.chat.input.input(k);
+                    }
+                    self.chat.update_slash_menu();
+                }
+            }
+            ChatAction::HistoryNext => {
+                // 浏览态呼出更新；非浏览态 → 交 textarea 移光标
+                if !self.chat.streaming {
+                    if !self.chat.history_next() {
+                        self.chat.input.input(k);
+                    }
+                    self.chat.update_slash_menu();
+                }
+            }
             ChatAction::Input => {
                 if !self.chat.streaming {
                     self.chat.input.input(k);
+                    self.chat.update_slash_menu();
                 }
             }
         }
@@ -364,6 +589,9 @@ impl App {
                     self.agent_handle = None;
                     self.save_history();
                 }
+            }
+            AgentEvent::Usage(u) => {
+                self.usage.add(&u);
             }
             AgentEvent::Error(m) => {
                 if self.chat.streaming {
@@ -470,6 +698,58 @@ impl App {
         }
     }
 
+    /// McpForm 模式按键分发：委托 `form.handle_key`，按 `McpFormAction` 执行副作用。
+    fn handle_mcp_form_key(&mut self, k: KeyEvent) {
+        let Some(form) = self.mcp_form.as_mut() else {
+            return;
+        };
+        let action = form.handle_key(k);
+        match action {
+            McpFormAction::None => {}
+            McpFormAction::Cancel => {
+                self.mcp_form = None;
+                self.mode = self.prev_mode;
+            }
+            McpFormAction::Save => self.save_mcp_form(),
+        }
+    }
+
+    /// 保存 MCP 表单：校验 → upsert → 标脏（Settings 延迟保存）→ 返回 prev_mode。
+    /// 校验失败时保留表单 + toast，不退出。
+    fn save_mcp_form(&mut self) {
+        // 先校验（不消费 form），失败则保留表单 + toast
+        let result = {
+            let Some(form) = self.mcp_form.as_ref() else {
+                return;
+            };
+            let names: Vec<&str> = self.mcp_config.servers.iter().map(|s| s.name.as_str()).collect();
+            form.into_spec(&names)
+        };
+        match result {
+            Err(msg) => {
+                self.toast = Some(msg);
+            }
+            Ok(spec) => {
+                let name = spec.name.clone();
+                let original = self
+                    .mcp_form
+                    .as_ref()
+                    .and_then(|f| f.original_name.clone());
+                // 处理重命名：先删旧名再 upsert 新名
+                if let Some(orig) = &original {
+                    if orig != &name {
+                        self.mcp_config.remove(orig);
+                    }
+                }
+                self.mcp_config.upsert(spec);
+                self.settings.dirty_mcp = true;
+                self.toast = Some(format!("MCP server '{name}' 已暂存（保存设置后写入，重启生效）"));
+                self.mcp_form = None;
+                self.mode = self.prev_mode;
+            }
+        }
+    }
+
     /// 拉起一次 agent 流式任务。先 abort 任何旧任务 + bump generation（隔离 stale 事件）。
     fn spawn_agent(&mut self, text: String, history: Vec<Message>) {
         if let Some(h) = self.agent_handle.take() {
@@ -483,10 +763,297 @@ impl App {
         let tx = self.agent_tx.clone();
         let mock = self.mock;
         let cwd = self.paths.cwd.clone();
+        let registry = self.registries.tools.clone();
         let handle = tokio::spawn(async move {
-            run_stream(config, providers, project, text, history, tx, gen, mock, cwd).await;
+            run_stream(config, providers, project, text, history, tx, gen, mock, cwd, registry).await;
         });
         self.agent_handle = Some(handle);
+    }
+
+    // ── Session 管理（/new + /sessions + 面板） ───────────────────────────
+
+    /// 切换到指定 session：保存当前 → 加载目标 entries → 重置 chat → 更新 current。
+    /// id 不存在或已是 current → toast 提示，不切换。
+    fn switch_session(&mut self, id: &str) {
+        if id == self.sessions.current {
+            self.toast = Some("已在当前会话".into());
+            return;
+        }
+        if self.sessions.get(id).is_none() {
+            self.toast = Some(format!("未知会话：{id}"));
+            return;
+        }
+        // 保存当前 session
+        self.save_history();
+        // 加载目标 session
+        let entries =
+            crate::history::load_entries(&self.paths.history_dir, &self.paths.cwd, id);
+        self.chat = ChatState::new();
+        self.chat.entries.extend(entries);
+        self.chat.seed_input_history();
+        self.usage = UsageStats::default();
+        self.sessions.current = id.to_string();
+        crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
+        let title = self
+            .sessions
+            .current_meta()
+            .map(|m| m.title.clone())
+            .unwrap_or_default();
+        self.toast = Some(format!("已切换到「{title}」"));
+    }
+
+    /// 新建空 session：保存当前 → 建 meta + 切到新 session → 重置 chat → 持久化。
+    fn create_session(&mut self) {
+        self.save_history();
+        let meta = crate::history::create_session_meta();
+        let new_id = meta.id.clone();
+        self.sessions.sessions.push(meta);
+        self.sessions.current = new_id.clone();
+        self.chat = ChatState::new();
+        self.usage = UsageStats::default();
+        crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
+        crate::history::save_entries(
+            &self.paths.history_dir,
+            &self.paths.cwd,
+            &new_id,
+            &[],
+        );
+        self.toast = Some("新会话已创建".into());
+    }
+
+    /// 删除指定 session：拒绝删除最后一个；删 current 则切到剩余首个并重载 chat。
+    /// 返回 true 表示已删除（供面板决定是否刷新）。
+    fn delete_session(&mut self, id: &str) -> bool {
+        if self.sessions.sessions.len() <= 1 {
+            self.toast = Some("至少保留 1 个会话（无法删除最后一个）".into());
+            return false;
+        }
+        let was_current = id == self.sessions.current;
+        let _remaining = crate::history::delete_session(
+            &self.paths.history_dir,
+            &self.paths.cwd,
+            id,
+        );
+        // 重新加载索引（delete_session 已处理 current 重指 + 写盘）
+        self.sessions = crate::history::load_index(&self.paths.history_dir, &self.paths.cwd);
+        if was_current {
+            // 切到新的 current（已由 history::delete_session 切到剩余首个）
+            let entries = crate::history::load_entries(
+                &self.paths.history_dir,
+                &self.paths.cwd,
+                &self.sessions.current,
+            );
+            self.chat = ChatState::new();
+            self.chat.entries.extend(entries);
+            self.chat.seed_input_history();
+        }
+        self.toast = Some("会话已删除".into());
+        true
+    }
+
+    /// 处理 `/sessions <list|read <id|关键词>|new>` 斜杠命令。
+    /// 流式期阻止（与 /mode 一致）。list → 打开面板；read → 跨读注入 System；new → 新建。
+    fn handle_sessions_slash(&mut self, args: &str) {
+        if self.chat.streaming {
+            self.chat.entries.push(ChatEntry::System(
+                "生成中，无法管理会话（先 /cancel）".into(),
+            ));
+            return;
+        }
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+        match sub.as_str() {
+            "" | "list" => {
+                self.sessions_panel.refresh(&self.sessions);
+                self.prev_mode = Mode::Chat;
+                self.mode = Mode::Sessions;
+            }
+            "read" => {
+                if rest.is_empty() {
+                    // 列出所有 session
+                    let mut lines = String::from("会话列表：");
+                    for s in &self.sessions.sessions {
+                        let star = if s.id == self.sessions.current {
+                            " ★当前"
+                        } else {
+                            ""
+                        };
+                        lines.push_str(&format!(
+                            "\n  {} [{}] · {} 条消息{}",
+                            s.title, s.id, s.message_count, star
+                        ));
+                    }
+                    self.chat.entries.push(ChatEntry::System(lines));
+                } else {
+                    // 精确匹配 id 或部分匹配 title
+                    let matches: Vec<&SessionMeta> = self
+                        .sessions
+                        .sessions
+                        .iter()
+                        .filter(|s| s.id == rest || s.title.contains(rest))
+                        .collect();
+                    if matches.is_empty() {
+                        self.chat.entries.push(ChatEntry::System(format!(
+                            "未找到匹配「{rest}」的会话"
+                        )));
+                    } else if matches.len() > 1 {
+                        let mut lines =
+                            format!("多个会话匹配「{rest}」，请用 id 指定：");
+                        for s in matches {
+                            lines.push_str(&format!(
+                                "\n  {} [{}] · {} 条消息",
+                                s.title, s.id, s.message_count
+                            ));
+                        }
+                        self.chat.entries.push(ChatEntry::System(lines));
+                    } else {
+                        let s = matches[0];
+                        match crate::history::read_session_text(
+                            &self.paths.history_dir,
+                            &self.paths.cwd,
+                            &s.id,
+                        ) {
+                            Some(text) => {
+                                self.chat.entries.push(ChatEntry::System(format!(
+                                    "📖 会话「{}」内容：\n{}",
+                                    s.title, text
+                                )));
+                            }
+                            None => {
+                                self.chat.entries.push(ChatEntry::System(format!(
+                                    "会话「{}」为空",
+                                    s.title
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            "new" => self.create_session(),
+            other => {
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "未知子命令：{other}（用法：/sessions <list|read <id|关键词>|new>）"
+                )));
+            }
+        }
+    }
+
+    /// `/sessions` 面板按键处理：Up/Down 选、Enter 切换、n 新建、d 删除（双击确认）、Esc 返回。
+    /// 直接处理原始 KeyEvent，不污染 Action 枚举（仿 handle_provider_form_key）。
+    fn handle_sessions_key(&mut self, k: KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // q / Ctrl+C 退出
+        if matches!(k.code, KeyCode::Char('q'))
+            || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.save_history();
+            self.should_quit = true;
+            return;
+        }
+
+        let len = self.sessions_panel.list.len();
+
+        // 'd' 单独处理（双击确认删除）
+        if matches!(k.code, KeyCode::Char('d')) {
+            if self.sessions_panel.pending_delete == Some(self.sessions_panel.selected) {
+                // 二次确认：执行删除
+                if let Some(meta) =
+                    self.sessions_panel.list.get(self.sessions_panel.selected).cloned()
+                {
+                    let id = meta.id.clone();
+                    if self.delete_session(&id) {
+                        self.sessions_panel.refresh(&self.sessions);
+                    }
+                }
+            } else {
+                // 首次 d：标记待删除
+                self.sessions_panel.pending_delete = Some(self.sessions_panel.selected);
+            }
+            return;
+        }
+
+        // 其它键均清除 pending_delete（"任一其他键取消"）
+        self.sessions_panel.pending_delete = None;
+
+        match k.code {
+            KeyCode::Up => {
+                if len > 0 {
+                    self.sessions_panel.selected =
+                        (self.sessions_panel.selected + len - 1) % len;
+                }
+            }
+            KeyCode::Down => {
+                if len > 0 {
+                    self.sessions_panel.selected = (self.sessions_panel.selected + 1) % len;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(meta) =
+                    self.sessions_panel.list.get(self.sessions_panel.selected).cloned()
+                {
+                    let id = meta.id.clone();
+                    self.switch_session(&id);
+                    self.mode = Mode::Chat;
+                }
+            }
+            KeyCode::Char('n') => {
+                self.create_session();
+                self.mode = Mode::Chat;
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Chat;
+            }
+            _ => {}
+        }
+    }
+
+    /// 切换日志查看器：已开则关（回 prev_mode），未开则读日志文件进入。
+    fn toggle_log_viewer(&mut self) {
+        if self.mode == Mode::LogViewer {
+            self.mode = self.prev_mode;
+            return;
+        }
+        // 读取日志文件尾部（最多 1000 行）
+        self.log_viewer.lines = read_log_tail(&self.paths.log_file, 1000);
+        self.log_viewer.scroll = 0; // 0 = 定位到最末
+        self.prev_mode = self.mode;
+        self.mode = Mode::LogViewer;
+    }
+
+    /// LogViewer 按键：Esc/Ctrl+L 关闭，Up/Down/PageUp/PageDown 翻滚。
+    fn handle_log_viewer_key(&mut self, k: KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Ctrl+L / Esc 关闭
+        if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL)
+            || k.code == KeyCode::Esc
+        {
+            self.mode = self.prev_mode;
+            return;
+        }
+        let total = self.log_viewer.lines.len();
+        match k.code {
+            KeyCode::Down => {
+                if self.log_viewer.scroll > 0 {
+                    self.log_viewer.scroll -= 1;
+                }
+            }
+            KeyCode::Up => {
+                self.log_viewer.scroll = (self.log_viewer.scroll + 1).min(total.saturating_sub(1));
+            }
+            KeyCode::PageDown => {
+                self.log_viewer.scroll = self.log_viewer.scroll.saturating_sub(20);
+            }
+            KeyCode::PageUp => {
+                self.log_viewer.scroll = (self.log_viewer.scroll + 20).min(total.saturating_sub(1));
+            }
+            // Ctrl+R 刷新（重新读文件）
+            KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.log_viewer.lines = read_log_tail(&self.paths.log_file, 1000);
+                self.toast = Some("日志已刷新".into());
+            }
+            _ => {}
+        }
     }
 
     /// 处理斜杠命令（输入以 `/` 开头时由 Submit 分支拦截）。
@@ -584,12 +1151,17 @@ impl App {
                 self.handle_provider_slash(&args);
             }
             SlashCommand::Tools => {
-                let reg = ToolRegistry::with_builtins();
                 let mut lines = String::from("可用工具：");
-                for s in reg.schemas() {
+                for s in self.registries.tools.schemas() {
                     lines.push_str(&format!("\n  {} — {}", s.name, s.description));
                 }
                 self.chat.entries.push(ChatEntry::System(lines));
+            }
+            SlashCommand::Skill(args) => {
+                self.handle_skill_slash(&args);
+            }
+            SlashCommand::Mcp(args) => {
+                self.handle_mcp_slash(&args);
             }
             SlashCommand::Cancel => {
                 if self.chat.streaming {
@@ -608,9 +1180,52 @@ impl App {
                         .push(ChatEntry::System("当前无生成任务".into()));
                 }
             }
+            SlashCommand::MaxSteps(arg) => {
+                if arg.is_empty() {
+                    // 无参数：显示当前值
+                    self.chat.entries.push(ChatEntry::System(format!(
+                        "当前 max_steps = {}（用法：/max_steps <1-1000>）",
+                        self.config.agent.max_steps
+                    )));
+                } else {
+                    // 有参数：解析并更新
+                    match arg.trim().parse::<u32>() {
+                        Ok(n) if (1..=1000).contains(&n) => {
+                            self.config.agent.max_steps = n;
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "max_steps 已设为 {n}"
+                            )));
+                        }
+                        Ok(n) => {
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "max_steps 须在 1-1000 范围内（收到 {n}），当前 = {}",
+                                self.config.agent.max_steps
+                            )));
+                        }
+                        Err(_) => {
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "无效参数：{arg}（须为 1-1000 的整数，当前 = {}）",
+                                self.config.agent.max_steps
+                            )));
+                        }
+                    }
+                }
+            }
             SlashCommand::Quit => {
                 self.save_history();
                 self.should_quit = true;
+            }
+            SlashCommand::New => {
+                if self.chat.streaming {
+                    self.chat.entries.push(ChatEntry::System(
+                        "生成中，无法新建会话（先 /cancel）".into(),
+                    ));
+                } else {
+                    self.create_session();
+                }
+            }
+            SlashCommand::Sessions(args) => {
+                self.handle_sessions_slash(&args);
             }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
@@ -733,6 +1348,73 @@ impl App {
         }
     }
 
+    /// 处理 `/skill <name|list>`：list 列出全部 skill；非空 name 注入 body 为 System 条目。
+    /// 对应 `skill_<name>` 工具的命令行入口（用户也可让 agent 自动调工具）。
+    fn handle_skill_slash(&mut self, args: &str) {
+        let name = args.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("list") {
+            if self.registries.skills.is_empty() {
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("（无可用 Skill）".into()));
+            } else {
+                let mut lines = String::from("可用 Skill：");
+                for s in self.registries.skills.iter() {
+                    let src = match s.source {
+                        cyber_skills::SkillSource::Global => "全局",
+                        cyber_skills::SkillSource::Project => "项目",
+                    };
+                    lines.push_str(&format!(
+                        "\n  {} [{}] — {}",
+                        s.name(),
+                        src,
+                        s.frontmatter.description
+                    ));
+                }
+                self.chat.entries.push(ChatEntry::System(lines));
+            }
+            return;
+        }
+        match self.registries.skills.find(name) {
+            Some(skill) => {
+                let body = skill.body.clone();
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "Skill「{name}」使用说明：\n{body}"
+                )));
+            }
+            None => {
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "未知 Skill：{name}（/skill list 查看全部）"
+                )));
+            }
+        }
+    }
+
+    /// 处理 `/mcp <list|status>`：列出已连接的 MCP server。
+    /// 空串 / list / status 均展示连接状态（v0.1 不做 reconnect）。
+    fn handle_mcp_slash(&mut self, _args: &str) {
+        match &self.registries.mcp {
+            None => {
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("MCP 未启用（mock 模式或无 server 配置）".into()));
+            }
+            Some(mcp) if mcp.is_empty() => {
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("（无已连接的 MCP server）".into()));
+            }
+            Some(mcp) => {
+                let names = mcp.server_names();
+                let mut lines = String::from("已连接 MCP server：");
+                for n in &names {
+                    lines.push_str(&format!("\n  {n}"));
+                }
+                self.chat.entries.push(ChatEntry::System(lines));
+            }
+        }
+    }
+
     /// 从 Settings Providers 段打开新增表单。
     fn open_provider_form_add(&mut self) {
         self.prev_mode = Mode::Settings;
@@ -785,6 +1467,44 @@ impl App {
         }
     }
 
+    /// 删除当前选中的 MCP server（双击 d 确认）。
+    fn delete_selected_mcp(&mut self) {
+        let Some(idx) = self.settings.mcp_pending_delete_idx else {
+            return;
+        };
+        let Some(spec) = self.mcp_config.servers.get(idx) else {
+            self.settings.mcp_pending_delete_idx = None;
+            return;
+        };
+        let name = spec.name.clone();
+        self.mcp_config.remove(&name);
+        self.settings.dirty_mcp = true;
+        self.settings.mcp_pending_delete_idx = None;
+        self.toast = Some(format!("已删除 MCP server：{name}（保存后重启生效）"));
+        // clamp cursor
+        let len = self.mcp_config.servers.len();
+        if self.settings.mcp_selected >= len && len > 0 {
+            self.settings.mcp_selected = len - 1;
+        }
+    }
+
+    /// 从 Settings MCP 段打开新增表单。
+    fn open_mcp_form_add(&mut self) {
+        self.prev_mode = Mode::Settings;
+        self.mcp_form = Some(McpFormState::empty());
+        self.mode = Mode::McpForm;
+    }
+
+    /// 从 Settings MCP 段打开编辑表单（按 mcp_selected 选中项）。
+    fn open_mcp_form_edit(&mut self) {
+        let Some(spec) = self.mcp_config.servers.get(self.settings.mcp_selected).cloned() else {
+            return;
+        };
+        self.prev_mode = Mode::Settings;
+        self.mcp_form = Some(McpFormState::from_spec(&spec));
+        self.mode = Mode::McpForm;
+    }
+
     /// draw 前的 `&mut self` 准备：① 刷新 ChatState 行缓存（entries/theme 变化时重建），
     /// ② 按 current theme + streaming 态配置 textarea 边框/样式。
     /// 两者都需 `&mut self`（`prepare_render` 写缓存、`set_block`/`set_style` 写 textarea），
@@ -795,6 +1515,17 @@ impl App {
             if let Some(form) = self.provider_form.as_mut() {
                 form.prepare_render(&self.theme);
             }
+            return;
+        }
+        // McpForm 模式：同 ProviderForm
+        if self.mode == Mode::McpForm {
+            if let Some(form) = self.mcp_form.as_mut() {
+                form.prepare_render(&self.theme);
+            }
+            return;
+        }
+        // LogViewer / Sessions 模式：无 textarea，跳过
+        if self.mode == Mode::LogViewer || self.mode == Mode::Sessions {
             return;
         }
         self.chat.prepare_render(&self.theme);
@@ -838,6 +1569,13 @@ impl App {
         {
             self.settings.pending_delete_idx = None;
         }
+        // MCP 段：同理清除待删除确认
+        if self.mode == Mode::Settings
+            && self.settings.on_mcp_section()
+            && !matches!(a, Action::DeleteProvider)
+        {
+            self.settings.mcp_pending_delete_idx = None;
+        }
         match a {
             Action::Quit => self.should_quit = true,
             Action::OpenSettings => {
@@ -846,10 +1584,12 @@ impl App {
                     self.prev_mode = self.mode;
                     self.config_at_entry = self.config.clone();
                     self.providers_at_entry = self.providers.clone();
+                    self.mcp_config_at_entry = self.mcp_config.clone();
                     self.settings.pending_discard = false;
                     self.mode = Mode::Settings;
                 }
             }
+            Action::ToggleLogs => self.toggle_log_viewer(),
             Action::Tab => {
                 if self.mode == Mode::Settings {
                     self.settings.next_section();
@@ -859,7 +1599,9 @@ impl App {
                         Mode::Chat => Mode::Workflow,
                         Mode::Workflow => Mode::Dashboard,
                         Mode::Dashboard => Mode::Chat,
-                        Mode::Welcome | Mode::Settings | Mode::ProviderForm => self.mode,
+                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::Sessions | Mode::LogViewer => {
+                            self.mode
+                        }
                     };
                 }
             }
@@ -876,6 +1618,10 @@ impl App {
                     if self.settings.on_providers_section() {
                         self.settings
                             .prev_provider(self.providers.providers.len());
+                    } else if self.settings.on_mcp_section() {
+                        self.settings.prev_mcp(self.mcp_config.servers.len());
+                    } else if self.settings.on_skills_section() {
+                        self.settings.prev_skill(self.registries.skills.len());
                     } else {
                         self.settings.prev_field();
                     }
@@ -888,6 +1634,10 @@ impl App {
                     if self.settings.on_providers_section() {
                         self.settings
                             .next_provider(self.providers.providers.len());
+                    } else if self.settings.on_mcp_section() {
+                        self.settings.next_mcp(self.mcp_config.servers.len());
+                    } else if self.settings.on_skills_section() {
+                        self.settings.next_skill(self.registries.skills.len());
                     } else {
                         self.settings.next_field();
                     }
@@ -896,13 +1646,21 @@ impl App {
                 }
             }
             Action::Left => {
-                if self.mode == Mode::Settings && !self.settings.on_providers_section() {
+                if self.mode == Mode::Settings
+                    && !self.settings.on_providers_section()
+                    && !self.settings.on_mcp_section()
+                    && !self.settings.on_skills_section()
+                {
                     let live = self.settings.apply_edit(&mut self.config, &self.providers, false);
                     self.apply_live(live);
                 }
             }
             Action::Right => {
-                if self.mode == Mode::Settings && !self.settings.on_providers_section() {
+                if self.mode == Mode::Settings
+                    && !self.settings.on_providers_section()
+                    && !self.settings.on_mcp_section()
+                    && !self.settings.on_skills_section()
+                {
                     let live = self.settings.apply_edit(&mut self.config, &self.providers, true);
                     self.apply_live(live);
                 }
@@ -934,6 +1692,7 @@ impl App {
                             self.prev_mode = Mode::Welcome;
                             self.config_at_entry = self.config.clone();
                             self.providers_at_entry = self.providers.clone();
+                            self.mcp_config_at_entry = self.mcp_config.clone();
                             self.settings.pending_discard = false;
                             self.mode = Mode::Settings;
                         }
@@ -948,11 +1707,15 @@ impl App {
             Action::AddProvider => {
                 if self.mode == Mode::Settings && self.settings.on_providers_section() {
                     self.open_provider_form_add();
+                } else if self.mode == Mode::Settings && self.settings.on_mcp_section() {
+                    self.open_mcp_form_add();
                 }
             }
             Action::EditProvider => {
                 if self.mode == Mode::Settings && self.settings.on_providers_section() {
                     self.open_provider_form_edit();
+                } else if self.mode == Mode::Settings && self.settings.on_mcp_section() {
+                    self.open_mcp_form_edit();
                 }
             }
             Action::DeleteProvider => {
@@ -964,6 +1727,13 @@ impl App {
                     } else {
                         // 首次 d：标记待删除
                         self.settings.pending_delete_idx = Some(cur);
+                    }
+                } else if self.mode == Mode::Settings && self.settings.on_mcp_section() {
+                    let cur = self.settings.mcp_selected;
+                    if self.settings.mcp_pending_delete_idx == Some(cur) {
+                        self.delete_selected_mcp();
+                    } else {
+                        self.settings.mcp_pending_delete_idx = Some(cur);
                     }
                 }
             }
@@ -993,7 +1763,8 @@ impl App {
         }
     }
 
-    /// 保存配置到 `~/.cyber/config.toml` + providers 到 `~/.cyber/providers.toml`。
+    /// 保存配置到 `~/.cyber/config.toml` + providers 到 `~/.cyber/providers.toml`
+    /// + MCP servers 到 `~/.cyber/mcp/servers.toml`。
     fn save_settings(&mut self) {
         let config_res = save_config(&self.config, &self.paths.config_file);
         let providers_res = if self.settings.dirty_providers {
@@ -1001,40 +1772,52 @@ impl App {
         } else {
             Ok(())
         };
-        match (config_res, providers_res) {
-            (Ok(()), Ok(())) => {
+        let mcp_res = if self.settings.dirty_mcp {
+            self.mcp_config.save(&self.paths.mcp_servers_file)
+        } else {
+            Ok(())
+        };
+        match (config_res, providers_res, mcp_res) {
+            (Ok(()), Ok(()), Ok(())) => {
                 self.settings.dirty = false;
                 self.settings.dirty_providers = false;
+                self.settings.dirty_mcp = false;
                 self.settings.pending_discard = false;
                 self.config_at_entry = self.config.clone();
                 self.providers_at_entry = self.providers.clone();
+                self.mcp_config_at_entry = self.mcp_config.clone();
                 self.toast = Some("配置已保存".into());
             }
-            (Err(e), _) => {
+            (Err(e), _, _) => {
                 self.toast = Some(format!("配置保存失败: {e}"));
             }
-            (_, Err(e)) => {
+            (_, Err(e), _) => {
                 self.toast = Some(format!("providers 保存失败: {e}"));
+            }
+            (_, _, Err(e)) => {
+                self.toast = Some(format!("MCP 配置保存失败: {e}"));
             }
         }
     }
 
-    /// 退出设置：dirty（config 或 providers）时首次 Esc 提示，二次 Esc 回退到快照后返回 prev_mode。
+    /// 退出设置：dirty（config / providers / mcp）时首次 Esc 提示，二次 Esc 回退到快照后返回 prev_mode。
     fn exit_settings(&mut self) {
-        let dirty = self.settings.dirty || self.settings.dirty_providers;
+        let dirty = self.settings.dirty || self.settings.dirty_providers || self.settings.dirty_mcp;
         if dirty {
             if !self.settings.pending_discard {
                 self.settings.pending_discard = true;
                 self.toast = Some("再按 Esc 丢弃改动，或选择「保存设置」".into());
                 return;
             }
-            // 二次 Esc：回退到进入时的快照（config + providers）
+            // 二次 Esc：回退到进入时的快照（config + providers + mcp）
             self.config = self.config_at_entry.clone();
             self.providers = self.providers_at_entry.clone();
+            self.mcp_config = self.mcp_config_at_entry.clone();
             self.apply_live(LiveApply::Theme);
             self.apply_live(LiveApply::Mouse);
             self.settings.dirty = false;
             self.settings.dirty_providers = false;
+            self.settings.dirty_mcp = false;
             self.settings.pending_discard = false;
             self.toast = Some("已丢弃改动".into());
         }
@@ -1096,6 +1879,11 @@ impl App {
                 &self.chat,
                 self.project.as_ref(),
                 &self.config.agent.default_provider,
+                &self.usage,
+                self.providers
+                    .providers
+                    .get(&self.config.agent.default_provider)
+                    .and_then(|p| p.price.as_ref()),
             ),
             Mode::Workflow => views::chat::render_placeholder(
                 frame,
@@ -1119,6 +1907,8 @@ impl App {
                 &self.theme,
                 &self.config,
                 &self.providers,
+                &self.mcp_config,
+                &self.registries.skills,
                 &self.settings,
                 self.has_project_config,
             ),
@@ -1127,7 +1917,73 @@ impl App {
                     views::providers::render_form(frame, area, &self.theme, form);
                 }
             }
+            Mode::McpForm => {
+                if let Some(form) = &self.mcp_form {
+                    views::mcp_form::render_form(frame, area, &self.theme, form);
+                }
+            }
+            Mode::Sessions => views::sessions::render(
+                frame,
+                area,
+                &self.theme,
+                &self.sessions_panel,
+                &self.sessions,
+            ),
+            Mode::LogViewer => self.render_log_viewer(frame, area),
         }
+    }
+
+    /// 渲染日志查看器面板（Ctrl+L 打开）。
+    ///
+    /// 全屏显示日志文件尾部，scroll=0 定位最末行。Up 向上翻、Down 向下翻。
+    fn render_log_viewer(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.accent))
+            .title(
+                Line::from(format!(
+                    " 日志 {} · {} 行 · Ctrl+R 刷新 · Esc 关闭 ",
+                    self.paths.log_file.display(),
+                    self.log_viewer.lines.len()
+                ))
+                .style(Style::default().fg(self.theme.title)),
+            )
+            .style(Style::default().bg(self.theme.bg).fg(self.theme.fg));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let total = self.log_viewer.lines.len();
+        if total == 0 {
+            frame.render_widget(
+                Paragraph::new("（日志为空）").style(Style::default().fg(self.theme.muted)),
+                inner,
+            );
+            return;
+        }
+
+        // 计算可见窗口：scroll=0 → 末尾，scroll增大 → 向上
+        let visible_h = inner.height as usize;
+        let end = total.saturating_sub(self.log_viewer.scroll);
+        let start = end.saturating_sub(visible_h);
+        let visible: Vec<Line> = self.log_viewer.lines[start..end.min(total)]
+            .iter()
+            .map(|s| {
+                // WARN/ERROR 行高亮
+                let style = if s.contains("ERROR") {
+                    Style::default().fg(self.theme.accent)
+                } else if s.contains("WARN") {
+                    Style::default().fg(self.theme.muted)
+                } else {
+                    Style::default().fg(self.theme.fg)
+                };
+                Line::from(s.clone()).style(style)
+            })
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(visible).style(Style::default().bg(self.theme.bg)),
+            inner,
+        );
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
@@ -1137,6 +1993,9 @@ impl App {
             Mode::Chat if self.chat.streaming => " ● 流式生成中… Esc 取消 · Ctrl+C 退出",
             Mode::Chat => " ○ 就绪 · 输入消息 Enter 发送",
             Mode::ProviderForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 kind  Esc 取消",
+            Mode::McpForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 transport  Esc 取消",
+            Mode::Sessions => " ↑↓ 选会话  Enter 切换  n 新建  d 删除  Esc 返回  q 退出",
+            Mode::LogViewer => " ↑↓ 翻滚  PageUp/PageDown 翻页  Ctrl+R 刷新  Esc/Ctrl+L 关闭",
             _ => " Tab 切换模式   s 设置   Esc 返回 Welcome   q 退出",
         };
         frame.render_widget(
@@ -1145,6 +2004,19 @@ impl App {
             area,
         );
     }
+}
+
+/// 读取日志文件尾部 `max_lines` 行。文件不存在或为空返回空 Vec。
+fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return vec![format!("（无法读取日志文件: {}）", path.display())];
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1169,23 +2041,43 @@ mod tests {
     fn make_app(initial: Mode, config_file: PathBuf) -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
         let (ftx, _frx) = tokio::sync::mpsc::unbounded_channel::<FetchResult>();
-        App::new(
+        // 每个 app 独占 history_dir + cwd，避免并行测试共享 session 文件互相干扰。
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let history_dir =
+            std::env::temp_dir().join(format!("cyber_app_hist_{}_{seed}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let cwd = history_dir.join("proj");
+        let mut app = App::new(
             Config::default(),
             ProvidersConfig::default(),
+            McpServersConfig::default(),
             None,
             initial,
             false,
             AppPaths {
                 config_file,
-                providers_file: std::env::temp_dir().join("cyber_test_providers.toml"),
-                history_dir: std::env::temp_dir(),
-                cwd: std::env::temp_dir(),
+                providers_file: std::env::temp_dir()
+                    .join(format!("cyber_test_providers_{seed}.toml")),
+                mcp_servers_file: std::env::temp_dir()
+                    .join(format!("cyber_test_mcp_{seed}.toml")),
+                log_file: std::env::temp_dir()
+                    .join(format!("cyber_test_log_{seed}.log")),
+                history_dir: history_dir.clone(),
+                cwd: cwd.clone(),
             },
             false,
             false,
             tx,
             ftx,
-        )
+            AppRegistries::with_builtins(),
+        );
+        // App::new 不加载历史（由 run() 负责）；测试需 sessions 已初始化才能 save_history。
+        app.sessions = crate::history::load_index(&history_dir, &cwd);
+        app
     }
 
     #[test]
@@ -1303,12 +2195,15 @@ mod tests {
         let mut app2 = App::new(
             Config::default(),
             ProvidersConfig::default_template(),
+            McpServersConfig::default(),
             None,
             Mode::Chat,
             false,
             AppPaths {
                 config_file: temp_config_path(),
                 providers_file: std::env::temp_dir().join("cyber_test_providers2.toml"),
+                mcp_servers_file: std::env::temp_dir().join("cyber_test_mcp2.toml"),
+                log_file: std::env::temp_dir().join("cyber_test_log2.log"),
                 history_dir: std::env::temp_dir(),
                 cwd: std::env::temp_dir(),
             },
@@ -1316,6 +2211,7 @@ mod tests {
             false,
             tx2,
             ftx2,
+            AppRegistries::with_builtins(),
         );
         app2.mode = Mode::Settings;
         app2.settings.section = 5; // Providers
@@ -1350,12 +2246,15 @@ mod tests {
         let mut app = App::new(
             Config::default(),
             ProvidersConfig::default_template(),
+            McpServersConfig::default(),
             None,
             Mode::Chat,
             false,
             AppPaths {
                 config_file: temp_config_path(),
                 providers_file: std::env::temp_dir().join("cyber_test_providers3.toml"),
+                mcp_servers_file: std::env::temp_dir().join("cyber_test_mcp3.toml"),
+                log_file: std::env::temp_dir().join("cyber_test_log3.log"),
                 history_dir: std::env::temp_dir(),
                 cwd: std::env::temp_dir(),
             },
@@ -1363,6 +2262,7 @@ mod tests {
             true, // mock
             tx,
             ftx,
+            AppRegistries::with_builtins(),
         );
         app.chat.input.insert_str("你好");
         // 模拟 Submit（无修饰 Enter）
@@ -1495,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn save_history_persists_to_cwd_hash_file() {
+    fn save_history_persists_session_file() {
         use crate::history;
         let hist_dir = std::env::temp_dir().join(format!(
             "cyber_app_hist_{}_{}",
@@ -1513,12 +2413,15 @@ mod tests {
         let mut app = App::new(
             Config::default(),
             ProvidersConfig::default(),
+            McpServersConfig::default(),
             None,
             Mode::Chat,
             false,
             AppPaths {
                 config_file: temp_config_path(),
                 providers_file: std::env::temp_dir().join("cyber_test_providers4.toml"),
+                mcp_servers_file: std::env::temp_dir().join("cyber_test_mcp4.toml"),
+                log_file: std::env::temp_dir().join("cyber_test_log4.log"),
                 history_dir: hist_dir.clone(),
                 cwd: cwd.clone(),
             },
@@ -1526,14 +2429,18 @@ mod tests {
             false,
             tx,
             ftx,
+            AppRegistries::with_builtins(),
         );
+        // App::new 不加载历史；手动初始化 sessions 索引，使 save_history 写入合法 session。
+        app.sessions = history::load_index(&hist_dir, &cwd);
         app.chat.entries.push(ChatEntry::User("你好".into()));
         app.chat.entries.push(ChatEntry::Assistant("收到".into()));
         app.save_history();
 
-        let file = history::history_file(&hist_dir, &cwd);
-        assert!(file.exists(), "save_history 应写入 cwd_hash.json 文件");
-        let loaded = history::load(&hist_dir, &cwd);
+        let file = history::session_dir(&hist_dir, &cwd)
+            .join(format!("{}.json", app.sessions.current));
+        assert!(file.exists(), "save_history 应写入当前 session 文件");
+        let loaded = history::load_entries(&hist_dir, &cwd, &app.sessions.current);
         assert_eq!(loaded.len(), 2, "重新加载应得到相同条目数");
         assert!(matches!(&loaded[0], ChatEntry::User(c) if c == "你好"));
         assert!(matches!(&loaded[1], ChatEntry::Assistant(c) if c == "收到"));
@@ -1560,12 +2467,15 @@ mod tests {
         let mut app = App::new(
             Config::default(),
             ProvidersConfig::default(),
+            McpServersConfig::default(),
             None,
             Mode::Chat,
             false,
             AppPaths {
                 config_file: temp_config_path(),
                 providers_file: std::env::temp_dir().join("cyber_test_providers5.toml"),
+                mcp_servers_file: std::env::temp_dir().join("cyber_test_mcp5.toml"),
+                log_file: std::env::temp_dir().join("cyber_test_log5.log"),
                 history_dir: hist_dir.clone(),
                 cwd: cwd.clone(),
             },
@@ -1573,18 +2483,255 @@ mod tests {
             false,
             tx,
             ftx,
+            AppRegistries::with_builtins(),
         );
+        // App::new 不加载历史；手动初始化 sessions 索引，使 save_history 写入合法 session。
+        app.sessions = history::load_index(&hist_dir, &cwd);
         app.chat.streaming = true;
         app.generation = 0;
         app.chat.streaming_buffer.push_str("回复内容");
         app.handle_agent_event(0, AgentEvent::Done);
         assert!(!app.chat.streaming, "Done 应退出 streaming");
-        let loaded = history::load(&hist_dir, &cwd);
+        let loaded = history::load_entries(&hist_dir, &cwd, &app.sessions.current);
         assert_eq!(loaded.len(), 1, "Done 应已持久化 assistant 条目");
         assert!(
             matches!(&loaded[0], ChatEntry::Assistant(c) if c == "回复内容"),
             "持久化的应为 finalize 后的 assistant 条目"
         );
         let _ = std::fs::remove_dir_all(&hist_dir);
+    }
+
+    // ── Session 管理（/new + /sessions 面板 + 跨读 + 删除） ─────────────────
+
+    /// 构造一个 Press 态、无修饰的 KeyEvent（测试便利）。
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new_with_kind_and_state(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        )
+    }
+
+    #[test]
+    fn new_command_creates_second_session_and_resets_chat() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        assert_eq!(app.sessions.sessions.len(), 1, "初始应仅 1 个默认 session");
+        let old_current = app.sessions.current.clone();
+        // 给当前 session 填点内容
+        app.chat.entries.push(ChatEntry::User("在原会话".into()));
+        // /new：记录命令 → 保存当前 → 新建并切到空会话
+        app.handle_slash_command("/new");
+        assert_eq!(app.sessions.sessions.len(), 2, "/new 后应有 2 个 session");
+        assert_ne!(app.sessions.current, old_current, "current 应切到新 session");
+        assert!(
+            app.chat.entries.is_empty(),
+            "新会话的 chat 应被重置为空"
+        );
+        assert!(
+            app.toast.as_deref().unwrap_or("").contains("新会话"),
+            "应 toast 新会话已创建"
+        );
+    }
+
+    #[test]
+    fn sessions_command_opens_panel() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/new"); // 凑出 2 个 session
+        app.handle_slash_command("/sessions");
+        assert_eq!(app.mode, Mode::Sessions, "/sessions 应进入 Sessions 面板");
+        assert_eq!(app.prev_mode, Mode::Chat, "prev_mode 应记为 Chat");
+        assert_eq!(
+            app.sessions_panel.list.len(),
+            app.sessions.sessions.len(),
+            "面板 list 应为 sessions 快照"
+        );
+        // selected 应指向当前 session
+        let cur_idx = app
+            .sessions
+            .sessions
+            .iter()
+            .position(|s| s.id == app.sessions.current)
+            .unwrap();
+        assert_eq!(app.sessions_panel.selected, cur_idx);
+    }
+
+    #[test]
+    fn sessions_panel_enter_switches_session() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        let s1 = app.sessions.current.clone();
+        // /new 后 current 变为 s2，s1 留有 "/new" User 条目
+        app.handle_slash_command("/new");
+        let _s2 = app.sessions.current.clone();
+        app.chat.entries.push(ChatEntry::User("在 s2".into()));
+        // 打开面板，selected 指向 s2（index 1），Up 选 s1
+        app.handle_slash_command("/sessions");
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Up));
+        assert_eq!(app.sessions_panel.selected, 0);
+        // Enter 切换到 s1
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Chat, "Enter 后应返回 Chat");
+        assert_eq!(app.sessions.current, s1, "应切回 s1");
+        // s1 磁盘内容为 [User("/new")]（/new 时保存的）
+        assert_eq!(app.chat.entries.len(), 1);
+        assert!(matches!(&app.chat.entries[0], ChatEntry::User(c) if c == "/new"));
+    }
+
+    #[test]
+    fn sessions_panel_delete_refuses_when_single() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        assert_eq!(app.sessions.sessions.len(), 1);
+        app.handle_slash_command("/sessions");
+        // 首次 d：标记
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Char('d')));
+        assert_eq!(app.sessions_panel.pending_delete, Some(0));
+        // 二次 d：拒绝删除（仅 1 个）
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Char('d')));
+        assert_eq!(
+            app.sessions.sessions.len(),
+            1,
+            "单 session 时不应删除"
+        );
+        assert!(
+            app.toast.as_deref().unwrap_or("").contains("至少保留"),
+            "应提示至少保留 1 个"
+        );
+    }
+
+    #[test]
+    fn sessions_panel_delete_with_two_sessions() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/new"); // 2 个 session，current=s2
+        let s2 = app.sessions.current.clone();
+        app.handle_slash_command("/sessions");
+        // selected 指向 s2(idx1)，Up 选 s1(idx0)
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Up));
+        assert_eq!(app.sessions_panel.selected, 0);
+        // 双击 d 删除 s1
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Char('d')));
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Char('d')));
+        assert_eq!(app.sessions.sessions.len(), 1, "应删到 1 个 session");
+        assert_eq!(app.sessions.current, s2, "删非 current 不应改 current");
+        assert_eq!(
+            app.sessions_panel.list.len(),
+            1,
+            "面板 list 应刷新为 1 项"
+        );
+    }
+
+    #[test]
+    fn sessions_read_injects_cross_session_content() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        let s1 = app.sessions.current.clone();
+        // 在 s1 写入对话并保存
+        app.chat.entries.push(ChatEntry::User("hello".into()));
+        app.chat.entries.push(ChatEntry::Assistant("hi there".into()));
+        app.save_history();
+        // 新建 s2（current 切走），chat 重置为空
+        app.handle_slash_command("/new");
+        assert!(app.chat.entries.is_empty());
+        // /sessions read <s1> 跨读注入
+        app.handle_slash_command(&format!("/sessions read {s1}"));
+        // 末条应为 System，含 s1 的内容
+        let last = app.chat.entries.last().expect("应有注入条目");
+        assert!(
+            matches!(last, ChatEntry::System(t) if t.contains("hello") && t.contains("hi there")),
+            "跨读应注入 s1 内容为 System 条目，实际: {last:?}"
+        );
+        // current 仍是 s2（跨读不切换）
+        assert_ne!(app.sessions.current, s1);
+    }
+
+    #[test]
+    fn sessions_panel_esc_returns_without_switching() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        let cur = app.sessions.current.clone();
+        app.handle_slash_command("/new");
+        let s2 = app.sessions.current.clone();
+        app.handle_slash_command("/sessions");
+        app.handle_sessions_key(key(crossterm::event::KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Chat, "Esc 应返回 Chat");
+        assert_eq!(app.sessions.current, s2, "Esc 不应切换 session");
+        assert_ne!(app.sessions.current, cur);
+    }
+
+    #[test]
+    fn new_blocked_during_streaming() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        let before = app.sessions.sessions.len();
+        app.handle_slash_command("/new");
+        assert_eq!(
+            app.sessions.sessions.len(),
+            before,
+            "流式期 /new 应被阻止"
+        );
+        assert!(app.chat.streaming, "流式态不应被改变");
+    }
+
+    #[test]
+    fn sessions_panel_renders_without_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/new"); // 2 个 session
+        app.handle_slash_command("/sessions");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+    }
+
+    // ── /max_steps 命令 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn max_steps_no_arg_shows_current() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/max_steps");
+        let last = app.chat.entries.last().unwrap();
+        assert!(
+            matches!(last, ChatEntry::System(t) if t.contains("max_steps = 50")),
+            "无参数应显示当前值 50: {last:?}"
+        );
+    }
+
+    #[test]
+    fn max_steps_sets_valid_value() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/max_steps 100");
+        assert_eq!(app.config.agent.max_steps, 100);
+        let last = app.chat.entries.last().unwrap();
+        assert!(
+            matches!(last, ChatEntry::System(t) if t.contains("100")),
+            "应确认设为 100: {last:?}"
+        );
+    }
+
+    #[test]
+    fn max_steps_rejects_out_of_range() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/max_steps 9999");
+        assert_eq!(app.config.agent.max_steps, 50, "超范围不应更新");
+        let last = app.chat.entries.last().unwrap();
+        assert!(
+            matches!(last, ChatEntry::System(t) if t.contains("1-1000")),
+            "应提示范围: {last:?}"
+        );
+    }
+
+    #[test]
+    fn max_steps_rejects_non_number() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/max_steps abc");
+        assert_eq!(app.config.agent.max_steps, 50, "非数字不应更新");
+        let last = app.chat.entries.last().unwrap();
+        assert!(
+            matches!(last, ChatEntry::System(t) if t.contains("无效参数")),
+            "应提示无效参数: {last:?}"
+        );
+    }
+
+    #[test]
+    fn max_steps_accepts_minimum_one() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/max_steps 1");
+        assert_eq!(app.config.agent.max_steps, 1);
     }
 }

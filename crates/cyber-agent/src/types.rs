@@ -112,10 +112,29 @@ pub enum StreamEvent {
     Delta(String),
     /// 工具调用 delta 片段（参数分片到达，由 agent loop 累积）。
     ToolCallDelta(ToolCallDelta),
+    /// 流末尾的 token 用量（需请求 `stream_options: include_usage`）。
+    Usage(Usage),
     /// 流正常结束。
     Done,
     /// 流内可恢复错误（HTTP/stream/解析失败），不终止 agent 任务，仅展示。
     Error(String),
+}
+
+/// 单次 API 调用的 token 用量（从流式响应末尾的 usage 字段提取）。
+///
+/// DeepSeek/OpenAI 的流式 usage chunk 含 `prompt_cache_hit_tokens` /
+/// `prompt_cache_miss_tokens`（prefix cache 命中分解）。Anthropic/Ollama
+/// 暂不返回缓存分解，相应字段为 0。
+#[derive(Debug, Clone, Default)]
+pub struct Usage {
+    /// 输入 token 总数（含缓存命中 + 缓存未命中）。
+    pub prompt_tokens: u64,
+    /// 输出 token 数。
+    pub completion_tokens: u64,
+    /// 缓存命中的输入 token 数（DeepSeek/OpenAI prefix cache）。
+    pub cache_hit_tokens: u64,
+    /// 缓存未命中的输入 token 数。
+    pub cache_miss_tokens: u64,
 }
 
 /// agent 任务 → TUI 的事件。
@@ -140,6 +159,8 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
+    /// 单轮 API 调用的 token 用量（TUI 据此显示缓存命中率 + 成本）。
+    Usage(Usage),
     Done,
     Error(String),
 }

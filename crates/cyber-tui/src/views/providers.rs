@@ -2,6 +2,7 @@
 //!
 //! 从 Settings（`a`/`e`）或 Chat（`/provider add|edit`）进入，作为顶层 `Mode::ProviderForm`
 //! 渲染。字段：name / kind / base_url / api_key / model / max_tokens / temperature +
+//! 价格（input_per_m / output_per_m / cache_hit_per_m，可选，用于 TUI 显示成本）+
 //! 三个按钮：拉取模型 / 保存 / 取消。
 //!
 //! 文本字段用单个复用 `TextArea`：Enter 进入编辑（load 值）→ 输入 → Enter 提交 / Esc 取消编辑。
@@ -36,7 +37,7 @@ struct FieldDef {
 }
 
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
-/// 0-6 为数据字段，7=拉取模型，8=保存，9=取消。
+/// 0-6 为数据字段，7-9 为价格字段，10=拉取模型，11=保存，12=取消。
 const FIELDS: &[FieldDef] = &[
     FieldDef { label: "名称 name", kind: FieldKind::Text },
     FieldDef { label: "类型 kind", kind: FieldKind::Enum },
@@ -45,14 +46,17 @@ const FIELDS: &[FieldDef] = &[
     FieldDef { label: "model", kind: FieldKind::Text },
     FieldDef { label: "max_tokens", kind: FieldKind::Text },
     FieldDef { label: "temperature", kind: FieldKind::Text },
+    FieldDef { label: "输入价格 $/M (input_per_m)", kind: FieldKind::Text },
+    FieldDef { label: "输出价格 $/M (output_per_m)", kind: FieldKind::Text },
+    FieldDef { label: "缓存命中价格 $/M (cache_hit_per_m)", kind: FieldKind::Text },
     FieldDef { label: "拉取模型", kind: FieldKind::Button },
     FieldDef { label: "保存", kind: FieldKind::Button },
     FieldDef { label: "取消", kind: FieldKind::Button },
 ];
 const IDX_KIND: usize = 1;
-const IDX_FETCH: usize = 7;
-const IDX_SAVE: usize = 8;
-const IDX_CANCEL: usize = 9;
+const IDX_FETCH: usize = 10;
+const IDX_SAVE: usize = 11;
+const IDX_CANCEL: usize = 12;
 
 /// 表单按键的副作用意图，由 App 解释执行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +77,12 @@ pub struct ProviderFormState {
     pub model: String,
     pub max_tokens: String,
     pub temperature: String,
+    /// 每百万输入 token 价格（美元），空串 = 未配置。
+    pub price_input: String,
+    /// 每百万输出 token 价格（美元），空串 = 未配置。
+    pub price_output: String,
+    /// 每百万缓存命中输入 token 价格（美元），空串 = 未配置。
+    pub price_cache_hit: String,
     /// `Some` = 编辑现有（值为原始 name）；`None` = 新增。
     pub original_name: Option<String>,
     pub focused: usize,
@@ -99,6 +109,9 @@ impl ProviderFormState {
             model: String::new(),
             max_tokens: "4096".into(),
             temperature: "0.7".into(),
+            price_input: String::new(),
+            price_output: String::new(),
+            price_cache_hit: String::new(),
             original_name: None,
             focused: 0,
             editing: false,
@@ -126,6 +139,24 @@ impl ProviderFormState {
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens.to_string(),
             temperature: cfg.temperature.to_string(),
+            price_input: cfg
+                .price
+                .as_ref()
+                .and_then(|p| p.input_per_m)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            price_output: cfg
+                .price
+                .as_ref()
+                .and_then(|p| p.output_per_m)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            price_cache_hit: cfg
+                .price
+                .as_ref()
+                .and_then(|p| p.cache_hit_per_m)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             original_name: Some(name.to_string()),
             ..Self::empty()
         };
@@ -151,7 +182,23 @@ impl ProviderFormState {
             model: self.model.clone(),
             max_tokens: self.max_tokens.trim().parse().unwrap_or(4096),
             temperature: self.temperature.trim().parse().unwrap_or(0.7),
+            price: self.build_price(),
         }
+    }
+
+    /// 从表单价格字段构建 `PriceConfig`。全部为空时返回 None。
+    fn build_price(&self) -> Option<cyber_core::PriceConfig> {
+        let input = self.price_input.trim().parse::<f64>().ok();
+        let output = self.price_output.trim().parse::<f64>().ok();
+        let cache_hit = self.price_cache_hit.trim().parse::<f64>().ok();
+        if input.is_none() && output.is_none() && cache_hit.is_none() {
+            return None;
+        }
+        Some(cyber_core::PriceConfig {
+            input_per_m: input,
+            output_per_m: output,
+            cache_hit_per_m: cache_hit,
+        })
     }
 
     /// 校验并构造 `(name, ProviderConfig)`。失败返回错误文案（App 弹 toast）。
@@ -181,6 +228,19 @@ impl ProviderFormState {
             .trim()
             .parse()
             .map_err(|_| "temperature 必须是数字".to_string())?;
+        // 价格字段校验：非空时必须是有效数字
+        for (label, val) in [
+            ("input_per_m", &self.price_input),
+            ("output_per_m", &self.price_output),
+            ("cache_hit_per_m", &self.price_cache_hit),
+        ] {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                trimmed
+                    .parse::<f64>()
+                    .map_err(|_| format!("{label} 必须是数字"))?;
+            }
+        }
         Ok((
             name,
             ProviderConfig {
@@ -190,6 +250,7 @@ impl ProviderFormState {
                 model: self.model.trim().to_string(),
                 max_tokens,
                 temperature,
+                price: self.build_price(),
             },
         ))
     }
@@ -203,6 +264,9 @@ impl ProviderFormState {
             4 => self.model.clone(),
             5 => self.max_tokens.clone(),
             6 => self.temperature.clone(),
+            7 => self.price_input.clone(),
+            8 => self.price_output.clone(),
+            9 => self.price_cache_hit.clone(),
             _ => String::new(),
         }
     }
@@ -215,12 +279,15 @@ impl ProviderFormState {
             4 => self.model = val,
             5 => self.max_tokens = val,
             6 => self.temperature = val,
+            7 => self.price_input = val,
+            8 => self.price_output = val,
+            9 => self.price_cache_hit = val,
             _ => {}
         }
     }
 
     fn is_text_field(idx: usize) -> bool {
-        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6)
+        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9)
     }
 
     fn start_editing(&mut self, idx: usize) {
@@ -583,6 +650,7 @@ mod tests {
             model: "claude-sonnet-4-5".into(),
             max_tokens: 8192,
             temperature: 0.3,
+            ..Default::default()
         };
         let s = ProviderFormState::from_provider("anthropic", &cfg);
         assert!(s.is_edit());
@@ -792,5 +860,125 @@ mod tests {
         terminal
             .draw(|f| render_form(f, f.area(), &crate::theme::Theme::resolve("cyberpunk"), &s))
             .unwrap();
+    }
+
+    #[test]
+    fn from_provider_loads_price_fields() {
+        let cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            price: Some(cyber_core::PriceConfig {
+                input_per_m: Some(2.5),
+                output_per_m: Some(10.0),
+                cache_hit_per_m: Some(0.3),
+            }),
+            ..Default::default()
+        };
+        let s = ProviderFormState::from_provider("foo", &cfg);
+        assert_eq!(s.price_input, "2.5");
+        assert_eq!(s.price_output, "10");
+        assert!((s.price_cache_hit.parse::<f64>().unwrap() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn from_provider_price_none_yields_empty_strings() {
+        let cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            ..Default::default()
+        };
+        let s = ProviderFormState::from_provider("foo", &cfg);
+        assert!(s.price_input.is_empty());
+        assert!(s.price_output.is_empty());
+        assert!(s.price_cache_hit.is_empty());
+    }
+
+    #[test]
+    fn build_price_none_when_all_empty() {
+        let s = ProviderFormState::empty();
+        assert!(s.build_price().is_none());
+    }
+
+    #[test]
+    fn build_price_partial_fields() {
+        let mut s = ProviderFormState::empty();
+        s.price_output = "7.5".into();
+        let p = s.build_price().expect("部分字段也应返回 Some");
+        assert!(p.input_per_m.is_none());
+        assert!((p.output_per_m.unwrap() - 7.5).abs() < 1e-9);
+        assert!(p.cache_hit_per_m.is_none());
+    }
+
+    #[test]
+    fn into_provider_accepts_valid_prices() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.price_input = "2.5".into();
+        s.price_output = "10".into();
+        s.price_cache_hit = "0.3".into();
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        let p = cfg.price.expect("已配置价格应存在");
+        assert!((p.input_per_m.unwrap() - 2.5).abs() < 1e-9);
+        assert!((p.output_per_m.unwrap() - 10.0).abs() < 1e-9);
+        assert!((p.cache_hit_per_m.unwrap() - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn into_provider_rejects_bad_price_input() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.price_input = "abc".into();
+        let err = s.into_provider(&ProvidersConfig::default()).unwrap_err();
+        assert!(err.contains("input_per_m"), "err = {err}");
+    }
+
+    #[test]
+    fn into_provider_rejects_bad_price_output() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.price_output = "x".into();
+        let err = s.into_provider(&ProvidersConfig::default()).unwrap_err();
+        assert!(err.contains("output_per_m"), "err = {err}");
+    }
+
+    #[test]
+    fn into_provider_rejects_bad_price_cache_hit() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.price_cache_hit = "?".into();
+        let err = s.into_provider(&ProvidersConfig::default()).unwrap_err();
+        assert!(err.contains("cache_hit_per_m"), "err = {err}");
+    }
+
+    #[test]
+    fn into_provider_accepts_empty_prices() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        // 全部价格留空应通过且 price = None
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert!(cfg.price.is_none());
+    }
+
+    #[test]
+    fn price_fields_are_text_editable() {
+        assert!(ProviderFormState::is_text_field(7));
+        assert!(ProviderFormState::is_text_field(8));
+        assert!(ProviderFormState::is_text_field(9));
+    }
+
+    #[test]
+    fn price_fields_get_set_roundtrip() {
+        let mut s = ProviderFormState::empty();
+        s.set_field(7, "1.1".into());
+        s.set_field(8, "2.2".into());
+        s.set_field(9, "3.3".into());
+        assert_eq!(s.get_field(7), "1.1");
+        assert_eq!(s.get_field(8), "2.2");
+        assert_eq!(s.get_field(9), "3.3");
     }
 }

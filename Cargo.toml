@@ -45,6 +45,8 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
 # event-stream：P2 起用 crossterm::event::EventStream 接入 tokio select!
 crossterm = { version = "0.28", features = ["event-stream"] }
+# unicode 字符宽度：Chat 历史区预折行（CJK 占 2 列），与 ratatui 共用 0.2 系列
+unicode-width = "0.2"
 # 多行输入框；原 tui-textarea 0.7 pin ratatui ^0.29，与 0.30 不兼容，故用维护 fork tui-textarea-2。
 # 关键：tui-textarea-2 默认 crossterm feature 绑定 crossterm 0.29，与本项目 0.28 冲突
 #（两份 crossterm → KeyEvent 类型不匹配，textarea.input(key) 编译失败）。

@@ -32,6 +32,9 @@ desktop.ini
 *.pem
 *.key
 
+# Project-level local config & runtime data (skills installs, sessions, etc.)
+/.cyber/
+
 # Logs
 *.log
 

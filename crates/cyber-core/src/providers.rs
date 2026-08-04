@@ -26,6 +26,19 @@ pub struct ProviderConfig {
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// 每百万 token 价格（美元），用于 TUI 显示成本。可选，缺省时不显示成本。
+    pub price: Option<PriceConfig>,
+}
+
+/// token 单价配置（每百万 token 美元）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PriceConfig {
+    /// 每百万输入 token（缓存未命中）价格。
+    pub input_per_m: Option<f64>,
+    /// 每百万输出 token 价格。
+    pub output_per_m: Option<f64>,
+    /// 每百万输入 token（缓存命中）价格。缺省时回退到 input_per_m。
+    pub cache_hit_per_m: Option<f64>,
 }
 
 impl Default for ProviderConfig {
@@ -37,6 +50,7 @@ impl Default for ProviderConfig {
             model: String::new(),
             max_tokens: 4096,
             temperature: 0.7,
+            price: None,
         }
     }
 }

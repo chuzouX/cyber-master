@@ -127,7 +127,7 @@ pub fn save_providers(providers: &ProvidersConfig, path: &Path) -> Result<()> {
 /// 原子写：写 `.tmp` → 备份旧文件为 `.bak` → rename `.tmp` 覆盖目标。
 ///
 /// 主 rename 失败时尝试从 `.bak` 恢复，避免写坏原文件。
-fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("toml.tmp");
     let bak = path.with_extension("toml.bak");
     std::fs::write(&tmp, data)?;
@@ -292,6 +292,7 @@ mod tests {
                 model: "gpt-4o-mini".into(),
                 max_tokens: 8192,
                 temperature: 0.5,
+                ..Default::default()
             },
         );
 

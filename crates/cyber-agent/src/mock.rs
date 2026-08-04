@@ -112,6 +112,7 @@ mod tests {
                 StreamEvent::Delta(t) => out.push_str(&t),
                 StreamEvent::Done => got_done = true,
                 StreamEvent::Error(_) => panic!("mock 不应产生错误"),
+                StreamEvent::Usage(_) => {}
                 StreamEvent::ToolCallDelta(_) => panic!("echo 模式不应产生 tool call"),
             }
         }
@@ -139,6 +140,7 @@ mod tests {
                 }
                 StreamEvent::Done => got_done = true,
                 StreamEvent::Error(_) => panic!("mock 不应产生错误"),
+                StreamEvent::Usage(_) => {}
             }
         }
         assert!(!text.is_empty(), "第一步应先发文本");
@@ -165,6 +167,7 @@ mod tests {
                 StreamEvent::ToolCallDelta(_) => got_tool_call = true,
                 StreamEvent::Done => got_done = true,
                 StreamEvent::Error(_) => panic!("mock 不应产生错误"),
+                StreamEvent::Usage(_) => {}
             }
         }
         assert!(!text.is_empty(), "第二步应发最终文本");

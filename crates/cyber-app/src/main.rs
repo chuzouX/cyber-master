@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use cyber_agent::AgentEvent;
 use cyber_core::load_app_context;
-use cyber_tui::{App, AppPaths, FetchResult, Mode};
+use cyber_tui::{build_registries, App, AppPaths, FetchResult, McpServersConfig, Mode};
 use tokio::sync::mpsc;
 
 /// Cyber Master CLI 参数。
@@ -45,7 +45,6 @@ async fn main() -> color_eyre::Result<()> {
     let default_filter = cli.log_level.as_deref().unwrap_or("info");
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cwd = match cli.cwd {
         Some(c) => c,
@@ -53,6 +52,25 @@ async fn main() -> color_eyre::Result<()> {
     };
 
     let ctx = load_app_context(&cwd)?;
+
+    // 日志写文件（~/.cyber/logs/cyber.log），不输出到终端——避免干扰 TUI 渲染。
+    // 启动早期（load_app_context 之前）的日志丢弃，无碍。
+    let log_file = ctx.paths.logs_dir.join("cyber.log");
+    let _ = std::fs::create_dir_all(&ctx.paths.logs_dir);
+    match std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
+        Ok(f) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(f)
+                .init();
+        }
+        Err(e) => {
+            eprintln!("警告：无法打开日志文件 {}: {e}，回退 stderr（可能干扰 TUI）", log_file.display());
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+        }
+    }
 
     // mock：CLI flag 或环境变量 CYBER_MOCK_PROVIDER=1
     let mock = cli.mock || std::env::var("CYBER_MOCK_PROVIDER").is_ok_and(|v| v == "1");
@@ -87,16 +105,33 @@ async fn main() -> color_eyre::Result<()> {
         "启动 TUI"
     );
 
+    // 加载 MCP servers 配置（~/.cyber/mcp/servers.toml）。文件不存在 → 空 config。
+    // 注意在 `paths` move 前从 ctx.paths 借用加载，避免后续 borrow 冲突。
+    let mcp_config = McpServersConfig::load(&ctx.paths.mcp_servers_file).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "MCP servers.toml 加载失败，使用空配置降级");
+        McpServersConfig::default()
+    });
+
     let paths = AppPaths {
         config_file: ctx.paths.config_file.clone(),
         providers_file: ctx.paths.providers_file.clone(),
+        mcp_servers_file: ctx.paths.mcp_servers_file.clone(),
+        log_file: log_file.clone(),
         history_dir: ctx.paths.history_dir.clone(),
         cwd,
     };
 
-    App::new(
+    // 构建统一工具表（builtins + Skills + MCP）。注意在 `paths` move 前 borrow ctx.paths + cwd。
+    // mock 模式跳过 MCP 连接。boot_errors 经 toast 展示（降级为仅可用部分，不阻断启动）。
+    let (registries, boot_errors) = build_registries(&ctx.paths, &paths.cwd, mock).await;
+    for e in &boot_errors {
+        tracing::warn!(error = %e, "启动注册表构建警告");
+    }
+
+    let mut app = App::new(
         ctx.config,
         ctx.providers,
+        mcp_config,
         ctx.project,
         initial_mode,
         ctx.is_first_run,
@@ -105,9 +140,12 @@ async fn main() -> color_eyre::Result<()> {
         mock,
         agent_tx,
         fetch_tx,
-    )
-    .run(agent_rx, fetch_rx)
-    .await?;
+        registries,
+    );
+    if !boot_errors.is_empty() {
+        app.set_toast(format!("启动警告：{}", boot_errors.join("; ")));
+    }
+    app.run(agent_rx, fetch_rx).await?;
 
     Ok(())
 }

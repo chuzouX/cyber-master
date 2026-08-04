@@ -24,4 +24,4 @@ pub use models::{extract_model_ids, fetch_models};
 pub use provider::{provider_factory, Provider, StreamRequest};
 pub use tool::{Tool, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::builtin_tool_names;
-pub use types::{AgentEvent, Message, Role, StreamEvent, ToolCall, ToolCallDelta};
+pub use types::{AgentEvent, Message, Role, StreamEvent, ToolCall, ToolCallDelta, Usage};

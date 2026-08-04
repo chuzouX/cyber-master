@@ -211,12 +211,15 @@ log_level = "info"
 - **流式输出**：token-by-token 渲染（SSE/流式 API）
 - **工具调用内联展示**：工具名、参数摘要、状态、耗时、结果计数；可展开看详情
 - **斜杠命令**：`/help /workflow /skill /mcp /model /provider /clear /save /load /report /targets /scan /dashboard`
+- **斜杠补全菜单**：输入 `/` 自动弹出命令目录（按前缀大小写不敏感过滤），↑/↓ 选择、Enter/Tab 补全命令名+空格、Esc 关闭；菜单展示用法串与描述（详见 §9.7）
 - **服务商管理**：`/provider list|add|edit|use|remove` 在对话中增删改查 LLM 服务商，无需退出到配置文件；表单内「拉取模型」按钮异步 `GET {base}/models` 拉取模型列表供选择（详见 §9.5）
 - **项目上下文感知**：`.cyber.md` 自动注入；`@file` 引用文件；`/add` 添加目录到上下文
 - **文件编辑 diff**：agent 修改文件时以 diff 块展示，确认后落盘
 - **多行输入**：`tui-textarea`，Shift+Enter 换行，Enter 发送
-- **历史导航**：↑/↓ 翻阅历史
-- **Agent Loop**：支持自主多步工具调用（受 `max_steps` 与 `rules` 护栏约束）
+- **历史滚动**：PageUp/PageDown 整页、Ctrl+↑/Ctrl+↓ 单行、鼠标滚轮（3 行/格）翻阅历史聊天记录；贴底时 auto-follow 流式新内容，上滚后视图钉在原内容。预折行缓存 + 可见窗口渲染保证长历史滚动跟手性（详见 §9.7）
+- **输入历史呼出**：空输入框下普通 ↑/↓ 呼出已发送消息（shell 风格），跨会话复用；非空时交 textarea 移光标保留多行编辑（详见 §9.7）
+- **Agent Loop**：支持自主多步工具调用（受 `max_steps` 与 `rules` 护栏约束）；达到 `max_steps` 时不裸中断，而是发起一次无工具的收尾流式让模型总结已收集的信息后正常 `Done`，使「继续」有上下文
+- **Markdown 渲染**：assistant 消息（含流式 buffer）按 Markdown 子集渲染（标题/代码块/行内代码/粗体/粗斜体/斜体/下划线/删除线/行内数学/块级数学/链接/列表/引用/分隔线），详见 §9.6
 - **Chat ↔ Workflow 联动**：对话中可一句"把这些资产跑漏扫"自动生成并启动工作流
 
 ### 3.3 安全护栏
@@ -379,21 +382,23 @@ Tab 切换：`Overview / Nodes / Logs / Stats / Assets`。
 
 ## 6. MCP 支持
 
+> **P3 实现状态**：v0.1 三种传输全部落地（[cyber-mcp](../crates/cyber-mcp/src/)）。stdio 经子进程 JSON-RPC；Streamable HTTP 每次 call 一个 POST + `Mcp-Session-Id` 回带；legacy SSE 长连 GET event-stream 收响应 + POST endpoint 发请求。`connect_one` 按 transport 分派到三个 spawn 函数。
+
 ### 6.1 传输层
 
-| 传输 | 用途 |
-| --- | --- |
-| stdio | 本地 MCP server（子进程） |
-| SSE | 远程 server（旧规范） |
-| Streamable HTTP | 远程 server（新规范） |
+| 传输 | 用途 | v0.1 |
+| --- | --- | :---: |
+| stdio | 本地 MCP server（子进程 JSON-RPC over stdin/stdout） | ✅ |
+| SSE | 远程 server（旧规范，长连 event-stream + POST endpoint） | ✅ |
+| Streamable HTTP | 远程 server（新规范，每次 call 一个 POST + `Mcp-Session-Id`） | ✅ |
 
 ### 6.2 能力
 
-- 启动时按 `mcp/servers.toml` 拉起/连接所有 server，健康检查
-- 工具发现 + schema 缓存（避免每次拉取）
-- 支持 `tools/list` `tools/call` `resources/*` `prompts/*`
-- **统一工具表**：MCP 工具与内置工具、Skill 同等暴露给 agent 与工作流节点
-- 工作流中用 `mcp-tool` 节点调用任意 MCP 工具
+- 启动时按 `mcp/servers.toml` **并行**拉起所有 stdio server（`McpRegistry::connect_all`，每 server 独立超时，失败 warn + skip 不阻断启动）
+- 握手：`initialize`（协议版本 + client/server info）→ `tools/list` 缓存工具 schema 到 `McpConnection`（避免每次拉取）
+- v0.1 支持 `tools/list` `tools/call`；`resources/*` `prompts/*` 留待后续阶段
+- **统一工具表**：MCP 工具与内置工具、Skill 同等暴露给 agent 与工作流节点（详见 §6.4）
+- 工作流中用 `mcp-tool` 节点调用任意 MCP 工具（P4 接入）
 
 ### 6.3 servers.toml 示例
 
@@ -411,16 +416,46 @@ url = "https://scanner.internal/mcp"
 headers = { Authorization = "Bearer ${MCP_TOKEN}" }
 ```
 
+### 6.4 连接模型（actor 模式）
+
+`Tool::run` 是 `&self`，MCP 需内部可变性。`McpConnection` 本身**传输无关**：只持 `tx: UnboundedSender<McpRequest>` + `next_id: AtomicU64` + `tools`，`call()` / `handshake()` / `call_tool()` 全走 `tx` channel + oneshot。三种传输各自起一个**不同的 actor 实现**处理同一 `McpRequest` 流（见 [connection.rs](../crates/cyber-mcp/src/connection.rs)）：
+
+- **stdio actor**（`spawn_stdio` → `start_actor`）：单 task 串行处理子进程 stdin/stdout。actor loop 用 `tokio::select!` 处理请求通道（写 stdin）+ stdout 行（按 `\n` 切行解析 response，按 id 路由到 pending oneshot；无 id 的 notification 记 log 后忽略；半行缓冲累积）。
+- **Streamable HTTP actor**（`spawn_http` → `start_http_actor`）：每次 `Call` 一个 `POST`（`application/json` 请求 / `application/json` 或 `text/event-stream` 响应）。维护 `session_id: Option<String>`——initialize 响应头 `Mcp-Session-Id` 下发后，后续请求回带。响应按 Content-Type 分派：`text/event-stream` → `parse_sse_text` + `extract_jsonrpc_responses` 取 id 匹配者；否则按 JSON 解析。`Notification` best-effort POST（忽略响应体）。client 不设全局超时，由 `call()` 的 30s oneshot 超时兜底。
+- **legacy SSE actor**（`spawn_sse` → `start_sse_actor`）：长连 `GET` event-stream 收响应（reader task 把 `bytes_stream` 喂给 `SseParser`，按 id 路由到共享 `pending` 表；`event: endpoint` 携带的 POST URL 存入 `endpoint`），每次 `Call` `POST` 到 endpoint。流结束/出错 → fail 所有 pending。Shutdown 置 shutdown 标志 + abort reader。
+
+通用约定：
+- JSON-RPC `id` 单调递增无竞争，无需 Mutex；id 用 `AtomicU64`。notification 用 `JsonRpcRequest::notification(...)`（`id: None`，序列化省略 id 字段）。
+- `call(method, params)` 带 30s 超时（`tokio::time::timeout` 包裹 oneshot）；握手用 `spec.timeout_secs`（默认 5s）防卡死。
+- `headers` 支持 `${VAR}` 环境变量展开（`expand_env_headers`），使 `Authorization = "Bearer ${MCP_TOKEN}"` 生效。
+- cancel 时调用方 drop oneshot sender，无害（agent cancel 流程复用 generation 计数器隔离 stale 事件）。
+
+### 6.5 统一工具表与命名
+
+`McpRegistry::connect_all` 返回 `(Self, Vec<McpTool>, Vec<(String, McpError)>)`，`McpTool` 实现 `cyber_agent::Tool` trait：
+
+- **命名**：`mcp_<server>_<tool>`（非法字符替换为 `_`），与内置工具、`skill_<name>` 前缀隔离，避免冲突。
+- `schema.description` = `[<server>] <tool description>`，便于 LLM 区分来源。
+- `run` 发 `tools/call` → 把 `content[]` 的 text 项拼成单字符串 → `ToolOutput`。
+
+**跨 turn 共享**：`App` 持有 `Arc<ToolRegistry>`（启动时 `build_registries` 构建一次），每次 `spawn_agent` 时 `Arc::clone` 传入 `run_stream`——MCP 子进程连接跨多轮 agent turn 长存，不每轮重连。退出时 `App::run` 调 `mcp.shutdown_all()`（发 `Shutdown` + await actor 退出 + 回收子进程）。
+
+### 6.6 降级保证
+
+`build_registries` 永不返回 Err：MCP 配置加载失败 / 某 server 连接失败（含 HTTP/SSE 网络错误、握手超时），均收集为 `Vec<String>` boot_errors 经 toast 展示，TUI 仍以「内置工具 + Skills」降级启动。`--mock` 模式跳过 MCP 连接（离线冒烟）。
+
 ---
 
 ## 7. Skill 支持
+
+> **P3 实现状态**：v0.1 已落地目录扫描 + 渐进式披露 + `/skill` 命令 + `skill_<name>` 工具（[cyber-skills](../crates/cyber-skills/src/)）。v0.1 仅**显式触发**（`/skill <name>` 或 LLM 调 `skill_<name>` 工具），不做 `triggers` 自动匹配（`triggers` 字段保留并写入 schema description 供 LLM 参考）。
 
 ### 7.1 Skill 结构
 
 ```
 ~/.cyber/skills/src-recon/
 ├── SKILL.md          # 名称/描述/触发条件/使用说明（渐进式披露）
-└── scripts/          # 可选脚本
+└── scripts/          # 可选脚本（v0.1 不自动执行，仅供 body 引用）
     └── enrich.sh
 ```
 
@@ -439,9 +474,28 @@ tools: [subfinder, httpx]
 
 ### 7.2 调用方式
 
-- **Chat**：`/skill src-recon` 或 agent 自动按 `triggers` 匹配加载
-- **Workflow**：`skill` 节点，把 Skill 作为一个可复用子流程
-- **渐进式披露**：模型先读 frontmatter，需要时再读正文，节省上下文
+- **Chat**：`/skill <name>` 查看说明；`/skill list` 列出全部；LLM 调 `skill_<name>` 工具获取说明
+- **Workflow**：`skill` 节点，把 Skill 作为一个可复用子流程（P4 接入）
+- **渐进式披露**：模型先读 frontmatter（经 schema description），需要时调工具读正文，节省上下文
+
+### 7.3 加载与覆盖（P3 实现）
+
+`SkillRegistry::load_all(global_dir, project_dir)` 扫描两个目录下每个子目录的 `SKILL.md`（见 [registry.rs](../crates/cyber-skills/src/registry.rs)）：
+
+- **全局**：`~/.cyber/skills/<name>/SKILL.md`
+- **项目级**：`<cwd>/.cyber/skills/<name>/SKILL.md`（`Paths::project_skills_dir`）
+- **覆盖**：项目级与全局同名时，项目级优先（按 `frontmatter.name` 去重，Project 覆盖 Global）。
+- 单个 Skill 加载失败（缺 name / frontmatter 损坏）收集到 errors 列表，不 panic、不阻断其余 Skill 加载。
+- frontmatter 解析复用 `.cyber.md` 的 BOM strip + `---` 分隔 + serde_yaml 模式（拷贝到 `cyber-skills::frontmatter`，不泛型化 core 的 parse 以免影响 core 测试）。
+
+### 7.4 SkillTool（渐进式披露）
+
+每个 `Skill` 包成 `SkillTool` impl `cyber_agent::Tool`（见 [tool.rs](../crates/cyber-skills/src/tool.rs)）：
+
+- **命名**：`skill_<name>`，与内置工具、`mcp_<server>_<tool>` 前缀隔离。
+- `schema.description` = `[Skill] <description>` + `触发词: ...`（非空时）+ `调用此工具以获取详细使用说明`（第一层披露：LLM 据此判断是否调用）。
+- `run` 返回 skill body（第二层披露：详细使用说明）。
+- 工具无参数（`{"type":"object","properties":{}}`）。
 
 ---
 
@@ -503,7 +557,7 @@ subfinder, amass, assetfinder, httpx, naabu, dnsx, nmap, masscan, nuclei, xray, 
 | e | Settings Providers 段：编辑当前服务商 |
 | d | Settings Providers 段：删除当前服务商（双击 `d` 确认） |
 
-> **Chat 输入态键位差异（P2）**：Chat 是文本输入模式，`s`/`q`/`/` 等均为打字字符，不触发上表动作。Chat 专属键：`Enter` 发送、`Shift+Enter`/`Alt+Enter`/`Ctrl+J` 换行、`Ctrl+,` 打开设置（替代 `s`）、`Ctrl+C`/`Ctrl+Q` 退出（替代 `q`）、`Esc` 取消流式或返回。其余模式仍用上表全局键位。
+> **Chat 输入态键位差异（P2）**：Chat 是文本输入模式，`s`/`q`/`/` 等均为打字字符，不触发上表动作。Chat 专属键：`Enter` 发送、`Shift+Enter`/`Alt+Enter`/`Ctrl+J` 换行、`Ctrl+,` 打开设置（替代 `s`）、`Ctrl+C`/`Ctrl+Q` 退出（替代 `q`）、`Esc` 取消流式或返回、`PageUp`/`PageDown` 整页滚动历史、`Ctrl+↑`/`Ctrl+↓` 单行滚动历史、鼠标滚轮（3 行/格，需 `config.ui.mouse`）。普通 ↑/↓：空输入框时呼出输入历史（浏览态继续 ↑/↓ 翻更早/更新，↓ 到头回到空输入），非空时交 textarea 移光标（保留多行编辑）；斜杠补全菜单打开时 ↑/↓/Enter/Tab/Esc 由菜单消费（详见 §9.7）。其余模式仍用上表全局键位。
 
 ### 9.3 主题与动画
 
@@ -588,6 +642,113 @@ P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`�
 **删除确认**：Settings Providers 段 `d` 双击（首次置 `pending_delete_idx` + 行内 `[待删除!]` 标记，任一其他键清除；二次 `d` 执行删除）。删除/重命名触及 `default_provider` 时自动回退到排序后首个剩余 / 同步改名，并 toast。
 
 **default_provider 防悬空**：删除当前默认 provider → 回退到排序后首个剩余；重命名当前默认 → 同步改名。两者均标 dirty 触发持久化。
+
+### 9.6 Markdown 渲染
+
+P2 阶段为 Chat 的 assistant 消息（含流式 buffer）实现轻量 Markdown 渲染，让 LLM 输出的标题、代码块、列表等结构清晰可读。由 `cyber-tui::markdown` 模块负责（手写解析器，不引入外部 markdown crate——TUI 只需 span 级样式，手写可精确映射主题色且避免依赖膨胀，与项目自实现 FNV hash / SSE 行缓冲一致）。
+
+**覆盖子集**：
+
+| 元素 | 语法 | 渲染 |
+| --- | --- | --- |
+| 标题 | `#`..`######` | accent 色 + 粗体，保留 `#` 前缀 |
+| 代码块 | ` ``` ` / `~~~` 围栏 | `│ ` 左标记 + title 色，围栏分隔行隐藏 |
+| 行内代码 | `` `code` `` | title 色 + DIM |
+| 粗体 | `**text**` | BOLD（内部递归解析，支持 `**`code`**`） |
+| 粗斜体 | `***text***` | BOLD + ITALIC（先于 `**` 匹配，否则 `**` 会吞掉前两个 `*`；内部递归） |
+| 斜体 | `*text*` | ITALIC（跳过成对 `**` 避免与粗体冲突） |
+| 下划线 | `<u>text</u>` / `<ins>text</ins>` | UNDERLINED（Markdown 无原生下划线语法，用 HTML 语法糖） |
+| 删除线 | `~~text~~` | CROSSED_OUT |
+| 行内数学 | `$...$` | math 色 + ITALIC（开头非空格、闭合前非空格、内容非空，避免 `$5` 货币误触发） |
+| 块级数学 | 独占行 `$$` 起止 | 每行缩进 2 + math 色 + ITALIC（内容原样展示，不递归解析避免 `^`/`_` 误触发） |
+| 链接 | `[text](url)` | accent 色 + UNDERLINED（url 不显示，保持简洁） |
+| 无序列表 | `-`/`*`/`+` + 空格 | accent 色标记 |
+| 有序列表 | `数字.` + 空格 | accent 色标记 |
+| 引用 | `> text` | `│ ` muted 色标记 |
+| 分隔线 | `---`/`***`/`___`（≥3 同字符） | muted 色 `─` 行 |
+
+**匹配优先级**：行内标记扫描按前缀冲突时长者先：行内代码 > 粗斜体 `***` > 粗体 `**` > 斜体 `*` > 下划线 `<u>`/`<ins>` > 删除线 `~~` > 显示数学 `$$` > 行内数学 `$` > 链接 `[`。匹配失败（未找到闭合）时该字符按普通文本处理，继续向后扫描——保证未闭合格式降级为纯文本而非吞字符。
+
+**非目标**（不实现）：嵌套列表、表格、通用 HTML（仅 `<u>`/`<ins>` 作下划线语法糖）、脚注、图片——TUI 场景下收益低且复杂度高。TUI 无法渲染 LaTeX，数学公式仅原样展示公式文本并以 accent 色 + 斜体作视觉标记。
+
+**颜色映射**：不新增 `Theme` 字段，由现有主题色派生（`code_fg=title`、`header=link=list=math=accent`、`quote=hr=muted`），随主题切换经 `invalidate_cache` 触发重建。
+
+**渲染集成**：
+- 已定稿 assistant 条目：`[assistant]` 标签独占一行（与 User/System 的内联标签不同——块级结构需自然铺开，标签独占一行避免缩进错位），随后是 Markdown 渲染的内容行；经 `prepare_render` 入行缓存复用。
+- 流式 buffer：每帧经 `markdown::render` 现场解析（量小，不入缓存），末行追加 `▌` 光标。buffer 可能为不完整 Markdown（未闭合 `**` 或未闭合围栏），解析器把未闭合格式降级为纯文本，不 panic。
+
+**降级保证**：所有未闭合标记按普通文本处理，不吞字符；流式中途渲染始终稳定。
+
+### 9.7 历史滚动与斜杠补全菜单
+
+Chat 是文本输入态，普通 ↑/↓ 交给 textarea 移光标，因此历史滚动与命令补全需要专属交互。
+
+**历史滚动**（`ChatState::scroll_history`）：
+
+| 输入 | 动作 |
+| --- | --- |
+| PageUp / PageDown | 整页滚动（页大小 = 上一帧历史区可见高度） |
+| Ctrl+↑ / Ctrl+↓ | 单行滚动 |
+| 鼠标滚轮上/下 | 滚动 3 行（需 `config.ui.mouse`） |
+
+- `scroll_y` 以绝对顶部行号记录偏移；哨兵值 `SCROLL_FOLLOW`（`usize::MAX`）表示"跟随底部"。
+- 贴底时切回 `SCROLL_FOLLOW` → 流式新内容自动滚到底（auto-follow）；上滚后记录绝对偏移，内容增长时视图钉在原内容（不滑向新内容）。
+- 度量（总行数 / 可见高度）由 render 每帧经 `Cell` 回写，按键处理据此计算 `max_scroll` 与页大小；首帧前度量为 0 → 滚动 no-op（安全）。
+- submit / clear / cancel 后调 `scroll_to_bottom()` 恢复 auto-follow。
+- 标题栏显示滚动指示：跟随底部时不显示，上滚后显示位置/总量（如 `[12/45]`）。
+
+**滚动跟手性（预折行缓存 + 可见窗口）**：长历史下滚动卡顿的主因是旧行为每帧 `Paragraph::line_count` + `Wrap` 重算（O(N)）+ 全量 `extend_from_slice` clone。优化为：
+
+- `WrappedCache`（`RefCell`，render 以 `&self` 经内部可变更新）按当前可视宽度把已完成条目 + 流式 tail 预折行为单行 `Line` 列表，缓存键 = `(entries.len, streaming_buffer.len, width)`；key 命中且 `valid` 时 O(1) 复用，仅内容/宽度变化时 O(N) 重建。
+- 折行用 `unicode-width`（CJK 占 2 列、tab 占 1 列），贪婪字符宽度填充，相邻同 style 字符合并为一个 span（控制行样式边界）。
+- render 只 clone 可见窗口 `wrapped[offset..end]`（O(visible)），以**无 `Wrap`、无 `scroll`** 的 `Paragraph` 渲染——ratatui 渲染复杂度从 O(N) 降到 O(visible)，滚动时内容未变直接命中缓存，跟手性显著改善。
+- theme 切换经 `invalidate_cache` 置 `valid=false` 强制重建（颜色变了但折行数不变，key 不会变，须显式失效）。
+- 空会话引导文本量小，直接 `Paragraph+Wrap` 不参与缓存/滚动路径。
+
+**斜杠补全菜单**（`ChatState::slash_menu` + `slash::COMMANDS`）：
+
+- 输入首行以 `/` 开头且不含空格时，`update_slash_menu` 每次输入后按前缀大小写不敏感过滤 `COMMANDS` 目录并打开菜单；不匹配或输入离开 `/` 前缀态时自动关闭。流式期输入被禁，菜单不会打开。
+- `COMMANDS` 是命令名/用法/描述的单一来源（`CommandSpec { name, usage, desc }`），`HELP_TEXT` 与菜单均据此展示，避免多处维护漂移。
+- 菜单打开时 ↑/↓/Enter/Tab/Esc 由 `slash_menu_key` 消费，不传给 textarea 也不触发其他动作：↑/↓ 循环选择、Enter/Tab 用选中命令名+空格替换输入框（用户继续输参数再 Enter 提交）、Esc 关闭。
+- 菜单浮于输入框正上方（覆盖历史区底部），用 `Clear` 清背景后渲染 `List`（高亮选中行 `▶`），最高 8 项后内部滚动。
+- 输入普通字符后实时刷新过滤；过滤结果变化时保持选中项在范围内。
+
+**输入历史呼出**（`ChatState::input_history` + `history_prev`/`history_next`）：
+
+- 空输入框下普通 ↑ 呼出最新一条已发送消息，继续 ↑ 往更早翻、↓ 往更新翻、↓ 到头清空输入框并退出浏览态（回到最新）。
+- **与多行编辑的冲突处理**：输入框非空时 ↑/↓ 返回 `false`（未处理）→ App 层转交 textarea 移光标，保留 Shift+Enter 换行后的多行光标移动。仅空输入框（或已进入浏览态）才呼出历史，避免抢夺多行编辑的光标控制。
+- 不单独持久化：`InputHistory.entries` 由 chat history 的 `ChatEntry::User` 条目派生（App 启动加载历史后 `seed_input_history` 填充），新提交经 `record` 追加（trim 空跳过、与末条相同则相邻去重）。跨会话呼出靠下次启动重新 seed，不新增存储文件。
+- 浏览态语义：`browse=None` 表示正在输入新内容；首次 ↑ 进入浏览态指向最新条目，继续 ↑ 往更早（到最早保持当前）、↓ 往更新（到头清空并退出）。提交新消息或编辑输入后退出浏览态。
+- 流式期由 App 拦截不调用此处（生成中禁用输入）；斜杠补全菜单打开时 ↑/↓ 由菜单消费，不触发历史呼出。
+
+### 9.8 Session 管理（多会话）
+
+同一 cwd 内支持多个独立会话，对话历史从单文件升级为多 session 结构（[history.rs](../crates/cyber-tui/src/history.rs)）：
+
+```text
+~/.cyber/history/{cwd_hash}/
+  index.json     # { "current": "<id>", "sessions": [SessionMeta] }
+  {id}.json      # Vec<ChatEntry>
+```
+
+- `SessionMeta { id, title, created_at, updated_at, message_count }`；`SessionIndex { current, sessions }`。`cwd_hash` 沿用 FNV-1a 64bit（跨 Rust 版本稳定），session id 用 `SystemTime` 纳秒 base36 编码（短、单调、无新依赖）。
+- **迁移**：`load_index` 见旧单文件 `{cwd_hash}.json`（无 `index.json` 时）→ 自动迁移为单 session（title 取首条 User 前 40 字符或 "默认会话"），旧文件 rename `.legacy.bak`（不删，防回退丢失）。无任何历史 → 建默认空 session（title "新会话"）。
+- **title 派生**：`save_current` 时若 meta.title=="新会话" 且 entries 首条为 User → title = 首 40 字符（避免一直显示 "新会话"）。
+- **独立性**：`spawn_agent` 传 `self.chat.history()`，天然只含当前 session；`history()` 剥离 ToolCall/ToolResult（工具链仅单次 spawn 内部维护）。各 session 独立文件，切换时整条 `ChatState` 重建。
+
+**斜杠命令**（`slash.rs` + `app.rs::handle_slash_command`，均流式期阻止）：
+
+- `/new` — 保存当前 → 建 meta + 切到新空会话 → 重置 `ChatState` → 持久化 index + 空 entries。
+- `/sessions`（空参 / `list`）— 打开 Sessions 面板（`Mode::Sessions`）。
+- `/sessions read <id|关键词>` — 跨会话读取：精确 id 命中或 title 部分匹配唯一者 → `read_session_text` 格式化（🧑 User / 🤖 Assistant / ▶ 工具）注入为 `ChatEntry::System`。**仅展示，不入 agent history**（System 条目被 `history()` 剥离，保持 session 独立）。无参列举所有 session；多匹配提示候选。
+- `/sessions new` — 同 `/new`。
+
+**Sessions 面板**（`views/sessions.rs` + `handle_sessions_key`，仿 ProviderForm 直接处理原始 KeyEvent）：
+
+- `SessionsPanelState { selected, pending_delete, list }`：`list` 是进入面板时从 `SessionIndex` 克隆的快照，面板内导航/删除均操作快照。
+- ↑/↓ 循环选择、Enter 切换（`switch_session` + 返回 Chat）、n 新建、d 删除（双击确认：首次 `d` 设 `pending_delete`，同项二次 `d` 执行；其它键取消）、Esc 返回（不切换）、q/Ctrl+C 退出。
+- 渲染：title + message_count + id（截断）+ 当前 `★` 标记 + 待删除 `[待删除!]` 提示，底部 hint 随待删除态切换。
+- 删除拒绝删最后一个（至少保留 1 个）；删 current 自动切到剩余首个并重载 chat。
 
 ---
 

@@ -9,6 +9,9 @@
 //! 跨轮历史（`history()`）只取 User/Assistant 文本，剥离 ToolCall/ToolResult
 //! （工具链仅在单次 spawn 内部维护，避免历史膨胀 + provider 翻译复杂度）。
 
+use std::cell::{Cell, RefCell};
+
+use crossterm::event::{KeyCode, KeyEvent};
 use cyber_agent::Message;
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -16,7 +19,9 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthChar;
 
+use crate::slash::CommandSpec;
 use crate::theme::Theme;
 
 /// 一条对话条目（user / assistant / 工具调用 / 工具结果 / system）。
@@ -50,6 +55,75 @@ pub enum ChatEntry {
     System(String),
 }
 
+/// `scroll_y` 的哨兵值：表示"跟随底部"（auto-follow），流式新内容自动滚到底。
+/// 用 `usize::MAX` 避免额外 `Option` 字段，且任何真实偏移都远小于此值。
+const SCROLL_FOLLOW: usize = usize::MAX;
+
+/// 斜杠命令补全菜单状态。
+///
+/// 输入以 `/` 开头且不含空格时打开（`update_slash_menu` 每次输入后刷新）；按前缀过滤
+/// `COMMANDS`。Up/Down 选择，Enter/Tab 补全命令名 + 空格（`slash_menu_complete`），
+/// Esc 关闭。菜单打开时 Up/Down 由菜单消费（`slash_menu_key`），不传给 textarea。
+#[derive(Debug, Default)]
+pub struct SlashMenu {
+    /// 是否打开。
+    pub open: bool,
+    /// 当前选中项索引（在 `filtered` 中）。
+    pub selected: usize,
+    /// 前缀过滤后的命令列表（引用静态目录，无拷贝）。
+    pub filtered: Vec<&'static CommandSpec>,
+}
+
+impl SlashMenu {
+    fn close(&mut self) {
+        self.open = false;
+        self.filtered.clear();
+        self.selected = 0;
+    }
+}
+
+/// 输入历史：记录已发送消息，供 ↑/↓ 在**空输入框**时呼出（shell 风格）。
+///
+/// 不单独持久化——由 chat history 的 `ChatEntry::User` 条目派生（`seed_input_history`
+/// 在 App 启动加载历史后调用），新提交经 `record` 追加。跨会话呼出靠下次启动重新 seed。
+///
+/// 浏览态语义：`browse=None` 表示正在输入新内容；首次 ↑（输入框为空）进入浏览态指向
+/// 最新条目，继续 ↑ 往更早、↓ 往更新，↓ 到头清空输入并退出浏览态（回到最新）。
+/// 输入框非空时 ↑/↓ 不呼出（交 textarea 移光标，保留多行编辑）。
+#[derive(Default)]
+pub struct InputHistory {
+    /// 已发送文本（oldest → newest），相邻去重。
+    entries: Vec<String>,
+    /// 当前浏览索引；`None` = 未浏览态。
+    browse: Option<usize>,
+}
+
+impl InputHistory {
+    /// 记录一条已发送文本：trim 后为空跳过，与末条相同则跳过（相邻去重），并退出浏览态。
+    fn record(&mut self, text: &str) {
+        let t = text.trim();
+        if t.is_empty() {
+            return;
+        }
+        if self.entries.last().map(|s| s.as_str()) == Some(t) {
+            self.browse = None;
+            return;
+        }
+        self.entries.push(t.to_string());
+        self.browse = None;
+    }
+
+    /// 从 `ChatEntry::User` 文本序列填充（App 启动加载历史后调用，跨会话呼出）。
+    fn seed(&mut self, user_texts: impl IntoIterator<Item = String>) {
+        self.entries.clear();
+        self.browse = None;
+        for t in user_texts {
+            // 复用 record 的去重逻辑，保持一致
+            self.record(&t);
+        }
+    }
+}
+
 /// Chat 模式状态。
 pub struct ChatState {
     /// 已完成的对话条目（按时间序）。
@@ -68,6 +142,35 @@ pub struct ChatState {
     cached_entries_len: usize,
     /// 强制重建标记（theme 切换等 entries.len() 不变但内容样式需刷新的场景）。
     cache_dirty: bool,
+    /// 历史区垂直滚动偏移（绝对顶部行号）；`SCROLL_FOLLOW` = 跟随底部。
+    /// 由按键处理（`&mut self`）修改；render（`&self`）只读 + 经 `Cell` 回写度量。
+    pub scroll_y: usize,
+    /// 上一帧渲染的历史总行数（含 wrap 折行）。render 经 `Cell` 回写，按键处理读取
+    /// 以计算 PageUp/PageDown 的页大小与 max_scroll。首帧前为 0（按键 no-op 安全）。
+    last_total_lines: Cell<usize>,
+    /// 上一帧渲染的历史区可见高度。同上。
+    last_visible_height: Cell<usize>,
+    /// 预折行缓存：把已完成条目 + 流式 tail 按当前可视宽度拆成单行 `Line`，
+    /// render 直接取可见窗口切片（O(visible)），避免每帧 `Paragraph::line_count` +
+    /// `Wrap` 重算（O(N)）与全量 clone —— 滚动跟手性的关键。
+    /// key = (entries.len, streaming_buffer.len, width)；theme 切换经 `invalidate_cache`
+    /// 置 `valid=false` 强制重建。render 以 `&self` 经 `RefCell` 内部可变更新。
+    wrapped: RefCell<WrappedCache>,
+    /// 斜杠命令补全菜单状态。
+    pub slash_menu: SlashMenu,
+    /// 输入历史（↑/↓ 在空输入框时呼出）。
+    pub input_history: InputHistory,
+}
+
+/// `wrapped` 预折行缓存的载体。
+#[derive(Default)]
+struct WrappedCache {
+    /// 已折行的单行 `Line`（entries + tail）。
+    lines: Vec<Line<'static>>,
+    /// 缓存键：(entries.len, streaming_buffer.len, width)。
+    key: (usize, usize, u16),
+    /// 是否有效（theme 切换等 entries.len 不变但样式需刷新时置 false）。
+    valid: bool,
 }
 
 impl ChatState {
@@ -83,6 +186,12 @@ impl ChatState {
             cached_history: Vec::new(),
             cached_entries_len: 0,
             cache_dirty: true,
+            scroll_y: SCROLL_FOLLOW,
+            last_total_lines: Cell::new(0),
+            last_visible_height: Cell::new(0),
+            wrapped: RefCell::new(WrappedCache::default()),
+            slash_menu: SlashMenu::default(),
+            input_history: InputHistory::default(),
         }
     }
 
@@ -98,8 +207,250 @@ impl ChatState {
     }
 
     /// 标记缓存需要重建（entries.len() 不变但样式需刷新时调用，如 theme 切换）。
+    /// 同时使预折行缓存失效（颜色变了但折行数不变，key 不会变 → 须强制 valid=false）。
     pub fn invalidate_cache(&mut self) {
         self.cache_dirty = true;
+        self.wrapped.get_mut().valid = false;
+    }
+
+    // ── 历史滚动 ───────────────────────────────────────────────────────────
+    // `scroll_y` 为绝对顶部行号；`SCROLL_FOLLOW` 表示跟随底部。度量
+    //（`last_total_lines`/`last_visible_height`）由 render 每帧经 `Cell` 回写，
+    // 按键处理据此计算 max_scroll 与页大小。首帧前度量为 0 → 滚动 no-op（安全）。
+
+    /// 滚动历史区：`delta` 正向下（向底部），负向上。`page` 大小由上一帧可见高度决定。
+    /// 到达底部时切回 `SCROLL_FOLLOW`（auto-follow），新流式内容自动跟随。
+    pub fn scroll_history(&mut self, delta: i32) {
+        let total = self.last_total_lines.get();
+        let visible = self.last_visible_height.get();
+        let max_scroll = total.saturating_sub(visible);
+        let cur = if self.scroll_y == SCROLL_FOLLOW {
+            max_scroll
+        } else {
+            self.scroll_y.min(max_scroll)
+        };
+        let new = (cur as i32 + delta).clamp(0, max_scroll as i32) as usize;
+        // 到底部 → 跟随；否则记录绝对偏移（内容增长时视图钉在原内容，不滑向新内容）
+        self.scroll_y = if new >= max_scroll { SCROLL_FOLLOW } else { new };
+    }
+
+    /// 跳到最新（底部）并恢复 auto-follow。submit/clear/cancel 后调用。
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_y = SCROLL_FOLLOW;
+    }
+
+    /// 是否正在跟随底部（未上滚）。render 据此决定是否显示"已滚动"指示。
+    pub fn is_following_bottom(&self) -> bool {
+        self.scroll_y == SCROLL_FOLLOW
+    }
+
+    /// render 每帧回写度量（总行数 / 可见高度），供下次按键滚动计算。
+    pub fn set_scroll_metrics(&self, total: usize, visible: usize) {
+        self.last_total_lines.set(total);
+        self.last_visible_height.set(visible);
+    }
+
+    /// 返回上一帧渲染的历史区可见高度，供按键处理计算 PageUp/PageDown 的页大小。
+    pub fn last_visible_height_get(&self) -> usize {
+        self.last_visible_height.get()
+    }
+
+    /// 返回当前应在 Paragraph::scroll 使用的顶部偏移（已按 max_scroll 钳制）。
+    /// `SCROLL_FOLLOW` 解析为 max_scroll（底部）。
+    pub fn resolved_scroll_offset(&self, max_scroll: usize) -> usize {
+        if self.scroll_y == SCROLL_FOLLOW {
+            max_scroll
+        } else {
+            self.scroll_y.min(max_scroll)
+        }
+    }
+
+    // ── 预折行缓存 ──────────────────────────────────────────────────────────
+    // render（`&self`）每帧调用 `wrapped_lines(theme, width)`：若 key 不变且 valid，
+    // 直接复用缓存（滚动时内容未变 → O(1) 命中）；否则重建（折行 O(N)，仅在内容/宽度/
+    // theme 变化时）。返回 `Ref<Vec<Line>>` 供 render 切可见窗口。
+
+    /// 返回按 `width` 预折行的全部历史行（entries + 流式 tail）。key 命中则复用缓存。
+    /// 调用方持 `Ref` 期间不可再 `borrow_mut`（render 切片后立即 drop）。
+    pub fn wrapped_lines(&self, theme: &Theme, width: u16) -> std::cell::Ref<'_, Vec<Line<'static>>> {
+        {
+            let mut wc = self.wrapped.borrow_mut();
+            let key = (self.entries.len(), self.streaming_buffer.len(), width);
+            if !wc.valid || wc.key != key {
+                let unwrapped = self.build_render_lines(theme);
+                wc.lines = wrap_lines(&unwrapped, width as usize);
+                wc.key = key;
+                wc.valid = true;
+            }
+        }
+        std::cell::Ref::map(self.wrapped.borrow(), |wc| &wc.lines)
+    }
+
+    /// 构建未折行的全部历史行：复用 `cached_history`（prepare_render 维护），未就绪时
+    ///（如单测直接调 render 未先 prepare）回退现场构建；流式期追加 tail。
+    fn build_render_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let cached = self.cached_history();
+        if cached.is_empty() && !self.entries.is_empty() {
+            lines.extend(render_entries(&self.entries, theme));
+        } else {
+            lines.extend_from_slice(cached);
+        }
+        if self.streaming {
+            lines.extend(build_streaming_tail(&self.streaming_buffer, theme));
+        }
+        lines
+    }
+
+    // ── 斜杠命令补全菜单 ────────────────────────────────────────────────────
+
+    /// 根据当前输入刷新补全菜单：首行以 `/` 开头且不含空格 → 按前缀过滤打开；
+    /// 否则关闭。每次输入变动后调用。流式期输入被禁，菜单不会打开。
+    pub fn update_slash_menu(&mut self) {
+        let line: String = self.input.lines().first().cloned().unwrap_or_default();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('/') && !trimmed.contains(' ') {
+            let filtered = crate::slash::filter_commands(trimmed);
+            if filtered.is_empty() {
+                self.slash_menu.close();
+            } else {
+                if !self.slash_menu.open || self.slash_menu.filtered != filtered {
+                    // 列表变化时保持选中项在范围内
+                    if self.slash_menu.selected >= filtered.len() {
+                        self.slash_menu.selected = 0;
+                    }
+                    self.slash_menu.filtered = filtered;
+                }
+                self.slash_menu.open = true;
+            }
+        } else {
+            self.slash_menu.close();
+        }
+    }
+
+    /// 菜单打开时处理导航键。返回 `true` 表示已消费（不传给 textarea / 不触发其他动作）。
+    /// Up/Down 选择，Enter/Tab 补全，Esc 关闭；其余键返回 `false` 交正常输入路径。
+    pub fn slash_menu_key(&mut self, k: KeyEvent) -> bool {
+        if !self.slash_menu.open {
+            return false;
+        }
+        match k.code {
+            KeyCode::Up => {
+                self.slash_menu_up();
+                true
+            }
+            KeyCode::Down => {
+                self.slash_menu_down();
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.slash_menu_complete();
+                true
+            }
+            KeyCode::Esc => {
+                self.slash_menu.close();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn slash_menu_up(&mut self) {
+        let n = self.slash_menu.filtered.len();
+        if n > 0 {
+            self.slash_menu.selected = (self.slash_menu.selected + n - 1) % n;
+        }
+    }
+
+    fn slash_menu_down(&mut self) {
+        let n = self.slash_menu.filtered.len();
+        if n > 0 {
+            self.slash_menu.selected = (self.slash_menu.selected + 1) % n;
+        }
+    }
+
+    /// 补全：用选中命令名 + 空格替换输入框内容，关闭菜单。补全后用户继续输参数再 Enter 提交。
+    fn slash_menu_complete(&mut self) {
+        if let Some(spec) = self.slash_menu.filtered.get(self.slash_menu.selected).copied() {
+            self.input.clear();
+            self.input.insert_str(format!("{} ", spec.name));
+        }
+        self.slash_menu.close();
+    }
+
+    // ── 输入历史呼出（↑/↓）──────────────────────────────────────────────────
+    // 输入框为空时 ↑ 呼出更早、↓ 呼出更新、↓ 到头清空；非空时返回 false 交 textarea
+    // 移光标（保留多行编辑）。流式期由调用方（App）拦截不调用此处。
+
+    /// ↑：空输入（或浏览中）时呼出更早的已发送消息。
+    /// 返回 `true` = 已呼出（输入框已替换）；`false` = 未处理（交 textarea 移光标）。
+    pub fn history_prev(&mut self) -> bool {
+        if self.input_history.entries.is_empty() {
+            return false;
+        }
+        match self.input_history.browse {
+            None => {
+                if !self.input_empty() {
+                    return false; // 非空输入：交 textarea 移光标
+                }
+                let i = self.input_history.entries.len() - 1;
+                self.input_history.browse = Some(i);
+                self.load_history_entry(i);
+                true
+            }
+            Some(i) => {
+                if i == 0 {
+                    return true; // 已到最早，保持当前
+                }
+                let ni = i - 1;
+                self.input_history.browse = Some(ni);
+                self.load_history_entry(ni);
+                true
+            }
+        }
+    }
+
+    /// ↓：浏览中呼出更新的条目；到头清空输入并退出浏览态（回到最新）。
+    /// 返回 `true` = 已处理；`false` = 未浏览态（交 textarea 移光标）。
+    pub fn history_next(&mut self) -> bool {
+        match self.input_history.browse {
+            None => false, // 未浏览：交 textarea
+            Some(i) => {
+                if i + 1 >= self.input_history.entries.len() {
+                    self.input_history.browse = None;
+                    self.input.clear(); // 回到最新（空输入）
+                } else {
+                    let ni = i + 1;
+                    self.input_history.browse = Some(ni);
+                    self.load_history_entry(ni);
+                }
+                true
+            }
+        }
+    }
+
+    /// 用 `entries[i]` 替换输入框内容（clear + insert_str，沿用 slash_menu_complete 模式）。
+    fn load_history_entry(&mut self, i: usize) {
+        self.input.clear();
+        self.input.insert_str(&self.input_history.entries[i]);
+    }
+
+    /// 输入框是否全空（所有行为空串）。
+    fn input_empty(&self) -> bool {
+        self.input.lines().iter().all(|l| l.is_empty())
+    }
+
+    /// 从已完成条目的 `ChatEntry::User` 文本填充输入历史（App 启动加载历史后调用）。
+    pub fn seed_input_history(&mut self) {
+        let user_texts: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ChatEntry::User(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        self.input_history.seed(user_texts);
     }
 
     /// 已完成条目的渲染行（只读）。调用前须先经 `prepare_render` 刷新。
@@ -120,12 +471,15 @@ impl ChatState {
         if text.trim().is_empty() {
             return None;
         }
+        self.input_history.record(&text); // 记录到输入历史（清空输入前）
         self.input.clear();
         // history 必须在 push 当前 user 条目之前取（run_stream 会再 append user_input）
         let history = self.history();
         self.entries.push(ChatEntry::User(text.clone()));
         self.streaming = true;
         self.streaming_buffer.clear();
+        self.scroll_to_bottom(); // 新提交：跟随新响应
+        self.slash_menu.close();
         Some((text, history))
     }
 
@@ -167,6 +521,8 @@ impl ChatState {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.streaming_buffer.clear();
+        self.scroll_to_bottom();
+        self.slash_menu.close();
     }
 
     /// 取走输入框文本（不清屏、不 push 条目、不改 streaming），用于斜杠命令。
@@ -174,6 +530,7 @@ impl ChatState {
     pub fn take_input(&mut self) -> String {
         let text: String = self.input.lines().join("\n");
         self.input.clear();
+        self.slash_menu.close();
         text
     }
 
@@ -211,7 +568,7 @@ pub fn render_entries(entries: &[ChatEntry], theme: &Theme) -> Vec<Line<'static>
                 push_role_lines(&mut lines, "[user]", theme.accent, content, theme);
             }
             ChatEntry::Assistant(content) => {
-                push_role_lines(&mut lines, "[assistant]", theme.title, content, theme);
+                push_assistant_lines(&mut lines, theme, content);
             }
             ChatEntry::System(content) => {
                 push_role_lines(&mut lines, "[system]", theme.muted, content, theme);
@@ -235,6 +592,102 @@ pub fn render_entries(entries: &[ChatEntry], theme: &Theme) -> Vec<Line<'static>
         lines.push(Line::from("")); // 条目间空行
     }
     lines
+}
+
+/// 构建流式 tail：把 `streaming_buffer` 作为进行中的 assistant 消息（末行带 ▌ 光标）。
+///
+/// 标签 `[assistant]` 独占一行，随后是 Markdown 渲染的 buffer 内容；buffer 可能为
+/// 不完整 markdown（未闭合 `**` / 围栏），`markdown::render` 会把未闭合格式降级为
+/// 纯文本。空 buffer 显示标签行 + 等待光标。由 `build_render_lines` 调用并入预折行
+/// 缓存（量小，每帧随 buffer 变化重建）。
+fn build_streaming_tail(buffer: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "[assistant]",
+        Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+    )));
+    if buffer.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "▌",
+            Style::default().fg(theme.accent),
+        )));
+        return lines;
+    }
+    let mut md_lines = crate::markdown::render(buffer, theme);
+    if md_lines.is_empty() {
+        md_lines.push(Line::from(""));
+    }
+    // 末行追加 ▌ 光标
+    let last = md_lines.last_mut().expect("md_lines 至少 1 行");
+    last.spans
+        .push(Span::styled("▌", Style::default().fg(theme.accent)));
+    lines.extend(md_lines);
+    lines
+}
+
+/// 把未折行的 `Line` 列表按 `width` 拆成单行 `Line`（贪婪字符宽度填充，CJK 占 2 列）。
+///
+/// 替代 `Paragraph::line_count` + `Wrap` 的每帧 O(N) 重算：折行结果缓存于
+/// `WrappedCache`，render 直接切片可见窗口。样式按 span 边界保留（相邻同 style 字符
+/// 合并为一个 span）。`width == 0` 时不折行（避免除零，回退原样）。
+fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines.to_vec();
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        // 展平为 (char, 显示宽度, style)，按字符贪婪填行
+        let mut cells: Vec<(char, usize, Style)> = Vec::new();
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                // tab 按 1 列计（与历史区行为一致，避免对齐抖动）
+                let w = if ch == '\t' {
+                    1
+                } else {
+                    UnicodeWidthChar::width(ch).unwrap_or(0)
+                };
+                cells.push((ch, w, span.style));
+            }
+        }
+        if cells.is_empty() {
+            out.push(Line::from(""));
+            continue;
+        }
+        let mut row_spans: Vec<Span<'static>> = Vec::new();
+        let mut row_w: usize = 0;
+        let mut cur_str = String::new();
+        let mut cur_style: Option<Style> = None;
+        for (ch, w, st) in cells {
+            // 当前行非空且加入 ch 会超宽 → 先收尾当前 span 与行
+            if !cur_str.is_empty() && row_w + w > width {
+                row_spans.push(Span::styled(
+                    std::mem::take(&mut cur_str),
+                    cur_style.unwrap_or_default(),
+                ));
+                out.push(Line::from(std::mem::take(&mut row_spans)));
+                row_w = 0;
+                cur_style = None;
+            }
+            // style 边界：切出新 span
+            if cur_style != Some(st) {
+                if !cur_str.is_empty() {
+                    row_spans.push(Span::styled(
+                        std::mem::take(&mut cur_str),
+                        cur_style.unwrap_or_default(),
+                    ));
+                }
+                cur_style = Some(st);
+            }
+            cur_str.push(ch);
+            row_w += w;
+        }
+        // 收尾最后一个 span 与行
+        if !cur_str.is_empty() {
+            row_spans.push(Span::styled(cur_str, cur_style.unwrap_or_default()));
+        }
+        out.push(Line::from(row_spans));
+    }
+    out
 }
 
 /// 把一条 user/assistant/system 文本按行展开为带标签的 `Line`。
@@ -263,6 +716,20 @@ fn push_role_lines(
             Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
         )]));
     }
+}
+
+/// 渲染一条 assistant 条目：标签独占一行，随后是 Markdown 渲染的内容行。
+///
+/// 与 User/System 的内联标签不同——assistant 输出常含代码块 / 标题 / 列表等块级结构，
+/// 标签独占一行可避免块级缩进与标签前缀错位，Markdown 内容自然铺开。空内容仍保留
+/// 标签行（至少占一行，便于辨识空回复）。流式 buffer 复用同一渲染路径（见 views::chat）。
+fn push_assistant_lines(lines: &mut Vec<Line<'static>>, theme: &Theme, content: &str) {
+    lines.push(Line::from(Span::styled(
+        "[assistant]",
+        Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+    )));
+    let md_lines = crate::markdown::render(content, theme);
+    lines.extend(md_lines);
 }
 
 /// 渲染一次工具调用：`  ▶ [tool] name(arguments)`。
@@ -593,5 +1060,321 @@ mod tests {
         assert!(
             matches!(&loaded[3], ChatEntry::ToolResult { is_error, output, .. } if *is_error && output == "a.txt")
         );
+    }
+
+    // ---- 历史滚动 ----
+
+    #[test]
+    fn new_state_follows_bottom() {
+        let s = ChatState::new();
+        assert!(s.is_following_bottom(), "新建状态应跟随底部");
+    }
+
+    #[test]
+    fn scroll_history_no_op_without_metrics() {
+        // 首帧前度量为 0：滚动应 no-op 且不 panic
+        let mut s = ChatState::new();
+        s.scroll_history(-5);
+        assert!(s.is_following_bottom(), "max_scroll=0 时滚动到底 = 跟随");
+    }
+
+    #[test]
+    fn scroll_up_then_follow_breaks() {
+        let mut s = ChatState::new();
+        // 模拟 render 回写：20 行总，10 行可见 → max_scroll=10
+        s.set_scroll_metrics(20, 10);
+        s.scroll_history(-4); // 上滚 4 行
+        assert!(!s.is_following_bottom(), "上滚后应脱离跟随");
+        // resolved 偏移 = 10 - 4 = 6
+        assert_eq!(s.resolved_scroll_offset(10), 6);
+    }
+
+    #[test]
+    fn scroll_down_to_bottom_re_follows() {
+        let mut s = ChatState::new();
+        s.set_scroll_metrics(20, 10);
+        s.scroll_history(-4); // 偏移 6
+        s.scroll_history(4); // 回到底 → 跟随
+        assert!(s.is_following_bottom());
+        assert_eq!(s.resolved_scroll_offset(10), 10);
+    }
+
+    #[test]
+    fn scroll_clamps_at_top() {
+        let mut s = ChatState::new();
+        s.set_scroll_metrics(20, 10);
+        s.scroll_history(-100); // 远超顶部
+        assert_eq!(s.resolved_scroll_offset(10), 0, "顶部钳制为 0");
+    }
+
+    #[test]
+    fn page_scroll_uses_visible_height() {
+        let mut s = ChatState::new();
+        s.set_scroll_metrics(40, 10);
+        // PageUp: delta = -(visible=10)
+        s.scroll_history(-10);
+        assert_eq!(s.resolved_scroll_offset(30), 20, "max=30, 上滚 10 → 偏移 20");
+    }
+
+    #[test]
+    fn scroll_to_bottom_resets_follow() {
+        let mut s = ChatState::new();
+        s.set_scroll_metrics(20, 10);
+        s.scroll_history(-4);
+        s.scroll_to_bottom();
+        assert!(s.is_following_bottom());
+    }
+
+    #[test]
+    fn submit_resets_scroll_to_follow() {
+        let mut s = ChatState::new();
+        s.set_scroll_metrics(20, 10);
+        s.scroll_history(-4);
+        s.input.insert_str("x");
+        s.submit();
+        assert!(s.is_following_bottom(), "submit 后应恢复跟随新响应");
+    }
+
+    #[test]
+    fn clear_resets_scroll_to_follow() {
+        let mut s = ChatState::new();
+        s.set_scroll_metrics(20, 10);
+        s.scroll_history(-4);
+        s.clear();
+        assert!(s.is_following_bottom());
+    }
+
+    // ---- 斜杠命令补全菜单 ----
+
+    #[test]
+    fn slash_menu_opens_on_slash_input() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open, "输入 `/` 应打开菜单");
+        assert_eq!(s.slash_menu.filtered.len(), crate::slash::COMMANDS.len());
+    }
+
+    #[test]
+    fn slash_menu_filters_by_prefix() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/mo");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        let names: Vec<&str> = s.slash_menu.filtered.iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["/mode", "/model"]);
+    }
+
+    #[test]
+    fn slash_menu_closes_on_space() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/mode ");
+        s.update_slash_menu();
+        assert!(!s.slash_menu.open, "含空格（命令名已完成）应关闭菜单");
+    }
+
+    #[test]
+    fn slash_menu_closes_on_non_slash() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        s.input.clear();
+        s.input.insert_str("hello");
+        s.update_slash_menu();
+        assert!(!s.slash_menu.open);
+    }
+
+    #[test]
+    fn slash_menu_closes_when_no_match() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/zzz");
+        s.update_slash_menu();
+        assert!(!s.slash_menu.open, "无匹配应关闭菜单");
+    }
+
+    #[test]
+    fn slash_menu_key_navigates_and_completes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        fn key(code: KeyCode) -> KeyEvent {
+            KeyEvent::new(code, KeyModifiers::NONE)
+        }
+        let mut s = ChatState::new();
+        s.input.insert_str("/mo");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        // Down: 0 → 1 (/model)
+        assert!(s.slash_menu_key(key(KeyCode::Down)));
+        assert_eq!(s.slash_menu.selected, 1);
+        // Enter: 补全 /model + 空格，关闭菜单
+        assert!(s.slash_menu_key(key(KeyCode::Enter)));
+        assert!(!s.slash_menu.open);
+        assert_eq!(s.input.lines().join(""), "/model ");
+    }
+
+    #[test]
+    fn slash_menu_key_esc_closes_without_complete() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = ChatState::new();
+        s.input.insert_str("/he");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        assert!(s.slash_menu_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!s.slash_menu.open, "Esc 应关闭菜单");
+        assert_eq!(s.input.lines().join(""), "/he", "Esc 不补全，保留原输入");
+    }
+
+    #[test]
+    fn slash_menu_key_returns_false_when_closed() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = ChatState::new();
+        // 未打开：任何键都返回 false（交正常输入路径）
+        assert!(!s.slash_menu_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert!(!s.slash_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn slash_menu_key_unconsumed_for_letters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = ChatState::new();
+        s.input.insert_str("/");
+        s.update_slash_menu();
+        // 字母键未被菜单消费 → 返回 false（App 会把字符送 textarea 再 refilter）
+        assert!(!s.slash_menu_key(KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn take_input_closes_slash_menu() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/mo");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        let _ = s.take_input();
+        assert!(!s.slash_menu.open);
+    }
+
+    // ---- 输入历史呼出（↑/↓）----
+
+    fn submit_text(s: &mut ChatState, text: &str) {
+        s.input.insert_str(text);
+        // submit 置 streaming=true；为连续提交，复位 streaming
+        let _ = s.submit();
+        s.streaming = false;
+    }
+
+    #[test]
+    fn submit_records_to_input_history() {
+        let mut s = ChatState::new();
+        submit_text(&mut s, "你好");
+        submit_text(&mut s, "再见");
+        assert_eq!(s.input_history.entries, vec!["你好", "再见"]);
+    }
+
+    #[test]
+    fn input_history_record_dedups_adjacent() {
+        let mut s = ChatState::new();
+        submit_text(&mut s, "same");
+        submit_text(&mut s, "same"); // 相邻重复 → 跳过
+        submit_text(&mut s, "other");
+        assert_eq!(s.input_history.entries, vec!["same", "other"]);
+    }
+
+    #[test]
+    fn input_history_record_skips_blank() {
+        let mut s = ChatState::new();
+        s.input.insert_str("   ");
+        let _ = s.submit(); // 空白 → None，不记录
+        assert!(s.input_history.entries.is_empty());
+    }
+
+    #[test]
+    fn history_prev_recalls_only_when_input_empty() {
+        let mut s = ChatState::new();
+        submit_text(&mut s, "first");
+        submit_text(&mut s, "second");
+        // 非空输入：↑ 不呼出（返回 false）
+        s.input.insert_str("typing");
+        assert!(!s.history_prev());
+        // 清空后 ↑ 呼出最新
+        s.input.clear();
+        assert!(s.history_prev());
+        assert_eq!(s.input.lines().join("\n"), "second");
+    }
+
+    #[test]
+    fn history_prev_navigates_older() {
+        let mut s = ChatState::new();
+        submit_text(&mut s, "a");
+        submit_text(&mut s, "b");
+        submit_text(&mut s, "c");
+        s.input.clear();
+        // ↑ → c（最新），再 ↑ → b，再 ↑ → a，再 ↑ → 保持 a
+        assert!(s.history_prev());
+        assert_eq!(s.input.lines().join("\n"), "c");
+        assert!(s.history_prev());
+        assert_eq!(s.input.lines().join("\n"), "b");
+        assert!(s.history_prev());
+        assert_eq!(s.input.lines().join("\n"), "a");
+        assert!(s.history_prev(), "已到最早仍返回 true（保持）");
+        assert_eq!(s.input.lines().join("\n"), "a");
+    }
+
+    #[test]
+    fn history_next_navigates_newer_and_clears_at_end() {
+        let mut s = ChatState::new();
+        submit_text(&mut s, "a");
+        submit_text(&mut s, "b");
+        s.input.clear();
+        // 先 ↑ 进入浏览态并走到最早 a
+        s.history_prev(); // ↑ → b（最新）
+        s.history_prev(); // ↑ → a（最早）
+        s.history_prev(); // 已到最早，保持 a
+        assert_eq!(s.input.lines().join("\n"), "a");
+        // ↓ → b
+        assert!(s.history_next());
+        assert_eq!(s.input.lines().join("\n"), "b");
+        // ↓ 到头 → 清空 + 退出浏览
+        assert!(s.history_next());
+        assert!(s.input.lines().iter().all(|l| l.is_empty()), "到头应清空输入");
+        // 再 ↓：未浏览态 → 返回 false
+        assert!(!s.history_next());
+    }
+
+    #[test]
+    fn history_next_not_browsing_returns_false() {
+        let mut s = ChatState::new();
+        submit_text(&mut s, "a");
+        // 未按过 ↑（未浏览）→ ↓ 不处理
+        assert!(!s.history_next());
+    }
+
+    #[test]
+    fn history_prev_empty_history_returns_false() {
+        let mut s = ChatState::new();
+        s.input.clear();
+        assert!(!s.history_prev(), "无历史时 ↑ 返回 false");
+    }
+
+    #[test]
+    fn seed_input_history_from_user_entries() {
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::User("q1".into()));
+        s.entries.push(ChatEntry::Assistant("a1".into()));
+        s.entries.push(ChatEntry::User("q2".into()));
+        s.seed_input_history();
+        assert_eq!(s.input_history.entries, vec!["q1", "q2"], "应只取 User 条目");
+    }
+
+    #[test]
+    fn seed_input_history_dedups_adjacent() {
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::User("dup".into()));
+        s.entries.push(ChatEntry::User("dup".into())); // 相邻重复
+        s.entries.push(ChatEntry::User("uniq".into()));
+        s.seed_input_history();
+        assert_eq!(s.input_history.entries, vec!["dup", "uniq"]);
     }
 }

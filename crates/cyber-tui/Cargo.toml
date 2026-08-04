@@ -8,8 +8,13 @@ license.workspace = true
 cyber-core = { workspace = true }
 # P2 Chat：App 在 tui 内，需调 run_stream + 共享 AgentEvent/Message
 cyber-agent = { workspace = true }
+# P3 MCP + Skill：组合统一工具表（builtins + MCP + Skills）
+cyber-mcp = { workspace = true }
+cyber-skills = { workspace = true }
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
+# Chat 历史区预折行（按可视宽度拆行，CJK 占 2 列）
+unicode-width = { workspace = true }
 tui-textarea = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }

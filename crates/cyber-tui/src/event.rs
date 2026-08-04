@@ -27,6 +27,8 @@ pub enum Action {
     Esc,
     /// 打开设置页（`s` 键；Chat 模式下 `s` 是打字字符，改用 Ctrl+, 见 `ChatAction`）。
     OpenSettings,
+    /// 切换日志查看器（Ctrl+L）。
+    ToggleLogs,
     /// 新增 Provider（Settings Providers 段 `a` 键）。
     AddProvider,
     /// 编辑当前 Provider（Settings Providers 段 `e` 键）。
@@ -50,8 +52,22 @@ pub enum ChatAction {
     SwitchMode,
     /// 打开设置（Ctrl+,，编辑器惯例，避免与打字 `s` 冲突）。
     OpenSettings,
+    /// 切换日志查看器（Ctrl+L）。
+    ToggleLogs,
     /// 退出（Ctrl+C / Ctrl+Q；Chat 内 `q` 是打字字符，不退出）。
     Quit,
+    /// 历史区上滚一页（PageUp）。
+    ScrollPageUp,
+    /// 历史区下滚一页（PageDown）。
+    ScrollPageDown,
+    /// 历史区上滚一行（Ctrl+Up；Up 本身交 textarea 移光标，斜杠菜单打开时由菜单消费）。
+    ScrollLineUp,
+    /// 历史区下滚一行（Ctrl+Down）。
+    ScrollLineDown,
+    /// 输入历史呼出更早（普通 Up；空输入框时呼出，非空时 App 层交 textarea 移光标）。
+    HistoryPrev,
+    /// 输入历史呼出更新（普通 Down；浏览态呼出，非浏览态交 textarea 移光标）。
+    HistoryNext,
     /// 普通输入，交 textarea 处理。
     Input,
 }
@@ -77,6 +93,10 @@ pub fn key_to_action(k: KeyEvent) -> Action {
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
+    }
+    // Ctrl+L 切换日志查看器
+    if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::ToggleLogs;
     }
     // `s` 打开设置；Ctrl+S 不映射（保留给未来"保存会话"，见 DESIGN §9.2）。
     if let KeyCode::Char(ch) = k.code {
@@ -126,6 +146,10 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
     if k.code == KeyCode::Char(',') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return ChatAction::OpenSettings;
     }
+    // Ctrl+L 切换日志查看器
+    if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return ChatAction::ToggleLogs;
+    }
     match k.code {
         KeyCode::Enter => {
             // Shift/Alt+Enter → 换行；无修饰 Enter → 提交
@@ -137,6 +161,15 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
         }
         // Ctrl+J 兜底换行（部分终端不报 Shift+Enter）
         KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => ChatAction::Newline,
+        // 历史滚动：PageUp/PageDown 整页，Ctrl+Up/Ctrl+Down 单行。
+        // 普通 Up/Down：空输入框时呼出输入历史（HistoryPrev/Next），非空时 App 层交
+        // textarea 移光标（斜杠菜单打开时由菜单消费，不走到这里）。
+        KeyCode::PageUp => ChatAction::ScrollPageUp,
+        KeyCode::PageDown => ChatAction::ScrollPageDown,
+        KeyCode::Up if k.modifiers.contains(KeyModifiers::CONTROL) => ChatAction::ScrollLineUp,
+        KeyCode::Down if k.modifiers.contains(KeyModifiers::CONTROL) => ChatAction::ScrollLineDown,
+        KeyCode::Up => ChatAction::HistoryPrev,
+        KeyCode::Down => ChatAction::HistoryNext,
         KeyCode::Esc => ChatAction::Back,
         KeyCode::Tab => ChatAction::SwitchMode,
         _ => ChatAction::Input,
@@ -294,6 +327,57 @@ mod tests {
         assert_eq!(
             chat_key_to_action(key(KeyCode::Char('Z'), KeyModifiers::SHIFT)),
             ChatAction::Input
+        );
+    }
+
+    // ---- 历史滚动键映射 ----
+
+    #[test]
+    fn chat_page_up_down_scroll() {
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::PageUp, KeyModifiers::NONE)),
+            ChatAction::ScrollPageUp
+        );
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::PageDown, KeyModifiers::NONE)),
+            ChatAction::ScrollPageDown
+        );
+    }
+
+    #[test]
+    fn chat_ctrl_up_down_scroll_line() {
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Up, KeyModifiers::CONTROL)),
+            ChatAction::ScrollLineUp
+        );
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Down, KeyModifiers::CONTROL)),
+            ChatAction::ScrollLineDown
+        );
+    }
+
+    #[test]
+    fn ctrl_l_toggles_logs() {
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::ToggleLogs
+        );
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            ChatAction::ToggleLogs
+        );
+    }
+
+    #[test]
+    fn chat_plain_up_down_recall_input_history() {
+        // 普通 Up/Down 映射到输入历史呼出（空输入框时呼出，非空时 App 层交 textarea 移光标）
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Up, KeyModifiers::NONE)),
+            ChatAction::HistoryPrev
+        );
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Down, KeyModifiers::NONE)),
+            ChatAction::HistoryNext
         );
     }
 }

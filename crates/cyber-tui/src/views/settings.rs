@@ -6,6 +6,8 @@
 //! Esc 双击回退到进入时的快照（见 `app.rs` 的 `config_at_entry`）。
 
 use cyber_core::{Config, ProvidersConfig};
+use cyber_mcp::{McpServersConfig, McpTransport};
+use cyber_skills::{Skill, SkillRegistry, SkillSource};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -105,7 +107,7 @@ fn get_max_steps(c: &Config) -> String {
     c.agent.max_steps.to_string()
 }
 fn set_max_steps(c: &mut Config, v: String) {
-    c.agent.max_steps = v.parse().unwrap_or(25);
+    c.agent.max_steps = v.parse().unwrap_or(50);
 }
 
 fn get_max_parallel_nodes(c: &Config) -> String {
@@ -335,6 +337,16 @@ static SECTIONS: &[SectionDef] = &[
         editable: false,
         fields: &[],
     },
+    SectionDef {
+        name: "MCP",
+        editable: false,
+        fields: &[],
+    },
+    SectionDef {
+        name: "Skills",
+        editable: false,
+        fields: &[],
+    },
 ];
 
 /// 设置页视图状态。App 持有，跨次进入保留位置。
@@ -351,10 +363,22 @@ pub struct SettingsState {
     pub provider_selected: usize,
     /// 双击 `d` 删除确认：首次 `d` 置 `Some(idx)`，二次 `d` 执行删除，任一其他键清除。
     pub pending_delete_idx: Option<usize>,
+    /// MCP 段有未保存改动（与 dirty/dirty_providers 分离）。
+    pub dirty_mcp: bool,
+    /// MCP 段 cursor（在 servers 列表中）。
+    pub mcp_selected: usize,
+    /// MCP 段双击 `d` 删除确认。
+    pub mcp_pending_delete_idx: Option<usize>,
+    /// Skills 段 cursor（在 skills 列表中）。
+    pub skills_selected: usize,
 }
 
 /// Providers 段在 SECTIONS 中的索引。
 pub const PROVIDERS_SECTION_IDX: usize = 5;
+/// MCP 段在 SECTIONS 中的索引。
+pub const MCP_SECTION_IDX: usize = 6;
+/// Skills 段在 SECTIONS 中的索引。
+pub const SKILLS_SECTION_IDX: usize = 7;
 
 impl SettingsState {
     pub fn new() -> Self {
@@ -385,6 +409,16 @@ impl SettingsState {
         self.section == PROVIDERS_SECTION_IDX
     }
 
+    /// 当前是否在 MCP 段。
+    pub fn on_mcp_section(&self) -> bool {
+        self.section == MCP_SECTION_IDX
+    }
+
+    /// 当前是否在 Skills 段。
+    pub fn on_skills_section(&self) -> bool {
+        self.section == SKILLS_SECTION_IDX
+    }
+
     /// Providers 段 cursor 下移（clamp，空列表 no-op）。
     pub fn next_provider(&mut self, len: usize) {
         if len == 0 {
@@ -401,6 +435,42 @@ impl SettingsState {
             return;
         }
         self.provider_selected = self.provider_selected.saturating_sub(1);
+    }
+
+    /// MCP 段 cursor 下移。
+    pub fn next_mcp(&mut self, len: usize) {
+        if len == 0 {
+            self.mcp_selected = 0;
+            return;
+        }
+        self.mcp_selected = (self.mcp_selected + 1).min(len - 1);
+    }
+
+    /// MCP 段 cursor 上移。
+    pub fn prev_mcp(&mut self, len: usize) {
+        if len == 0 {
+            self.mcp_selected = 0;
+            return;
+        }
+        self.mcp_selected = self.mcp_selected.saturating_sub(1);
+    }
+
+    /// Skills 段 cursor 下移。
+    pub fn next_skill(&mut self, len: usize) {
+        if len == 0 {
+            self.skills_selected = 0;
+            return;
+        }
+        self.skills_selected = (self.skills_selected + 1).min(len - 1);
+    }
+
+    /// Skills 段 cursor 上移。
+    pub fn prev_skill(&mut self, len: usize) {
+        if len == 0 {
+            self.skills_selected = 0;
+            return;
+        }
+        self.skills_selected = self.skills_selected.saturating_sub(1);
     }
 
     pub fn next_field(&mut self) {
@@ -504,16 +574,20 @@ fn mask_key(k: &str) -> String {
 // ---- 渲染 ----
 
 /// 渲染设置页。
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
     config: &Config,
     providers: &ProvidersConfig,
+    mcp_config: &McpServersConfig,
+    skills: &SkillRegistry,
     state: &SettingsState,
     has_project_config: bool,
 ) {
-    let dirty_marker = if state.dirty || state.dirty_providers { " *" } else { "" };
+    let dirty_marker =
+        if state.dirty || state.dirty_providers || state.dirty_mcp { " *" } else { "" };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -543,7 +617,7 @@ pub fn render(
 
     let cols = Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
     render_sidebar(frame, cols[0], theme, state);
-    render_fields(frame, cols[1], theme, config, providers, state);
+    render_fields(frame, cols[1], theme, config, providers, mcp_config, skills, state);
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, theme: &Theme, state: &SettingsState) {
@@ -565,12 +639,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, theme: &Theme, state: &Settings
     frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.bg)), area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_fields(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
     config: &Config,
     providers: &ProvidersConfig,
+    mcp_config: &McpServersConfig,
+    skills: &SkillRegistry,
     state: &SettingsState,
 ) {
     let section = &SECTIONS[state.section];
@@ -607,7 +684,8 @@ fn render_fields(
         // 保存按钮行
         let on_save = state.on_save_row();
         let save_marker = if on_save { "▸ " } else { "  " };
-        let save_label = if state.dirty || state.dirty_providers { "保存设置 *" } else { "保存设置" };
+        let any_dirty = state.dirty || state.dirty_providers || state.dirty_mcp;
+        let save_label = if any_dirty { "保存设置 *" } else { "保存设置" };
         let save_style = if on_save {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -623,7 +701,7 @@ fn render_fields(
             .style(save_style),
         );
         lines.push(Line::from(""));
-        if state.dirty || state.dirty_providers {
+        if any_dirty {
             lines.push(
                 Line::from("有未保存改动：Enter 保存 / 再按 Esc 丢弃")
                     .style(Style::default().fg(theme.muted)),
@@ -631,7 +709,7 @@ fn render_fields(
         } else {
             lines.push(Line::from("Enter 编辑字段  ←→ 调整  Esc 返回").style(Style::default().fg(theme.muted)));
         }
-    } else {
+    } else if state.on_providers_section() {
         // Providers 段：交互式（a 新增 / e 编辑 / d 删除 / Enter 设默认）
         render_providers_lines(&mut lines, theme, providers, config, state);
         lines.push(Line::from(""));
@@ -648,6 +726,34 @@ fn render_fields(
             Style::default().fg(theme.muted)
         };
         lines.push(Line::from(hint).style(hint_style));
+    } else if state.on_mcp_section() {
+        // MCP 段：交互式（a 新增 / e 编辑 / d 删除 / ↑↓ 选择）
+        render_mcp_lines(&mut lines, theme, mcp_config, state);
+        lines.push(Line::from(""));
+        let hint = if let Some(idx) = state.mcp_pending_delete_idx {
+            let name = mcp_config
+                .servers
+                .get(idx)
+                .map(|s| s.name.as_str())
+                .unwrap_or("?");
+            format!(" 再按 d 确认删除 '{name}' · 其他键取消")
+        } else {
+            " a 新增  e 编辑  d 删除  ↑↓ 选择  (保存后重启生效)".to_string()
+        };
+        let hint_style = if state.mcp_pending_delete_idx.is_some() {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        lines.push(Line::from(hint).style(hint_style));
+    } else if state.on_skills_section() {
+        // Skills 段：只读展示（文件型，TUI 内不可编辑）
+        render_skills_lines(&mut lines, theme, skills, state);
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(" ↑↓ 选择  Skills 为文件型配置（编辑 SKILL.md 后重启生效）")
+                .style(Style::default().fg(theme.muted)),
+        );
     }
 
     frame.render_widget(
@@ -713,6 +819,163 @@ fn render_providers_lines(
         lines.push(
             Line::from(key_line).style(Style::default().fg(theme.muted)),
         );
+        // 价格配置行：显示单价（$/M），未配置则标「未设置」
+        let price_line = match &p.price {
+            None => "    price: 未设置".to_string(),
+            Some(pr) => {
+                let fmt = |v: Option<f64>| -> String {
+                    v.map(|x| format!("{x}")).unwrap_or_else(|| "-".into())
+                };
+                format!(
+                    "    price $/M: in={} out={} cache={}",
+                    fmt(pr.input_per_m),
+                    fmt(pr.output_per_m),
+                    fmt(pr.cache_hit_per_m),
+                )
+            }
+        };
+        lines.push(
+            Line::from(price_line).style(Style::default().fg(theme.muted)),
+        );
+    }
+}
+
+/// 渲染 MCP servers 列表（名称 / 传输 / 命令或 URL / 超时）。
+fn render_mcp_lines(
+    lines: &mut Vec<Line>,
+    theme: &Theme,
+    mcp_config: &McpServersConfig,
+    state: &SettingsState,
+) {
+    if mcp_config.servers.is_empty() {
+        lines.push(
+            Line::from("（无 MCP server，按 a 新增）").style(Style::default().fg(theme.muted)),
+        );
+        return;
+    }
+    for (i, spec) in mcp_config.servers.iter().enumerate() {
+        let selected = i == state.mcp_selected;
+        let pending_delete = state.mcp_pending_delete_idx == Some(i);
+        let marker = if selected { "▸ " } else { "  " };
+        let delete_tag = if pending_delete { "  [待删除!]" } else { "" };
+        let row_style = if selected {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        let name_color = if pending_delete { theme.accent } else { theme.title };
+        // 传输摘要：stdio → command + args；http/sse → url
+        let transport_summary = match spec.transport {
+            McpTransport::Stdio => {
+                let cmd = spec.command.as_deref().unwrap_or("(未设置)");
+                let args = if spec.args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", spec.args.join(" "))
+                };
+                format!("{cmd}{args}")
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                spec.url.as_deref().unwrap_or("(未设置 url)").to_string()
+            }
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw(marker.to_string()),
+                Span::styled(
+                    spec.name.to_string(),
+                    Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "  [{}] {} · timeout={}s{}",
+                    spec.transport, transport_summary, spec.timeout_secs, delete_tag,
+                )),
+            ])
+            .style(row_style),
+        );
+        // env / headers 摘要
+        if !spec.env.is_empty() {
+            let env_keys: Vec<&str> = spec.env.keys().map(|s| s.as_str()).collect();
+            lines.push(
+                Line::from(format!("    env: {}", env_keys.join(", ")))
+                    .style(Style::default().fg(theme.muted)),
+            );
+        }
+        if !spec.headers.is_empty() {
+            let header_keys: Vec<&str> = spec.headers.keys().map(|s| s.as_str()).collect();
+            lines.push(
+                Line::from(format!("    headers: {}", header_keys.join(", ")))
+                    .style(Style::default().fg(theme.muted)),
+            );
+        }
+    }
+}
+
+/// 渲染 Skills 列表（名称 / 来源 / 描述 / 触发词 / 预批准工具）。
+fn render_skills_lines(
+    lines: &mut Vec<Line>,
+    theme: &Theme,
+    skills: &SkillRegistry,
+    state: &SettingsState,
+) {
+    let all: Vec<&Skill> = skills.iter().map(|s| s.as_ref()).collect();
+    if all.is_empty() {
+        lines.push(
+            Line::from("（无 Skill，在 ~/.cyber/skills/<name>/SKILL.md 创建）")
+                .style(Style::default().fg(theme.muted)),
+        );
+        return;
+    }
+    for (i, skill) in all.iter().enumerate() {
+        let selected = i == state.skills_selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let row_style = if selected {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        let source_tag = match skill.source {
+            SkillSource::Global => "全局",
+            SkillSource::Project => "项目",
+        };
+        let manual_tag = if skill.frontmatter.disable_model_invocation {
+            "  [仅显式]"
+        } else {
+            ""
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw(marker.to_string()),
+                Span::styled(
+                    skill.name().to_string(),
+                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  [{source_tag}]{manual_tag}")),
+            ])
+            .style(row_style),
+        );
+        // 描述行
+        lines.push(
+            Line::from(format!("    {}", skill.frontmatter.description))
+                .style(Style::default().fg(theme.muted)),
+        );
+        // 触发词
+        if !skill.frontmatter.triggers.is_empty() {
+            lines.push(
+                Line::from(format!("    触发词: {}", skill.frontmatter.triggers.join(", ")))
+                    .style(Style::default().fg(theme.muted)),
+            );
+        }
+        // 预批准工具（Claude Code 风格 allowed-tools）
+        if !skill.frontmatter.allowed_tools.is_empty() {
+            lines.push(
+                Line::from(format!(
+                    "    预批准工具: {}",
+                    skill.frontmatter.allowed_tools.join(", ")
+                ))
+                .style(Style::default().fg(theme.muted)),
+            );
+        }
     }
 }
 
@@ -911,6 +1174,8 @@ mod tests {
                     &crate::theme::Theme::resolve("cyberpunk"),
                     &cfg,
                     &providers,
+                    &McpServersConfig::default(),
+                    &SkillRegistry::new(),
                     &st,
                     false,
                 )
@@ -934,6 +1199,8 @@ mod tests {
                     &crate::theme::Theme::resolve("cyberpunk"),
                     &cfg,
                     &providers,
+                    &McpServersConfig::default(),
+                    &SkillRegistry::new(),
                     &st,
                     false,
                 )
@@ -946,5 +1213,46 @@ mod tests {
         assert_eq!(mask_key(""), "(未设置)");
         assert_eq!(mask_key("${OPENAI_API_KEY}"), "${OPENAI_API_KEY}");
         assert_eq!(mask_key("sk-real-secret-key"), "(已设置)");
+    }
+
+    #[test]
+    fn providers_render_with_price_config_does_not_panic() {
+        use cyber_core::PriceConfig;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut st = SettingsState::new();
+        st.section = PROVIDERS_SECTION_IDX;
+        let cfg = Config::default();
+        let mut providers = ProvidersConfig::default_template();
+        // 给 openai 配置完整价格、anthropic 配置部分价格
+        if let Some(p) = providers.providers.get_mut("openai") {
+            p.price = Some(PriceConfig {
+                input_per_m: Some(2.5),
+                output_per_m: Some(10.0),
+                cache_hit_per_m: Some(0.3),
+            });
+        }
+        if let Some(p) = providers.providers.get_mut("anthropic") {
+            p.price = Some(PriceConfig {
+                input_per_m: Some(3.0),
+                output_per_m: None,
+                cache_hit_per_m: None,
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &crate::theme::Theme::resolve("cyberpunk"),
+                    &cfg,
+                    &providers,
+                    &McpServersConfig::default(),
+                    &SkillRegistry::new(),
+                    &st,
+                    false,
+                )
+            })
+            .unwrap();
     }
 }

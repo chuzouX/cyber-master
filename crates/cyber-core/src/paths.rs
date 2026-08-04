@@ -66,4 +66,11 @@ impl Paths {
     pub fn project_md_file(cwd: &Path) -> PathBuf {
         cwd.join(".cyber.md")
     }
+
+    /// 项目级 skills 目录（`<cwd>/.cyber/skills/`，可能不存在）。
+    ///
+    /// 项目级 skill 覆盖全局同名 skill（`SkillRegistry::load_all` 去重时 Project 优先）。
+    pub fn project_skills_dir(cwd: &Path) -> PathBuf {
+        Self::project_local_dir(cwd).join("skills")
+    }
 }

@@ -5,4 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# P3 接入：cyber-core, tokio, reqwest, serde
+cyber-core = { workspace = true }
+# 实现 Tool trait 注入统一工具表（cyber-agent 不反向依赖本 crate）
+cyber-agent = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+# P3.2: HTTP / SSE 远程传输（Streamable HTTP + legacy SSE）
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

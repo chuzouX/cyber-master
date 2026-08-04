@@ -46,7 +46,7 @@ impl Default for AgentConfig {
         Self {
             default_provider: "openai".into(),
             auto_tool_call: true,
-            max_steps: 25,
+            max_steps: 50,
         }
     }
 }

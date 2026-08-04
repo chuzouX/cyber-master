@@ -4,6 +4,8 @@
 //! 状态全部集中在 [`crate::app::App`]，便于 P2+ 演进为 trait + 状态机。
 
 pub mod chat;
+pub mod mcp_form;
 pub mod providers;
+pub mod sessions;
 pub mod settings;
 pub mod welcome;

@@ -5,4 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# P3 接入：cyber-core, serde_yaml
+cyber-core = { workspace = true }
+# 实现 Tool trait 注入统一工具表（cyber-agent 不反向依赖本 crate）
+cyber-agent = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

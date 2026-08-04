@@ -470,10 +470,32 @@ dependencies = [
 [[package]]
 name = "cyber-mcp"
 version = "0.1.0"
+dependencies = [
+ "cyber-agent",
+ "cyber-core",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tracing",
+]
 
 [[package]]
 name = "cyber-skills"
 version = "0.1.0"
+dependencies = [
+ "cyber-agent",
+ "cyber-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cyber-storage"
@@ -491,6 +513,8 @@ dependencies = [
  "crossterm 0.28.1",
  "cyber-agent",
  "cyber-core",
+ "cyber-mcp",
+ "cyber-skills",
  "futures",
  "ratatui",
  "serde",
@@ -498,6 +522,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tui-textarea-2",
+ "unicode-width",
 ]
 
 [[package]]

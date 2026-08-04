@@ -92,6 +92,7 @@ impl Provider for OpenAiProvider {
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::Value;
@@ -21,7 +22,51 @@ use crate::error::{AgentError, Result};
 use crate::prompt::build_system_prompt;
 use crate::provider::{provider_factory, StreamRequest};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
-use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta};
+use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Usage};
+
+/// 连续相同工具调用检测器：记录每轮工具调用指纹，连续 `threshold` 轮相同则判定死循环。
+///
+/// 指纹 = 本轮所有 ToolCall 的 `name|arguments` 排序后拼接（排序消除顺序差异）。
+/// 不同参数的同名工具不算重复（`read_file({"path":"a"})` vs `read_file({"path":"b"})` 指纹不同）。
+/// 单轮多个工具调用时，整组指纹参与比较——只要任一个参数变了就不算重复。
+struct LoopDetector {
+    last_fingerprint: Option<String>,
+    repeat_count: u32,
+    threshold: u32,
+}
+
+impl LoopDetector {
+    /// `threshold` = 连续多少轮相同触发（通常 3）。
+    fn new(threshold: u32) -> Self {
+        Self {
+            last_fingerprint: None,
+            repeat_count: 0,
+            threshold: threshold.max(1),
+        }
+    }
+
+    /// 记录本轮工具调用，返回 `true` 表示连续 `threshold` 轮指纹相同（死循环）。
+    fn observe(&mut self, calls: &BTreeMap<u32, ToolCall>) -> bool {
+        let fp = fingerprint(calls);
+        if Some(&fp) == self.last_fingerprint.as_ref() {
+            self.repeat_count += 1;
+        } else {
+            self.repeat_count = 1;
+            self.last_fingerprint = Some(fp);
+        }
+        self.repeat_count >= self.threshold
+    }
+}
+
+/// 计算一轮工具调用的指纹：所有 call 的 `name|arguments` 排序后拼接。
+fn fingerprint(calls: &BTreeMap<u32, ToolCall>) -> String {
+    let mut sigs: Vec<String> = calls
+        .values()
+        .map(|c| format!("{}|{}", c.name, c.arguments))
+        .collect();
+    sigs.sort();
+    sigs.join("§")
+}
 
 /// 发起一次流式对话（含 agent loop + 工具调用）。
 ///
@@ -30,6 +75,7 @@ use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta};
 /// - `gen`：generation 计数器，TUI cancel/新提交时 bump，据此忽略 stale 事件
 /// - `mock`：强制使用 MockProvider（离线）
 /// - `cwd`：工作目录（工具执行的 ToolCtx.cwd 来源）
+/// - `registry`：统一工具表（builtins + MCP + Skills），跨 agent turn 共享（`Arc` clone）
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stream(
     config: Config,
@@ -41,6 +87,7 @@ pub async fn run_stream(
     gen: u64,
     mock: bool,
     cwd: PathBuf,
+    registry: Arc<ToolRegistry>,
 ) {
     let _ = tx.send((gen, AgentEvent::Started));
     let res = run_inner(
@@ -53,6 +100,7 @@ pub async fn run_stream(
         gen,
         mock,
         cwd,
+        registry,
     )
     .await;
     if let Err(e) = res {
@@ -72,6 +120,7 @@ async fn run_inner(
     gen: u64,
     mock: bool,
     cwd: PathBuf,
+    registry: Arc<ToolRegistry>,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
@@ -86,7 +135,6 @@ async fn run_inner(
     let rules = project.map(|p| p.rules().to_vec()).unwrap_or_default();
     let scope = project.and_then(|p| p.frontmatter.scope.clone());
     let ctx = ToolCtx { cwd, rules, scope };
-    let registry = ToolRegistry::with_builtins();
 
     // tools：auto_tool_call 开启且注册表非空时才暴露工具
     let tools = if config.agent.auto_tool_call && !registry.is_empty() {
@@ -99,6 +147,8 @@ async fn run_inner(
     messages.push(Message::user(user_input));
 
     let max_steps = config.agent.max_steps.max(1);
+    let mut detector = LoopDetector::new(3);
+    let mut loop_detected = false;
     for step in 0..max_steps {
         debug!(step, gen, "agent loop 迭代");
         let req = StreamRequest::new(messages.clone())
@@ -107,7 +157,12 @@ async fn run_inner(
         let mut stream = provider.stream(req);
 
         // 累积本轮流式：Delta→Token 事件 + 文本；ToolCallDelta→按 index 合并；Done→break
-        let (text, calls) = accumulate_stream(&mut stream, tx, gen).await;
+        let (text, calls, usage) = accumulate_stream(&mut stream, tx, gen).await;
+
+        // 发送本轮 usage（TUI 据此显示缓存命中率 + 成本）
+        if let Some(ref u) = usage {
+            let _ = tx.send((gen, AgentEvent::Usage(u.clone())));
+        }
 
         if calls.is_empty() {
             // 无工具调用：push assistant 文本，发 Done，结束
@@ -152,28 +207,57 @@ async fn run_inner(
             ));
             messages.push(Message::tool(call.id.clone(), out.content));
         }
+
+        // 死循环检测：连续 3 轮相同工具调用指纹 → 提前中止（比空跑 max_steps 省钱省时）
+        if detector.observe(&calls) {
+            warn!(step, gen, repeat_count = detector.repeat_count, "检测到连续重复工具调用，提前中止 agent loop");
+            loop_detected = true;
+            break;
+        }
         // 继续循环：带着工具结果再流式一次
     }
 
-    // 超过 max_steps
-    warn!(max_steps, gen, "agent loop 超过最大步数");
-    let _ = tx.send((
-        gen,
-        AgentEvent::Error(format!("超过 max_steps({max_steps}) 限制，已停止")),
-    ));
+    // 收尾总结（max_steps 耗尽 或 死循环检测触发）：
+    // 做一次无工具的收尾流式，让模型总结已收集的信息，而非直接报错中断。
+    // 收尾流式 `tools=[]` → 模型无法再调工具，只能输出文本；其 Delta 经
+    // `accumulate_stream` → `AgentEvent::Token` 流式回传 TUI。发 `Done` 而非 `Error`
+    // → TUI 走正常定稿（总结文本成为 assistant 条目进入 history，使「继续」有上下文）。
+    let wrap = if loop_detected {
+        warn!(max_steps, gen, "agent loop 因连续重复工具调用提前中止，进入收尾总结");
+        "（系统提示：检测到连续多次相同的工具调用，可能已陷入循环。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）".to_string()
+    } else {
+        warn!(max_steps, gen, "agent loop 超过最大步数，进入收尾总结");
+        format!(
+            "（系统提示：已达到工具调用步数上限 {max_steps}。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）"
+        )
+    };
+    messages.push(Message::user(wrap));
+    let req = StreamRequest::new(messages.clone())
+        .with_system(system.clone())
+        .with_tools(Vec::new()); // 不暴露工具 → 模型只能给文本
+    let mut stream = provider.stream(req);
+    let (text, _calls, usage) = accumulate_stream(&mut stream, tx, gen).await;
+    if let Some(ref u) = usage {
+        let _ = tx.send((gen, AgentEvent::Usage(u.clone())));
+    }
+    if !text.is_empty() {
+        messages.push(Message::assistant(text));
+    }
+    let _ = tx.send((gen, AgentEvent::Done));
     Ok(())
 }
 
 /// 驱动一个流到结束，累积 Delta 文本与 ToolCallDelta（按 index 合并为完整 ToolCall）。
 /// Delta→发 `(gen, AgentEvent::Token(t))` 并 append 到文本；Done→break；Error→发 Error 并 break。
-/// 返回 `(累积文本, 按 index 排序的工具调用)`。
+/// 返回 `(累积文本, 按 index 排序的工具调用, usage 用量)`。
 async fn accumulate_stream(
     stream: &mut (impl futures::Stream<Item = StreamEvent> + Unpin),
     tx: &UnboundedSender<(u64, AgentEvent)>,
     gen: u64,
-) -> (String, BTreeMap<u32, ToolCall>) {
+) -> (String, BTreeMap<u32, ToolCall>, Option<Usage>) {
     let mut text = String::new();
     let mut calls: BTreeMap<u32, ToolCall> = BTreeMap::new();
+    let mut usage: Option<Usage> = None;
 
     while let Some(ev) = stream.next().await {
         match ev {
@@ -181,11 +265,14 @@ async fn accumulate_stream(
                 text.push_str(&t);
                 if tx.send((gen, AgentEvent::Token(t))).is_err() {
                     debug!("TUI 通道已关闭，agent 累积终止");
-                    return (text, calls);
+                    return (text, calls, usage);
                 }
             }
             StreamEvent::ToolCallDelta(d) => {
                 accumulate_tool_delta(&mut calls, d);
+            }
+            StreamEvent::Usage(u) => {
+                usage = Some(u);
             }
             StreamEvent::Done => break,
             StreamEvent::Error(m) => {
@@ -194,7 +281,7 @@ async fn accumulate_stream(
             }
         }
     }
-    (text, calls)
+    (text, calls, usage)
 }
 
 /// 把一个 `ToolCallDelta` 片段合并进 `calls` 累积器（按 index）。
@@ -294,7 +381,7 @@ mod tests {
         ];
         let mut s = stream::iter(events);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
-        let (text, calls) = accumulate_stream(&mut s, &tx, 0).await;
+        let (text, calls, _usage) = accumulate_stream(&mut s, &tx, 0).await;
         assert_eq!(text, "Hello world");
         assert!(calls.is_empty());
     }
@@ -319,10 +406,122 @@ mod tests {
         ];
         let mut s = stream::iter(events);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
-        let (text, calls) = accumulate_stream(&mut s, &tx, 0).await;
+        let (text, calls, _usage) = accumulate_stream(&mut s, &tx, 0).await;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[&0].name, "list_dir");
         assert_eq!(calls[&0].arguments, "{\"path\":\".\"}");
+    }
+
+    // ── LoopDetector / fingerprint ──────────────────────────────────────────
+
+    fn tc(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: String::new(),
+            name: name.into(),
+            arguments: args.into(),
+        }
+    }
+
+    fn calls_map(calls: &[ToolCall]) -> BTreeMap<u32, ToolCall> {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u32, c.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn fingerprint_same_calls_same_result() {
+        let a = calls_map(&[tc("list_dir", "{\"path\":\".\"}")]);
+        let b = calls_map(&[tc("list_dir", "{\"path\":\".\"}")]);
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_different_args_different_result() {
+        let a = calls_map(&[tc("read_file", "{\"path\":\"a.txt\"}")]);
+        let b = calls_map(&[tc("read_file", "{\"path\":\"b.txt\"}")]);
+        assert_ne!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_order_independent() {
+        let a = calls_map(&[
+            tc("read_file", "{\"path\":\"a\"}"),
+            tc("list_dir", "{\"path\":\".\"}"),
+        ]);
+        // 不同顺序
+        let b = calls_map(&[
+            tc("list_dir", "{\"path\":\".\"}"),
+            tc("read_file", "{\"path\":\"a\"}"),
+        ]);
+        assert_eq!(fingerprint(&a), fingerprint(&b), "排序后应相同");
+    }
+
+    #[test]
+    fn loop_detector_no_trigger_on_diverse_calls() {
+        let mut d = LoopDetector::new(3);
+        // 每轮不同参数 → 不触发
+        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"a\"}")])));
+        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"b\"}")])));
+        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"c\"}")])));
+    }
+
+    #[test]
+    fn loop_detector_triggers_on_3_consecutive_same() {
+        let mut d = LoopDetector::new(3);
+        let c = calls_map(&[tc("shell", "{\"command\":\"ls\"}")]);
+        assert!(!d.observe(&c), "第 1 轮：不触发");
+        assert!(!d.observe(&c), "第 2 轮：不触发");
+        assert!(d.observe(&c), "第 3 轮连续相同：应触发");
+    }
+
+    #[test]
+    fn loop_detector_resets_on_different_call() {
+        let mut d = LoopDetector::new(3);
+        let c1 = calls_map(&[tc("shell", "{\"command\":\"ls\"}")]);
+        let c2 = calls_map(&[tc("shell", "{\"command\":\"pwd\"}")]);
+        assert!(!d.observe(&c1));
+        assert!(!d.observe(&c1)); // 2 次相同
+        assert!(!d.observe(&c2)); // 不同 → 重置
+        assert!(!d.observe(&c2)); // 重新 2 次
+        assert!(d.observe(&c2)); // 3 次 → 触发
+    }
+
+    #[test]
+    fn loop_detector_threshold_1_triggers_immediately() {
+        let mut d = LoopDetector::new(1);
+        let c = calls_map(&[tc("list_dir", "{}")]);
+        assert!(d.observe(&c), "threshold=1 第 1 轮就应触发");
+    }
+
+    #[test]
+    fn loop_detector_multiple_tools_same_set_triggers() {
+        let mut d = LoopDetector::new(3);
+        // 每轮调两个工具，组合相同
+        let c = calls_map(&[
+            tc("read_file", "{\"path\":\"a\"}"),
+            tc("list_dir", "{\"path\":\".\"}"),
+        ]);
+        assert!(!d.observe(&c));
+        assert!(!d.observe(&c));
+        assert!(d.observe(&c), "连续 3 轮相同组合应触发");
+    }
+
+    #[test]
+    fn loop_detector_different_extra_tool_resets() {
+        let mut d = LoopDetector::new(3);
+        let base = calls_map(&[tc("shell", "{\"command\":\"ls\"}")]);
+        let extra = calls_map(&[
+            tc("shell", "{\"command\":\"ls\"}"),
+            tc("read_file", "{\"path\":\"x\"}"),
+        ]);
+        assert!(!d.observe(&base));
+        assert!(!d.observe(&base));
+        assert!(!d.observe(&extra)); // 组合变了 → 重置
+        assert!(!d.observe(&base));
+        assert!(!d.observe(&base));
+        // 仅 2 次 base，不触发
     }
 }

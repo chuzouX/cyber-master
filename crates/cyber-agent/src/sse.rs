@@ -8,7 +8,7 @@
 //! 用 `LineBuf` 在字节层按 `\n` 切行（ASCII 安全，不会切在多字节 UTF-8 中间），
 //! 半行留到下次，避免分片边界丢数据。
 
-use crate::types::{StreamEvent, ToolCallDelta};
+use crate::types::{StreamEvent, ToolCallDelta, Usage};
 
 /// 字节级行缓冲：喂任意分片，按 `\n` 切出完整行（去行尾 `\r\n`）。
 ///
@@ -81,6 +81,13 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    // usage chunk（stream_options.include_usage=true 时，流末尾的独立 chunk）：
+    // `{"choices":[],"usage":{...}}`。choices 为空数组，delta 不存在。
+    if let Some(usage) = v.get("usage") {
+        if let Some(u) = parse_usage(usage) {
+            return vec![StreamEvent::Usage(u)];
+        }
+    }
     let delta = match v
         .get("choices")
         .and_then(|c| c.get(0))
@@ -119,6 +126,33 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
         }
     }
     out
+}
+
+/// 从 OpenAI/DeepSeek usage JSON 对象提取 token 用量。
+///
+/// DeepSeek 在标准 `prompt_tokens`/`completion_tokens` 基础上额外返回
+/// `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（prefix cache 分解）。
+/// OpenAI 原生 API 无缓存分解字段，相应为 0。
+fn parse_usage(usage: &serde_json::Value) -> Option<Usage> {
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())?;
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_hit_tokens = usage
+        .get("prompt_cache_hit_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_miss_tokens = usage
+        .get("prompt_cache_miss_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        cache_hit_tokens,
+        cache_miss_tokens,
+    })
 }
 
 /// Anthropic SSE 行解析（靠 `data` 内 `type` 字段，跳过 `event:` 行）。返回 0..N 个事件：
@@ -426,6 +460,39 @@ mod tests {
                 assert_eq!(d.arguments_fragment, "{\"path\":\".\"}");
             }
             other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_usage_chunk() {
+        let d = r#"data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500,"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100}}"#;
+        let r = parse_openai_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.prompt_tokens, 1000);
+                assert_eq!(u.completion_tokens, 500);
+                assert_eq!(u.cache_hit_tokens, 900);
+                assert_eq!(u.cache_miss_tokens, 100);
+            }
+            other => panic!("应为 Usage，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_usage_without_cache_fields() {
+        // OpenAI 原生 API 无 cache 字段 → cache_hit/miss 为 0
+        let d = r#"data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50}}"#;
+        let r = parse_openai_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.prompt_tokens, 100);
+                assert_eq!(u.completion_tokens, 50);
+                assert_eq!(u.cache_hit_tokens, 0);
+                assert_eq!(u.cache_miss_tokens, 0);
+            }
+            other => panic!("应为 Usage，实际 {other:?}"),
         }
     }
 }

@@ -6,11 +6,14 @@
 //! echo 测试（前 4 个）设 `auto_tool_call=false` 以保持 echo 模式；
 //! `mock_tool_loop_roundtrip` 用默认 `auto_tool_call=true` 验证 agent loop 全链路。
 
-use cyber_agent::{run_stream, AgentEvent};
+use std::sync::Arc;
+
+use cyber_agent::{run_stream, AgentEvent, ToolRegistry};
 use cyber_core::{Config, ProjectContext, ProjectFrontmatter, ProvidersConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// 固定 generation 计数器与临时工作目录，启动一次 run_stream。
+/// 工具表统一用内置工具（read_file/write_file/list_dir/shell），与 P2 行为一致。
 fn spawn_run(
     config: Config,
     providers: ProvidersConfig,
@@ -24,6 +27,7 @@ fn spawn_run(
 ) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
     let cwd = std::env::temp_dir();
+    let registry = Arc::new(ToolRegistry::with_builtins());
     let handle = tokio::spawn(run_stream(
         config,
         providers,
@@ -34,6 +38,7 @@ fn spawn_run(
         0, // gen
         mock,
         cwd,
+        registry,
     ));
     (handle, rx)
 }
@@ -204,6 +209,7 @@ async fn mock_tool_loop_roundtrip() {
                 got_done = true;
                 break;
             }
+            AgentEvent::Usage(_) => {}
             AgentEvent::Error(m) => panic!("tool-loop 不应产生错误: {m}"),
         }
     }
@@ -223,6 +229,103 @@ async fn mock_tool_loop_roundtrip() {
     handle.await.unwrap();
 }
 
+/// 验证正常两步收敛的 tool-loop **不会误触发死循环检测**：
+/// mock 第一步发 list_dir，第二步收敛发最终文本。仅 1 轮工具调用 →
+/// LoopDetector repeat_count=1 < 3 → 不触发。最终文本应为 mock 正常完成文案，
+/// 不含「陷入循环」提示。
+#[tokio::test]
+async fn mock_tool_loop_not_loop_detected() {
+    let config = Config::default();
+    let providers = ProvidersConfig::default_template();
+    let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
+
+    let mut final_text = String::new();
+    let mut tool_call_count = 0;
+    let mut got_done = false;
+
+    while let Some((_, ev)) = rx.recv().await {
+        match ev {
+            AgentEvent::Started => {}
+            AgentEvent::Token(t) => final_text.push_str(&t),
+            AgentEvent::ToolCall { .. } => tool_call_count += 1,
+            AgentEvent::ToolResult { .. } => {}
+            AgentEvent::Done => {
+                got_done = true;
+                break;
+            }
+            AgentEvent::Usage(_) => {}
+            AgentEvent::Error(m) => panic!("不应产生错误: {m}"),
+        }
+    }
+
+    assert_eq!(tool_call_count, 1, "正常 tool-loop 应仅 1 次工具调用");
+    assert!(
+        !final_text.contains("陷入循环"),
+        "正常收敛不应触发死循环提示: {final_text}"
+    );
+    assert!(
+        final_text.contains("任务完成"),
+        "应为 mock 正常完成文案: {final_text}"
+    );
+    assert!(got_done);
+    handle.await.unwrap();
+}
+
+/// 验证 max_steps 耗尽时走**优雅收尾**而非直接报错：max_steps=1 使 step 0（含工具调用）
+/// 后循环即耗尽 → 追加「步数上限」user 提示 + 无工具收尾流式（mock echo 模式回放该提示）
+/// → 发 `Done`（非 `Error`）。断言：有工具调用/结果、有收尾总结文本（含「步数上限」）、
+/// 以 `Done` 结束、无 `Error`。
+#[tokio::test]
+async fn mock_max_steps_exhaustion_does_graceful_summary() {
+    let mut config = Config::default();
+    config.agent.max_steps = 1; // step 0 有工具调用 → 循环耗尽 → 收尾总结
+    // auto_tool_call 保持默认 true（tools 非空 → mock tool-loop 第一步发工具调用）
+    let providers = ProvidersConfig::default_template();
+    let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
+
+    let mut tool_call_seen = false;
+    let mut tool_result_seen = false;
+    let mut summary_text = String::new();
+    let mut got_done = false;
+
+    while let Some((_, ev)) = rx.recv().await {
+        match ev {
+            AgentEvent::Started => {}
+            AgentEvent::Token(t) => {
+                if tool_result_seen {
+                    summary_text.push_str(&t); // 收尾总结文本
+                }
+            }
+            AgentEvent::ToolCall { name, .. } => {
+                tool_call_seen = true;
+                assert_eq!(name, "list_dir");
+            }
+            AgentEvent::ToolResult { .. } => {
+                tool_result_seen = true;
+            }
+            AgentEvent::Done => {
+                got_done = true;
+                break;
+            }
+            AgentEvent::Usage(_) => {}
+            AgentEvent::Error(m) => panic!("max_steps 耗尽不应产生 Error（应优雅收尾）: {m}"),
+        }
+    }
+
+    assert!(tool_call_seen, "step 0 应有工具调用");
+    assert!(tool_result_seen, "应有工具结果回灌");
+    assert!(
+        !summary_text.is_empty(),
+        "耗尽后应有收尾总结文本（非裸中断）"
+    );
+    assert!(
+        summary_text.contains("步数上限"),
+        "收尾总结应含步数上限提示: {summary_text}"
+    );
+    assert!(got_done, "应以 Done 结束（非 Error）");
+    handle.await.unwrap();
+}
+
 /// 验证 cancel（generation bump）后 stale 事件被隔离：启动任务后立即以更高 gen
 /// 发送的事件不应影响断言。此测试通过确认正常 tool-loop 完成来间接验证 gen 路径。
 #[tokio::test]
@@ -232,6 +335,7 @@ async fn mock_tool_loop_respects_generation_tag() {
     // 使用 gen=5 启动，事件应全部携带 gen=5
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
     let cwd = std::env::temp_dir();
+    let registry = Arc::new(ToolRegistry::with_builtins());
     let handle = tokio::spawn(run_stream(
         config,
         providers,
@@ -242,6 +346,7 @@ async fn mock_tool_loop_respects_generation_tag() {
         5, // gen=5
         true,
         cwd,
+        registry,
     ));
 
     let mut gens = Vec::new();

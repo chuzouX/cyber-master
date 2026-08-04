@@ -13,7 +13,7 @@ pub mod providers;
 
 pub use config::Config;
 pub use error::{CoreError, Result};
-pub use loader::{load_app_context, save_config, save_providers, AppContext};
+pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
-pub use providers::{resolve_api_key, ProviderConfig, ProvidersConfig, PROVIDER_KINDS};
+pub use providers::{resolve_api_key, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS};
