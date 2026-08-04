@@ -55,8 +55,9 @@ impl StreamRequest {
     }
 }
 
-/// LLM 提供方抽象。`Send` 以便 `Box<dyn Provider>` 跨 tokio task。
-pub trait Provider: Send {
+/// LLM 提供方抽象。`Send + Sync` 以便 `&dyn Provider` 跨 `.await` 点（如压缩），
+/// 且 `Box<dyn Provider>` 可跨 tokio task。
+pub trait Provider: Send + Sync {
     /// 发起流式对话。返回 `'static` 流（impl 持有 owned reqwest::Client），
     /// 可直接 `tokio::spawn` 驱动。`req.tools` 空 = 不发 tools 字段。
     fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;

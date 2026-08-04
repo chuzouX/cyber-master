@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod mcp_form;
+pub mod model_picker;
 pub mod providers;
 pub mod sessions;
 pub mod settings;

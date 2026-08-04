@@ -30,7 +30,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::UsageStats;
+use crate::app::{ContextUsage, UsageStats};
 use crate::chat::ChatState;
 use crate::theme::Theme;
 
@@ -45,6 +45,7 @@ pub fn render(
     provider: &str,
     usage: &UsageStats,
     price: Option<&PriceConfig>,
+    context_usage: &ContextUsage,
 ) {
     let scrolled = !state.is_following_bottom();
     let title = if scrolled {
@@ -74,7 +75,7 @@ pub fn render(
 
     render_history(frame, chunks[0], theme, state, project);
     render_input(frame, chunks[1], state);
-    render_usage_bar(frame, chunks[2], theme, usage, price);
+    render_usage_bar(frame, chunks[2], theme, provider, usage, price, context_usage);
     render_hint(frame, chunks[3], theme, state);
     // 斜杠补全菜单：浮于输入框上方（覆盖历史区底部），最后绘制以叠加在最上层
     if state.slash_menu.open && !state.slash_menu.filtered.is_empty() {
@@ -164,29 +165,47 @@ fn render_input(frame: &mut Frame, area: Rect, state: &ChatState) {
     frame.render_widget(&state.input, area);
 }
 
-/// 渲染 usage 状态栏：缓存命中率 + token 计数 + 成本（如果配置了价格）。
+/// 渲染 usage 状态栏：provider/model 信息 + 上下文剩余百分比 + 缓存命中率 + token 计数 + 成本。
 ///
-/// 空会话（无任何 usage）显示灰色占位，避免空白行。
+/// 布局：` provider · model │ ctx 85% │ cache 0.0% │ ↑3.0k ↓318 │ $0.0000 `
+/// 无 usage 数据时只显示 provider/model 段 + 上下文剩余百分比（若已知）。
+/// 上下文长度未知（未配置 context_length）时不显示 ctx 段。
 fn render_usage_bar(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
+    provider: &str,
     usage: &UsageStats,
     price: Option<&PriceConfig>,
+    context_usage: &ContextUsage,
 ) {
-    let total_in = usage.cache_hit + usage.cache_miss;
-    if total_in == 0 && usage.completion == 0 {
-        // 无数据：显示淡色占位
-        frame.render_widget(
-            Paragraph::new(Line::from("")),
-            area,
-        );
-        return;
-    }
-
-    let hit_pct = usage.hit_rate() * 100.0;
+    // 前段：provider · model（始终显示，让用户随时知道当前用的什么模型）
     let mut spans: Vec<Span> = vec![
         Span::styled(
+            format!(" {provider} "),
+            Style::default()
+                .fg(theme.fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    // 上下文剩余百分比（模型配置了 context_length 时显示）
+    if let Some(pct) = context_usage.remaining_percent() {
+        // 剩余 < 20% 用 accent 高亮提醒；否则用 muted
+        let color = if pct < 20 { theme.accent } else { theme.muted };
+        spans.push(Span::raw("│"));
+        spans.push(Span::styled(
+            format!(" ctx {pct}% "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let total_in = usage.cache_hit + usage.cache_miss;
+    let has_usage = total_in != 0 || usage.completion != 0;
+    if has_usage {
+        let hit_pct = usage.hit_rate() * 100.0;
+        spans.push(Span::raw("│"));
+        spans.push(Span::styled(
             format!(" cache {hit_pct:.1}% "),
             Style::default()
                 .fg(if hit_pct >= 80.0 {
@@ -195,21 +214,21 @@ fn render_usage_bar(
                     theme.muted
                 })
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("│"),
-        Span::styled(
-            format!(" ↑{} ↓{} ", fmt_tokens(total_in), fmt_tokens(usage.completion)),
-            Style::default().fg(theme.muted),
-        ),
-    ];
-
-    if let Some(p) = price {
-        let cost = usage.cost(p);
+        ));
         spans.push(Span::raw("│"));
         spans.push(Span::styled(
-            format!(" ${cost:.4} "),
-            Style::default().fg(theme.accent),
+            format!(" ↑{} ↓{} ", fmt_tokens(total_in), fmt_tokens(usage.completion)),
+            Style::default().fg(theme.muted),
         ));
+
+        if let Some(p) = price {
+            let cost = usage.cost(p);
+            spans.push(Span::raw("│"));
+            spans.push(Span::styled(
+                format!(" ${cost:.4} "),
+                Style::default().fg(theme.accent),
+            ));
+        }
     }
 
     frame.render_widget(
@@ -232,7 +251,7 @@ fn render_hint(frame: &mut Frame, area: Rect, theme: &Theme, state: &ChatState) 
     let hint = if state.streaming {
         " 生成中… Esc 取消 · Tab 切换模式 · Ctrl+, 设置 · Ctrl+C 退出"
     } else {
-        " Enter 发送 · Shift+Enter 换行 · / 命令 · PgUp/PgDn 滚动 · Tab 切换 · Ctrl+, 设置 · Esc 返回 · Ctrl+C 退出"
+        " Enter 发送 · Shift+Enter 换行 · / 命令 · PgUp/PgDn 滚动 · Ctrl+O 工具回显 · Tab 切换 · Ctrl+, 设置 · Esc 返回 · Ctrl+C 退出"
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::default().fg(theme.muted)),
@@ -354,7 +373,7 @@ pub fn render_placeholder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::UsageStats;
+    use crate::app::{ContextUsage, UsageStats};
     use crate::chat::{ChatEntry, ChatState};
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -368,7 +387,7 @@ mod tests {
         let state = ChatState::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -380,7 +399,7 @@ mod tests {
         state.entries.push(ChatEntry::Assistant("收到：你好".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "openai", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "openai", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -392,7 +411,7 @@ mod tests {
         state.streaming_buffer = "收到：hi".into();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "ollama", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "ollama", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -404,7 +423,7 @@ mod tests {
         state.streaming_buffer.clear();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -417,7 +436,7 @@ mod tests {
             .push(ChatEntry::Assistant("第一行\n第二行\n第三行".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -443,7 +462,7 @@ mod tests {
             .push(ChatEntry::Assistant("当前目录有 3 个文件。".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -464,7 +483,52 @@ mod tests {
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .unwrap();
+    }
+
+    #[test]
+    fn chat_tool_result_multiline_folded_renders() {
+        // 5 行输出 > 3 → 折叠为最后 3 行 + 提示，确认不 panic
+        let theme = Theme::resolve("cyberpunk");
+        let mut state = ChatState::new();
+        state.entries.push(ChatEntry::ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        });
+        state.entries.push(ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "shell".into(),
+            output: "line1\nline2\nline3\nline4\nline5".into(),
+            is_error: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .unwrap();
+    }
+
+    #[test]
+    fn chat_tool_result_multiline_expanded_renders() {
+        // 展开 5 行输出 + 折叠提示，确认不 panic
+        let theme = Theme::resolve("cyberpunk");
+        let mut state = ChatState::new();
+        state.entries.push(ChatEntry::ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        });
+        state.entries.push(ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "shell".into(),
+            output: "line1\nline2\nline3\nline4\nline5".into(),
+            is_error: false,
+        });
+        state.toggle_last_tool_result_expansion();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -485,7 +549,7 @@ mod tests {
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -498,7 +562,7 @@ mod tests {
         assert!(state.slash_menu.open);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -519,7 +583,7 @@ mod tests {
         assert!(!state.is_following_bottom());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -531,7 +595,7 @@ mod tests {
         state.update_slash_menu();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
             .unwrap();
     }
 
@@ -547,11 +611,12 @@ mod tests {
             input_per_m: Some(0.14),
             output_per_m: Some(0.28),
             cache_hit_per_m: Some(0.014),
+            ..Default::default()
         };
         let state = ChatState::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &usage, Some(&price)))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &usage, Some(&price), &ContextUsage::default()))
             .unwrap();
     }
 
@@ -566,7 +631,53 @@ mod tests {
         let state = ChatState::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &usage, None))
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &usage, None, &ContextUsage::default()))
             .unwrap();
+    }
+
+    #[test]
+    fn usage_bar_renders_with_context_percent() {
+        // 配置了 context_length → 显示 ctx 百分比段
+        let theme = Theme::resolve("cyberpunk");
+        let state = ChatState::new();
+        let ctx = ContextUsage {
+            used_tokens: 25_000,
+            effective_context_length: Some(128_000),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ctx))
+            .unwrap();
+        // 剩余 ≈ 80% → 应渲染 "ctx 80%"
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("ctx"), "应显示 ctx 段: {content}");
+        assert!(content.contains("80%"), "应显示 80% 剩余: {content}");
+    }
+
+    #[test]
+    fn usage_bar_no_context_percent_when_unknown() {
+        // 未配置 context_length → 不显示 ctx 段
+        let theme = Theme::resolve("cyberpunk");
+        let state = ChatState::new();
+        let ctx = ContextUsage {
+            used_tokens: 1000,
+            effective_context_length: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ctx))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!content.contains("ctx"), "不应显示 ctx 段: {content}");
     }
 }

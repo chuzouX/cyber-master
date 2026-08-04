@@ -54,6 +54,10 @@ pub enum ChatAction {
     OpenSettings,
     /// 切换日志查看器（Ctrl+L）。
     ToggleLogs,
+    /// 切换鼠标捕获（F9）：滚轮翻页 ↔ 拖拽选区复制。
+    ToggleMouse,
+    /// 切换最近工具结果的展开/折叠（Ctrl+O）。
+    ToggleToolResult,
     /// 退出（Ctrl+C / Ctrl+Q；Chat 内 `q` 是打字字符，不退出）。
     Quit,
     /// 历史区上滚一页（PageUp）。
@@ -149,6 +153,14 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
     // Ctrl+L 切换日志查看器
     if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return ChatAction::ToggleLogs;
+    }
+    // F9 切换鼠标捕获（滚轮翻页 ↔ 拖拽选区复制）
+    if k.code == KeyCode::F(9) {
+        return ChatAction::ToggleMouse;
+    }
+    // Ctrl+O 切换最近工具结果展开/折叠
+    if k.code == KeyCode::Char('o') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return ChatAction::ToggleToolResult;
     }
     match k.code {
         KeyCode::Enter => {
@@ -378,6 +390,22 @@ mod tests {
         assert_eq!(
             chat_key_to_action(key(KeyCode::Down, KeyModifiers::NONE)),
             ChatAction::HistoryNext
+        );
+    }
+
+    #[test]
+    fn chat_ctrl_o_toggles_tool_result() {
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            ChatAction::ToggleToolResult
+        );
+    }
+
+    #[test]
+    fn chat_plain_o_is_input() {
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Char('o'), KeyModifiers::NONE)),
+            ChatAction::Input
         );
     }
 }

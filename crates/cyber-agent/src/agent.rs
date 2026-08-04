@@ -18,9 +18,12 @@ use tracing::{debug, warn};
 
 use cyber_core::{Config, ProjectContext, ProviderConfig, ProvidersConfig};
 
+use crate::compact::{
+    auto_compact_threshold, compact_messages, estimate_messages_tokens,
+};
 use crate::error::{AgentError, Result};
 use crate::prompt::build_system_prompt;
-use crate::provider::{provider_factory, StreamRequest};
+use crate::provider::{provider_factory, Provider, StreamRequest};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Usage};
 
@@ -146,11 +149,42 @@ async fn run_inner(
     let mut messages = history;
     messages.push(Message::user(user_input));
 
+    // 有效上下文长度（用于自动压缩阈值 + TUI 剩余百分比显示）。
+    // 未配置时为 None → 不触发自动压缩，TUI 不显示百分比。
+    let effective_ctx_len = cfg.effective_context_length();
+
+    // 首次发送上下文使用情况（TUI 据此显示初始剩余百分比）
+    emit_context_update(tx, gen, &messages, effective_ctx_len);
+
     let max_steps = config.agent.max_steps.max(1);
     let mut detector = LoopDetector::new(3);
     let mut loop_detected = false;
     for step in 0..max_steps {
         debug!(step, gen, "agent loop 迭代");
+
+        // 自动压缩检查：估算当前 messages token 数，超过阈值则先压缩再继续。
+        // 仅在 effective_ctx_len 已知时触发；压缩失败仅记日志不中断（回退到原消息）。
+        if let Some(threshold) = auto_compact_threshold(effective_ctx_len) {
+            let used = estimate_messages_tokens(&messages);
+            if used >= threshold as usize {
+                debug!(step, used, threshold, gen, "触发自动上下文压缩");
+                match do_compact(
+                    provider.as_ref(),
+                    &system,
+                    &mut messages,
+                    None,
+                    tx,
+                    gen,
+                    true, // is_auto
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => warn!(error = %e, gen, "自动压缩失败，回退到原消息继续"),
+                }
+            }
+        }
+
         let req = StreamRequest::new(messages.clone())
             .with_system(system.clone())
             .with_tools(tools.clone());
@@ -169,6 +203,7 @@ async fn run_inner(
             if !text.is_empty() {
                 messages.push(Message::assistant(text));
             }
+            emit_context_update(tx, gen, &messages, effective_ctx_len);
             let _ = tx.send((gen, AgentEvent::Done));
             return Ok(());
         }
@@ -208,6 +243,9 @@ async fn run_inner(
             messages.push(Message::tool(call.id.clone(), out.content));
         }
 
+        // 工具结果回灌后发送上下文使用情况（工具结果可能显著增加 token 数）
+        emit_context_update(tx, gen, &messages, effective_ctx_len);
+
         // 死循环检测：连续 3 轮相同工具调用指纹 → 提前中止（比空跑 max_steps 省钱省时）
         if detector.observe(&calls) {
             warn!(step, gen, repeat_count = detector.repeat_count, "检测到连续重复工具调用，提前中止 agent loop");
@@ -243,8 +281,130 @@ async fn run_inner(
     if !text.is_empty() {
         messages.push(Message::assistant(text));
     }
+    emit_context_update(tx, gen, &messages, effective_ctx_len);
     let _ = tx.send((gen, AgentEvent::Done));
     Ok(())
+}
+
+/// 发送上下文使用情况更新事件（TUI 据此显示剩余百分比）。
+/// `effective_ctx_len` 为 None 时不发送（TUI 不显示百分比）。
+fn emit_context_update(
+    tx: &UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    messages: &[Message],
+    effective_ctx_len: Option<u32>,
+) {
+    if effective_ctx_len.is_none() {
+        return; // 未知上下文长度 → 不发送
+    }
+    let used = estimate_messages_tokens(messages);
+    let _ = tx.send((
+        gen,
+        AgentEvent::ContextUpdate {
+            used_tokens: used,
+            effective_context_length: effective_ctx_len,
+        },
+    ));
+}
+
+/// 执行上下文压缩：发 Compacting 事件 → 调用 compact_messages 替换 messages → 发 Compacted 事件。
+/// `is_auto` 区分自动触发（达到阈值）与手动 `/compact`。
+/// 压缩成功后 `messages` 将被替换为 `[摘要 user 消息]`。
+async fn do_compact(
+    provider: &dyn Provider,
+    system: &str,
+    messages: &mut Vec<Message>,
+    custom_instructions: Option<&str>,
+    tx: &UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    is_auto: bool,
+) -> Result<()> {
+    let before_tokens = estimate_messages_tokens(messages);
+    let _ = tx.send((gen, AgentEvent::Compacting { is_auto }));
+    let summary_msg = compact_messages(provider, system, messages, custom_instructions).await?;
+    let after_tokens = estimate_messages_tokens(&[summary_msg.clone()]);
+    *messages = vec![summary_msg.clone()];
+    let _ = tx.send((
+        gen,
+        AgentEvent::Compacted {
+            summary: summary_msg.content,
+            before_tokens,
+            after_tokens,
+        },
+    ));
+    Ok(())
+}
+
+/// 手动触发上下文压缩（`/compact` 命令入口）。
+///
+/// 与 `run_stream` 类似的入参签名，但不进入 agent loop——仅做一次压缩并返回。
+/// 压缩后的 `messages`（含摘要）经 `AgentEvent::Compacted` 传回 TUI，TUI 据此
+/// 替换本地 chat 历史。
+///
+/// - `history`：当前会话的全部已完成消息（user/assistant，不含工具调用中间态）
+/// - `custom_instructions`：可选的自定义摘要指令（`/compact <instructions>` 参数）
+#[allow(clippy::too_many_arguments)]
+pub async fn run_compact_stream(
+    config: Config,
+    providers: ProvidersConfig,
+    project: Option<ProjectContext>,
+    history: Vec<Message>,
+    custom_instructions: Option<String>,
+    tx: UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    mock: bool,
+) {
+    let _ = tx.send((gen, AgentEvent::Started));
+    let res = run_compact_inner(
+        &config,
+        &providers,
+        project.as_ref(),
+        history,
+        custom_instructions,
+        &tx,
+        gen,
+        mock,
+    )
+    .await;
+    if let Err(e) = res {
+        warn!(error = %e, "run_compact_stream 失败");
+        let _ = tx.send((gen, AgentEvent::Error(e.to_string())));
+    }
+    let _ = tx.send((gen, AgentEvent::Done));
+}
+
+async fn run_compact_inner(
+    config: &Config,
+    providers: &ProvidersConfig,
+    project: Option<&ProjectContext>,
+    history: Vec<Message>,
+    custom_instructions: Option<String>,
+    tx: &UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    mock: bool,
+) -> Result<()> {
+    let name = &config.agent.default_provider;
+    let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
+        AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
+    })?;
+    let provider = provider_factory(cfg, mock)?;
+    let system = build_system_prompt(project);
+
+    if history.is_empty() {
+        return Err(AgentError::Provider("无消息可压缩".into()));
+    }
+
+    let mut messages = history;
+    do_compact(
+        provider.as_ref(),
+        &system,
+        &mut messages,
+        custom_instructions.as_deref(),
+        tx,
+        gen,
+        false, // is_auto = false（手动触发）
+    )
+    .await
 }
 
 /// 驱动一个流到结束，累积 Delta 文本与 ToolCallDelta（按 index 合并为完整 ToolCall）。

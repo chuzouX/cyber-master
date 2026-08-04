@@ -161,6 +161,23 @@ pub enum AgentEvent {
     },
     /// 单轮 API 调用的 token 用量（TUI 据此显示缓存命中率 + 成本）。
     Usage(Usage),
+    /// 上下文使用情况更新（每次流式前后发送，TUI 据此显示剩余百分比）。
+    /// `used_tokens` 为估算的当前消息列表 token 数；
+    /// `effective_context_length` 为模型有效上下文长度（None 表示未知）。
+    ContextUpdate {
+        used_tokens: usize,
+        effective_context_length: Option<u32>,
+    },
+    /// 即将开始上下文压缩（自动或手动触发）。TUI 可展示「正在压缩…」状态。
+    /// `is_auto` 区分自动触发（达到阈值）与手动 `/compact`。
+    Compacting { is_auto: bool },
+    /// 上下文压缩已完成。`summary` 为压缩后的摘要文本（供 TUI 展示）。
+    /// `before_tokens` / `after_tokens` 为压缩前后的 token 估算。
+    Compacted {
+        summary: String,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
     Done,
     Error(String),
 }
@@ -246,6 +263,21 @@ mod tests {
             name: "n".into(),
             output: "ok".into(),
             is_error: false,
+        };
+    }
+
+    #[test]
+    fn agent_event_compact_variants() {
+        let _ = AgentEvent::ContextUpdate {
+            used_tokens: 1000,
+            effective_context_length: Some(128_000),
+        };
+        let _ = AgentEvent::Compacting { is_auto: true };
+        let _ = AgentEvent::Compacting { is_auto: false };
+        let _ = AgentEvent::Compacted {
+            summary: "摘要内容".into(),
+            before_tokens: 100_000,
+            after_tokens: 5_000,
         };
     }
 }

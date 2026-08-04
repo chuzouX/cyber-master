@@ -44,8 +44,8 @@ impl AnthropicProvider {
             url: format!("{base}/v1/messages"),
             api_key,
             model: cfg.model.clone(),
-            max_tokens: cfg.max_tokens,
-            temperature: cfg.temperature,
+            max_tokens: cfg.effective_max_tokens(),
+            temperature: cfg.effective_temperature(),
         })
     }
 }

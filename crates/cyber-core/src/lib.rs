@@ -16,4 +16,4 @@ pub use error::{CoreError, Result};
 pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
-pub use providers::{resolve_api_key, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS};
+pub use providers::{resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS};

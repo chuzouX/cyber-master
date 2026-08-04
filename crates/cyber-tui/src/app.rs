@@ -25,8 +25,8 @@ use crossterm::execute;
 use futures::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     DefaultTerminal, Frame,
 };
@@ -34,7 +34,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use cyber_agent::{fetch_models, run_stream, AgentEvent, Message, ToolRegistry, Usage};
+use cyber_agent::{
+    context_remaining_percent, fetch_models, run_compact_stream, run_stream, AgentEvent, Message,
+    ToolRegistry, Usage,
+};
 use cyber_core::{save_config, save_providers, Config, ProjectContext, ProvidersConfig};
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
@@ -50,8 +53,9 @@ use crate::views::providers::{FormAction, ProviderFormState};
 use crate::views::settings::{LiveApply, SettingsState};
 
 /// 顶层模式 / 屏幕。Welcome 为启动入口屏，Settings 为模态设置层，ProviderForm 为
-/// 服务商新增/编辑模态层（从 Settings 或 Chat 两路进入），Sessions 为会话管理面板
-/// （`/sessions` 或 `/new` 触发），其余三个对应 DESIGN §9。
+/// 服务商新增/编辑模态层（从 Settings 或 Chat 两路进入），ModelPicker 为 `/model` 面板
+/// （双栏选 provider + model），Sessions 为会话管理面板（`/sessions` 或 `/new` 触发），
+/// 其余三个对应 DESIGN §9。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Welcome,
@@ -61,6 +65,7 @@ pub enum Mode {
     Settings,
     ProviderForm,
     McpForm,
+    ModelPicker,
     Sessions,
     LogViewer,
 }
@@ -75,6 +80,7 @@ impl Mode {
             Mode::Settings => "Settings",
             Mode::ProviderForm => "Provider Form",
             Mode::McpForm => "MCP Form",
+            Mode::ModelPicker => "Model Picker",
             Mode::Sessions => "Sessions",
             Mode::LogViewer => "Logs",
         }
@@ -177,6 +183,25 @@ impl UsageStats {
     }
 }
 
+/// 上下文使用情况（TUI 状态栏显示剩余百分比）。
+///
+/// 由 agent 的 `ContextUpdate` 事件更新。`effective_context_length` 为 None 时
+/// 表示模型未配置上下文长度 → TUI 不显示百分比段。
+#[derive(Debug, Clone, Default)]
+pub struct ContextUsage {
+    /// 估算的当前消息列表 token 数。
+    pub used_tokens: usize,
+    /// 模型有效上下文长度（token）。None = 未知。
+    pub effective_context_length: Option<u32>,
+}
+
+impl ContextUsage {
+    /// 计算剩余百分比（0-100）。None 表示上下文长度未知。
+    pub(crate) fn remaining_percent(&self) -> Option<u32> {
+        context_remaining_percent(self.used_tokens, self.effective_context_length)
+    }
+}
+
 /// `/sessions` 面板状态：选中索引 + 待删除确认 + 进入时刷新的列表快照。
 ///
 /// `list` 是进入面板时从 `SessionIndex.sessions` 克隆的快照，面板内导航/删除均
@@ -201,6 +226,61 @@ impl SessionsPanelState {
             .position(|s| s.id == idx.current)
             .unwrap_or(0);
         self.pending_delete = None;
+    }
+}
+
+/// `/model` 面板状态：双栏选择 provider + model。
+///
+/// 左栏（providers）选中项变化时自动拉取该 provider 的模型列表；右栏（models）
+/// 列出拉取结果，Enter 确认 → 保存 `default_provider` + 更新 `providers[name].model`。
+#[derive(Debug, Default, Clone)]
+pub struct ModelPickerState {
+    /// 当前选中的 provider 索引（在 `sorted_names` 内）。
+    pub provider_selected: usize,
+    /// 当前选中的 model 索引（在 `models` 内）。
+    pub model_selected: usize,
+    /// 已拉取的当前 provider 模型列表。
+    pub models: Vec<String>,
+    /// 是否正在拉取模型列表。
+    pub fetching: bool,
+    /// fetch_id（防 stale 结果，bump 后旧结果被忽略）。
+    pub fetch_id: u64,
+    /// 拉取错误信息。
+    pub fetch_error: Option<String>,
+    /// 焦点：false=provider 列表，true=model 列表。
+    pub focus_models: bool,
+}
+
+impl ModelPickerState {
+    /// bump fetch_id + 置 fetching + 清空旧结果。返回新 fetch_id 供 App spawn 任务。
+    pub fn start_fetch(&mut self) -> u64 {
+        self.fetch_id = self.fetch_id.wrapping_add(1);
+        self.fetching = true;
+        self.fetch_error = None;
+        self.models.clear();
+        self.model_selected = 0;
+        self.fetch_id
+    }
+
+    /// 接收拉取结果。fetch_id 不匹配（已发起新一轮或面板已重开）则丢弃。
+    pub fn deliver_fetch(&mut self, fetch_id: u64, result: Result<Vec<String>, String>) {
+        if fetch_id != self.fetch_id {
+            return;
+        }
+        self.fetching = false;
+        match result {
+            Ok(models) => {
+                if models.is_empty() {
+                    self.fetch_error = Some("未返回任何模型".into());
+                } else {
+                    self.models = models;
+                    self.model_selected = 0;
+                }
+            }
+            Err(e) => {
+                self.fetch_error = Some(e);
+            }
+        }
     }
 }
 
@@ -229,6 +309,9 @@ pub struct App {
     // Settings 模态层状态
     settings: SettingsState,
     prev_mode: Mode,
+    /// 表单/面板（ProviderForm/McpForm/LogViewer/ModelPicker）的返回模式。
+    /// 与 prev_mode 分离：避免从 Settings 打开表单时覆盖 Settings 自身的 prev_mode。
+    form_prev_mode: Mode,
     /// 进入 Settings 时的配置快照，供 Esc 双击回退。
     config_at_entry: Config,
     /// 进入 Settings 时的 providers 快照，供 Esc 双击回退（与 config_at_entry 同步）。
@@ -263,8 +346,20 @@ pub struct App {
     sessions_panel: SessionsPanelState,
     /// session 内累计 token 用量（TUI 状态栏显示命中率 + 成本）。
     usage: UsageStats,
+    /// 上下文使用情况（TUI 状态栏显示剩余百分比）。
+    /// 由 agent 的 `ContextUpdate` 事件更新；None 表示有效上下文长度未知。
+    context_usage: ContextUsage,
+    /// 是否正在执行上下文压缩（手动 `/compact` 或自动触发）。
+    /// 压缩期间阻止提交/切换等操作（与 streaming 期一致）。
+    compacting: bool,
     /// 日志查看器状态（Ctrl+L 打开，Esc 关闭）。
     log_viewer: LogViewerState,
+    /// `/model` 面板状态（双栏选 provider + model）。
+    model_picker: ModelPickerState,
+    /// 鼠标捕获开关（F9 切换）。
+    /// true：滚轮翻页（终端原生选区被禁用）；
+    /// false：可拖拽选区复制（滚轮事件会被终端翻译为 ↑/↓，不再路由到 scroll_history）。
+    mouse_capture: bool,
 }
 
 const WELCOME_OPTIONS: usize = 4;
@@ -302,6 +397,7 @@ impl App {
             should_quit: false,
             settings: SettingsState::new(),
             prev_mode: initial,
+            form_prev_mode: initial,
             paths,
             has_project_config,
             chat: ChatState::new(),
@@ -316,7 +412,11 @@ impl App {
             sessions: SessionIndex::default(),
             sessions_panel: SessionsPanelState::default(),
             usage: UsageStats::default(),
+            context_usage: ContextUsage::default(),
+            compacting: false,
             log_viewer: LogViewerState::default(),
+            model_picker: ModelPickerState::default(),
+            mouse_capture: true,
         }
     }
 
@@ -346,7 +446,9 @@ impl App {
         // 从已加载的 User 条目派生输入历史，使 ↑/↓ 可跨会话呼出历史指令。
         self.chat.seed_input_history();
         let mut terminal: DefaultTerminal = ratatui::init();
-        if self.config.ui.mouse {
+        // 鼠标捕获开关：true 时启用滚轮翻页（默认），false 时不启用（可拖拽选区复制）。
+        // F9 在 Chat 模式下随时切换。
+        if self.mouse_capture {
             execute!(io::stdout(), EnableMouseCapture)?;
         }
         // 即使 main_loop 出错也先恢复终端，避免终端卡在 alternate screen。
@@ -435,6 +537,7 @@ impl App {
                     Mode::Chat => self.handle_chat_key(k),
                     Mode::ProviderForm => self.handle_provider_form_key(k),
                     Mode::McpForm => self.handle_mcp_form_key(k),
+                    Mode::ModelPicker => self.handle_model_picker_key(k),
                     Mode::Sessions => self.handle_sessions_key(k),
                     Mode::LogViewer => self.handle_log_viewer_key(k),
                     Mode::Welcome | Mode::Workflow | Mode::Dashboard | Mode::Settings => {
@@ -511,6 +614,8 @@ impl App {
                 }
             }
             ChatAction::ToggleLogs => self.toggle_log_viewer(),
+            ChatAction::ToggleMouse => self.toggle_mouse_capture(),
+            ChatAction::ToggleToolResult => self.chat.toggle_last_tool_result_expansion(),
             ChatAction::Quit => {
                 self.save_history();
                 self.should_quit = true;
@@ -528,19 +633,24 @@ impl App {
             ChatAction::HistoryPrev => {
                 // 空输入框时呼出更早的已发送消息；未呼出（非空/无历史）→ 交 textarea 移光标
                 if !self.chat.streaming {
-                    if !self.chat.history_prev() {
+                    if self.chat.history_prev() {
+                        // 历史浏览态：关闭斜杠菜单，避免菜单拦截后续 Up/Down
+                        self.chat.slash_menu.close();
+                    } else {
                         self.chat.input.input(k);
+                        self.chat.update_slash_menu();
                     }
-                    self.chat.update_slash_menu();
                 }
             }
             ChatAction::HistoryNext => {
                 // 浏览态呼出更新；非浏览态 → 交 textarea 移光标
                 if !self.chat.streaming {
-                    if !self.chat.history_next() {
+                    if self.chat.history_next() {
+                        self.chat.slash_menu.close();
+                    } else {
                         self.chat.input.input(k);
+                        self.chat.update_slash_menu();
                     }
-                    self.chat.update_slash_menu();
                 }
             }
             ChatAction::Input => {
@@ -589,14 +699,62 @@ impl App {
                     self.agent_handle = None;
                     self.save_history();
                 }
+                if self.compacting {
+                    self.compacting = false;
+                    self.save_history();
+                }
             }
             AgentEvent::Usage(u) => {
                 self.usage.add(&u);
+            }
+            AgentEvent::ContextUpdate {
+                used_tokens,
+                effective_context_length,
+            } => {
+                self.context_usage.used_tokens = used_tokens;
+                self.context_usage.effective_context_length = effective_context_length;
+            }
+            AgentEvent::Compacting { is_auto } => {
+                // 自动压缩在 streaming 期间发生，仅追加 System 提示；
+                // 手动压缩 compacting 已在 spawn_compact 置 true。
+                if is_auto {
+                    self.chat.entries.push(ChatEntry::System(
+                        "上下文已超过阈值，正在自动压缩…".into(),
+                    ));
+                } else {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("正在压缩上下文…".into()));
+                }
+            }
+            AgentEvent::Compacted {
+                summary,
+                before_tokens,
+                after_tokens,
+            } => {
+                // 压缩完成：用摘要替换全部对话历史。
+                // 摘要作为 User 条目（chat.history() 会转为 user Message），
+                // 使下一次请求以摘要为上下文起点。
+                self.chat.clear();
+                self.chat.entries.push(ChatEntry::User(summary));
+                self.usage = UsageStats::default();
+                self.context_usage.used_tokens = after_tokens;
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "上下文已压缩：{} → {} tokens",
+                    fmt_compact_tokens(before_tokens),
+                    fmt_compact_tokens(after_tokens)
+                )));
             }
             AgentEvent::Error(m) => {
                 if self.chat.streaming {
                     self.chat.finalize_stream();
                     self.save_history();
+                }
+                if self.compacting {
+                    self.compacting = false;
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("压缩失败: {m}")));
                 }
                 self.agent_handle = None;
                 self.toast = Some(format!("生成失败: {m}"));
@@ -614,7 +772,7 @@ impl App {
             FormAction::None => {}
             FormAction::Cancel => {
                 self.provider_form = None;
-                self.mode = self.prev_mode;
+                self.mode = self.form_prev_mode;
             }
             FormAction::Save => self.save_provider_form(),
             FormAction::Fetch => self.start_provider_fetch(),
@@ -622,13 +780,18 @@ impl App {
         }
     }
 
-    /// 接收异步模型拉取结果：非 ProviderForm 模式丢弃；否则 deliver_fetch。
+    /// 接收异步模型拉取结果：按当前模式分发（ProviderForm / ModelPicker），其余丢弃。
     fn handle_fetch_result(&mut self, fr: FetchResult) {
-        if self.mode != Mode::ProviderForm {
-            return;
-        }
-        if let Some(form) = self.provider_form.as_mut() {
-            form.deliver_fetch(fr.fetch_id, fr.result);
+        match self.mode {
+            Mode::ProviderForm => {
+                if let Some(form) = self.provider_form.as_mut() {
+                    form.deliver_fetch(fr.fetch_id, fr.result);
+                }
+            }
+            Mode::ModelPicker => {
+                self.model_picker.deliver_fetch(fr.fetch_id, fr.result);
+            }
+            _ => {}
         }
     }
 
@@ -648,6 +811,122 @@ impl App {
                 .map_err(|e| e.to_string());
             let _ = tx.send(FetchResult { fetch_id, result });
         });
+    }
+
+    /// `/model` 面板：为当前选中 provider 拉取模型列表。
+    /// 取 sorted_names[provider_selected] 的配置快照 spawn 异步任务。
+    fn start_model_fetch(&mut self) {
+        let names = self.providers.sorted_names();
+        let Some(name) = names.get(self.model_picker.provider_selected).cloned() else {
+            return;
+        };
+        let Some(cfg_snapshot) = self.providers.providers.get(&name).cloned() else {
+            return;
+        };
+        let fetch_id = self.model_picker.start_fetch();
+        let tx = self.fetch_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_models(&cfg_snapshot)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(FetchResult { fetch_id, result });
+        });
+    }
+
+    /// `/model` 面板：确认选择 → 设 default_provider + 更新 provider.model + 持久化 + 返回。
+    fn confirm_model_pick(&mut self) {
+        let names = self.providers.sorted_names();
+        let Some(name) = names.get(self.model_picker.provider_selected).cloned() else {
+            return;
+        };
+        let Some(model) = self.model_picker.models.get(self.model_picker.model_selected).cloned() else {
+            self.toast = Some("无模型可选".into());
+            return;
+        };
+        // 更新 provider 的 model 字段
+        if let Some(cfg) = self.providers.providers.get_mut(&name) {
+            cfg.model = model.clone();
+        }
+        self.config.agent.default_provider = name.clone();
+        // 持久化 config + providers
+        let cfg_res = save_config(&self.config, &self.paths.config_file);
+        let prov_res = save_providers(&self.providers, &self.paths.providers_file);
+        match (cfg_res, prov_res) {
+            (Ok(()), Ok(())) => {
+                self.toast = Some(format!("已切换到 {name} · {model}"));
+            }
+            (Err(e), _) => {
+                self.toast = Some(format!("config 保存失败: {e}"));
+            }
+            (_, Err(e)) => {
+                self.toast = Some(format!("providers 保存失败: {e}"));
+            }
+        }
+        self.mode = self.form_prev_mode;
+    }
+
+    /// `/model` 面板按键分发：双栏导航 + 拉取 + 确认。
+    ///
+    /// - Provider 栏（focus_models=false）：↑/↓ 切 provider 并自动拉取模型；Tab/Enter 切到 Models 栏。
+    /// - Model 栏（focus_models=true）：↑/↓ 选模型；Enter 确认保存；Tab 切回 Providers 栏。
+    /// - Esc：返回 prev_mode。
+    fn handle_model_picker_key(&mut self, k: KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // q / Ctrl+C 退出
+        if matches!(k.code, KeyCode::Char('q'))
+            || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.save_history();
+            self.should_quit = true;
+            return;
+        }
+        let provider_count = self.providers.providers.len();
+        match k.code {
+            KeyCode::Esc => {
+                self.mode = self.form_prev_mode;
+            }
+            KeyCode::Tab => {
+                self.model_picker.focus_models = !self.model_picker.focus_models;
+            }
+            KeyCode::Up => {
+                if self.model_picker.focus_models {
+                    if self.model_picker.model_selected > 0 {
+                        self.model_picker.model_selected -= 1;
+                    }
+                } else if provider_count > 0 {
+                    self.model_picker.provider_selected =
+                        (self.model_picker.provider_selected + provider_count - 1) % provider_count;
+                    self.start_model_fetch();
+                }
+            }
+            KeyCode::Down => {
+                if self.model_picker.focus_models {
+                    if self.model_picker.model_selected + 1 < self.model_picker.models.len() {
+                        self.model_picker.model_selected += 1;
+                    }
+                } else if provider_count > 0 {
+                    self.model_picker.provider_selected =
+                        (self.model_picker.provider_selected + 1) % provider_count;
+                    self.start_model_fetch();
+                }
+            }
+            KeyCode::Enter => {
+                if self.model_picker.focus_models {
+                    if self.model_picker.models.is_empty() {
+                        self.toast = Some("无模型可选，请先等待拉取或切换 provider".into());
+                    } else {
+                        self.confirm_model_pick();
+                    }
+                } else {
+                    // Provider 栏 Enter → 切到 Model 栏（若未拉取则触发拉取）
+                    self.model_picker.focus_models = true;
+                    if self.model_picker.models.is_empty() && !self.model_picker.fetching {
+                        self.start_model_fetch();
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// 保存 Provider 表单：校验 → upsert → 持久化（Settings 延迟 / Chat 立即）→ 返回 prev_mode。
@@ -677,7 +956,7 @@ impl App {
                     }
                 }
                 self.providers.upsert(&name, cfg);
-                let from_settings = self.prev_mode == Mode::Settings;
+                let from_settings = self.form_prev_mode == Mode::Settings;
                 if from_settings {
                     self.settings.dirty_providers = true;
                     self.toast = Some(format!("Provider '{name}' 已暂存（保存设置后写入）"));
@@ -693,7 +972,7 @@ impl App {
                     }
                 }
                 self.provider_form = None;
-                self.mode = self.prev_mode;
+                self.mode = self.form_prev_mode;
             }
         }
     }
@@ -708,7 +987,7 @@ impl App {
             McpFormAction::None => {}
             McpFormAction::Cancel => {
                 self.mcp_form = None;
-                self.mode = self.prev_mode;
+                self.mode = self.form_prev_mode;
             }
             McpFormAction::Save => self.save_mcp_form(),
         }
@@ -745,7 +1024,7 @@ impl App {
                 self.settings.dirty_mcp = true;
                 self.toast = Some(format!("MCP server '{name}' 已暂存（保存设置后写入，重启生效）"));
                 self.mcp_form = None;
-                self.mode = self.prev_mode;
+                self.mode = self.form_prev_mode;
             }
         }
     }
@@ -766,6 +1045,29 @@ impl App {
         let registry = self.registries.tools.clone();
         let handle = tokio::spawn(async move {
             run_stream(config, providers, project, text, history, tx, gen, mock, cwd, registry).await;
+        });
+        self.agent_handle = Some(handle);
+    }
+
+    /// 拉起一次手动上下文压缩任务（`/compact`）。
+    ///
+    /// 与 `spawn_agent` 类似：abort 旧任务 + bump generation（隔离 stale 事件）。
+    /// 置 `compacting = true` 阻止期间提交/切换；任务结束（Done/Error）由
+    /// `handle_agent_event` 复位。
+    fn spawn_compact(&mut self, history: Vec<Message>, custom_instructions: Option<String>) {
+        if let Some(h) = self.agent_handle.take() {
+            h.abort();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let gen = self.generation;
+        let config = self.config.clone();
+        let providers = self.providers.clone();
+        let project = self.project.clone();
+        let tx = self.agent_tx.clone();
+        let mock = self.mock;
+        self.compacting = true;
+        let handle = tokio::spawn(async move {
+            run_compact_stream(config, providers, project, history, custom_instructions, tx, gen, mock).await;
         });
         self.agent_handle = Some(handle);
     }
@@ -866,7 +1168,7 @@ impl App {
         match sub.as_str() {
             "" | "list" => {
                 self.sessions_panel.refresh(&self.sessions);
-                self.prev_mode = Mode::Chat;
+                self.form_prev_mode = Mode::Chat;
                 self.mode = Mode::Sessions;
             }
             "read" => {
@@ -1008,17 +1310,37 @@ impl App {
         }
     }
 
-    /// 切换日志查看器：已开则关（回 prev_mode），未开则读日志文件进入。
+    /// 切换日志查看器：已开则关（回 form_prev_mode），未开则读日志文件进入。
     fn toggle_log_viewer(&mut self) {
         if self.mode == Mode::LogViewer {
-            self.mode = self.prev_mode;
+            self.mode = self.form_prev_mode;
             return;
         }
         // 读取日志文件尾部（最多 1000 行）
         self.log_viewer.lines = read_log_tail(&self.paths.log_file, 1000);
         self.log_viewer.scroll = 0; // 0 = 定位到最末
-        self.prev_mode = self.mode;
+        self.form_prev_mode = self.mode;
         self.mode = Mode::LogViewer;
+    }
+
+    /// 切换鼠标捕获（F9）。
+    /// - 开启时：滚轮翻页（终端原生选区被禁用）。
+    /// - 关闭时：可拖拽选区复制（滚轮会被终端翻译为 ↑/↓，不再路由到 scroll_history）。
+    fn toggle_mouse_capture(&mut self) {
+        self.mouse_capture = !self.mouse_capture;
+        let res = if self.mouse_capture {
+            execute!(io::stdout(), EnableMouseCapture)
+        } else {
+            execute!(io::stdout(), DisableMouseCapture)
+        };
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "切换鼠标捕获失败");
+        }
+        self.toast = if self.mouse_capture {
+            Some("鼠标已启用：滚轮可翻页（F9 切回选择模式）".into())
+        } else {
+            Some("鼠标已禁用：可拖拽选区复制（F9 切回滚轮模式）".into())
+        };
     }
 
     /// LogViewer 按键：Esc/Ctrl+L 关闭，Up/Down/PageUp/PageDown 翻滚。
@@ -1028,7 +1350,7 @@ impl App {
         if k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::CONTROL)
             || k.code == KeyCode::Esc
         {
-            self.mode = self.prev_mode;
+            self.mode = self.form_prev_mode;
             return;
         }
         let total = self.log_viewer.lines.len();
@@ -1125,10 +1447,8 @@ impl App {
                         .entries
                         .push(ChatEntry::System("生成中，无法切换 provider".into()));
                 } else if name.is_empty() {
-                    self.chat.entries.push(ChatEntry::System(format!(
-                        "当前 provider：{}（用法：/model <provider>）",
-                        self.config.agent.default_provider
-                    )));
+                    // 无参数：打开 ModelPicker 面板选择 provider + model
+                    self.open_model_picker();
                 } else if self.providers.providers.contains_key(&name) {
                     self.config.agent.default_provider = name.clone();
                     self.chat
@@ -1178,6 +1498,27 @@ impl App {
                     self.chat
                         .entries
                         .push(ChatEntry::System("当前无生成任务".into()));
+                }
+            }
+            SlashCommand::Compact(instructions) => {
+                if self.chat.streaming || self.compacting {
+                    self.chat.entries.push(ChatEntry::System(
+                        "生成中，无法压缩上下文（先 /cancel）".into(),
+                    ));
+                } else {
+                    let history = self.chat.history();
+                    if history.is_empty() {
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System("无消息可压缩".into()));
+                    } else {
+                        let custom = if instructions.trim().is_empty() {
+                            None
+                        } else {
+                            Some(instructions.clone())
+                        };
+                        self.spawn_compact(history, custom);
+                    }
                 }
             }
             SlashCommand::MaxSteps(arg) => {
@@ -1272,7 +1613,7 @@ impl App {
                 }
             }
             "add" => {
-                self.prev_mode = Mode::Chat;
+                self.form_prev_mode = Mode::Chat;
                 self.provider_form = Some(ProviderFormState::empty());
                 self.mode = Mode::ProviderForm;
             }
@@ -1282,7 +1623,7 @@ impl App {
                         "用法：/provider edit <name>".into(),
                     ));
                 } else if let Some(cfg) = self.providers.providers.get(rest).cloned() {
-                    self.prev_mode = Mode::Chat;
+                    self.form_prev_mode = Mode::Chat;
                     self.provider_form = Some(ProviderFormState::from_provider(rest, &cfg));
                     self.mode = Mode::ProviderForm;
                 } else {
@@ -1415,9 +1756,28 @@ impl App {
         }
     }
 
+    /// 打开 `/model` 面板：重置状态 → 选中当前 default_provider → 自动拉取其模型列表。
+    fn open_model_picker(&mut self) {
+        self.form_prev_mode = self.mode;
+        self.model_picker = ModelPickerState::default();
+        // 选中当前 default_provider
+        let names = self.providers.sorted_names();
+        if let Some(idx) = names
+            .iter()
+            .position(|n| n == &self.config.agent.default_provider)
+        {
+            self.model_picker.provider_selected = idx;
+        }
+        self.mode = Mode::ModelPicker;
+        // 自动拉取当前 provider 的模型列表
+        if !names.is_empty() {
+            self.start_model_fetch();
+        }
+    }
+
     /// 从 Settings Providers 段打开新增表单。
     fn open_provider_form_add(&mut self) {
-        self.prev_mode = Mode::Settings;
+        self.form_prev_mode = self.mode;
         self.provider_form = Some(ProviderFormState::empty());
         self.mode = Mode::ProviderForm;
     }
@@ -1431,7 +1791,7 @@ impl App {
         let Some(cfg) = self.providers.providers.get(&name).cloned() else {
             return;
         };
-        self.prev_mode = Mode::Settings;
+        self.form_prev_mode = self.mode;
         self.provider_form = Some(ProviderFormState::from_provider(&name, &cfg));
         self.mode = Mode::ProviderForm;
     }
@@ -1490,7 +1850,7 @@ impl App {
 
     /// 从 Settings MCP 段打开新增表单。
     fn open_mcp_form_add(&mut self) {
-        self.prev_mode = Mode::Settings;
+        self.form_prev_mode = self.mode;
         self.mcp_form = Some(McpFormState::empty());
         self.mode = Mode::McpForm;
     }
@@ -1500,7 +1860,7 @@ impl App {
         let Some(spec) = self.mcp_config.servers.get(self.settings.mcp_selected).cloned() else {
             return;
         };
-        self.prev_mode = Mode::Settings;
+        self.form_prev_mode = self.mode;
         self.mcp_form = Some(McpFormState::from_spec(&spec));
         self.mode = Mode::McpForm;
     }
@@ -1524,11 +1884,16 @@ impl App {
             }
             return;
         }
-        // LogViewer / Sessions 模式：无 textarea，跳过
-        if self.mode == Mode::LogViewer || self.mode == Mode::Sessions {
+        // LogViewer / Sessions / ModelPicker 模式：无 textarea，跳过
+        if self.mode == Mode::LogViewer || self.mode == Mode::Sessions || self.mode == Mode::ModelPicker {
             return;
         }
-        self.chat.prepare_render(&self.theme);
+        // 历史区可用宽度 = 终端宽 - 2(边框) - 2(左右 padding)，用于工具结果折叠阈值的
+        // 可视行数计算。crossterm::terminal::size 失败时回退 80（不会 panic）。
+        let chat_width = crossterm::terminal::size()
+            .map(|(w, _)| w.saturating_sub(4))
+            .unwrap_or(80);
+        self.chat.prepare_render(&self.theme, chat_width);
         let border_fg = if self.chat.streaming {
             self.theme.muted
         } else {
@@ -1558,8 +1923,9 @@ impl App {
         if a != Action::Other && self.toast.is_some() {
             self.toast = None;
         }
-        // Settings 下：除 Esc/Quit/Other 外的任何动作取消"待丢弃"状态
-        if self.mode == Mode::Settings && !matches!(a, Action::Esc | Action::Quit | Action::Other) {
+        // Settings 下：除 Esc/Quit/Other/Enter 外的任何动作取消"待丢弃"状态
+        //（Enter 在 pending_discard 态用于"保存并退出"，不应取消）
+        if self.mode == Mode::Settings && !matches!(a, Action::Esc | Action::Quit | Action::Other | Action::Enter) {
             self.settings.pending_discard = false;
         }
         // Providers 段：非 DeleteProvider 的动作清除待删除确认（"任一其他键取消"）
@@ -1599,7 +1965,7 @@ impl App {
                         Mode::Chat => Mode::Workflow,
                         Mode::Workflow => Mode::Dashboard,
                         Mode::Dashboard => Mode::Chat,
-                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::Sessions | Mode::LogViewer => {
+                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::ModelPicker | Mode::Sessions | Mode::LogViewer => {
                             self.mode
                         }
                     };
@@ -1667,7 +2033,23 @@ impl App {
             }
             Action::Enter => {
                 if self.mode == Mode::Settings {
-                    if self.settings.on_providers_section() {
+                    if self.settings.pending_discard {
+                        // Esc 确认态：Enter 保存并退出
+                        self.save_settings();
+                        let still_dirty = self.settings.dirty
+                            || self.settings.dirty_providers
+                            || self.settings.dirty_mcp;
+                        if !still_dirty {
+                            self.settings.pending_discard = false;
+                            self.mode = self.prev_mode;
+                        }
+                    } else if self.settings.on_provider_save_row() {
+                        // Providers 段保存按钮：保存设置
+                        self.save_settings();
+                    } else if self.settings.on_mcp_save_row() {
+                        // MCP 段保存按钮：保存设置
+                        self.save_settings();
+                    } else if self.settings.on_providers_section() {
                         // Providers 段 Enter：设当前选中为默认 provider
                         let names = self.providers.sorted_names();
                         if let Some(name) = names.get(self.settings.provider_selected).cloned() {
@@ -1705,21 +2087,36 @@ impl App {
                 // Chat 走 handle_chat_key；Workflow/Dashboard 占位态：Enter 无操作
             }
             Action::AddProvider => {
-                if self.mode == Mode::Settings && self.settings.on_providers_section() {
+                if self.mode == Mode::Settings
+                    && self.settings.on_providers_section()
+                    && !self.settings.provider_on_save
+                {
                     self.open_provider_form_add();
-                } else if self.mode == Mode::Settings && self.settings.on_mcp_section() {
+                } else if self.mode == Mode::Settings
+                    && self.settings.on_mcp_section()
+                    && !self.settings.mcp_on_save
+                {
                     self.open_mcp_form_add();
                 }
             }
             Action::EditProvider => {
-                if self.mode == Mode::Settings && self.settings.on_providers_section() {
+                if self.mode == Mode::Settings
+                    && self.settings.on_providers_section()
+                    && !self.settings.provider_on_save
+                {
                     self.open_provider_form_edit();
-                } else if self.mode == Mode::Settings && self.settings.on_mcp_section() {
+                } else if self.mode == Mode::Settings
+                    && self.settings.on_mcp_section()
+                    && !self.settings.mcp_on_save
+                {
                     self.open_mcp_form_edit();
                 }
             }
             Action::DeleteProvider => {
-                if self.mode == Mode::Settings && self.settings.on_providers_section() {
+                if self.mode == Mode::Settings
+                    && self.settings.on_providers_section()
+                    && !self.settings.provider_on_save
+                {
                     let cur = self.settings.provider_selected;
                     if self.settings.pending_delete_idx == Some(cur) {
                         // 二次 d：执行删除
@@ -1728,7 +2125,10 @@ impl App {
                         // 首次 d：标记待删除
                         self.settings.pending_delete_idx = Some(cur);
                     }
-                } else if self.mode == Mode::Settings && self.settings.on_mcp_section() {
+                } else if self.mode == Mode::Settings
+                    && self.settings.on_mcp_section()
+                    && !self.settings.mcp_on_save
+                {
                     let cur = self.settings.mcp_selected;
                     if self.settings.mcp_pending_delete_idx == Some(cur) {
                         self.delete_selected_mcp();
@@ -1751,14 +2151,8 @@ impl App {
                 self.chat.invalidate_cache();
             }
             LiveApply::Mouse => {
-                let res = if self.config.ui.mouse {
-                    execute!(io::stdout(), EnableMouseCapture)
-                } else {
-                    execute!(io::stdout(), DisableMouseCapture)
-                };
-                if let Err(e) = res {
-                    tracing::warn!(error = %e, "切换鼠标捕获失败");
-                }
+                // 鼠标捕获在 run 开始时已总是启用，此处不再动态切换。
+                // config.ui.mouse 字段保留但不再控制鼠标捕获。
             }
         }
     }
@@ -1800,13 +2194,14 @@ impl App {
         }
     }
 
-    /// 退出设置：dirty（config / providers / mcp）时首次 Esc 提示，二次 Esc 回退到快照后返回 prev_mode。
+    /// 退出设置：dirty（config / providers / mcp）时首次 Esc 提示（Enter 保存退出 / 再按 Esc 丢弃），
+    /// 二次 Esc 回退到快照后返回 prev_mode。
     fn exit_settings(&mut self) {
         let dirty = self.settings.dirty || self.settings.dirty_providers || self.settings.dirty_mcp;
         if dirty {
             if !self.settings.pending_discard {
                 self.settings.pending_discard = true;
-                self.toast = Some("再按 Esc 丢弃改动，或选择「保存设置」".into());
+                self.toast = Some("Enter 保存退出 / 再按 Esc 丢弃退出".into());
                 return;
             }
             // 二次 Esc：回退到进入时的快照（config + providers + mcp）
@@ -1872,19 +2267,40 @@ impl App {
                 self.selected,
                 self.toast.as_deref(),
             ),
-            Mode::Chat => views::chat::render(
-                frame,
-                area,
-                &self.theme,
-                &self.chat,
-                self.project.as_ref(),
-                &self.config.agent.default_provider,
-                &self.usage,
-                self.providers
+            Mode::Chat => {
+                // 组合显示标签：provider 名 + model 显示名（alias 优先）
+                let provider_label = self
+                    .providers
                     .providers
                     .get(&self.config.agent.default_provider)
-                    .and_then(|p| p.price.as_ref()),
-            ),
+                    .map(|p| {
+                        let display = p.model_display_name();
+                        if display != p.model {
+                            format!("{} · {}", self.config.agent.default_provider, display)
+                        } else if !p.model.is_empty() {
+                            format!("{} · {}", self.config.agent.default_provider, p.model)
+                        } else {
+                            self.config.agent.default_provider.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| self.config.agent.default_provider.clone());
+                let effective_price = self
+                    .providers
+                    .providers
+                    .get(&self.config.agent.default_provider)
+                    .and_then(|p| p.effective_price());
+                views::chat::render(
+                    frame,
+                    area,
+                    &self.theme,
+                    &self.chat,
+                    self.project.as_ref(),
+                    &provider_label,
+                    &self.usage,
+                    effective_price,
+                    &self.context_usage,
+                )
+            }
             Mode::Workflow => views::chat::render_placeholder(
                 frame,
                 area,
@@ -1911,6 +2327,7 @@ impl App {
                 &self.registries.skills,
                 &self.settings,
                 self.has_project_config,
+                self.toast.as_deref(),
             ),
             Mode::ProviderForm => {
                 if let Some(form) = &self.provider_form {
@@ -1922,6 +2339,14 @@ impl App {
                     views::mcp_form::render_form(frame, area, &self.theme, form);
                 }
             }
+            Mode::ModelPicker => views::model_picker::render(
+                frame,
+                area,
+                &self.theme,
+                &self.model_picker,
+                &self.providers,
+                &self.config.agent.default_provider,
+            ),
             Mode::Sessions => views::sessions::render(
                 frame,
                 area,
@@ -1942,7 +2367,7 @@ impl App {
             .border_style(Style::default().fg(self.theme.accent))
             .title(
                 Line::from(format!(
-                    " 日志 {} · {} 行 · Ctrl+R 刷新 · Esc 关闭 ",
+                    " 日志 {} · {} 行 · Ctrl+R 刷新 · Esc/Ctrl+L 关闭 ",
                     self.paths.log_file.display(),
                     self.log_viewer.lines.len()
                 ))
@@ -1965,19 +2390,10 @@ impl App {
         let visible_h = inner.height as usize;
         let end = total.saturating_sub(self.log_viewer.scroll);
         let start = end.saturating_sub(visible_h);
+        // 解析 ANSI 颜色码 → ratatui Span（只解析可见行，避免全量解析开销）
         let visible: Vec<Line> = self.log_viewer.lines[start..end.min(total)]
             .iter()
-            .map(|s| {
-                // WARN/ERROR 行高亮
-                let style = if s.contains("ERROR") {
-                    Style::default().fg(self.theme.accent)
-                } else if s.contains("WARN") {
-                    Style::default().fg(self.theme.muted)
-                } else {
-                    Style::default().fg(self.theme.fg)
-                };
-                Line::from(s.clone()).style(style)
-            })
+            .map(|s| ansi_to_line(s, &self.theme))
             .collect();
 
         frame.render_widget(
@@ -1991,18 +2407,42 @@ impl App {
             Mode::Welcome => " ↑/↓ 导航   Enter 确认   s 设置   q 退出",
             Mode::Settings => " ↑↓ 行  Tab 段  Enter 编辑/保存  ←→ 调整  Esc 返回  q 退出",
             Mode::Chat if self.chat.streaming => " ● 流式生成中… Esc 取消 · Ctrl+C 退出",
-            Mode::Chat => " ○ 就绪 · 输入消息 Enter 发送",
+            Mode::Chat if self.mouse_capture => " ○ 就绪 · Enter 发送 · F9 切选择模式",
+            Mode::Chat => " ○ 选择模式 · 可拖拽复制 · F9 切回滚轮",
             Mode::ProviderForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 kind  Esc 取消",
             Mode::McpForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 transport  Esc 取消",
             Mode::Sessions => " ↑↓ 选会话  Enter 切换  n 新建  d 删除  Esc 返回  q 退出",
+            Mode::ModelPicker => " ↑↓ 导航  Tab 切换栏  Enter 选择/确认  Esc 返回  q 退出",
             Mode::LogViewer => " ↑↓ 翻滚  PageUp/PageDown 翻页  Ctrl+R 刷新  Esc/Ctrl+L 关闭",
             _ => " Tab 切换模式   s 设置   Esc 返回 Welcome   q 退出",
         };
+
+        // 右下角 Ctrl+L 热键提示（所有模式常驻）
+        let right_hint = " Ctrl+L 日志 ";
+        let right_len = right_hint.len() as u16;
+        let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_len)])
+            .split(area);
+
         frame.render_widget(
             Paragraph::new(Line::from(hint))
                 .style(Style::default().bg(self.theme.muted).fg(self.theme.bg)),
-            area,
+            chunks[0],
         );
+        frame.render_widget(
+            Paragraph::new(Line::from(right_hint))
+                .style(Style::default().bg(self.theme.muted).fg(self.theme.bg)),
+            chunks[1],
+        );
+    }
+}
+
+/// 格式化压缩前后的 token 计数（用于 Compacted 事件展示）。
+/// < 1000 原样，≥ 1000 用 k 单位（如 12.3k）。
+fn fmt_compact_tokens(n: usize) -> String {
+    if n < 1000 {
+        format!("{n}")
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
     }
 }
 
@@ -2017,6 +2457,79 @@ fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// 把带 ANSI SGR 转义码的字符串解析为 ratatui `Line`（多 `Span`，各带样式）。
+///
+/// 支持 tracing-subscriber 输出的常见码：dim(2)、bold(1)、italic(3)、
+/// 前景色 30-37/90-97、reset(0)。不支持的码静默忽略。
+fn ansi_to_line(s: &str, theme: &Theme) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    let mut remaining = s;
+
+    while let Some(esc_pos) = remaining.find('\x1b') {
+        // 输出转义序列前的文本
+        if esc_pos > 0 {
+            spans.push(Span::styled(remaining[..esc_pos].to_string(), style));
+        }
+        remaining = &remaining[esc_pos + 1..]; // 跳过 ESC
+
+        // 只处理 CSI 序列（\x1b[...m），其它 ESC 序列跳过
+        if remaining.starts_with('[') {
+            if let Some(m_pos) = remaining.find('m') {
+                let codes = &remaining[1..m_pos];
+                style = parse_sgr(codes, style, theme);
+                remaining = &remaining[m_pos + 1..];
+            } else {
+                // 无 'm' 结束符，跳过剩余
+                break;
+            }
+        }
+        // 非 '[' 开头的 ESC 序列直接跳过（不影响 style）
+    }
+
+    if !remaining.is_empty() {
+        spans.push(Span::styled(remaining.to_string(), style));
+    }
+    if spans.is_empty() {
+        Line::from("")
+    } else {
+        Line::from(spans)
+    }
+}
+
+/// 解析 SGR 码字符串（如 `"2"` 或 `"1;32"`）为 ratatui `Style`。
+fn parse_sgr(codes: &str, base: Style, theme: &Theme) -> Style {
+    let mut style = base;
+    for code_str in codes.split(';') {
+        let code: u16 = code_str.parse().unwrap_or(0);
+        match code {
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            30 => style = style.fg(Color::Black),
+            31 => style = style.fg(theme.accent),
+            32 => style = style.fg(Color::Green),
+            33 => style = style.fg(Color::Yellow),
+            34 => style = style.fg(Color::Blue),
+            35 => style = style.fg(Color::Magenta),
+            36 => style = style.fg(Color::Cyan),
+            37 => style = style.fg(Color::Gray),
+            90 => style = style.fg(Color::DarkGray),
+            91 => style = style.fg(Color::LightRed),
+            92 => style = style.fg(Color::LightGreen),
+            93 => style = style.fg(Color::LightYellow),
+            94 => style = style.fg(Color::LightBlue),
+            95 => style = style.fg(Color::LightMagenta),
+            96 => style = style.fg(Color::LightCyan),
+            97 => style = style.fg(Color::White),
+            _ => {}
+        }
+    }
+    style
 }
 
 #[cfg(test)]
@@ -2132,6 +2645,54 @@ mod tests {
         app.handle_action(Action::OpenSettings);
         app.handle_action(Action::Esc);
         assert_eq!(app.mode, Mode::Chat, "无改动时 Esc 应直接返回");
+    }
+
+    #[test]
+    fn esc_exits_after_provider_form_closed() {
+        // 回归测试：从 Settings 打开 ProviderForm → 关闭表单 → Esc 应退出 Settings
+        // 之前 bug：表单覆盖 prev_mode=Settings，导致 exit_settings 回到 Settings（卡住）
+        let path = temp_config_path();
+        let mut app = make_app(Mode::Chat, path.clone());
+        app.handle_action(Action::OpenSettings);
+        assert_eq!(app.prev_mode, Mode::Chat);
+        // 打开 provider 表单（从 Settings）
+        app.open_provider_form_add();
+        assert_eq!(app.mode, Mode::ProviderForm);
+        assert_eq!(app.form_prev_mode, Mode::Settings);
+        // prev_mode 不应被覆盖
+        assert_eq!(app.prev_mode, Mode::Chat, "打开表单不应覆盖 prev_mode");
+        // 关闭表单（Cancel）
+        app.provider_form = None;
+        app.mode = app.form_prev_mode;
+        assert_eq!(app.mode, Mode::Settings, "表单关闭后应回到 Settings");
+        // Esc 应退出 Settings（无 dirty 时直接退出）
+        app.handle_action(Action::Esc);
+        assert_eq!(app.mode, Mode::Chat, "Esc 应退出到 Chat，不应卡在 Settings");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn esc_then_enter_saves_and_exits() {
+        let path = temp_config_path();
+        let mut app = make_app(Mode::Chat, path.clone());
+        app.handle_action(Action::OpenSettings);
+        app.handle_action(Action::Right); // theme → dracula, dirty
+        assert!(app.settings.dirty);
+        // 首次 Esc：进入确认态
+        app.handle_action(Action::Esc);
+        assert_eq!(app.mode, Mode::Settings, "首次 Esc 不应退出");
+        assert!(app.settings.pending_discard);
+        // Enter：保存并退出
+        app.handle_action(Action::Enter);
+        assert_eq!(app.mode, Mode::Chat, "Enter 应保存并退出");
+        assert!(!app.settings.dirty, "保存后 dirty 应清");
+        assert!(!app.settings.pending_discard);
+        assert!(
+            app.toast.as_deref().unwrap_or("").contains("已保存"),
+            "应提示已保存，实际: {:?}",
+            app.toast
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -2540,7 +3101,7 @@ mod tests {
         app.handle_slash_command("/new"); // 凑出 2 个 session
         app.handle_slash_command("/sessions");
         assert_eq!(app.mode, Mode::Sessions, "/sessions 应进入 Sessions 面板");
-        assert_eq!(app.prev_mode, Mode::Chat, "prev_mode 应记为 Chat");
+        assert_eq!(app.form_prev_mode, Mode::Chat, "form_prev_mode 应记为 Chat");
         assert_eq!(
             app.sessions_panel.list.len(),
             app.sessions.sessions.len(),
@@ -2733,5 +3294,174 @@ mod tests {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.handle_slash_command("/max_steps 1");
         assert_eq!(app.config.agent.max_steps, 1);
+    }
+
+    // ── /model 面板（ModelPicker） ──────────────────────────────────────────
+
+    fn make_app_with_providers(initial: Mode, config_file: PathBuf) -> App {
+        let mut app = make_app(initial, config_file);
+        app.providers = ProvidersConfig::default_template();
+        app.config.agent.default_provider = "openai".into();
+        app
+    }
+
+    #[tokio::test]
+    async fn model_no_arg_opens_picker_panel() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model");
+        assert_eq!(app.mode, Mode::ModelPicker, "/model 无参数应打开 ModelPicker 面板");
+        assert_eq!(app.form_prev_mode, Mode::Chat);
+        // 选中项应指向当前 default_provider（openai）
+        // sorted_names = ["anthropic", "ollama", "openai"] → openai 在 idx=2
+        let names = app.providers.sorted_names();
+        let expected_idx = names.iter().position(|n| n == "openai").unwrap();
+        assert_eq!(app.model_picker.provider_selected, expected_idx);
+        // 应自动发起拉取
+        assert!(app.model_picker.fetching, "打开面板应自动拉取当前 provider 模型");
+    }
+
+    #[test]
+    fn model_with_arg_switches_provider_directly() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model ollama");
+        assert_eq!(app.mode, Mode::Chat, "/model <provider> 不应打开面板");
+        assert_eq!(app.config.agent.default_provider, "ollama");
+    }
+
+    #[tokio::test]
+    async fn model_picker_esc_returns_to_prev() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model");
+        assert_eq!(app.mode, Mode::ModelPicker);
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Chat, "Esc 应返回 prev_mode");
+    }
+
+    #[tokio::test]
+    async fn model_picker_tab_toggles_focus() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model");
+        assert!(!app.model_picker.focus_models, "初始焦点应在 provider 栏");
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Tab));
+        assert!(app.model_picker.focus_models, "Tab 应切到 model 栏");
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Tab));
+        assert!(!app.model_picker.focus_models, "再 Tab 切回 provider 栏");
+    }
+
+    #[tokio::test]
+    async fn model_picker_confirm_saves_provider_and_model() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        // 打开面板
+        app.handle_slash_command("/model");
+        // 模拟拉取成功
+        let fid = app.model_picker.fetch_id;
+        app.model_picker.deliver_fetch(fid, Ok(vec!["gpt-4o".into(), "gpt-4o-mini".into()]));
+        assert!(!app.model_picker.fetching);
+        assert_eq!(app.model_picker.models.len(), 2);
+        // 切到 model 栏选第二个模型
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Tab));
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Down));
+        assert_eq!(app.model_picker.model_selected, 1);
+        // Enter 确认
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Chat, "确认后应返回 Chat");
+        assert_eq!(app.config.agent.default_provider, "openai");
+        assert_eq!(app.providers.providers["openai"].model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn model_picker_provider_nav_triggers_fetch() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model");
+        let fid0 = app.model_picker.fetch_id;
+        // openai 在 sorted_names idx=2，Down 后 wrap 到 idx=0（anthropic）
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Down));
+        let names = app.providers.sorted_names();
+        assert_eq!(app.model_picker.provider_selected, 0, "Down 应切到 sorted_names[0]");
+        assert_eq!(names[0], "anthropic");
+        assert!(app.model_picker.fetching, "切换 provider 应触发拉取");
+        assert_ne!(app.model_picker.fetch_id, fid0, "fetch_id 应 bump");
+        // models 应被清空（旧结果清除）
+        assert!(app.model_picker.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_picker_enter_on_empty_models_toasts() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model");
+        // 模拟拉取失败
+        let fid = app.model_picker.fetch_id;
+        app.model_picker.deliver_fetch(fid, Err("timeout".into()));
+        // 切到 model 栏，Enter 应 toast 而非确认
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Tab));
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Enter));
+        assert_eq!(app.mode, Mode::ModelPicker, "无模型时 Enter 不应退出");
+        assert!(app.toast.as_deref().unwrap_or("").contains("无模型"));
+    }
+
+    #[test]
+    fn model_picker_state_start_fetch_bumps_id() {
+        let mut s = ModelPickerState::default();
+        s.models = vec!["old".into()];
+        let id1 = s.start_fetch();
+        assert!(s.fetching);
+        assert!(s.models.is_empty(), "start_fetch 应清空旧 models");
+        let id2 = s.start_fetch();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn model_picker_state_deliver_stale_ignored() {
+        let mut s = ModelPickerState::default();
+        let id = s.start_fetch();
+        s.deliver_fetch(id.wrapping_sub(1), Ok(vec!["m".into()]));
+        assert!(s.fetching, "stale 结果应被忽略");
+        assert!(s.models.is_empty());
+    }
+
+    #[test]
+    fn model_picker_state_deliver_success_populates() {
+        let mut s = ModelPickerState::default();
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Ok(vec!["a".into(), "b".into()]));
+        assert!(!s.fetching);
+        assert_eq!(s.models.len(), 2);
+        assert_eq!(s.model_selected, 0);
+    }
+
+    #[test]
+    fn model_picker_state_deliver_error_stores() {
+        let mut s = ModelPickerState::default();
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Err("boom".into()));
+        assert!(!s.fetching);
+        assert_eq!(s.fetch_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn model_picker_state_deliver_empty_errors() {
+        let mut s = ModelPickerState::default();
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Ok(vec![]));
+        assert!(!s.fetching);
+        assert!(s.fetch_error.is_some(), "空模型列表应记为错误");
+    }
+
+    #[test]
+    fn model_picker_blocked_during_streaming() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        app.handle_slash_command("/model");
+        assert_eq!(app.mode, Mode::Chat, "流式期 /model 应被阻止");
+        assert!(app.chat.streaming);
+    }
+
+    #[tokio::test]
+    async fn model_picker_render_does_not_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/model");
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
     }
 }

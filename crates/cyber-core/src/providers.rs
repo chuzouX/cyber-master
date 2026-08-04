@@ -28,9 +28,38 @@ pub struct ProviderConfig {
     pub temperature: f32,
     /// 每百万 token 价格（美元），用于 TUI 显示成本。可选，缺省时不显示成本。
     pub price: Option<PriceConfig>,
+    /// 每个 model 的专属配置（覆盖 provider 级默认值）。key = model id。
+    #[serde(default)]
+    pub models: HashMap<String, ModelConfig>,
 }
 
-/// token 单价配置（每百万 token 美元）。
+/// 单个 model 的专属配置（覆盖 provider 级默认值）。
+///
+/// 存于 `ProviderConfig::models` map，key 为 model id。所有字段可选：
+/// 缺省时回退到 provider 级的 `max_tokens` / `temperature` / `price`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelConfig {
+    /// 显示别名（空则用 model id）。/model 面板和 chat 标题显示用，不影响 API 调用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// 上下文长度（token 数，如 128000）。空则未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    /// 最大输出 token 数（覆盖 provider.max_tokens）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// 采样温度（覆盖 provider.temperature）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// 价格配置（覆盖 provider.price）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<PriceConfig>,
+    /// 备注（自由文本）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// token 单价配置（每百万 token）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PriceConfig {
     /// 每百万输入 token（缓存未命中）价格。
@@ -39,6 +68,9 @@ pub struct PriceConfig {
     pub output_per_m: Option<f64>,
     /// 每百万输入 token（缓存命中）价格。缺省时回退到 input_per_m。
     pub cache_hit_per_m: Option<f64>,
+    /// 价格货币："usd"（美元）或 "cny"（人民币）。缺省 "usd"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -51,6 +83,7 @@ impl Default for ProviderConfig {
             max_tokens: 4096,
             temperature: 0.7,
             price: None,
+            models: HashMap::new(),
         }
     }
 }
@@ -125,6 +158,59 @@ impl ProviderConfig {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         self.api_key = self.api_key.trim().to_string();
         self.model = self.model.trim().to_string();
+    }
+
+    /// 当前 model 的专属配置（若存在）。
+    pub fn current_model_config(&self) -> Option<&ModelConfig> {
+        self.models.get(&self.model)
+    }
+
+    /// 当前 model 的有效 max_tokens：per-model 优先，回退到 provider 级。
+    pub fn effective_max_tokens(&self) -> u32 {
+        self.current_model_config()
+            .and_then(|m| m.max_tokens)
+            .unwrap_or(self.max_tokens)
+    }
+
+    /// 当前 model 的有效 temperature：per-model 优先，回退到 provider 级。
+    pub fn effective_temperature(&self) -> f32 {
+        self.current_model_config()
+            .and_then(|m| m.temperature)
+            .unwrap_or(self.temperature)
+    }
+
+    /// 当前 model 的有效价格：per-model 优先，回退到 provider 级。
+    pub fn effective_price(&self) -> Option<&PriceConfig> {
+        self.current_model_config()
+            .and_then(|m| m.price.as_ref())
+            .or(self.price.as_ref())
+    }
+
+    /// 当前 model 的有效货币："usd" 或 "cny"。缺省 "usd"。
+    pub fn effective_currency(&self) -> &str {
+        self.effective_price()
+            .and_then(|p| p.currency.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("usd")
+    }
+
+    /// 当前 model 的显示名：per-model alias 非空则用 alias，否则用 model id。
+    /// 用于 /model 面板、chat 标题等 UI 展示；API 调用始终用 `self.model`。
+    pub fn model_display_name(&self) -> &str {
+        self.current_model_config()
+            .and_then(|m| m.alias.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.model)
+    }
+
+    /// 当前 model 的有效上下文长度（token 数）。仅 per-model 配置生效；
+    /// 未配置时返回 None（调用方应回退到默认值，如 128_000）。
+    ///
+    /// 用于自动上下文压缩阈值计算与 TUI 状态栏剩余百分比显示。
+    pub fn effective_context_length(&self) -> Option<u32> {
+        self.current_model_config()
+            .and_then(|m| m.context_length)
+            .filter(|&n| n > 0)
     }
 }
 
@@ -261,5 +347,259 @@ mod tests {
         assert!(removed.is_some());
         assert!(!cfg.providers.contains_key("openai"));
         assert!(cfg.remove("nope").is_none());
+    }
+
+    // ── ModelConfig / effective_* 测试 ──
+
+    #[test]
+    fn effective_params_fallback_to_provider_level() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.max_tokens = 4096;
+        p.temperature = 0.5;
+        // 无 per-model 配置 → 回退到 provider 级
+        assert_eq!(p.effective_max_tokens(), 4096);
+        assert!((p.effective_temperature() - 0.5).abs() < 1e-6);
+        assert_eq!(p.model_display_name(), "gpt-4o");
+    }
+
+    #[test]
+    fn effective_params_per_model_overrides() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.max_tokens = 4096;
+        p.temperature = 0.5;
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                alias: Some("我的GPT".into()),
+                max_tokens: Some(8192),
+                temperature: Some(0.1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.effective_max_tokens(), 8192);
+        assert!((p.effective_temperature() - 0.1).abs() < 1e-6);
+        assert_eq!(p.model_display_name(), "我的GPT");
+    }
+
+    #[test]
+    fn effective_price_per_model_overrides() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.price = Some(PriceConfig {
+            input_per_m: Some(2.5),
+            ..Default::default()
+        });
+        // per-model price 覆盖
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                price: Some(PriceConfig {
+                    input_per_m: Some(5.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let eff = p.effective_price().unwrap();
+        assert!((eff.input_per_m.unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_price_falls_back_to_provider() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.price = Some(PriceConfig {
+            input_per_m: Some(2.5),
+            ..Default::default()
+        });
+        // per-model 有配置但 price=None → 回退到 provider 级
+        p.models.insert("gpt-4o".into(), ModelConfig::default());
+        let eff = p.effective_price().unwrap();
+        assert!((eff.input_per_m.unwrap() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_display_name_empty_alias_falls_back() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                alias: Some(String::new()), // 空字符串
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.model_display_name(), "gpt-4o");
+    }
+
+    #[test]
+    fn model_display_name_no_per_model_config() {
+        let mut p = ProviderConfig::default();
+        p.model = "claude-3".into();
+        // 无 per-model 配置
+        assert_eq!(p.model_display_name(), "claude-3");
+    }
+
+    #[test]
+    fn effective_params_model_not_in_models_map() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o-mini".into();
+        p.max_tokens = 2048;
+        // models 有 gpt-4o 但当前 model 是 gpt-4o-mini
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                max_tokens: Some(8192),
+                ..Default::default()
+            },
+        );
+        // gpt-4o-mini 不在 models → 回退到 provider 级
+        assert_eq!(p.effective_max_tokens(), 2048);
+    }
+
+    #[test]
+    fn effective_context_length_per_model() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                context_length: Some(128_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.effective_context_length(), Some(128_000));
+    }
+
+    #[test]
+    fn effective_context_length_none_when_not_configured() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        // 无 per-model 配置
+        assert_eq!(p.effective_context_length(), None);
+        // 即便配置了，0 也视作未配置
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                context_length: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.effective_context_length(), None);
+    }
+
+    #[test]
+    fn effective_context_length_falls_back_when_model_not_in_map() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o-mini".into();
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                context_length: Some(128_000),
+                ..Default::default()
+            },
+        );
+        // 当前 model 不在 models → None（无 provider 级回退）
+        assert_eq!(p.effective_context_length(), None);
+    }
+
+    #[test]
+    fn effective_currency_defaults_to_usd() {
+        let p = ProviderConfig::default();
+        assert_eq!(p.effective_currency(), "usd");
+    }
+
+    #[test]
+    fn effective_currency_from_provider_price() {
+        let mut p = ProviderConfig::default();
+        p.price = Some(PriceConfig {
+            input_per_m: Some(2.5),
+            currency: Some("cny".into()),
+            ..Default::default()
+        });
+        assert_eq!(p.effective_currency(), "cny");
+    }
+
+    #[test]
+    fn effective_currency_per_model_overrides_provider() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.price = Some(PriceConfig {
+            input_per_m: Some(2.5),
+            currency: Some("usd".into()),
+            ..Default::default()
+        });
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                price: Some(PriceConfig {
+                    input_per_m: Some(2.5),
+                    currency: Some("cny".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.effective_currency(), "cny");
+    }
+
+    #[test]
+    fn model_config_serde_roundtrip() {
+        let mc = ModelConfig {
+            alias: Some("别名".into()),
+            context_length: Some(128000),
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            price: Some(PriceConfig {
+                input_per_m: Some(2.5),
+                output_per_m: Some(10.0),
+                cache_hit_per_m: None,
+                ..Default::default()
+            }),
+            notes: Some("测试备注".into()),
+        };
+        let json = serde_json::to_string(&mc).unwrap();
+        let mc2: ModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(mc2.alias, Some("别名".into()));
+        assert_eq!(mc2.context_length, Some(128000));
+        assert_eq!(mc2.notes, Some("测试备注".into()));
+    }
+
+    #[test]
+    fn provider_config_with_models_serde_roundtrip() {
+        let mut p = ProviderConfig::default();
+        p.model = "gpt-4o".into();
+        p.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                alias: Some("GPT4o".into()),
+                context_length: Some(128000),
+                ..Default::default()
+            },
+        );
+        let toml_str = toml::to_string(&p).unwrap();
+        let p2: ProviderConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(p2.model, "gpt-4o");
+        assert!(p2.models.contains_key("gpt-4o"));
+        assert_eq!(p2.models["gpt-4o"].alias, Some("GPT4o".into()));
+    }
+
+    #[test]
+    fn provider_config_without_models_backwards_compat() {
+        // 旧配置无 models 字段，serde(default) 应正常解析
+        let toml_str = r#"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-x"
+model = "gpt-4o"
+max_tokens = 4096
+temperature = 0.7
+"#;
+        let p: ProviderConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.model, "gpt-4o");
+        assert!(p.models.is_empty());
+        assert_eq!(p.effective_max_tokens(), 4096);
     }
 }

@@ -75,7 +75,6 @@ impl Tool for FindFileTool {
             let mut matches: Vec<String> = Vec::new();
             walk_dir(
                 &resolved,
-                &resolved,
                 &pattern_lower,
                 content_lower.as_deref(),
                 recursive,
@@ -116,15 +115,14 @@ impl Tool for FindFileTool {
 
 /// 递归遍历目录，收集匹配的文件路径。
 ///
-/// - `root` 是搜索根目录（用于计算相对路径）
 /// - `pattern_lower` 是文件名匹配子串（小写），空串匹配所有
 /// - `content_lower` 是内容关键词（小写），None 时不搜索内容
 /// - `recursive` 控制是否进入子目录
 /// - `max_depth` = Some(n) 时限制深度，None 无限制
 /// - `depth` 是当前深度（从 0 开始）
+#[allow(clippy::too_many_arguments)]
 fn walk_dir(
     dir: &Path,
-    root: &Path,
     pattern_lower: &str,
     content_lower: Option<&str>,
     recursive: bool,
@@ -178,7 +176,6 @@ fn walk_dir(
             }
             walk_dir(
                 &path,
-                root,
                 pattern_lower,
                 content_lower,
                 recursive,

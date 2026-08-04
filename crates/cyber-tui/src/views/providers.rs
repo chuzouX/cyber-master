@@ -19,7 +19,7 @@ use ratatui::{
 };
 use tui_textarea::TextArea;
 
-use cyber_core::{ProviderConfig, ProviderConfig as _Cfg, ProvidersConfig, PROVIDER_KINDS};
+use cyber_core::{ModelConfig, PriceConfig, ProviderConfig, ProviderConfig as _Cfg, ProvidersConfig, PROVIDER_KINDS};
 
 use crate::theme::Theme;
 
@@ -36,27 +36,37 @@ struct FieldDef {
     kind: FieldKind,
 }
 
+/// 价格货币选项（←→ 循环）。与 `PriceConfig::currency` 对应。
+const CURRENCIES: &[(&str, &str)] = &[("usd", "美元"), ("cny", "人民币")];
+
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
-/// 0-6 为数据字段，7-9 为价格字段，10=拉取模型，11=保存，12=取消。
+/// 0-4 provider 基本字段，5-12 为当前 model 的参数，13=价格单位，
+/// 14=拉取模型，15=保存，16=取消。
 const FIELDS: &[FieldDef] = &[
     FieldDef { label: "名称 name", kind: FieldKind::Text },
     FieldDef { label: "类型 kind", kind: FieldKind::Enum },
     FieldDef { label: "base_url", kind: FieldKind::Text },
     FieldDef { label: "api_key", kind: FieldKind::Text },
     FieldDef { label: "model", kind: FieldKind::Text },
-    FieldDef { label: "max_tokens", kind: FieldKind::Text },
-    FieldDef { label: "temperature", kind: FieldKind::Text },
-    FieldDef { label: "输入价格 $/M (input_per_m)", kind: FieldKind::Text },
-    FieldDef { label: "输出价格 $/M (output_per_m)", kind: FieldKind::Text },
-    FieldDef { label: "缓存命中价格 $/M (cache_hit_per_m)", kind: FieldKind::Text },
+    FieldDef { label: "别名 alias（显示名，留空用 model id）", kind: FieldKind::Text },
+    FieldDef { label: "上下文长度 context_length", kind: FieldKind::Text },
+    FieldDef { label: "max_tokens（最大输出 token）", kind: FieldKind::Text },
+    FieldDef { label: "temperature（温度）", kind: FieldKind::Text },
+    FieldDef { label: "输入价格 /M (input_per_m)", kind: FieldKind::Text },
+    FieldDef { label: "输出价格 /M (output_per_m)", kind: FieldKind::Text },
+    FieldDef { label: "缓存命中价格 /M (cache_hit_per_m)", kind: FieldKind::Text },
+    FieldDef { label: "备注 notes", kind: FieldKind::Text },
+    FieldDef { label: "价格单位 currency", kind: FieldKind::Enum },
     FieldDef { label: "拉取模型", kind: FieldKind::Button },
     FieldDef { label: "保存", kind: FieldKind::Button },
     FieldDef { label: "取消", kind: FieldKind::Button },
 ];
 const IDX_KIND: usize = 1;
-const IDX_FETCH: usize = 10;
-const IDX_SAVE: usize = 11;
-const IDX_CANCEL: usize = 12;
+const IDX_MODEL: usize = 4;
+const IDX_CURRENCY: usize = 13;
+const IDX_FETCH: usize = 14;
+const IDX_SAVE: usize = 15;
+const IDX_CANCEL: usize = 16;
 
 /// 表单按键的副作用意图，由 App 解释执行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,9 +82,14 @@ pub enum FormAction {
 pub struct ProviderFormState {
     pub name: String,
     pub kind_idx: usize,
+    /// 价格货币索引（CURRENCIES），0=usd, 1=cny。
+    pub currency_idx: usize,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    // ── 当前 model 的参数（per-model，存入 models map）──
+    pub alias: String,
+    pub context_length: String,
     pub max_tokens: String,
     pub temperature: String,
     /// 每百万输入 token 价格（美元），空串 = 未配置。
@@ -83,6 +98,17 @@ pub struct ProviderFormState {
     pub price_output: String,
     /// 每百万缓存命中输入 token 价格（美元），空串 = 未配置。
     pub price_cache_hit: String,
+    pub notes: String,
+    // ── 工作副本 ──
+    /// provider 的 models map 工作副本（编辑期间维护，保存时写回）。
+    pub models: std::collections::HashMap<String, ModelConfig>,
+    /// 已知 model 列表（←→ 切换用）：models map 的 key + 当前 model + 拉取到的 model。
+    pub known_models: Vec<String>,
+    /// provider 级默认值（model 无 per-model 配置时的回退）。
+    pub provider_max_tokens: u32,
+    pub provider_temperature: f32,
+    pub provider_price: Option<PriceConfig>,
+    // ── UI 状态 ──
     /// `Some` = 编辑现有（值为原始 name）；`None` = 新增。
     pub original_name: Option<String>,
     pub focused: usize,
@@ -104,14 +130,23 @@ impl ProviderFormState {
         Self {
             name: String::new(),
             kind_idx: 0,
+            currency_idx: 0,
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
+            alias: String::new(),
+            context_length: String::new(),
             max_tokens: "4096".into(),
             temperature: "0.7".into(),
             price_input: String::new(),
             price_output: String::new(),
             price_cache_hit: String::new(),
+            notes: String::new(),
+            models: std::collections::HashMap::new(),
+            known_models: Vec::new(),
+            provider_max_tokens: 4096,
+            provider_temperature: 0.7,
+            provider_price: None,
             original_name: None,
             focused: 0,
             editing: false,
@@ -137,32 +172,116 @@ impl ProviderFormState {
             base_url: cfg.base_url.clone(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
-            max_tokens: cfg.max_tokens.to_string(),
-            temperature: cfg.temperature.to_string(),
-            price_input: cfg
-                .price
-                .as_ref()
-                .and_then(|p| p.input_per_m)
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            price_output: cfg
-                .price
-                .as_ref()
-                .and_then(|p| p.output_per_m)
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            price_cache_hit: cfg
-                .price
-                .as_ref()
-                .and_then(|p| p.cache_hit_per_m)
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
+            models: cfg.models.clone(),
+            known_models: {
+                let mut list: Vec<String> = cfg.models.keys().cloned().collect();
+                let cur = cfg.model.trim().to_string();
+                if !cur.is_empty() && !list.contains(&cur) {
+                    list.push(cur);
+                }
+                list.sort();
+                list
+            },
+            provider_max_tokens: cfg.max_tokens,
+            provider_temperature: cfg.temperature,
+            provider_price: cfg.price.clone(),
             original_name: Some(name.to_string()),
             ..Self::empty()
         };
+        // 装载当前 model 的参数（per-model 优先，回退到 provider 级）
+        s.load_model_params(&cfg.model.clone());
         // 编辑模式焦点先停在 base_url（name 一般不改）
         s.focused = 2;
         s
+    }
+
+    /// 从 `models[model]` 装载参数到表单字段；per-model 字段为 None 时回退到 provider 级默认。
+    fn load_model_params(&mut self, model: &str) {
+        let mc = self.models.get(model);
+        self.alias = mc.and_then(|m| m.alias.clone()).unwrap_or_default();
+        self.context_length = mc
+            .and_then(|m| m.context_length)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        self.max_tokens = mc
+            .and_then(|m| m.max_tokens)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| self.provider_max_tokens.to_string());
+        self.temperature = mc
+            .and_then(|m| m.temperature)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| self.provider_temperature.to_string());
+        let price = mc.and_then(|m| m.price.as_ref()).or(self.provider_price.as_ref());
+        self.price_input = price
+            .and_then(|p| p.input_per_m)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        self.price_output = price
+            .and_then(|p| p.output_per_m)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        self.price_cache_hit = price
+            .and_then(|p| p.cache_hit_per_m)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        // 装载货币
+        self.currency_idx = match price.and_then(|p| p.currency.as_deref()) {
+            Some("cny") => 1,
+            _ => 0, // "usd" 或 None → 默认美元
+        };
+        self.notes = mc.and_then(|m| m.notes.clone()).unwrap_or_default();
+    }
+
+    /// 将当前表单参数字段保存到 `models[model]`。model 为空则跳过。
+    fn save_model_params(&mut self, model: &str) {
+        if model.trim().is_empty() {
+            return;
+        }
+        let mc = ModelConfig {
+            alias: if self.alias.trim().is_empty() {
+                None
+            } else {
+                Some(self.alias.trim().to_string())
+            },
+            context_length: self.context_length.trim().parse().ok(),
+            max_tokens: self.max_tokens.trim().parse().ok(),
+            temperature: self.temperature.trim().parse().ok(),
+            price: self.build_price(),
+            notes: if self.notes.trim().is_empty() {
+                None
+            } else {
+                Some(self.notes.trim().to_string())
+            },
+        };
+        self.models.insert(model.trim().to_string(), mc);
+    }
+
+    /// ←→ 切换 model：保存当前 model 参数，装载新 model 参数。
+    /// dir > 0 下一个，dir < 0 上一个。known_models 不足 2 个时无操作。
+    fn switch_model(&mut self, dir: i32) {
+        if self.known_models.len() <= 1 {
+            return;
+        }
+        let current = self.model.trim().to_string();
+        let n = self.known_models.len();
+        let new_pos = match self.known_models.iter().position(|m| *m == current) {
+            Some(p) => {
+                if dir > 0 {
+                    (p + 1) % n
+                } else {
+                    (p + n - 1) % n
+                }
+            }
+            None => 0,
+        };
+        let new_model = self.known_models[new_pos].clone();
+        if new_model != current {
+            if !current.is_empty() {
+                self.save_model_params(&current);
+            }
+            self.model = new_model.clone();
+            self.load_model_params(&new_model);
+        }
     }
 
     pub fn is_edit(&self) -> bool {
@@ -171,6 +290,16 @@ impl ProviderFormState {
 
     pub fn kind(&self) -> &'static str {
         PROVIDER_KINDS[self.kind_idx]
+    }
+
+    /// 当前价格货币代码："usd" 或 "cny"。
+    pub fn currency(&self) -> &'static str {
+        CURRENCIES[self.currency_idx].0
+    }
+
+    /// 当前价格货币显示名："美元" 或 "人民币"。
+    pub fn currency_label(&self) -> &'static str {
+        CURRENCIES[self.currency_idx].1
     }
 
     /// 当前表单值的快照（用于 fetch，即使未校验通过也能拉取）。
@@ -183,6 +312,7 @@ impl ProviderFormState {
             max_tokens: self.max_tokens.trim().parse().unwrap_or(4096),
             temperature: self.temperature.trim().parse().unwrap_or(0.7),
             price: self.build_price(),
+            models: self.models.clone(),
         }
     }
 
@@ -198,6 +328,7 @@ impl ProviderFormState {
             input_per_m: input,
             output_per_m: output,
             cache_hit_per_m: cache_hit,
+            currency: Some(self.currency().to_string()),
         })
     }
 
@@ -251,8 +382,36 @@ impl ProviderFormState {
                 max_tokens,
                 temperature,
                 price: self.build_price(),
+                models: self.build_models_map(max_tokens, temperature),
             },
         ))
+    }
+
+    /// 构建保存后的 models map：克隆工作副本，将当前表单参数写入 `models[self.model]`。
+    /// model 为空时返回原始工作副本（不插入新条目）。
+    fn build_models_map(&self, max_tokens: u32, temperature: f32) -> std::collections::HashMap<String, ModelConfig> {
+        let mut models = self.models.clone();
+        let model_id = self.model.trim();
+        if !model_id.is_empty() {
+            let mc = ModelConfig {
+                alias: if self.alias.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.alias.trim().to_string())
+                },
+                context_length: self.context_length.trim().parse().ok(),
+                max_tokens: Some(max_tokens),
+                temperature: Some(temperature),
+                price: self.build_price(),
+                notes: if self.notes.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.notes.trim().to_string())
+                },
+            };
+            models.insert(model_id.to_string(), mc);
+        }
+        models
     }
 
     fn get_field(&self, idx: usize) -> String {
@@ -262,11 +421,15 @@ impl ProviderFormState {
             2 => self.base_url.clone(),
             3 => self.api_key.clone(),
             4 => self.model.clone(),
-            5 => self.max_tokens.clone(),
-            6 => self.temperature.clone(),
-            7 => self.price_input.clone(),
-            8 => self.price_output.clone(),
-            9 => self.price_cache_hit.clone(),
+            5 => self.alias.clone(),
+            6 => self.context_length.clone(),
+            7 => self.max_tokens.clone(),
+            8 => self.temperature.clone(),
+            9 => self.price_input.clone(),
+            10 => self.price_output.clone(),
+            11 => self.price_cache_hit.clone(),
+            12 => self.notes.clone(),
+            13 => self.currency_label().to_string(),
             _ => String::new(),
         }
     }
@@ -277,17 +440,20 @@ impl ProviderFormState {
             2 => self.base_url = val,
             3 => self.api_key = val,
             4 => self.model = val,
-            5 => self.max_tokens = val,
-            6 => self.temperature = val,
-            7 => self.price_input = val,
-            8 => self.price_output = val,
-            9 => self.price_cache_hit = val,
+            5 => self.alias = val,
+            6 => self.context_length = val,
+            7 => self.max_tokens = val,
+            8 => self.temperature = val,
+            9 => self.price_input = val,
+            10 => self.price_output = val,
+            11 => self.price_cache_hit = val,
+            12 => self.notes = val,
             _ => {}
         }
     }
 
     fn is_text_field(idx: usize) -> bool {
-        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9)
+        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12)
     }
 
     fn start_editing(&mut self, idx: usize) {
@@ -319,12 +485,21 @@ impl ProviderFormState {
                 if self.focused == IDX_KIND {
                     self.kind_idx =
                         (self.kind_idx + PROVIDER_KINDS.len() - 1) % PROVIDER_KINDS.len();
+                } else if self.focused == IDX_MODEL {
+                    self.switch_model(-1);
+                } else if self.focused == IDX_CURRENCY {
+                    self.currency_idx =
+                        (self.currency_idx + CURRENCIES.len() - 1) % CURRENCIES.len();
                 }
                 FormAction::None
             }
             KeyCode::Right => {
                 if self.focused == IDX_KIND {
                     self.kind_idx = (self.kind_idx + 1) % PROVIDER_KINDS.len();
+                } else if self.focused == IDX_MODEL {
+                    self.switch_model(1);
+                } else if self.focused == IDX_CURRENCY {
+                    self.currency_idx = (self.currency_idx + 1) % CURRENCIES.len();
                 }
                 FormAction::None
             }
@@ -339,7 +514,7 @@ impl ProviderFormState {
                     }
                     IDX_SAVE => FormAction::Save,
                     IDX_CANCEL => FormAction::Cancel,
-                    IDX_KIND => FormAction::None,
+                    IDX_KIND | IDX_CURRENCY => FormAction::None,
                     idx if Self::is_text_field(idx) => {
                         self.start_editing(idx);
                         FormAction::None
@@ -356,7 +531,25 @@ impl ProviderFormState {
         match k.code {
             KeyCode::Enter => {
                 let val = self.textarea.lines().join("\n");
-                self.set_field(self.focused, val);
+                // 提交 model 字段时：先保存旧 model 参数，再装载新 model 参数
+                if self.focused == IDX_MODEL {
+                    let old_model = self.model.clone();
+                    let new_model = val.trim().to_string();
+                    if !old_model.is_empty() && old_model != new_model {
+                        self.save_model_params(&old_model);
+                    }
+                    self.model = new_model.clone();
+                    if old_model != new_model {
+                        self.load_model_params(&new_model);
+                    }
+                    // 将新 model 加入 known_models（去重 + 排序）
+                    if !new_model.is_empty() && !self.known_models.contains(&new_model) {
+                        self.known_models.push(new_model.clone());
+                        self.known_models.sort();
+                    }
+                } else {
+                    self.set_field(self.focused, val);
+                }
                 self.editing = false;
                 FormAction::None
             }
@@ -388,7 +581,15 @@ impl ProviderFormState {
             }
             KeyCode::Enter => {
                 let m = self.fetched_models[self.picker_selected].clone();
-                self.model = m;
+                // 保存旧 model 参数，再装载新 model 参数
+                let old_model = self.model.clone();
+                if !old_model.is_empty() && old_model != m {
+                    self.save_model_params(&old_model);
+                }
+                self.model = m.clone();
+                if old_model != m {
+                    self.load_model_params(&m);
+                }
                 self.picker_open = false;
                 FormAction::None
             }
@@ -422,6 +623,13 @@ impl ProviderFormState {
                     self.fetch_error = Some("未返回任何模型".into());
                 } else {
                     self.fetched_models = models;
+                    // 将拉取到的 model 加入 known_models（去重 + 排序）
+                    for m in &self.fetched_models {
+                        if !self.known_models.contains(m) {
+                            self.known_models.push(m.clone());
+                        }
+                    }
+                    self.known_models.sort();
                     self.picker_selected = 0;
                     self.picker_open = true;
                 }
@@ -485,14 +693,39 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provide
 
 fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderFormState) {
     let mut lines: Vec<Line> = Vec::new();
+    let sep_width = area.width.saturating_sub(2).min(60) as usize;
     for (i, f) in FIELDS.iter().enumerate() {
         if f.kind == FieldKind::Button {
             continue; // 按钮单独渲染
+        }
+        // 在 per-model 区域前插入分隔线和标题
+        if i == IDX_MODEL {
+            lines.push(Line::from("").style(Style::default().bg(theme.bg)));
+            lines.push(
+                Line::from("─".repeat(sep_width))
+                    .style(Style::default().fg(theme.border).bg(theme.bg)),
+            );
+            lines.push(
+                Line::from(" 模型个性化配置").style(
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.bg),
+                ),
+            );
         }
         let selected = i == state.focused && !state.editing && !state.picker_open;
         let marker = if selected { "▸ " } else { "  " };
         let value: String = if i == IDX_KIND {
             format!("{}  ←→", state.kind())
+        } else if i == IDX_MODEL {
+            if state.model.is_empty() {
+                "(空，Enter 输入或拉取模型)".to_string()
+            } else {
+                format!("{}  ←→", state.model)
+            }
+        } else if i == IDX_CURRENCY {
+            format!("{}  ←→", state.currency_label())
         } else if i == 3 {
             // api_key 脱敏显示
             mask_key(&state.api_key)
@@ -554,7 +787,7 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
     let hint = if state.fetching {
         " 拉取中…"
     } else {
-        " Enter 编辑字段 · ←→ 切换 kind · Esc 取消"
+        " Enter 编辑字段 · ←→ 切换 kind/model/currency · Esc 取消"
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::default().fg(theme.muted)),
@@ -871,6 +1104,7 @@ mod tests {
                 input_per_m: Some(2.5),
                 output_per_m: Some(10.0),
                 cache_hit_per_m: Some(0.3),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -966,19 +1200,400 @@ mod tests {
 
     #[test]
     fn price_fields_are_text_editable() {
-        assert!(ProviderFormState::is_text_field(7));
-        assert!(ProviderFormState::is_text_field(8));
+        // 新索引：9=input, 10=output, 11=cache_hit
         assert!(ProviderFormState::is_text_field(9));
+        assert!(ProviderFormState::is_text_field(10));
+        assert!(ProviderFormState::is_text_field(11));
     }
 
     #[test]
     fn price_fields_get_set_roundtrip() {
         let mut s = ProviderFormState::empty();
-        s.set_field(7, "1.1".into());
-        s.set_field(8, "2.2".into());
-        s.set_field(9, "3.3".into());
-        assert_eq!(s.get_field(7), "1.1");
-        assert_eq!(s.get_field(8), "2.2");
-        assert_eq!(s.get_field(9), "3.3");
+        s.set_field(9, "1.1".into());
+        s.set_field(10, "2.2".into());
+        s.set_field(11, "3.3".into());
+        assert_eq!(s.get_field(9), "1.1");
+        assert_eq!(s.get_field(10), "2.2");
+        assert_eq!(s.get_field(11), "3.3");
+    }
+
+    // ── per-model 参数测试 ──
+
+    #[test]
+    fn from_provider_loads_per_model_params() {
+        let mut cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            model: "gpt-4o".into(),
+            max_tokens: 4096,
+            temperature: 0.7,
+            ..Default::default()
+        };
+        cfg.models.insert(
+            "gpt-4o".into(),
+            ModelConfig {
+                alias: Some("我的GPT".into()),
+                context_length: Some(128000),
+                max_tokens: Some(8192),
+                temperature: Some(0.3),
+                notes: Some("备注".into()),
+                ..Default::default()
+            },
+        );
+        let s = ProviderFormState::from_provider("openai", &cfg);
+        assert_eq!(s.alias, "我的GPT");
+        assert_eq!(s.context_length, "128000");
+        assert_eq!(s.max_tokens, "8192");
+        assert!((s.temperature.parse::<f32>().unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(s.notes, "备注");
+    }
+
+    #[test]
+    fn from_provider_falls_back_to_provider_level() {
+        // model 不在 models map → 回退到 provider 级
+        let cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            model: "gpt-4o".into(),
+            max_tokens: 4096,
+            temperature: 0.7,
+            ..Default::default()
+        };
+        let s = ProviderFormState::from_provider("openai", &cfg);
+        assert_eq!(s.max_tokens, "4096");
+        assert!((s.temperature.parse::<f32>().unwrap() - 0.7).abs() < 1e-6);
+        assert!(s.alias.is_empty());
+        assert!(s.context_length.is_empty());
+        assert!(s.notes.is_empty());
+    }
+
+    #[test]
+    fn into_provider_writes_per_model_config() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.model = "gpt-4o".into();
+        s.alias = "我的GPT".into();
+        s.context_length = "128000".into();
+        s.max_tokens = "8192".into();
+        s.temperature = "0.3".into();
+        s.notes = "备注".into();
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        let mc = cfg.models.get("gpt-4o").expect("应有 per-model 配置");
+        assert_eq!(mc.alias, Some("我的GPT".into()));
+        assert_eq!(mc.context_length, Some(128000));
+        assert_eq!(mc.max_tokens, Some(8192));
+        assert!((mc.temperature.unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(mc.notes, Some("备注".into()));
+    }
+
+    #[test]
+    fn into_provider_empty_model_skips_models_insert() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.model = "".into();
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert!(cfg.models.is_empty());
+    }
+
+    #[test]
+    fn into_provider_preserves_existing_models() {
+        // 编辑时已有其他 model 的配置，保存当前 model 不应丢失其他
+        let mut existing = std::collections::HashMap::new();
+        existing.insert(
+            "gpt-4o-mini".into(),
+            ModelConfig {
+                alias: Some("Mini".into()),
+                ..Default::default()
+            },
+        );
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.model = "gpt-4o".into();
+        s.alias = "GPT4o".into();
+        s.models = existing;
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        // 两个 model 都应在
+        assert!(cfg.models.contains_key("gpt-4o"));
+        assert!(cfg.models.contains_key("gpt-4o-mini"));
+        assert_eq!(cfg.models["gpt-4o-mini"].alias, Some("Mini".into()));
+        assert_eq!(cfg.models["gpt-4o"].alias, Some("GPT4o".into()));
+    }
+
+    #[test]
+    fn model_field_commit_syncs_params() {
+        // 编辑 model 字段并提交 → 应保存旧 model 参数，装载新 model 参数
+        let mut s = ProviderFormState::empty();
+        s.model = "gpt-4o".into();
+        s.alias = "OldAlias".into();
+        s.max_tokens = "8192".into();
+        // 预设 gpt-4o-mini 的 per-model 配置
+        s.models.insert(
+            "gpt-4o-mini".into(),
+            ModelConfig {
+                alias: Some("Mini".into()),
+                max_tokens: Some(2048),
+                ..Default::default()
+            },
+        );
+        // 进入编辑 model 字段
+        s.focused = IDX_MODEL;
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert!(s.editing);
+        // 清空 textarea（"gpt-4o" 有 6 个字符）
+        for _ in 0..6 {
+            s.handle_key(key(KeyCode::Backspace), &ProvidersConfig::default());
+        }
+        // 逐字符输入 "gpt-4o-mini"
+        for ch in "gpt-4o-mini".chars() {
+            s.handle_key(key(KeyCode::Char(ch)), &ProvidersConfig::default());
+        }
+        // 提交
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert!(!s.editing);
+        // model 已切换
+        assert_eq!(s.model, "gpt-4o-mini");
+        // 旧 model 参数已保存到 models map
+        assert_eq!(s.models["gpt-4o"].alias, Some("OldAlias".into()));
+        assert_eq!(s.models["gpt-4o"].max_tokens, Some(8192));
+        // 新 model 参数已装载
+        assert_eq!(s.alias, "Mini");
+        assert_eq!(s.max_tokens, "2048");
+    }
+
+    #[test]
+    fn alias_and_notes_are_text_editable() {
+        assert!(ProviderFormState::is_text_field(5));  // alias
+        assert!(ProviderFormState::is_text_field(6));  // context_length
+        assert!(ProviderFormState::is_text_field(12)); // notes
+    }
+
+    #[test]
+    fn alias_context_length_notes_get_set_roundtrip() {
+        let mut s = ProviderFormState::empty();
+        s.set_field(5, "别名".into());
+        s.set_field(6, "96000".into());
+        s.set_field(12, "备注内容".into());
+        assert_eq!(s.get_field(5), "别名");
+        assert_eq!(s.get_field(6), "96000");
+        assert_eq!(s.get_field(12), "备注内容");
+    }
+
+    #[test]
+    fn empty_alias_becomes_none_in_models_map() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.model = "gpt-4o".into();
+        s.alias = "   ".into(); // 空白
+        s.notes = "".into();
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        let mc = &cfg.models["gpt-4o"];
+        assert!(mc.alias.is_none(), "空白 alias 应为 None");
+        assert!(mc.notes.is_none(), "空 notes 应为 None");
+    }
+
+    #[test]
+    fn to_provider_config_snapshot_includes_models() {
+        let mut s = ProviderFormState::empty();
+        s.model = "gpt-4o".into();
+        s.models.insert(
+            "gpt-4o-mini".into(),
+            ModelConfig {
+                alias: Some("Mini".into()),
+                ..Default::default()
+            },
+        );
+        let snap = s.to_provider_config_snapshot();
+        assert!(snap.models.contains_key("gpt-4o-mini"));
+    }
+
+    // ── ←→ model 切换测试 ──
+
+    #[test]
+    fn from_provider_initializes_known_models() {
+        let mut cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        cfg.models.insert("gpt-4o-mini".into(), ModelConfig::default());
+        let s = ProviderFormState::from_provider("openai", &cfg);
+        assert!(s.known_models.contains(&"gpt-4o".to_string()));
+        assert!(s.known_models.contains(&"gpt-4o-mini".to_string()));
+    }
+
+    #[test]
+    fn deliver_fetch_adds_to_known_models() {
+        let mut s = ProviderFormState::empty();
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Ok(vec!["m1".into(), "m2".into()]));
+        assert!(s.known_models.contains(&"m1".to_string()));
+        assert!(s.known_models.contains(&"m2".to_string()));
+    }
+
+    #[test]
+    fn switch_model_cycles_and_syncs_params() {
+        let mut s = ProviderFormState::empty();
+        s.model = "model-a".into();
+        s.alias = "AliasA".into();
+        s.max_tokens = "1000".into();
+        s.models.insert(
+            "model-b".into(),
+            ModelConfig {
+                alias: Some("AliasB".into()),
+                max_tokens: Some(2000),
+                ..Default::default()
+            },
+        );
+        s.known_models = vec!["model-a".into(), "model-b".into()];
+        s.focused = IDX_MODEL;
+
+        // → 切换到 model-b
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.model, "model-b");
+        assert_eq!(s.alias, "AliasB");
+        assert_eq!(s.max_tokens, "2000");
+        // 旧 model-a 参数已保存到 map
+        assert_eq!(s.models["model-a"].alias, Some("AliasA".into()));
+        assert_eq!(s.models["model-a"].max_tokens, Some(1000));
+
+        // ← 切换回 model-a
+        s.handle_key(key(KeyCode::Left), &ProvidersConfig::default());
+        assert_eq!(s.model, "model-a");
+        assert_eq!(s.alias, "AliasA");
+        assert_eq!(s.max_tokens, "1000");
+    }
+
+    #[test]
+    fn switch_model_noop_with_single_model() {
+        let mut s = ProviderFormState::empty();
+        s.model = "only".into();
+        s.known_models = vec!["only".into()];
+        s.focused = IDX_MODEL;
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.model, "only", "仅 1 个 model 时 ←→ 应无操作");
+    }
+
+    #[test]
+    fn switch_model_noop_with_empty_known_models() {
+        let mut s = ProviderFormState::empty();
+        s.model = "x".into();
+        s.focused = IDX_MODEL;
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.model, "x", "known_models 为空时 ←→ 应无操作");
+    }
+
+    #[test]
+    fn manual_model_entry_adds_to_known_models() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_MODEL;
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        for ch in "new-model".chars() {
+            s.handle_key(key(KeyCode::Char(ch)), &ProvidersConfig::default());
+        }
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert!(!s.editing);
+        assert_eq!(s.model, "new-model");
+        assert!(s.known_models.contains(&"new-model".to_string()));
+    }
+
+    // ── 价格货币 (currency) 测试 ──
+
+    #[test]
+    fn currency_defaults_to_usd() {
+        let s = ProviderFormState::empty();
+        assert_eq!(s.currency(), "usd");
+        assert_eq!(s.currency_label(), "美元");
+    }
+
+    #[test]
+    fn currency_cycles_via_left_right() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_CURRENCY;
+        // → 切换到 cny
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.currency(), "cny");
+        assert_eq!(s.currency_label(), "人民币");
+        // → 回绕到 usd
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.currency(), "usd");
+        // ← 回绕到 cny
+        s.handle_key(key(KeyCode::Left), &ProvidersConfig::default());
+        assert_eq!(s.currency(), "cny");
+    }
+
+    #[test]
+    fn from_provider_loads_currency_cny() {
+        let cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            price: Some(cyber_core::PriceConfig {
+                input_per_m: Some(2.5),
+                currency: Some("cny".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let s = ProviderFormState::from_provider("foo", &cfg);
+        assert_eq!(s.currency(), "cny");
+        assert_eq!(s.currency_label(), "人民币");
+    }
+
+    #[test]
+    fn from_provider_currency_none_defaults_usd() {
+        let cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            price: Some(cyber_core::PriceConfig {
+                input_per_m: Some(2.5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let s = ProviderFormState::from_provider("foo", &cfg);
+        assert_eq!(s.currency(), "usd");
+    }
+
+    #[test]
+    fn build_price_includes_currency() {
+        let mut s = ProviderFormState::empty();
+        s.price_input = "2.5".into();
+        s.currency_idx = 1; // cny
+        let p = s.build_price().expect("应有 price");
+        assert_eq!(p.currency, Some("cny".into()));
+    }
+
+    #[test]
+    fn into_provider_writes_currency() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        s.price_input = "2.5".into();
+        s.currency_idx = 1; // cny
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        let p = cfg.price.expect("应有 price");
+        assert_eq!(p.currency, Some("cny".into()));
+    }
+
+    #[test]
+    fn into_provider_no_price_no_currency() {
+        let mut s = ProviderFormState::empty();
+        s.name = "foo".into();
+        s.base_url = "https://x".into();
+        // 全部价格留空 → price = None，currency 也不保存
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert!(cfg.price.is_none());
+    }
+
+    #[test]
+    fn currency_enter_is_noop() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_CURRENCY;
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::None);
+        assert!(!s.editing, "currency 字段 Enter 不应进入编辑模式");
     }
 }

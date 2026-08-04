@@ -1,10 +1,12 @@
-//! 工具护栏：危险命令 / 路径越界检测。
+//! 工具护栏：危险命令 / 路径越界 / SSRF 检测。
 //!
 //! P2.2 为字符串子串 denylist + 路径词法约束（无 regex 依赖）。
 //! 完整的目标白名单 / scope glob / 路径 canonicalize 约束留 P6。
 
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
+use crate::error::{AgentError, Result};
 use crate::tool::ToolCtx;
 
 /// 危险命令子串 denylist（小写匹配）。
@@ -112,6 +114,72 @@ pub(crate) fn resolve_under_cwd(path: &Path, cwd: &Path) -> std::result::Result<
     Ok(out.iter().collect())
 }
 
+/// SSRF 检查：禁止非 http/https 协议 + 私有/内网 IP 地址。
+///
+/// 解析 URL 后对 host 做 DNS 解析，检查所有解析到的 IP 是否属于私有范围。
+pub(crate) fn check_ssrf(url_str: &str) -> Result<()> {
+    let url = reqwest::Url::parse(url_str)
+        .map_err(|e| AgentError::Provider(format!("URL 解析失败: {e}")))?;
+
+    // 只允许 http/https
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(AgentError::Provider(format!(
+                "不允许的协议 '{other}'，仅支持 http/https"
+            )));
+        }
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| AgentError::Provider("URL 缺少 host".into()))?;
+
+    // DNS 解析并检查所有 IP
+    let port = url.port_or_known_default().unwrap_or(80);
+    let socket_addrs = format!("{host}:{port}");
+    let addrs: Vec<_> = socket_addrs
+        .to_socket_addrs()
+        .map_err(|e| AgentError::Provider(format!("DNS 解析失败: {e}")))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(AgentError::Provider(format!("DNS 解析无结果: {host}")));
+    }
+
+    for addr in &addrs {
+        let ip = addr.ip();
+        if is_private_ip(ip) {
+            return Err(AgentError::Provider(format!(
+                "SSRF 保护：{host} 解析到内网地址 {ip}，已拒绝"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// 判断 IP 是否是私有/内网/保留地址。
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback() // 127.0.0.0/8
+                || v4.is_unspecified() // 0.0.0.0
+                || v4.is_link_local() // 169.254.0.0/16
+                || o[0] == 10 // 10.0.0.0/8
+                || (o[0] == 172 && (16..=31).contains(&o[1])) // 172.16.0.0/12
+                || (o[0] == 192 && o[1] == 168) // 192.168.0.0/16
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback() // ::1
+                || v6.is_unspecified() // ::
+                || v6.is_unicast_link_local() // fe80::/10
+                || (v6.octets()[0] == 0xfc || v6.octets()[0] == 0xfd) // fc00::/7 unique local
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +235,59 @@ mod tests {
         let c = ctx("/tmp/proj");
         assert!(check_write_path(Path::new("a.txt"), &c).is_ok());
         assert!(check_write_path(Path::new("sub/b.txt"), &c).is_ok());
+    }
+
+    #[test]
+    fn private_ipv4_addresses_detected() {
+        assert!(is_private_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_private_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_private_ip("172.16.0.1".parse().unwrap()));
+        assert!(is_private_ip("172.31.255.255".parse().unwrap()));
+        assert!(is_private_ip("192.168.1.1".parse().unwrap()));
+        assert!(is_private_ip("169.254.1.1".parse().unwrap()));
+        assert!(is_private_ip("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_ipv4_addresses_allowed() {
+        assert!(!is_private_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_private_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_private_ip("172.15.0.1".parse().unwrap()));
+        assert!(!is_private_ip("172.32.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_ipv6_addresses_detected() {
+        assert!(is_private_ip("::1".parse().unwrap()));
+        assert!(is_private_ip("::".parse().unwrap()));
+        assert!(is_private_ip("fe80::1".parse().unwrap()));
+        assert!(is_private_ip("fc00::1".parse().unwrap()));
+        assert!(is_private_ip("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ssrf_rejects_non_http_schemes() {
+        let err = check_ssrf("file:///etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("不允许的协议"));
+        assert!(err.to_string().contains("file"));
+
+        let err = check_ssrf("ftp://example.com").unwrap_err();
+        assert!(err.to_string().contains("ftp"));
+    }
+
+    #[test]
+    fn ssrf_rejects_localhost_ip() {
+        let err = check_ssrf("http://127.0.0.1/").unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+        assert!(err.to_string().contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn ssrf_rejects_private_ip() {
+        let err = check_ssrf("http://10.0.0.1/").unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+
+        let err = check_ssrf("http://192.168.1.1/").unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
     }
 }

@@ -371,6 +371,10 @@ pub struct SettingsState {
     pub mcp_pending_delete_idx: Option<usize>,
     /// Skills 段 cursor（在 skills 列表中）。
     pub skills_selected: usize,
+    /// Providers 段 cursor 是否停在保存按钮行。
+    pub provider_on_save: bool,
+    /// MCP 段 cursor 是否停在保存按钮行。
+    pub mcp_on_save: bool,
 }
 
 /// Providers 段在 SECTIONS 中的索引。
@@ -419,17 +423,47 @@ impl SettingsState {
         self.section == SKILLS_SECTION_IDX
     }
 
+    /// Providers 段是否停在保存按钮行。
+    pub fn on_provider_save_row(&self) -> bool {
+        self.on_providers_section() && self.provider_on_save
+    }
+
+    /// MCP 段是否停在保存按钮行。
+    pub fn on_mcp_save_row(&self) -> bool {
+        self.on_mcp_section() && self.mcp_on_save
+    }
+
     /// Providers 段 cursor 下移（clamp，空列表 no-op）。
+    /// 下移超过最后一项时移到保存按钮行。
     pub fn next_provider(&mut self, len: usize) {
+        if self.provider_on_save {
+            return; // 已在保存行，不再下移
+        }
         if len == 0 {
+            self.provider_on_save = true;
             self.provider_selected = 0;
             return;
         }
-        self.provider_selected = (self.provider_selected + 1).min(len - 1);
+        if self.provider_selected + 1 >= len {
+            // 超过最后一项 → 移到保存行
+            self.provider_on_save = true;
+        } else {
+            self.provider_selected += 1;
+        }
     }
 
     /// Providers 段 cursor 上移（clamp，空列表 no-op）。
+    /// 在保存行时上移回到最后一项。
     pub fn prev_provider(&mut self, len: usize) {
+        if self.provider_on_save {
+            self.provider_on_save = false;
+            if len > 0 {
+                self.provider_selected = len - 1;
+            } else {
+                self.provider_selected = 0;
+            }
+            return;
+        }
         if len == 0 {
             self.provider_selected = 0;
             return;
@@ -439,15 +473,32 @@ impl SettingsState {
 
     /// MCP 段 cursor 下移。
     pub fn next_mcp(&mut self, len: usize) {
+        if self.mcp_on_save {
+            return;
+        }
         if len == 0 {
+            self.mcp_on_save = true;
             self.mcp_selected = 0;
             return;
         }
-        self.mcp_selected = (self.mcp_selected + 1).min(len - 1);
+        if self.mcp_selected + 1 >= len {
+            self.mcp_on_save = true;
+        } else {
+            self.mcp_selected += 1;
+        }
     }
 
     /// MCP 段 cursor 上移。
     pub fn prev_mcp(&mut self, len: usize) {
+        if self.mcp_on_save {
+            self.mcp_on_save = false;
+            if len > 0 {
+                self.mcp_selected = len - 1;
+            } else {
+                self.mcp_selected = 0;
+            }
+            return;
+        }
         if len == 0 {
             self.mcp_selected = 0;
             return;
@@ -494,6 +545,9 @@ impl SettingsState {
     pub fn next_section(&mut self) {
         self.section = (self.section + 1) % SECTIONS.len();
         self.selected = 0;
+        // 切段时重置保存按钮焦点
+        self.provider_on_save = false;
+        self.mcp_on_save = false;
     }
 
     /// 应用编辑（`forward`=正向下/右，否则反向上/左）。返回需 live-apply 的类型。
@@ -585,6 +639,7 @@ pub fn render(
     skills: &SkillRegistry,
     state: &SettingsState,
     has_project_config: bool,
+    toast: Option<&str>,
 ) {
     let dirty_marker =
         if state.dirty || state.dirty_providers || state.dirty_mcp { " *" } else { "" };
@@ -600,16 +655,32 @@ pub fn render(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // 顶部横幅（项目级覆盖提示）
-    let content_area = if has_project_config {
-        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-        frame.render_widget(
-            Paragraph::new(Line::from(
-                " ⚠ 检测到项目级 .cyber/config.toml：保存仅写全局，被覆盖字段重启后回弹".to_string(),
-            ))
-            .style(Style::default().fg(theme.accent).bg(theme.bg)),
-            chunks[0],
-        );
+    // 顶部横幅（项目级覆盖提示）+ 底部 toast：两行固定高度
+    let content_area = if has_project_config || toast.is_some() {
+        let top_h: u16 = if has_project_config { 1 } else { 0 };
+        let bottom_h: u16 = if toast.is_some() { 1 } else { 0 };
+        let chunks = Layout::vertical([
+            Constraint::Length(top_h),
+            Constraint::Min(0),
+            Constraint::Length(bottom_h),
+        ])
+        .split(inner);
+        if has_project_config {
+            frame.render_widget(
+                Paragraph::new(Line::from(
+                    " ⚠ 检测到项目级 .cyber/config.toml：保存仅写全局，被覆盖字段重启后回弹"
+                        .to_string(),
+                ))
+                .style(Style::default().fg(theme.accent).bg(theme.bg)),
+                chunks[0],
+            );
+        }
+        if let Some(t) = toast {
+            frame.render_widget(
+                Paragraph::new(Line::from(format!(" {t}")).style(Style::default().fg(theme.accent))),
+                chunks[2],
+            );
+        }
         chunks[1]
     } else {
         inner
@@ -712,13 +783,32 @@ fn render_fields(
     } else if state.on_providers_section() {
         // Providers 段：交互式（a 新增 / e 编辑 / d 删除 / Enter 设默认）
         render_providers_lines(&mut lines, theme, providers, config, state);
+        // 保存按钮行
+        lines.push(Line::from(""));
+        let on_save = state.provider_on_save;
+        let save_marker = if on_save { "▸ " } else { "  " };
+        let any_dirty = state.dirty || state.dirty_providers || state.dirty_mcp;
+        let save_label = if any_dirty { "保存设置 *" } else { "保存设置" };
+        let save_style = if on_save {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw(save_marker.to_string()),
+                Span::styled(save_label.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::raw("   (Enter 保存)"),
+            ])
+            .style(save_style),
+        );
         lines.push(Line::from(""));
         let hint = if let Some(idx) = state.pending_delete_idx {
             let names = providers.sorted_names();
             let name = names.get(idx).map(|s| s.as_str()).unwrap_or("?");
             format!(" 再按 d 确认删除 '{name}' · 其他键取消")
         } else {
-            " a 新增  e 编辑  d 删除  Enter 设默认  ↑↓ 选择".to_string()
+            " a 新增  e 编辑  d 删除  Enter 设默认/保存  ↑↓ 选择".to_string()
         };
         let hint_style = if state.pending_delete_idx.is_some() {
             Style::default().fg(theme.accent)
@@ -729,6 +819,25 @@ fn render_fields(
     } else if state.on_mcp_section() {
         // MCP 段：交互式（a 新增 / e 编辑 / d 删除 / ↑↓ 选择）
         render_mcp_lines(&mut lines, theme, mcp_config, state);
+        // 保存按钮行
+        lines.push(Line::from(""));
+        let on_save = state.mcp_on_save;
+        let save_marker = if on_save { "▸ " } else { "  " };
+        let any_dirty = state.dirty || state.dirty_providers || state.dirty_mcp;
+        let save_label = if any_dirty { "保存设置 *" } else { "保存设置" };
+        let save_style = if on_save {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw(save_marker.to_string()),
+                Span::styled(save_label.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::raw("   (Enter 保存)"),
+            ])
+            .style(save_style),
+        );
         lines.push(Line::from(""));
         let hint = if let Some(idx) = state.mcp_pending_delete_idx {
             let name = mcp_config
@@ -738,7 +847,7 @@ fn render_fields(
                 .unwrap_or("?");
             format!(" 再按 d 确认删除 '{name}' · 其他键取消")
         } else {
-            " a 新增  e 编辑  d 删除  ↑↓ 选择  (保存后重启生效)".to_string()
+            " a 新增  e 编辑  d 删除  Enter 保存  ↑↓ 选择  (保存后重启生效)".to_string()
         };
         let hint_style = if state.mcp_pending_delete_idx.is_some() {
             Style::default().fg(theme.accent)
@@ -794,7 +903,7 @@ fn render_providers_lines(
         let p = &providers.providers[name];
         let is_default = name.as_str() == config.agent.default_provider;
         let star = if is_default { " ★默认" } else { "" };
-        let selected = i == state.provider_selected;
+        let selected = i == state.provider_selected && !state.provider_on_save;
         let pending_delete = state.pending_delete_idx == Some(i);
         let marker = if selected { "▸ " } else { "  " };
         let delete_tag = if pending_delete { "  [待删除!]" } else { "" };
@@ -811,7 +920,7 @@ fn render_providers_lines(
                     format!("{name}{star}"),
                     Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("  [{}] {} · {}{}", p.kind, p.base_url, p.model, delete_tag)),
+                Span::raw(format!("  [{}] {} · {}{}", p.kind, p.base_url, p.model_display_name(), delete_tag)),
             ])
             .style(row_style),
         );
@@ -819,8 +928,8 @@ fn render_providers_lines(
         lines.push(
             Line::from(key_line).style(Style::default().fg(theme.muted)),
         );
-        // 价格配置行：显示单价（$/M），未配置则标「未设置」
-        let price_line = match &p.price {
+        // 价格配置行：显示单价（$/M），未配置则标「未设置」。使用 effective_price（per-model 优先）
+        let price_line = match p.effective_price() {
             None => "    price: 未设置".to_string(),
             Some(pr) => {
                 let fmt = |v: Option<f64>| -> String {
@@ -854,7 +963,7 @@ fn render_mcp_lines(
         return;
     }
     for (i, spec) in mcp_config.servers.iter().enumerate() {
-        let selected = i == state.mcp_selected;
+        let selected = i == state.mcp_selected && !state.mcp_on_save;
         let pending_delete = state.mcp_pending_delete_idx == Some(i);
         let marker = if selected { "▸ " } else { "  " };
         let delete_tag = if pending_delete { "  [待删除!]" } else { "" };
@@ -1134,7 +1243,16 @@ mod tests {
         assert_eq!(st.provider_selected, 1);
         st.next_provider(3);
         assert_eq!(st.provider_selected, 2);
-        st.next_provider(3); // clamp 到 2
+        // 再下移 → 到保存行
+        st.next_provider(3);
+        assert!(st.provider_on_save);
+        assert_eq!(st.provider_selected, 2);
+        // 保存行再下移 → 停留
+        st.next_provider(3);
+        assert!(st.provider_on_save);
+        // 从保存行上移 → 回到最后一项
+        st.prev_provider(3);
+        assert!(!st.provider_on_save);
         assert_eq!(st.provider_selected, 2);
         st.prev_provider(3);
         assert_eq!(st.provider_selected, 1);
@@ -1149,10 +1267,13 @@ mod tests {
         let mut st = SettingsState::new();
         st.section = PROVIDERS_SECTION_IDX;
         st.provider_selected = 5;
+        // 空列表下移 → 保存行
         st.next_provider(0);
+        assert!(st.provider_on_save);
         assert_eq!(st.provider_selected, 0);
-        st.provider_selected = 5;
+        // 从保存行上移 → 回到 0（空列表）
         st.prev_provider(0);
+        assert!(!st.provider_on_save);
         assert_eq!(st.provider_selected, 0);
     }
 
@@ -1178,6 +1299,7 @@ mod tests {
                     &SkillRegistry::new(),
                     &st,
                     false,
+                    None,
                 )
             })
             .unwrap();
@@ -1203,6 +1325,7 @@ mod tests {
                     &SkillRegistry::new(),
                     &st,
                     false,
+                    None,
                 )
             })
             .unwrap();
@@ -1229,6 +1352,7 @@ mod tests {
                 input_per_m: Some(2.5),
                 output_per_m: Some(10.0),
                 cache_hit_per_m: Some(0.3),
+                ..Default::default()
             });
         }
         if let Some(p) = providers.providers.get_mut("anthropic") {
@@ -1236,6 +1360,7 @@ mod tests {
                 input_per_m: Some(3.0),
                 output_per_m: None,
                 cache_hit_per_m: None,
+                ..Default::default()
             });
         }
         let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
@@ -1251,6 +1376,7 @@ mod tests {
                     &SkillRegistry::new(),
                     &st,
                     false,
+                    None,
                 )
             })
             .unwrap();

@@ -10,6 +10,7 @@
 //! （工具链仅在单次 spawn 内部维护，避免历史膨胀 + provider 翻译复杂度）。
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use cyber_agent::Message;
@@ -59,6 +60,10 @@ pub enum ChatEntry {
 /// 用 `usize::MAX` 避免额外 `Option` 字段，且任何真实偏移都远小于此值。
 const SCROLL_FOLLOW: usize = usize::MAX;
 
+/// 工具结果回显折叠阈值：输出行数超过此值时默认折叠为最后 N 行，
+/// 提示 Ctrl+O 展开（参考 Claude Code 的折叠行为）。
+const TOOL_RESULT_FOLD_THRESHOLD: usize = 3;
+
 /// 斜杠命令补全菜单状态。
 ///
 /// 输入以 `/` 开头且不含空格时打开（`update_slash_menu` 每次输入后刷新）；按前缀过滤
@@ -75,7 +80,7 @@ pub struct SlashMenu {
 }
 
 impl SlashMenu {
-    fn close(&mut self) {
+    pub fn close(&mut self) {
         self.open = false;
         self.filtered.clear();
         self.selected = 0;
@@ -160,6 +165,12 @@ pub struct ChatState {
     pub slash_menu: SlashMenu,
     /// 输入历史（↑/↓ 在空输入框时呼出）。
     pub input_history: InputHistory,
+    /// 已展开的工具结果条目索引（按 entries 下标）。
+    /// 默认折叠（仅显示最后 `TOOL_RESULT_FOLD_THRESHOLD` 行），Ctrl+O 切换。
+    expanded_tool_results: HashSet<usize>,
+    /// 上次 `prepare_render` 使用的终端宽度。宽度变化时须重建 `cached_history`，
+    /// 因为工具结果折叠阈值基于可视行数（受宽度影响）。
+    last_render_width: u16,
 }
 
 /// `wrapped` 预折行缓存的载体。
@@ -192,16 +203,24 @@ impl ChatState {
             wrapped: RefCell::new(WrappedCache::default()),
             slash_menu: SlashMenu::default(),
             input_history: InputHistory::default(),
+            expanded_tool_results: HashSet::new(),
+            last_render_width: 0,
         }
     }
 
-    /// 在 draw 前（`&mut self` 上下文）调用：若 `entries.len()` 变化或缓存被标脏
-    ///（如 theme 切换），则重建已完成条目的渲染行缓存。流式 tail 不入缓存，由 view
-    /// 每帧追加。render 以 `&self` 经 `cached_history()` 只读复用，避免每帧重建。
-    pub fn prepare_render(&mut self, theme: &Theme) {
-        if self.cache_dirty || self.cached_entries_len != self.entries.len() {
-            self.cached_history = render_entries(&self.entries, theme);
+    /// 在 draw 前（`&mut self` 上下文）调用：若 `entries.len()` 变化、缓存被标脏
+    ///（如 theme 切换）或终端宽度变化，则重建已完成条目的渲染行缓存。流式 tail 不入
+    /// 缓存，由 view 每帧追加。render 以 `&self` 经 `cached_history()` 只读复用，避免
+    /// 每帧重建。`width` 为历史区可用宽度，用于工具结果折叠阈值的可视行数计算。
+    pub fn prepare_render(&mut self, theme: &Theme, width: u16) {
+        if self.cache_dirty
+            || self.cached_entries_len != self.entries.len()
+            || self.last_render_width != width
+        {
+            self.cached_history =
+                render_entries(&self.entries, theme, &self.expanded_tool_results, width);
             self.cached_entries_len = self.entries.len();
+            self.last_render_width = width;
             self.cache_dirty = false;
         }
     }
@@ -277,7 +296,7 @@ impl ChatState {
             let mut wc = self.wrapped.borrow_mut();
             let key = (self.entries.len(), self.streaming_buffer.len(), width);
             if !wc.valid || wc.key != key {
-                let unwrapped = self.build_render_lines(theme);
+                let unwrapped = self.build_render_lines(theme, width);
                 wc.lines = wrap_lines(&unwrapped, width as usize);
                 wc.key = key;
                 wc.valid = true;
@@ -288,11 +307,16 @@ impl ChatState {
 
     /// 构建未折行的全部历史行：复用 `cached_history`（prepare_render 维护），未就绪时
     ///（如单测直接调 render 未先 prepare）回退现场构建；流式期追加 tail。
-    fn build_render_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+    fn build_render_lines(&self, theme: &Theme, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let cached = self.cached_history();
         if cached.is_empty() && !self.entries.is_empty() {
-            lines.extend(render_entries(&self.entries, theme));
+            lines.extend(render_entries(
+                &self.entries,
+                theme,
+                &self.expanded_tool_results,
+                width,
+            ));
         } else {
             lines.extend_from_slice(cached);
         }
@@ -504,6 +528,26 @@ impl ChatState {
             .push(ChatEntry::ToolResult { id, name, output, is_error });
     }
 
+    /// 切换最后一个工具结果的展开/折叠状态（Ctrl+O）。
+    ///
+    /// 工具结果输出行数超过 `TOOL_RESULT_FOLD_THRESHOLD` 时默认折叠（仅显示最后 N 行），
+    /// 调用此方法切换。索引以 `entries` 下标为准（条目只追加不插入，下标稳定）。
+    /// 无工具结果时 no-op。切换后 `invalidate_cache` 强制重渲染。
+    pub fn toggle_last_tool_result_expansion(&mut self) {
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, ChatEntry::ToolResult { .. }))
+        {
+            if self.expanded_tool_results.contains(&idx) {
+                self.expanded_tool_results.remove(&idx);
+            } else {
+                self.expanded_tool_results.insert(idx);
+            }
+            self.invalidate_cache();
+        }
+    }
+
     /// 把当前 `streaming_buffer` 定稿为一条 assistant 条目，退出 streaming 态。
     /// buffer 为空时不 push（避免空 assistant 条目；工具链已有 ToolCall/ToolResult 记录）。
     pub fn finalize_stream(&mut self) {
@@ -523,6 +567,7 @@ impl ChatState {
         self.streaming_buffer.clear();
         self.scroll_to_bottom();
         self.slash_menu.close();
+        self.expanded_tool_results.clear();
     }
 
     /// 取走输入框文本（不清屏、不 push 条目、不改 streaming），用于斜杠命令。
@@ -560,9 +605,18 @@ impl Default for ChatState {
 // 避免每帧重新 tokenize 全部条目。流式 tail（光标行）由 view 现场构建，不入此缓存。
 
 /// 把已完成条目序列渲染为 `Line<'static>`（每条目后附一空行作分隔）。
-pub fn render_entries(entries: &[ChatEntry], theme: &Theme) -> Vec<Line<'static>> {
+///
+/// `expanded` 标记哪些 `ToolResult` 条目（按下标）已展开——默认折叠仅显示最后
+/// `TOOL_RESULT_FOLD_THRESHOLD` 可视行，展开后显示全部并附折叠提示。`width` 为
+/// 历史区可用宽度，用于计算工具结果的可视行数（单行长输出也会触发折叠）。
+pub fn render_entries(
+    entries: &[ChatEntry],
+    theme: &Theme,
+    expanded: &HashSet<usize>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for entry in entries {
+    for (i, entry) in entries.iter().enumerate() {
         match entry {
             ChatEntry::User(content) => {
                 push_role_lines(&mut lines, "[user]", theme.accent, content, theme);
@@ -586,7 +640,8 @@ pub fn render_entries(entries: &[ChatEntry], theme: &Theme) -> Vec<Line<'static>
                 output,
                 is_error,
             } => {
-                push_tool_result(&mut lines, theme, output, *is_error);
+                let is_expanded = expanded.contains(&i);
+                push_tool_result(&mut lines, theme, output, *is_error, is_expanded, width);
             }
         }
         lines.push(Line::from("")); // 条目间空行
@@ -760,53 +815,197 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, theme: &Theme, name: &str, arg
 }
 
 /// 渲染工具结果：成功 `    → output`（muted/fg），错误 `    ✗ output`（红色）。
+///
 /// 多行 output 逐行展开，续行缩进对齐首行内容；空 output 仍显示标记。
+///
+/// 折叠行为（参考 Claude Code）：输出 **可视行数**（按 `width` 折行后）超过
+/// `TOOL_RESULT_FOLD_THRESHOLD` 且未展开时，仅渲染最后 N 可视行，并在上方加
+/// `⋮ +M 行已折叠 · Ctrl+O 展开` 提示；展开后渲染全部行，并在末尾附
+/// `⋮ 共 N 行 · Ctrl+O 折叠` 提示。≤阈值行数照常全显，无提示。
+/// 使用可视行数而非源行数，可确保单行长输出（如 MCP JSON 回显）也能正确折叠。
 fn push_tool_result(
     lines: &mut Vec<Line<'static>>,
     theme: &Theme,
     output: &str,
     is_error: bool,
+    expanded: bool,
+    width: u16,
 ) {
     let (marker, marker_color, content_color) = if is_error {
         ("✗", Color::Red, Color::Red)
     } else {
         ("→", theme.muted, theme.fg)
     };
-    let out_lines: Vec<&str> = output.lines().collect();
-    if out_lines.is_empty() {
+    // 内容宽度 = 总宽 - 前缀（"    {marker} " = 6 列）。前缀由 push_result_lines 添加。
+    let content_width = (width as usize).saturating_sub(6);
+    let visual_lines = wrap_string_to_visual_lines(output, content_width);
+    let visual_count = visual_lines.len();
+    let folded = visual_count > TOOL_RESULT_FOLD_THRESHOLD && !expanded;
+
+    // 折叠提示行（折叠态放顶部，展开态放底部）
+    let fold_hint_top = |lines: &mut Vec<Line<'static>>, hidden: usize| {
+        lines.push(Line::from(vec![
+            Span::styled("    ⋮ ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("+{hidden} 行已折叠 · Ctrl+O 展开"),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
+    };
+    let fold_hint_bottom = |lines: &mut Vec<Line<'static>>, total: usize| {
+        lines.push(Line::from(vec![
+            Span::styled("    ⋮ ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("共 {total} 行 · Ctrl+O 折叠"),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
+    };
+
+    if visual_lines.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             format!("    {marker} "),
             Style::default()
                 .fg(marker_color)
                 .add_modifier(Modifier::BOLD),
         )]));
+        return;
+    }
+
+    // 折叠态：先输出折叠提示，再输出最后 N 可视行
+    if folded {
+        let hidden = visual_count - TOOL_RESULT_FOLD_THRESHOLD;
+        fold_hint_top(lines, hidden);
+        let start = visual_count - TOOL_RESULT_FOLD_THRESHOLD;
+        push_result_lines(
+            lines,
+            &visual_lines[start..],
+            marker,
+            marker_color,
+            content_color,
+        );
     } else {
-        for (i, line) in out_lines.iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("    {marker} "),
-                        Style::default()
-                            .fg(marker_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(line.to_string(), Style::default().fg(content_color)),
-                ]));
-            } else {
-                // 续行缩进对齐首行内容（6 空格 = "    {marker} " 宽度）
-                lines.push(Line::from(vec![
-                    Span::styled("      ", Style::default()),
-                    Span::styled(line.to_string(), Style::default().fg(content_color)),
-                ]));
-            }
+        // 全显（≤阈值 或 已展开）
+        push_result_lines(lines, &visual_lines, marker, marker_color, content_color);
+        // 已展开且超阈值：追加底部折叠提示
+        if visual_count > TOOL_RESULT_FOLD_THRESHOLD && expanded {
+            fold_hint_bottom(lines, visual_count);
         }
     }
+}
+
+/// 渲染工具结果的多行内容：首行带 `marker`，续行缩进对齐首行内容。
+fn push_result_lines(
+    lines: &mut Vec<Line<'static>>,
+    out_lines: &[String],
+    marker: &str,
+    marker_color: Color,
+    content_color: Color,
+) {
+    for (i, line) in out_lines.iter().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {marker} "),
+                    Style::default()
+                        .fg(marker_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(line.clone(), Style::default().fg(content_color)),
+            ]));
+        } else {
+            // 续行缩进对齐首行内容（6 空格 = "    {marker} " 宽度）
+            lines.push(Line::from(vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(line.clone(), Style::default().fg(content_color)),
+            ]));
+        }
+    }
+}
+
+/// 把字符串按 `width` 列宽贪婪折行为可视行列表（CJK 占 2 列，tab 占 1 列）。
+///
+/// 与 `wrap_lines` 的折行逻辑一致，但操作于纯字符串（不含 span/style），用于工具结果
+/// 折叠阈值的可视行数计算。空字符串返回空 Vec（与 `str::lines()` 一致），`"\n"` 返回
+/// `[""]`。`width == 0` 时不折行，每条源行原样返回（避免除零）。
+fn wrap_string_to_visual_lines(s: &str, width: usize) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut result: Vec<String> = Vec::new();
+    for source_line in s.lines() {
+        if source_line.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        if width == 0 {
+            result.push(source_line.to_string());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_w: usize = 0;
+        for ch in source_line.chars() {
+            let w = if ch == '\t' {
+                1
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            };
+            if !current.is_empty() && current_w + w > width {
+                result.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
+            current.push(ch);
+            current_w += w;
+        }
+        result.push(current);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cyber_agent::Role;
+
+    #[test]
+    fn wrap_string_to_visual_lines_basic() {
+        // 空字符串 → 空 Vec
+        assert!(wrap_string_to_visual_lines("", 10).is_empty());
+        // 无换行短串 → 1 行
+        assert_eq!(wrap_string_to_visual_lines("hello", 10), vec!["hello"]);
+        // 多行 → 每源行一项
+        assert_eq!(
+            wrap_string_to_visual_lines("a\nb\nc", 10),
+            vec!["a", "b", "c"]
+        );
+        // 仅换行 → 1 个空行
+        assert_eq!(wrap_string_to_visual_lines("\n", 10), vec![""]);
+    }
+
+    #[test]
+    fn wrap_string_to_visual_lines_wraps_long_line() {
+        // 20 字符在宽 5 时 → 4 行
+        let result = wrap_string_to_visual_lines("aaaaaaaaaaaaaaaaaaaa", 5);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0], "aaaaa");
+        assert_eq!(result[3], "aaaaa");
+        // width == 0 → 不折行
+        let result0 = wrap_string_to_visual_lines("aaaaaaaaaaaaaaaaaaaa", 0);
+        assert_eq!(result0, vec!["aaaaaaaaaaaaaaaaaaaa"]);
+    }
+
+    #[test]
+    fn wrap_string_to_visual_lines_cjk_width() {
+        // CJK 字符占 2 列：4 个中文字 = 8 列，宽 4 → 2 行
+        let result = wrap_string_to_visual_lines("你好世界", 4);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "你好");
+        assert_eq!(result[1], "世界");
+    }
 
     #[test]
     fn submit_returns_text_history_and_pushes_user_entry() {
@@ -963,6 +1162,172 @@ mod tests {
         assert!(matches!(&s.entries[1], ChatEntry::ToolResult { output, is_error, .. } if output == "a.txt" && !is_error));
     }
 
+    /// 工具字符串转单行拼接（含 marker），便于断言折叠提示是否出现。
+    fn tool_lines_to_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn tool_result_folded_when_exceeds_threshold() {
+        let theme = Theme::resolve("cyberpunk");
+        let expanded = HashSet::new();
+        let entries = vec![ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "list_dir".into(),
+            output: "l1\nl2\nl3\nl4\nl5".into(),
+            is_error: false,
+        }];
+        let lines = render_entries(&entries, &theme, &expanded, 80);
+        let text = tool_lines_to_text(&lines);
+        // 5 行 > 3 → 折叠，出现提示与 +2（隐藏 2 行）
+        assert!(text.contains("Ctrl+O 展开"), "折叠态应含 Ctrl+O 展开提示: {text}");
+        assert!(text.contains("+2 行已折叠"), "应显示隐藏行数: {text}");
+        // 仅显示最后 3 行（l3/l4/l5），不含 l1/l2
+        assert!(!text.contains("l1"), "折叠态不应含 l1: {text}");
+        assert!(!text.contains("l2"), "折叠态不应含 l2: {text}");
+        assert!(text.contains("l3") && text.contains("l4") && text.contains("l5"));
+    }
+
+    #[test]
+    fn tool_result_not_folded_at_or_below_threshold() {
+        let theme = Theme::resolve("cyberpunk");
+        let expanded = HashSet::new();
+        // 恰好 3 行 → 不折叠
+        let entries = vec![ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "list_dir".into(),
+            output: "l1\nl2\nl3".into(),
+            is_error: false,
+        }];
+        let lines = render_entries(&entries, &theme, &expanded, 80);
+        let text = tool_lines_to_text(&lines);
+        assert!(!text.contains("Ctrl+O"), "≤阈值不应有折叠提示: {text}");
+        assert!(text.contains("l1") && text.contains("l2") && text.contains("l3"));
+    }
+
+    #[test]
+    fn tool_result_expanded_shows_all_lines_and_collapse_hint() {
+        let theme = Theme::resolve("cyberpunk");
+        let mut expanded = HashSet::new();
+        expanded.insert(0);
+        let entries = vec![ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "list_dir".into(),
+            output: "l1\nl2\nl3\nl4\nl5".into(),
+            is_error: false,
+        }];
+        let lines = render_entries(&entries, &theme, &expanded, 80);
+        let text = tool_lines_to_text(&lines);
+        assert!(text.contains("Ctrl+O 折叠"), "展开态应含折叠提示: {text}");
+        assert!(text.contains("共 5 行"), "应显示总行数: {text}");
+        // 全部行可见
+        for l in ["l1", "l2", "l3", "l4", "l5"] {
+            assert!(text.contains(l), "展开态应含 {l}: {text}");
+        }
+    }
+
+    #[test]
+    fn tool_result_single_long_line_folded_by_visual_width() {
+        // 回归测试：单行超长输出（如 MCP JSON 回显）按可视行数折叠，而非源行数。
+        // 窄宽度（20 列）下，80 字符的单行会折为多行 → 触发折叠。
+        let theme = Theme::resolve("cyberpunk");
+        let expanded = HashSet::new();
+        let long_json = "{\"has_response\":true,\"url\":\"http://example.com/view.php\",\"status_code\":200}";
+        let entries = vec![ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "mcp_tool".into(),
+            output: long_json.into(),
+            is_error: false,
+        }];
+        // 宽度 20 → 内容宽 14 → 80 字符约 6 可视行 > 3 → 折叠
+        let lines = render_entries(&entries, &theme, &expanded, 20);
+        let text = tool_lines_to_text(&lines);
+        assert!(
+            text.contains("Ctrl+O 展开"),
+            "单行长输出应按可视行数折叠: {text}"
+        );
+        // 宽度 200 → 内容宽 194 → 80 字符 1 可视行 ≤ 3 → 不折叠
+        let lines_wide = render_entries(&entries, &theme, &expanded, 200);
+        let text_wide = tool_lines_to_text(&lines_wide);
+        assert!(
+            !text_wide.contains("Ctrl+O"),
+            "宽终端下单行不超阈值不应折叠: {text_wide}"
+        );
+    }
+
+    #[test]
+    fn toggle_last_tool_result_expansion_flips_state() {
+        let theme = Theme::resolve("cyberpunk");
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "list_dir".into(),
+            output: "l1\nl2\nl3\nl4\nl5".into(),
+            is_error: false,
+        });
+        // 默认折叠
+        s.prepare_render(&theme, 80);
+        let folded_text = tool_lines_to_text(s.cached_history());
+        assert!(folded_text.contains("Ctrl+O 展开"));
+        assert!(!folded_text.contains("l1"));
+        // 展开
+        s.toggle_last_tool_result_expansion();
+        s.prepare_render(&theme, 80);
+        let expanded_text = tool_lines_to_text(s.cached_history());
+        assert!(expanded_text.contains("Ctrl+O 折叠"));
+        assert!(expanded_text.contains("l1"));
+        // 再次切换 → 折叠
+        s.toggle_last_tool_result_expansion();
+        s.prepare_render(&theme, 80);
+        let refolded_text = tool_lines_to_text(s.cached_history());
+        assert!(refolded_text.contains("Ctrl+O 展开"));
+        assert!(!refolded_text.contains("l1"));
+    }
+
+    #[test]
+    fn toggle_with_no_tool_result_is_noop() {
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::User("hi".into()));
+        s.toggle_last_tool_result_expansion(); // 不应 panic
+        assert!(s.expanded_tool_results.is_empty());
+    }
+
+    #[test]
+    fn toggle_targets_last_tool_result_among_many() {
+        let theme = Theme::resolve("cyberpunk");
+        let mut s = ChatState::new();
+        // idx 0: ToolResult（5 行，折叠）
+        s.entries.push(ChatEntry::ToolResult {
+            id: "c1".into(),
+            name: "t1".into(),
+            output: "a1\na2\na3\na4\na5".into(),
+            is_error: false,
+        });
+        s.entries.push(ChatEntry::Assistant("中间文本".into()));
+        // idx 2: 最后一个 ToolResult（5 行，折叠）
+        s.entries.push(ChatEntry::ToolResult {
+            id: "c2".into(),
+            name: "t2".into(),
+            output: "b1\nb2\nb3\nb4\nb5".into(),
+            is_error: false,
+        });
+        s.toggle_last_tool_result_expansion();
+        // 仅 idx 2 应展开（idx 0 仍折叠）
+        assert!(s.expanded_tool_results.contains(&2));
+        assert!(!s.expanded_tool_results.contains(&0));
+        s.prepare_render(&theme, 80);
+        let text = tool_lines_to_text(s.cached_history());
+        // idx 2 展开（含 b1 全显 + 折叠提示），idx 0 折叠（含 Ctrl+O 展开 + 不含 a1）
+        assert!(text.contains("b1"));
+        assert!(text.contains("Ctrl+O 折叠"));
+        assert!(!text.contains("a1"));
+    }
+
     #[test]
     fn clear_empties_entries() {
         let mut s = ChatState::new();
@@ -990,7 +1355,7 @@ mod tests {
         s.entries.push(ChatEntry::User("你好".into()));
         s.entries.push(ChatEntry::Assistant("收到".into()));
         // 首次 prepare：缓存为空 + dirty → 重建
-        s.prepare_render(&theme);
+        s.prepare_render(&theme, 80);
         let cached = s.cached_history();
         assert!(!cached.is_empty(), "有条目则缓存非空");
         // render_entries 在每条目后附一空行；2 条目 → 至少 4 行（含分隔空行）
@@ -1002,14 +1367,14 @@ mod tests {
         let theme = Theme::resolve("cyberpunk");
         let mut s = ChatState::new();
         s.entries.push(ChatEntry::User("q".into()));
-        s.prepare_render(&theme);
+        s.prepare_render(&theme, 80);
         let len_after_first = s.cached_history().len();
         // 无 entries 变化再次 prepare：缓存长度不变（复用，不重建）
-        s.prepare_render(&theme);
+        s.prepare_render(&theme, 80);
         assert_eq!(s.cached_history().len(), len_after_first);
         // 新增条目 → 重建，缓存增长
         s.entries.push(ChatEntry::Assistant("a".into()));
-        s.prepare_render(&theme);
+        s.prepare_render(&theme, 80);
         assert!(
             s.cached_history().len() > len_after_first,
             "条目增加后缓存应重建并增长"
@@ -1022,10 +1387,10 @@ mod tests {
         let theme_b = Theme::resolve("nord");
         let mut s = ChatState::new();
         s.entries.push(ChatEntry::User("hi".into()));
-        s.prepare_render(&theme_a);
+        s.prepare_render(&theme_a, 80);
         // entries.len() 不变，仅 theme 变 → 须 invalidate 才会重建
         s.invalidate_cache();
-        s.prepare_render(&theme_b);
+        s.prepare_render(&theme_b, 80);
         // 重建后缓存仍非空（内容样式已用 theme_b，这里仅验证重建发生不 panic）
         assert!(!s.cached_history().is_empty());
     }

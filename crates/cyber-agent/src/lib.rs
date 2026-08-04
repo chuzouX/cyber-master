@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod anthropic;
+pub mod compact;
 pub mod error;
 pub mod mock;
 pub mod models;
@@ -18,7 +19,12 @@ pub mod tool;
 pub mod tools;
 pub mod types;
 
-pub use agent::run_stream;
+pub use agent::{run_stream, run_compact_stream};
+pub use compact::{
+    auto_compact_threshold, compact_messages, compact_prompt,
+    context_remaining_percent, estimate_messages_tokens, estimate_tokens,
+    AUTOCOMPACT_BUFFER_TOKENS, COMPACT_MAX_OUTPUT_TOKENS,
+};
 pub use error::{AgentError, Result};
 pub use models::{extract_model_ids, fetch_models};
 pub use provider::{provider_factory, Provider, StreamRequest};

@@ -36,9 +36,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 异步
 tokio = { version = "1", features = ["full"] }
 # HTTP / 流式（P2 Chat）
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
 futures = "0.3"
 bytes = "1"
+# HTML→纯文本（web_fetch 工具用）
+html2text = "0.14"
 # CLI
 clap = { version = "4", features = ["derive"] }
 # TUI

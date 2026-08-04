@@ -1,8 +1,8 @@
 //! 斜杠命令解析（Chat 输入态）。
 //!
 //! 用户在输入框输入以 `/` 开头的文本并 Enter 时，App 拦截为斜杠命令（不发送给
-//! agent）。支持：`/help` `/clear` `/mode` `/model` `/provider` `/tools` `/cancel` `/quit`
-//! `/new` `/sessions` `/max_steps`。
+//! agent）。支持：`/help` `/clear` `/mode` `/model`（打开面板选 provider+model）
+//! `/provider` `/tools` `/cancel` `/quit` `/new` `/sessions` `/max_steps`。
 //!
 //! 命令名大小写不敏感（`/HELP` 与 `/help` 等价）；参数保留原样。未知命令返回
 //! `Unknown`，由 App 层展示提示。
@@ -43,8 +43,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/model",
-        usage: "/model <provider>",
-        desc: "切换默认 provider（/provider use 的 alias）",
+        usage: "/model [provider]",
+        desc: "打开面板选择 provider + model（带 provider 参数则直接切换）",
     },
     CommandSpec {
         name: "/provider",
@@ -70,6 +70,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/cancel",
         usage: "/cancel",
         desc: "取消当前生成",
+    },
+    CommandSpec {
+        name: "/compact",
+        usage: "/compact [instructions]",
+        desc: "手动压缩上下文（可选自定义摘要指令）",
     },
     CommandSpec {
         name: "/max_steps",
@@ -109,7 +114,7 @@ pub enum SlashCommand {
     Clear,
     /// `/mode <name>` — 切换模式（空串表示缺参数）。
     Mode(String),
-    /// `/model <provider>` — 切换默认 provider（`/provider use` 的 alias，向后兼容）。
+    /// `/model [provider]` — 打开面板选择 provider + model（空串）；或直接切换 provider（向后兼容）。
     Model(String),
     /// `/provider <subcommand>` — 管理服务商（list / add / edit / use / remove）。
     /// 空串 = list；子命令参数保留原样由 App 层解析。
@@ -124,6 +129,9 @@ pub enum SlashCommand {
     Mcp(String),
     /// `/cancel` — 取消当前生成。
     Cancel,
+    /// `/compact [instructions]` — 手动压缩上下文。
+    /// 空串 = 无自定义指令；非空 = 自定义摘要指令。
+    Compact(String),
     /// `/max_steps <N>` — 查看或设置工具调用步数上限。空串 = 查看当前值。
     MaxSteps(String),
     /// `/new` — 新建会话（保存当前 → 切到空会话）。
@@ -155,6 +163,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/skill" => SlashCommand::Skill(args.to_string()),
         "/mcp" => SlashCommand::Mcp(args.to_string()),
         "/cancel" => SlashCommand::Cancel,
+        "/compact" => SlashCommand::Compact(args.to_string()),
         "/max_steps" => SlashCommand::MaxSteps(args.to_string()),
         "/new" => SlashCommand::New,
         "/sessions" => SlashCommand::Sessions(args.to_string()),
@@ -169,12 +178,13 @@ pub const HELP_TEXT: &str = "\
   /help              显示此帮助
   /clear             清空对话历史
   /mode <name>       切换模式（chat / workflow / dashboard）
-  /model <provider>  切换默认 provider（/provider use 的 alias）
+  /model [provider]  打开面板选择 provider + model（带 provider 参数则直接切换）
   /provider <sub>    管理服务商：list | add | edit <name> | use <name> | remove <name>
   /tools             列出可用工具
   /skill <name|list> 查看 Skill 详细说明（list 列出全部）
   /mcp <list|status> 查看 MCP server 连接状态
   /cancel            取消当前生成
+  /compact [instr]   手动压缩上下文（可选自定义摘要指令）
   /max_steps <N>     查看或设置工具调用步数上限（1-1000）
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
@@ -242,6 +252,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_compact_no_arg() {
+        assert_eq!(parse("/compact"), SlashCommand::Compact(String::new()));
+        assert_eq!(parse("/compact   "), SlashCommand::Compact(String::new()));
+    }
+
+    #[test]
+    fn parse_compact_with_instructions() {
+        assert_eq!(
+            parse("/compact 关注安全相关内容"),
+            SlashCommand::Compact("关注安全相关内容".into())
+        );
+        // 多词指令保留原样
+        assert_eq!(
+            parse("/compact focus on code changes and tests"),
+            SlashCommand::Compact("focus on code changes and tests".into())
+        );
+    }
+
+    #[test]
     fn parse_unknown() {
         match parse("/foobar") {
             SlashCommand::Unknown(name) => assert_eq!(name, "/foobar"),
@@ -268,7 +297,7 @@ mod tests {
 
     #[test]
     fn help_text_lists_all_commands() {
-        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/max_steps", "/new", "/sessions", "/quit"] {
+        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/new", "/sessions", "/quit"] {
             assert!(HELP_TEXT.contains(cmd), "HELP_TEXT 应包含 {cmd}");
         }
     }
@@ -354,7 +383,7 @@ mod tests {
     #[test]
     fn commands_catalog_covers_all_parsed_commands() {
         // 目录应覆盖每个可解析命令名
-        for name in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/max_steps", "/new", "/sessions", "/quit"] {
+        for name in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/new", "/sessions", "/quit"] {
             assert!(
                 COMMANDS.iter().any(|c| c.name == name),
                 "COMMANDS 应包含 {name}"

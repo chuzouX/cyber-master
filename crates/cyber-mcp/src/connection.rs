@@ -857,7 +857,7 @@ async fn sse_reader_loop(
             Ok(chunk) => {
                 let events = parser.feed(&chunk);
                 for event in events {
-                    handle_sse_event(&server_name, &event, &endpoint, &pending);
+                    handle_sse_event(&server_name, &event, &endpoint, &pending, &sse_url);
                 }
             }
             Err(e) => {
@@ -872,16 +872,22 @@ async fn sse_reader_loop(
 }
 
 /// 处理单个 SSE 事件：endpoint → 存 URL；message → 路由响应。
+///
+/// `endpoint` 事件 data 可能是绝对 URL（`http://host:port/message`）或相对路径（`/message`）。
+/// 相对路径以 `sse_url` 的 origin（scheme://host:port）补全为绝对 URL，
+/// 否则 reqwest `client.post(relative)` 会报 `builder error`。
 fn handle_sse_event(
     server_name: &str,
     event: &SseEvent,
     endpoint: &Arc<Mutex<Option<String>>>,
     pending: &PendingMap,
+    sse_url: &str,
 ) {
     if event.event == "endpoint" {
         let ep = event.data.trim().to_string();
         if !ep.is_empty() {
-            *endpoint.lock().unwrap() = Some(ep);
+            let resolved = resolve_endpoint_url(&ep, sse_url);
+            *endpoint.lock().unwrap() = Some(resolved);
         }
         return;
     }
@@ -923,6 +929,34 @@ async fn wait_for_endpoint(
             return None;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 把 SSE endpoint 事件下发的 URL 补全为绝对 URL。
+///
+/// - 绝对 URL（`http://` / `https://`）→ 原样返回
+/// - 相对路径（`/message`、`message`）→ 用 `sse_url` 的 origin 拼接
+fn resolve_endpoint_url(ep: &str, sse_url: &str) -> String {
+    if ep.starts_with("http://") || ep.starts_with("https://") {
+        return ep.to_string();
+    }
+    // 从 sse_url 提取 origin（scheme://host:port）
+    let origin = match sse_url.find("://") {
+        Some(i) => {
+            let after_scheme = &sse_url[i + 3..];
+            // origin 到下一个 '/' 或末尾
+            match after_scheme.find('/') {
+                Some(j) => &sse_url[..i + 3 + j],
+                None => sse_url,
+            }
+        }
+        None => sse_url,
+    };
+    // 拼接：ep 以 '/' 开头直接 append，否则补 '/'
+    if ep.starts_with('/') {
+        format!("{origin}{ep}")
+    } else {
+        format!("{origin}/{ep}")
     }
 }
 
@@ -1143,6 +1177,46 @@ mod tests {
             text: String::new(),
         };
         assert!(!c2.is_text());
+    }
+
+    // ── 单元测试：SSE endpoint 相对路径补全 ──────────────────────────────
+
+    #[test]
+    fn resolve_endpoint_url_absolute_unchanged() {
+        let url = resolve_endpoint_url("http://127.0.0.1:9876/message", "http://127.0.0.1:9876/sse");
+        assert_eq!(url, "http://127.0.0.1:9876/message");
+    }
+
+    #[test]
+    fn resolve_endpoint_url_https_absolute_unchanged() {
+        let url = resolve_endpoint_url("https://api.example.com/mcp", "https://api.example.com/sse");
+        assert_eq!(url, "https://api.example.com/mcp");
+    }
+
+    #[test]
+    fn resolve_endpoint_url_relative_leading_slash() {
+        // /message + sse_url origin → http://host:port/message
+        let url = resolve_endpoint_url("/message", "http://127.0.0.1:9876/sse");
+        assert_eq!(url, "http://127.0.0.1:9876/message");
+    }
+
+    #[test]
+    fn resolve_endpoint_url_relative_no_leading_slash() {
+        let url = resolve_endpoint_url("message", "http://127.0.0.1:9876/sse");
+        assert_eq!(url, "http://127.0.0.1:9876/message");
+    }
+
+    #[test]
+    fn resolve_endpoint_url_relative_with_trailing_slash_sse_url() {
+        // sse_url 以 / 结尾时也要正确提取 origin
+        let url = resolve_endpoint_url("/message", "http://127.0.0.1:9876/");
+        assert_eq!(url, "http://127.0.0.1:9876/message");
+    }
+
+    #[test]
+    fn resolve_endpoint_url_relative_different_port() {
+        let url = resolve_endpoint_url("/endpoint", "http://localhost:3000/sse");
+        assert_eq!(url, "http://localhost:3000/endpoint");
     }
 }
 
