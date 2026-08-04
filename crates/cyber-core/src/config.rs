@@ -9,6 +9,27 @@ pub struct Config {
     pub workflow: WorkflowConfig,
     pub tools: ToolsConfig,
     pub storage: StorageConfig,
+    pub env: EnvConfig,
+}
+
+/// 环境变量配置：存储用户自定义 env vars，供 shell/agent 子进程注入。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvConfig {
+    /// 环境变量列表（有序，保留用户输入顺序）。
+    pub vars: Vec<EnvVar>,
+}
+
+/// 单条环境变量。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvVar {
+    /// 变量名（如 `OPENAI_API_KEY`）。
+    pub key: String,
+    /// 变量值。
+    pub value: String,
+    /// 是否为敏感内容：true 时 UI 脱敏展示（如 `sk-****key`）。
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

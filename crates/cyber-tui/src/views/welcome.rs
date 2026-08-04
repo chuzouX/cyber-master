@@ -15,6 +15,7 @@ const OPTIONS: &[&str] = &[
     "打开工作流 (Open Workflow)",
     "进入聊天  (Enter Chat)",
     "设置      (Settings)",
+    "关于      (About)",
 ];
 
 /// 渲染 Welcome 页。

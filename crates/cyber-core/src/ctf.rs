@@ -119,6 +119,14 @@ pub struct CtfChallenge {
     /// 关键知识点/卡点。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_points: Option<String>,
+    /// 是否为全局题目（跨 session 可见）。false = 仅当前 session。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_global: bool,
+}
+
+/// serde skip_serializing_if 辅助：值为 false 时跳过序列化。
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 impl CtfChallenge {
@@ -137,6 +145,7 @@ impl CtfChallenge {
             end_time: None,
             writeup: None,
             key_points: None,
+            is_global: false,
         }
     }
 
@@ -170,8 +179,8 @@ fn short_id() -> String {
     format!("{now:08x}")[..8].to_string()
 }
 
-/// 当前时间字符串（`HH:MM` 格式）。
-fn current_time_str() -> String {
+/// 当前时间字符串（`HH:MM` 格式，UTC+8）。
+pub fn current_time_str() -> String {
     // 不引入 chrono 依赖；用 SystemTime 手算
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

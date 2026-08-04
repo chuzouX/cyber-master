@@ -81,6 +81,7 @@ mod tests {
             cwd: dir.clone(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         };
         let out = ListDirTool
             .run(json!({"path": "."}), &ctx)
@@ -101,6 +102,7 @@ mod tests {
             cwd: dir.clone(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         };
         let out = ListDirTool.run(json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("marker.txt"));

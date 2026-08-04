@@ -189,6 +189,7 @@ mod tests {
             cwd: PathBuf::from(cwd),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         }
     }
 

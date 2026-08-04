@@ -32,11 +32,15 @@ impl CtfChallengeTool {
         }
     }
 
-    /// 持久化当前 challenges 到 `challenges.json`。
+    /// 持久化全局 challenges 到 `challenges.json`。
+    ///
+    /// 仅保存 `is_global == true` 的题目；session 级题目由 TUI 的 `save_history()` 负责。
+    /// 这样避免 session 题目污染全局文件导致重复加载。
     fn persist(&self) {
         let challenges = self.challenges.lock().unwrap();
+        let global: Vec<_> = challenges.iter().filter(|c| c.is_global).cloned().collect();
         let path = self.ctf_dir.join("challenges.json");
-        match serde_json::to_string_pretty(&*challenges) {
+        match serde_json::to_string_pretty(&global) {
             Ok(json) => {
                 if let Err(e) = std::fs::create_dir_all(&self.ctf_dir) {
                     warn!(error = %e, dir = %self.ctf_dir.display(), "CTF 目录创建失败");
@@ -285,6 +289,7 @@ mod tests {
             cwd: PathBuf::from("."),
             rules: Vec::new(),
             scope: None,
+            env: Vec::new(),
         }
     }
 

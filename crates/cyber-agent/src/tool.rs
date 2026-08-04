@@ -28,12 +28,14 @@ pub struct ToolOutput {
     pub is_error: bool,
 }
 
-/// 工具执行上下文：工作目录 + 安全护栏（rules / scope）。
+/// 工具执行上下文：工作目录 + 安全护栏（rules / scope）+ 用户自定义环境变量。
 #[derive(Debug, Clone)]
 pub struct ToolCtx {
     pub cwd: PathBuf,
     pub rules: Vec<String>,
     pub scope: Option<String>,
+    /// 用户在 Settings → Env 配置的环境变量，注入 shell 子进程。
+    pub env: Vec<(String, String)>,
 }
 
 /// 工具抽象。`Send + Sync` 以便 `Box<dyn Tool>` 跨 tokio task。
@@ -139,6 +141,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         }
     }
 

@@ -343,6 +343,11 @@ static SECTIONS: &[SectionDef] = &[
         fields: &[],
     },
     SectionDef {
+        name: "Env",
+        editable: false,
+        fields: &[],
+    },
+    SectionDef {
         name: "Skills",
         editable: false,
         fields: &[],
@@ -375,14 +380,24 @@ pub struct SettingsState {
     pub provider_on_save: bool,
     /// MCP 段 cursor 是否停在保存按钮行。
     pub mcp_on_save: bool,
+    /// Env 段有未保存改动。
+    pub dirty_env: bool,
+    /// Env 段 cursor（在 env vars 列表中）。
+    pub env_selected: usize,
+    /// Env 段双击 `d` 删除确认。
+    pub env_pending_delete_idx: Option<usize>,
+    /// Env 段 cursor 是否停在保存按钮行。
+    pub env_on_save: bool,
 }
 
 /// Providers 段在 SECTIONS 中的索引。
 pub const PROVIDERS_SECTION_IDX: usize = 5;
 /// MCP 段在 SECTIONS 中的索引。
 pub const MCP_SECTION_IDX: usize = 6;
+/// Env 段在 SECTIONS 中的索引。
+pub const ENV_SECTION_IDX: usize = 7;
 /// Skills 段在 SECTIONS 中的索引。
-pub const SKILLS_SECTION_IDX: usize = 7;
+pub const SKILLS_SECTION_IDX: usize = 8;
 
 impl SettingsState {
     pub fn new() -> Self {
@@ -423,6 +438,11 @@ impl SettingsState {
         self.section == SKILLS_SECTION_IDX
     }
 
+    /// 当前是否在 Env 段。
+    pub fn on_env_section(&self) -> bool {
+        self.section == ENV_SECTION_IDX
+    }
+
     /// Providers 段是否停在保存按钮行。
     pub fn on_provider_save_row(&self) -> bool {
         self.on_providers_section() && self.provider_on_save
@@ -431,6 +451,11 @@ impl SettingsState {
     /// MCP 段是否停在保存按钮行。
     pub fn on_mcp_save_row(&self) -> bool {
         self.on_mcp_section() && self.mcp_on_save
+    }
+
+    /// Env 段是否停在保存按钮行。
+    pub fn on_env_save_row(&self) -> bool {
+        self.on_env_section() && self.env_on_save
     }
 
     /// Providers 段 cursor 下移（clamp，空列表 no-op）。
@@ -522,6 +547,41 @@ impl SettingsState {
             return;
         }
         self.skills_selected = self.skills_selected.saturating_sub(1);
+    }
+
+    /// Env 段 cursor 下移（与 Providers/MCP 同：末尾 → 保存行）。
+    pub fn next_env(&mut self, len: usize) {
+        if self.env_on_save {
+            return;
+        }
+        if len == 0 {
+            self.env_on_save = true;
+            self.env_selected = 0;
+            return;
+        }
+        if self.env_selected + 1 >= len {
+            self.env_on_save = true;
+        } else {
+            self.env_selected += 1;
+        }
+    }
+
+    /// Env 段 cursor 上移。
+    pub fn prev_env(&mut self, len: usize) {
+        if self.env_on_save {
+            self.env_on_save = false;
+            if len > 0 {
+                self.env_selected = len - 1;
+            } else {
+                self.env_selected = 0;
+            }
+            return;
+        }
+        if len == 0 {
+            self.env_selected = 0;
+            return;
+        }
+        self.env_selected = self.env_selected.saturating_sub(1);
     }
 
     pub fn next_field(&mut self) {
@@ -642,8 +702,15 @@ pub fn render(
     has_project_config: bool,
     toast: Option<&str>,
 ) {
-    let dirty_marker =
-        if state.dirty || state.dirty_providers || state.dirty_mcp { " *" } else { "" };
+    let dirty_marker = if state.dirty
+        || state.dirty_providers
+        || state.dirty_mcp
+        || state.dirty_env
+    {
+        " *"
+    } else {
+        ""
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -865,6 +932,29 @@ fn render_fields(
             Line::from(" ↑↓ 选择  Skills 为文件型配置（编辑 SKILL.md 后重启生效）")
                 .style(Style::default().fg(theme.muted)),
         );
+    } else if state.on_env_section() {
+        // Env 段：交互式（a 新增 / e 编辑 / d 删除 / ↑↓ 选择）
+        render_env_lines(&mut lines, theme, &config.env, state);
+        // 保存按钮行
+        lines.push(Line::from(""));
+        let on_save = state.env_on_save;
+        let save_marker = if on_save { "▸ " } else { "  " };
+        let save_style = if on_save {
+            Style::default().bg(theme.sel_bg).fg(theme.sel_fg)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        lines.push(
+            Line::from(format!("{save_marker}保存设置"))
+                .style(save_style.add_modifier(Modifier::BOLD)),
+        );
+        let hint_style = Style::default().fg(theme.muted);
+        let hint = if state.env_pending_delete_idx.is_some() {
+            " 再按 d 确认删除 · 其他键取消"
+        } else {
+            " a 新增 · e 编辑 · d 删除 · ↑↓ 选择 · Enter 保存"
+        };
+        lines.push(Line::from(hint).style(hint_style));
     }
 
     frame.render_widget(
@@ -1105,6 +1195,63 @@ fn render_skills_lines(
                 .style(Style::default().fg(theme.muted)),
             );
         }
+    }
+}
+
+/// 脱敏展示环境变量值：保留前 2 + 后 3 字符，中间用 `****` 替代。
+/// 值长度 ≤ 5 时全部掩码为 `****`。
+fn mask_env_value(val: &str) -> String {
+    if val.len() <= 5 {
+        "****".into()
+    } else {
+        let prefix: String = val.chars().take(2).collect();
+        let suffix: String = val.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("{prefix}****{suffix}")
+    }
+}
+
+/// 渲染 Env vars 列表（名称 / 值 / 敏感标记）。
+fn render_env_lines(
+    lines: &mut Vec<Line>,
+    theme: &Theme,
+    env_config: &cyber_core::EnvConfig,
+    state: &SettingsState,
+) {
+    if env_config.vars.is_empty() {
+        lines.push(
+            Line::from("（无环境变量，按 a 新增）").style(Style::default().fg(theme.muted)),
+        );
+        return;
+    }
+    for (i, var) in env_config.vars.iter().enumerate() {
+        let selected = i == state.env_selected && !state.env_on_save;
+        let pending_delete = state.env_pending_delete_idx == Some(i);
+        let marker = if selected { "▸ " } else { "  " };
+        let delete_tag = if pending_delete { "  [待删除!]" } else { "" };
+        let row_style = if selected {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        let key_color = if pending_delete { theme.accent } else { theme.title };
+        // 敏感变量脱敏展示
+        let display_value = if var.sensitive {
+            mask_env_value(&var.value)
+        } else {
+            var.value.clone()
+        };
+        let sensitive_tag = if var.sensitive { " 🔒敏感" } else { "" };
+        lines.push(
+            Line::from(vec![
+                Span::raw(marker.to_string()),
+                Span::styled(
+                    var.key.clone(),
+                    Style::default().fg(key_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" = {display_value}{sensitive_tag}{delete_tag}")),
+            ])
+            .style(row_style),
+        );
     }
 }
 

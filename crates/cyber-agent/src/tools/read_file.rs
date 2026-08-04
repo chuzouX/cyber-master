@@ -92,6 +92,7 @@ mod tests {
             cwd: dir.to_path_buf(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         }
     }
 

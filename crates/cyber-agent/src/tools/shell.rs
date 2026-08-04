@@ -84,6 +84,10 @@ impl Tool for ShellTool {
                 c.arg("-c").arg(command);
                 c
             };
+            // 注入用户在 Settings → Env 配置的环境变量
+            for (k, v) in &ctx.env {
+                cmd.env(k, v);
+            }
             cmd.current_dir(&ctx.cwd);
             let output = cmd.output().await.map_err(|e| {
                 AgentError::Provider(format!("执行命令失败: {e}"))
@@ -121,6 +125,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         }
     }
 

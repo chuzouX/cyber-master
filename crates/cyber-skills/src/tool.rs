@@ -104,6 +104,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         }
     }
 

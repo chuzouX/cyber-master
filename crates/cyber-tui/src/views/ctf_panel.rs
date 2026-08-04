@@ -102,6 +102,7 @@ fn render_list(
             // 后缀："  "(2) + 状态(最多 6) = 8
             let name_max = (content_area.width as usize).saturating_sub(20);
             let name_parts = wrap_text_by_width(&c.name, name_max);
+            let global_marker = if c.is_global { "★" } else { " " };
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(
@@ -121,6 +122,7 @@ fn render_list(
                 ),
                 Span::raw("  "),
                 Span::styled(status_str, Style::default().fg(status_color)),
+                Span::styled(global_marker, Style::default().fg(theme.accent)),
             ]));
             // 名称换行续行（缩进对齐名称位置）
             for extra in &name_parts[1..] {
@@ -159,7 +161,7 @@ fn render_list(
     let hint = if challenges.is_empty() {
         "Ctrl+T 关闭面板"
     } else {
-        "↑↓选择 Enter查看 Esc关闭"
+        "↑↓选择 Enter查看 d删除 s状态 g全局 G全部全局 e编辑 Esc关闭"
     };
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().fg(theme.muted)),
@@ -303,9 +305,9 @@ fn render_detail(
     frame.render_widget(para, content_area);
 
     let hint = if c.is_solved() && !c.has_writeup() {
-        "w写WP Esc返回"
+        "w写WP Esc返回 Shift+Esc回对话"
     } else {
-        "Esc返回"
+        "Esc返回 Shift+Esc回对话"
     };
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().fg(theme.muted)),

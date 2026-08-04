@@ -143,7 +143,13 @@ async fn run_inner(
     // 工具上下文 + 注册表
     let rules = project.map(|p| p.rules().to_vec()).unwrap_or_default();
     let scope = project.and_then(|p| p.frontmatter.scope.clone());
-    let ctx = ToolCtx { cwd, rules, scope };
+    let env = config
+        .env
+        .vars
+        .iter()
+        .map(|v| (v.key.clone(), v.value.clone()))
+        .collect();
+    let ctx = ToolCtx { cwd, rules, scope, env };
 
     // tools：auto_tool_call 开启且注册表非空时才暴露工具
     let tools = if config.agent.auto_tool_call && !registry.is_empty() {

@@ -39,8 +39,8 @@ use cyber_agent::{
     AgentEvent, Message, ToolRegistry, Usage,
 };
 use cyber_core::{
-    save_config, save_providers, Config, CtfCategory, CtfChallenge, ProjectContext,
-    ProvidersConfig,
+    current_time_str, save_config, save_providers, Config, CtfCategory, CtfChallenge, CtfStatus,
+    ProjectContext, ProvidersConfig,
 };
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
@@ -52,8 +52,10 @@ use crate::slash::{parse as parse_slash, SlashCommand, HELP_TEXT as SLASH_HELP};
 use crate::theme::Theme;
 use crate::ctf_store;
 use crate::views;
+use crate::views::ctf_edit_form::{CtfEditFormAction, CtfEditFormState};
 use crate::views::ctf_panel;
 use crate::views::mcp_form::{McpFormAction, McpFormState};
+use crate::views::env_form::{EnvFormAction, EnvFormState};
 use crate::views::providers::{FormAction, ProviderFormState};
 use crate::views::settings::{LiveApply, SettingsState};
 
@@ -70,9 +72,12 @@ pub enum Mode {
     Settings,
     ProviderForm,
     McpForm,
+    EnvForm,
     ModelPicker,
     Sessions,
     LogViewer,
+    CtfEditForm,
+    About,
 }
 
 impl Mode {
@@ -85,9 +90,12 @@ impl Mode {
             Mode::Settings => "Settings",
             Mode::ProviderForm => "Provider Form",
             Mode::McpForm => "MCP Form",
+            Mode::EnvForm => "Env Form",
+            Mode::CtfEditForm => "CTF Edit",
             Mode::ModelPicker => "Model Picker",
             Mode::Sessions => "Sessions",
             Mode::LogViewer => "Logs",
+            Mode::About => "About",
         }
     }
 }
@@ -350,6 +358,10 @@ pub struct App {
     provider_form: Option<ProviderFormState>,
     /// MCP server 表单状态（Mode::McpForm 时 Some）。
     mcp_form: Option<McpFormState>,
+    /// Env var 编辑表单状态（Mode::EnvForm 时 Some）。
+    env_form: Option<EnvFormState>,
+    /// CTF 题目编辑表单状态（Mode::CtfEditForm 时 Some）。
+    ctf_edit_form: Option<CtfEditFormState>,
     /// 是否强制使用 MockProvider（离线冒烟）。
     mock: bool,
     /// 统一工具表 + Skill / MCP 注册表（P3：跨 agent turn 共享）。
@@ -396,7 +408,7 @@ pub struct App {
     mouse_capture: bool,
 }
 
-const WELCOME_OPTIONS: usize = 4;
+const WELCOME_OPTIONS: usize = 5;
 
 impl App {
     #[allow(clippy::too_many_arguments)]
@@ -447,6 +459,8 @@ impl App {
             fetch_tx,
             provider_form: None,
             mcp_form: None,
+            env_form: None,
+            ctf_edit_form: None,
             mock,
             registries,
             sessions: SessionIndex::default(),
@@ -495,11 +509,12 @@ impl App {
         }
         // 从已加载的 User 条目派生输入历史，使 ↑/↓ 可跨会话呼出历史指令。
         self.chat.seed_input_history();
-        // 加载当前 session 的 CTF 题目
+        // 加载 CTF 题目：全局 + 当前 session（按名称去重，session 版本优先）
+        let global_challenges = ctf_store::load_challenges(&self.paths.ctf_dir);
         let session_challenges =
             ctf_store::load_session_challenges(&self.paths.ctf_dir, &self.sessions.current);
         if let Ok(mut list) = self.ctf_challenges.lock() {
-            *list = session_challenges;
+            *list = merge_challenges(global_challenges, session_challenges);
         }
         let mut terminal: DefaultTerminal = ratatui::init();
         // 鼠标捕获开关：true 时启用滚轮翻页（默认），false 时不启用（可拖拽选区复制）。
@@ -538,16 +553,23 @@ impl App {
             &mut self.sessions,
             &self.chat.entries,
         );
-        // 同步保存当前 session 的 CTF 题目
+        // CTF 题目：全局题目存 challenges.json，session 题目存 sessions/{id}.json
         let challenges: Vec<_> = self
             .ctf_challenges
             .lock()
             .map(|l| l.clone())
             .unwrap_or_default();
+        let global: Vec<_> = challenges.iter().filter(|c| c.is_global).cloned().collect();
+        let session: Vec<_> = challenges
+            .iter()
+            .filter(|c| !c.is_global)
+            .cloned()
+            .collect();
+        ctf_store::save_challenges(&self.paths.ctf_dir, &global);
         ctf_store::save_session_challenges(
             &self.paths.ctf_dir,
             &self.sessions.current,
-            &challenges,
+            &session,
         );
     }
 
@@ -612,10 +634,12 @@ impl App {
                     Mode::Chat => self.handle_chat_key(k),
                     Mode::ProviderForm => self.handle_provider_form_key(k),
                     Mode::McpForm => self.handle_mcp_form_key(k),
+                    Mode::EnvForm => self.handle_env_form_key(k),
+                    Mode::CtfEditForm => self.handle_ctf_edit_form_key(k),
                     Mode::ModelPicker => self.handle_model_picker_key(k),
                     Mode::Sessions => self.handle_sessions_key(k),
                     Mode::LogViewer => self.handle_log_viewer_key(k),
-                    Mode::Welcome | Mode::Workflow | Mode::Dashboard | Mode::Settings => {
+                    Mode::Welcome | Mode::Workflow | Mode::Dashboard | Mode::Settings | Mode::About => {
                         self.handle_action(key_to_action(k));
                     }
                 }
@@ -809,11 +833,6 @@ impl App {
                                 c,
                                 &writeup_text,
                             );
-                            ctf_store::save_session_challenges(
-                                &self.paths.ctf_dir,
-                                &self.sessions.current,
-                                &list,
-                            );
                             path
                         } else {
                             None
@@ -821,6 +840,8 @@ impl App {
                     } else {
                         None
                     };
+                    // 持久化题目（锁已释放）：全局→challenges.json，session→sessions/{id}.json
+                    self.save_history();
                     self.chat.entries.push(ChatEntry::System(format!(
                         "题目 {} 的 writeup 已生成{}",
                         name,
@@ -1178,6 +1199,62 @@ impl App {
         }
     }
 
+    /// CTF 编辑表单按键分发：委托 `form.handle_key`，按 `CtfEditFormAction` 执行副作用。
+    fn handle_ctf_edit_form_key(&mut self, k: KeyEvent) {
+        let Some(form) = self.ctf_edit_form.as_mut() else {
+            return;
+        };
+        let action = form.handle_key(k);
+        match action {
+            CtfEditFormAction::None => {}
+            CtfEditFormAction::Cancel => {
+                self.ctf_edit_form = None;
+                self.mode = self.form_prev_mode;
+            }
+            CtfEditFormAction::Save => self.save_ctf_edit_form(),
+        }
+    }
+
+    /// 保存 CTF 编辑表单：将表单值回写到选中题目 → 持久化 → 返回 prev_mode。
+    fn save_ctf_edit_form(&mut self) {
+        let form = match self.ctf_edit_form.as_ref() {
+            Some(f) => f,
+            None => return,
+        };
+        let challenge_id = form.challenge_id.clone();
+        let applied = {
+            let Ok(list) = self.ctf_challenges.lock() else {
+                return;
+            };
+            let Some(c) = list.iter().find(|c| c.id == challenge_id).cloned() else {
+                return;
+            };
+            form.apply_to(c)
+        };
+        let name = applied.name.clone();
+        let updated = self
+            .ctf_challenges
+            .lock()
+            .map(|mut list| {
+                let mut done = false;
+                for c in list.iter_mut() {
+                    if c.id == challenge_id {
+                        *c = applied.clone();
+                        done = true;
+                        break;
+                    }
+                }
+                done
+            })
+            .unwrap_or(false);
+        if updated {
+            self.toast = Some(format!("「{name}」已保存"));
+            self.save_history();
+        }
+        self.ctf_edit_form = None;
+        self.mode = self.form_prev_mode;
+    }
+
     /// 拉起一次 agent 流式任务。先 abort 任何旧任务 + bump generation（隔离 stale 事件）。
     fn spawn_agent(&mut self, text: String, history: Vec<Message>) {
         if let Some(h) = self.agent_handle.take() {
@@ -1330,11 +1407,12 @@ impl App {
         self.chat.seed_input_history();
         self.usage = UsageStats::default();
         self.sessions.current = id.to_string();
-        // 加载目标 session 的 CTF 题目
-        let new_challenges =
+        // 加载目标 session 的 CTF 题目（全局题目保留不动）
+        let global_challenges = ctf_store::load_challenges(&self.paths.ctf_dir);
+        let session_challenges =
             ctf_store::load_session_challenges(&self.paths.ctf_dir, id);
         if let Ok(mut list) = self.ctf_challenges.lock() {
-            *list = new_challenges;
+            *list = merge_challenges(global_challenges, session_challenges);
         }
         // 重置面板选中状态
         self.ctf_selected = 0;
@@ -1641,6 +1719,11 @@ impl App {
             self.ctf_panel_fullscreen = false;
             return Some(true);
         }
+        // Shift+Esc: 取消面板聚焦，直接回到对话（不退出详情视图 / 不还原全屏）
+        if k.code == KeyCode::Esc && k.modifiers.contains(KeyModifiers::SHIFT) {
+            self.ctf_panel_focused = false;
+            return Some(true);
+        }
         match k.code {
             KeyCode::Esc => {
                 if self.ctf_panel_fullscreen {
@@ -1682,6 +1765,122 @@ impl App {
                     if self.ctf_selected < len {
                         self.ctf_detail_view = true;
                         self.ctf_detail_scroll = 0;
+                    }
+                }
+                Some(true)
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                // 列表视图：删除选中题目
+                if !self.ctf_detail_view {
+                    let removed_name = self
+                        .ctf_challenges
+                        .lock()
+                        .ok()
+                        .and_then(|mut list| {
+                            if self.ctf_selected < list.len() {
+                                let name = list[self.ctf_selected].name.clone();
+                                list.remove(self.ctf_selected);
+                                Some(name)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(name) = removed_name {
+                        // 调整选中索引
+                        let len = self.ctf_challenges.lock().map(|l| l.len()).unwrap_or(0);
+                        if self.ctf_selected >= len && len > 0 {
+                            self.ctf_selected = len - 1;
+                        }
+                        self.toast = Some(format!("已删除「{name}」"));
+                        self.save_history();
+                    }
+                }
+                Some(true)
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                // 切换选中题目状态（进行中 ↔ 已完成）
+                let toggled = self
+                    .ctf_challenges
+                    .lock()
+                    .ok()
+                    .and_then(|mut list| {
+                        let c = list.get_mut(self.ctf_selected)?;
+                        let was_solved = c.is_solved();
+                        c.status = if was_solved {
+                            CtfStatus::InProgress
+                        } else {
+                            CtfStatus::Solved
+                        };
+                        if !was_solved {
+                            c.end_time = Some(current_time_str());
+                        } else {
+                            c.end_time = None;
+                        }
+                        Some((c.name.clone(), c.is_solved()))
+                    });
+                if let Some((name, solved)) = toggled {
+                    self.toast = Some(format!(
+                        "「{name}」→ {}",
+                        if solved { "已完成" } else { "进行中" }
+                    ));
+                    self.save_history();
+                }
+                Some(true)
+            }
+            KeyCode::Char('g') => {
+                // 切换选中题目的全局/Session 范围
+                let toggled = self
+                    .ctf_challenges
+                    .lock()
+                    .ok()
+                    .and_then(|mut list| {
+                        let c = list.get_mut(self.ctf_selected)?;
+                        c.is_global = !c.is_global;
+                        Some((c.name.clone(), c.is_global))
+                    });
+                if let Some((name, is_global)) = toggled {
+                    self.toast = Some(format!(
+                        "「{name}」→ {}",
+                        if is_global { "全局 ★" } else { "仅本 session" }
+                    ));
+                    self.save_history();
+                }
+                Some(true)
+            }
+            KeyCode::Char('G') => {
+                // 将当前 session 的所有题目（非全局）改为全局
+                let count = self
+                    .ctf_challenges
+                    .lock()
+                    .ok()
+                    .map(|mut list| {
+                        let n = list.iter().filter(|c| !c.is_global).count();
+                        for c in list.iter_mut() {
+                            c.is_global = true;
+                        }
+                        n
+                    })
+                    .unwrap_or(0);
+                if count > 0 {
+                    self.toast = Some(format!("已将 {count} 道题目设为全局"));
+                    self.save_history();
+                } else {
+                    self.toast = Some("当前 session 无需转换的题目".into());
+                }
+                Some(true)
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                // 列表视图：打开编辑表单
+                if !self.ctf_detail_view {
+                    let challenge = self
+                        .ctf_challenges
+                        .lock()
+                        .ok()
+                        .and_then(|list| list.get(self.ctf_selected).cloned());
+                    if let Some(c) = challenge {
+                        self.form_prev_mode = self.mode;
+                        self.ctf_edit_form = Some(CtfEditFormState::from_challenge(&c));
+                        self.mode = Mode::CtfEditForm;
                     }
                 }
                 Some(true)
@@ -1980,8 +2179,8 @@ impl App {
                 let challenge = CtfChallenge::new(name.into(), category);
                 if let Ok(mut list) = self.ctf_challenges.lock() {
                     list.push(challenge);
-                    ctf_store::save_challenges(&self.paths.ctf_dir, &list);
                 }
+                self.save_history();
                 self.chat.entries.push(ChatEntry::System(format!(
                     "已添加题目 [{}] {}",
                     category, name
@@ -2351,6 +2550,95 @@ impl App {
         self.mode = Mode::McpForm;
     }
 
+    // ---- Env var 表单 ----
+
+    /// EnvForm 模式按键分发。
+    fn handle_env_form_key(&mut self, k: KeyEvent) {
+        let Some(form) = self.env_form.as_mut() else {
+            return;
+        };
+        let action = form.handle_key(k);
+        match action {
+            EnvFormAction::None => {}
+            EnvFormAction::Cancel => {
+                self.env_form = None;
+                self.mode = self.form_prev_mode;
+            }
+            EnvFormAction::Save => self.save_env_form(),
+        }
+    }
+
+    /// 保存 Env 表单：校验 → upsert → 标脏 → 返回 prev_mode。
+    fn save_env_form(&mut self) {
+        let form = match self.env_form.as_ref() {
+            Some(f) => f,
+            None => return,
+        };
+        if !form.is_valid() {
+            self.toast = Some("key 不能为空".into());
+            return;
+        }
+        let var = form.build_var();
+        let key = var.key.clone();
+        match form.edit_index {
+            Some(idx) => {
+                // 编辑已有：替换
+                if let Some(slot) = self.config.env.vars.get_mut(idx) {
+                    *slot = var;
+                }
+            }
+            None => {
+                // 新增：同 key 覆盖，否则追加
+                if let Some(existing) = self.config.env.vars.iter_mut().find(|v| v.key == key) {
+                    *existing = var;
+                } else {
+                    self.config.env.vars.push(var);
+                }
+            }
+        }
+        self.settings.dirty_env = true;
+        self.toast = Some(format!("环境变量 '{key}' 已暂存（保存设置后生效）"));
+        self.env_form = None;
+        self.mode = self.form_prev_mode;
+    }
+
+    /// 从 Settings Env 段打开新增表单。
+    fn open_env_form_add(&mut self) {
+        self.form_prev_mode = self.mode;
+        self.env_form = Some(EnvFormState::for_add());
+        self.mode = Mode::EnvForm;
+    }
+
+    /// 从 Settings Env 段打开编辑表单。
+    fn open_env_form_edit(&mut self) {
+        let Some(var) = self.config.env.vars.get(self.settings.env_selected).cloned() else {
+            return;
+        };
+        self.form_prev_mode = self.mode;
+        self.env_form = Some(EnvFormState::for_edit(self.settings.env_selected, &var));
+        self.mode = Mode::EnvForm;
+    }
+
+    /// 删除当前选中的 Env var（双击 d 确认）。
+    fn delete_selected_env(&mut self) {
+        let Some(idx) = self.settings.env_pending_delete_idx else {
+            return;
+        };
+        if idx >= self.config.env.vars.len() {
+            self.settings.env_pending_delete_idx = None;
+            return;
+        }
+        let key = self.config.env.vars[idx].key.clone();
+        self.config.env.vars.remove(idx);
+        self.settings.dirty_env = true;
+        self.settings.env_pending_delete_idx = None;
+        self.toast = Some(format!("已删除环境变量：{key}（保存后生效）"));
+        let len = self.config.env.vars.len();
+        if self.settings.env_selected >= len && len > 0 {
+            self.settings.env_selected = len - 1;
+        }
+    }
+
     /// draw 前的 `&mut self` 准备：① 刷新 ChatState 行缓存（entries/theme 变化时重建），
     /// ② 按 current theme + streaming 态配置 textarea 边框/样式。
     /// 两者都需 `&mut self`（`prepare_render` 写缓存、`set_block`/`set_style` 写 textarea），
@@ -2366,6 +2654,13 @@ impl App {
         // McpForm 模式：同 ProviderForm
         if self.mode == Mode::McpForm {
             if let Some(form) = self.mcp_form.as_mut() {
+                form.prepare_render(&self.theme);
+            }
+            return;
+        }
+        // CtfEditForm 模式：同 ProviderForm
+        if self.mode == Mode::CtfEditForm {
+            if let Some(form) = self.ctf_edit_form.as_mut() {
                 form.prepare_render(&self.theme);
             }
             return;
@@ -2428,6 +2723,13 @@ impl App {
         {
             self.settings.mcp_pending_delete_idx = None;
         }
+        // Env 段：同理清除待删除确认
+        if self.mode == Mode::Settings
+            && self.settings.on_env_section()
+            && !matches!(a, Action::DeleteProvider)
+        {
+            self.settings.env_pending_delete_idx = None;
+        }
         match a {
             Action::Quit => self.should_quit = true,
             Action::OpenSettings => {
@@ -2451,7 +2753,7 @@ impl App {
                         Mode::Chat => Mode::Workflow,
                         Mode::Workflow => Mode::Dashboard,
                         Mode::Dashboard => Mode::Chat,
-                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::ModelPicker | Mode::Sessions | Mode::LogViewer => {
+                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::EnvForm | Mode::CtfEditForm | Mode::ModelPicker | Mode::Sessions | Mode::LogViewer | Mode::About => {
                             self.mode
                         }
                     };
@@ -2460,6 +2762,9 @@ impl App {
             Action::Esc => {
                 if self.mode == Mode::Settings {
                     self.exit_settings();
+                } else if self.mode == Mode::About {
+                    // 关于页：返回进入前的模式
+                    self.mode = self.prev_mode;
                 } else if self.project.is_none() && self.mode != Mode::Welcome {
                     // 仅在无项目上下文时允许从占位模式返回 Welcome
                     self.mode = Mode::Welcome;
@@ -2472,6 +2777,8 @@ impl App {
                             .prev_provider(self.providers.providers.len());
                     } else if self.settings.on_mcp_section() {
                         self.settings.prev_mcp(self.mcp_config.servers.len());
+                    } else if self.settings.on_env_section() {
+                        self.settings.prev_env(self.config.env.vars.len());
                     } else if self.settings.on_skills_section() {
                         self.settings.prev_skill(self.registries.skills.len());
                     } else {
@@ -2488,6 +2795,8 @@ impl App {
                             .next_provider(self.providers.providers.len());
                     } else if self.settings.on_mcp_section() {
                         self.settings.next_mcp(self.mcp_config.servers.len());
+                    } else if self.settings.on_env_section() {
+                        self.settings.next_env(self.config.env.vars.len());
                     } else if self.settings.on_skills_section() {
                         self.settings.next_skill(self.registries.skills.len());
                     } else {
@@ -2501,6 +2810,7 @@ impl App {
                 if self.mode == Mode::Settings
                     && !self.settings.on_providers_section()
                     && !self.settings.on_mcp_section()
+                    && !self.settings.on_env_section()
                     && !self.settings.on_skills_section()
                 {
                     let live = self.settings.apply_edit(&mut self.config, &self.providers, false);
@@ -2511,6 +2821,7 @@ impl App {
                 if self.mode == Mode::Settings
                     && !self.settings.on_providers_section()
                     && !self.settings.on_mcp_section()
+                    && !self.settings.on_env_section()
                     && !self.settings.on_skills_section()
                 {
                     let live = self.settings.apply_edit(&mut self.config, &self.providers, true);
@@ -2524,7 +2835,8 @@ impl App {
                         self.save_settings();
                         let still_dirty = self.settings.dirty
                             || self.settings.dirty_providers
-                            || self.settings.dirty_mcp;
+                            || self.settings.dirty_mcp
+                            || self.settings.dirty_env;
                         if !still_dirty {
                             self.settings.pending_discard = false;
                             self.mode = self.prev_mode;
@@ -2534,6 +2846,9 @@ impl App {
                         self.save_settings();
                     } else if self.settings.on_mcp_save_row() {
                         // MCP 段保存按钮：保存设置
+                        self.save_settings();
+                    } else if self.settings.on_env_save_row() {
+                        // Env 段保存按钮：保存设置
                         self.save_settings();
                     } else if self.settings.on_providers_section() {
                         // Providers 段 Enter：设当前选中为默认 provider
@@ -2564,6 +2879,11 @@ impl App {
                             self.settings.pending_discard = false;
                             self.mode = Mode::Settings;
                         }
+                        4 => {
+                            // 进入关于页
+                            self.prev_mode = Mode::Welcome;
+                            self.mode = Mode::About;
+                        }
                         0 => self.toast =
                             Some("（P1 占位：新建项目向导将在后续阶段实现）".into()),
                         1 => self.toast = Some("（P1 占位：工作流编辑器将在 P4 实现）".into()),
@@ -2583,6 +2903,11 @@ impl App {
                     && !self.settings.mcp_on_save
                 {
                     self.open_mcp_form_add();
+                } else if self.mode == Mode::Settings
+                    && self.settings.on_env_section()
+                    && !self.settings.env_on_save
+                {
+                    self.open_env_form_add();
                 }
             }
             Action::EditProvider => {
@@ -2596,6 +2921,11 @@ impl App {
                     && !self.settings.mcp_on_save
                 {
                     self.open_mcp_form_edit();
+                } else if self.mode == Mode::Settings
+                    && self.settings.on_env_section()
+                    && !self.settings.env_on_save
+                {
+                    self.open_env_form_edit();
                 }
             }
             Action::DeleteProvider => {
@@ -2620,6 +2950,16 @@ impl App {
                         self.delete_selected_mcp();
                     } else {
                         self.settings.mcp_pending_delete_idx = Some(cur);
+                    }
+                } else if self.mode == Mode::Settings
+                    && self.settings.on_env_section()
+                    && !self.settings.env_on_save
+                {
+                    let cur = self.settings.env_selected;
+                    if self.settings.env_pending_delete_idx == Some(cur) {
+                        self.delete_selected_env();
+                    } else {
+                        self.settings.env_pending_delete_idx = Some(cur);
                     }
                 }
             }
@@ -2662,6 +3002,7 @@ impl App {
                 self.settings.dirty = false;
                 self.settings.dirty_providers = false;
                 self.settings.dirty_mcp = false;
+                self.settings.dirty_env = false;
                 self.settings.pending_discard = false;
                 self.config_at_entry = self.config.clone();
                 self.providers_at_entry = self.providers.clone();
@@ -2683,7 +3024,10 @@ impl App {
     /// 退出设置：dirty（config / providers / mcp）时首次 Esc 提示（Enter 保存退出 / 再按 Esc 丢弃），
     /// 二次 Esc 回退到快照后返回 prev_mode。
     fn exit_settings(&mut self) {
-        let dirty = self.settings.dirty || self.settings.dirty_providers || self.settings.dirty_mcp;
+        let dirty = self.settings.dirty
+            || self.settings.dirty_providers
+            || self.settings.dirty_mcp
+            || self.settings.dirty_env;
         if dirty {
             if !self.settings.pending_discard {
                 self.settings.pending_discard = true;
@@ -2699,6 +3043,7 @@ impl App {
             self.settings.dirty = false;
             self.settings.dirty_providers = false;
             self.settings.dirty_mcp = false;
+            self.settings.dirty_env = false;
             self.settings.pending_discard = false;
             self.toast = Some("已丢弃改动".into());
         }
@@ -2875,6 +3220,16 @@ impl App {
                     views::mcp_form::render_form(frame, area, &self.theme, form);
                 }
             }
+            Mode::EnvForm => {
+                if let Some(form) = &self.env_form {
+                    views::env_form::render_form(frame, area, &self.theme, form);
+                }
+            }
+            Mode::CtfEditForm => {
+                if let Some(form) = &self.ctf_edit_form {
+                    views::ctf_edit_form::render_form(frame, area, &self.theme, form);
+                }
+            }
             Mode::ModelPicker => views::model_picker::render(
                 frame,
                 area,
@@ -2891,6 +3246,7 @@ impl App {
                 &self.sessions,
             ),
             Mode::LogViewer => self.render_log_viewer(frame, area),
+            Mode::About => views::about::render(frame, area, &self.theme),
         }
     }
 
@@ -2947,9 +3303,11 @@ impl App {
             Mode::Chat => " ○ 选择模式 · 可拖拽复制 · F9 切回滚轮",
             Mode::ProviderForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 kind  Esc 取消",
             Mode::McpForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 transport  Esc 取消",
+            Mode::CtfEditForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切枚举  Esc 取消",
             Mode::Sessions => " ↑↓ 选会话  Enter 切换  n 新建  d 删除  Esc 返回  q 退出",
             Mode::ModelPicker => " ↑↓ 导航  Tab 切换栏  Enter 选择/确认  Esc 返回  q 退出",
             Mode::LogViewer => " ↑↓ 翻滚  PageUp/PageDown 翻页  Ctrl+R 刷新  Esc/Ctrl+L 关闭",
+            Mode::About => " Esc 返回   q 退出",
             _ => " Tab 切换模式   s 设置   Esc 返回 Welcome   q 退出",
         };
 
@@ -2980,6 +3338,28 @@ fn fmt_compact_tokens(n: usize) -> String {
     } else {
         format!("{:.1}k", n as f64 / 1000.0)
     }
+}
+
+/// 合并全局 + session 题目列表，按名称去重。
+///
+/// 如果同名题目同时存在于全局和 session，保留 session 版本（可能包含更新的数据）。
+/// 同时也去除 session 列表内部的重名条目（保留最后一条）。
+fn merge_challenges(global: Vec<CtfChallenge>, session: Vec<CtfChallenge>) -> Vec<CtfChallenge> {
+    let mut result: Vec<CtfChallenge> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 先插入 session 题目（优先保留）
+    for c in session {
+        seen_names.insert(c.name.clone());
+        result.push(c);
+    }
+    // 再插入全局题目中不与 session 重名的
+    for c in global {
+        if !seen_names.contains(&c.name) {
+            seen_names.insert(c.name.clone());
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// 读取日志文件尾部 `max_lines` 行。文件不存在或为空返回空 Vec。

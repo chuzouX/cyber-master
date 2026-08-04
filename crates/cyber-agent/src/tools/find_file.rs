@@ -198,6 +198,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         }
     }
 

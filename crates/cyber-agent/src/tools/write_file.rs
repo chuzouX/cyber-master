@@ -73,6 +73,7 @@ mod tests {
             cwd: dir.clone(),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         };
         let out = WriteFileTool
             .run(json!({"path": "out.txt", "content": "hello"}), &ctx)
@@ -89,6 +90,7 @@ mod tests {
             cwd: std::env::temp_dir().join("cyber_write_guard"),
             rules: vec![],
             scope: None,
+            env: Vec::new(),
         };
         let out = WriteFileTool
             .run(json!({"path": "../../etc/evil", "content": "x"}), &ctx)
