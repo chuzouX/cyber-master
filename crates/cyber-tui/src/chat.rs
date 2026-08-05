@@ -144,6 +144,10 @@ pub struct ChatState {
     /// 当前流式思考过程的累积 buffer（DeepSeek reasoning_content）；
     /// Done 时转为 Thinking 条目（位于对应 Assistant 条目之前）。
     pub thinking_buffer: String,
+    /// 当前工具执行的增量输出累积（shell 逐行 stdout/stderr 经 ToolProgress 推送）。
+    /// ToolResult 到达后定稿为 ToolResult 条目并清空。渲染时作为流式 tail 追加在
+    /// 对应 ToolCall 条目之后（带 ▌ 光标），实现「边执行边输出」。
+    pub streaming_tool_output: String,
     /// 已完成条目的渲染行缓存（不含流式 tail 与空态引导）。
     /// 仅当 `entries.len()` 变化或 `cache_dirty`（如 theme 切换）时重建，
     /// 避免每帧重新 tokenize 全部条目。流式 tail 由 view 每帧追加（量小）。
@@ -183,8 +187,8 @@ pub struct ChatState {
 struct WrappedCache {
     /// 已折行的单行 `Line`（entries + tail）。
     lines: Vec<Line<'static>>,
-    /// 缓存键：(entries.len, streaming_buffer.len, thinking_buffer.len, width)。
-    key: (usize, usize, usize, u16),
+    /// 缓存键：(entries.len, streaming_buffer.len, thinking_buffer.len, streaming_tool_output.len, width)。
+    key: (usize, usize, usize, usize, u16),
     /// 是否有效（theme 切换等 entries.len 不变但样式需刷新时置 false）。
     valid: bool,
 }
@@ -200,6 +204,7 @@ impl ChatState {
             streaming: false,
             streaming_buffer: String::new(),
             thinking_buffer: String::new(),
+            streaming_tool_output: String::new(),
             cached_history: Vec::new(),
             cached_entries_len: 0,
             cache_dirty: true,
@@ -304,6 +309,7 @@ impl ChatState {
                 self.entries.len(),
                 self.streaming_buffer.len(),
                 self.thinking_buffer.len(),
+                self.streaming_tool_output.len(),
                 width,
             );
             if !wc.valid || wc.key != key {
@@ -335,6 +341,7 @@ impl ChatState {
             lines.extend(build_streaming_tail(
                 &self.streaming_buffer,
                 &self.thinking_buffer,
+                &self.streaming_tool_output,
                 theme,
             ));
         }
@@ -523,6 +530,16 @@ impl ChatState {
         Some((text, history))
     }
 
+    /// 插入粘贴文本（bracketed paste）：整块插入输入框，不触发提交。
+    /// 流式期忽略。粘贴后刷新斜杠菜单（可能以 `/` 开头）。
+    pub fn paste(&mut self, text: &str) {
+        if self.streaming {
+            return;
+        }
+        self.input.insert_str(text);
+        self.update_slash_menu();
+    }
+
     /// 把当前 `streaming_buffer` 定稿为一条 assistant 条目（仅 buffer 非空时 push），
     /// **不**改变 streaming 态。用于 ToolCall 到达前先把已累积的 assistant 文本落盘。
     pub fn flush_streaming_to_assistant(&mut self) {
@@ -540,11 +557,20 @@ impl ChatState {
     /// 收到一次工具调用事件：先 flush buffer（若有 assistant 前导文本），再 push ToolCall。
     pub fn push_tool_call(&mut self, id: String, name: String, arguments: String) {
         self.flush_streaming_to_assistant();
+        // 防御：新工具调用开始前清空残留的流式输出（正常情况下上一工具的 ToolResult 已清空）
+        self.streaming_tool_output.clear();
         self.entries.push(ChatEntry::ToolCall { id, name, arguments });
     }
 
-    /// 收到工具结果事件：push ToolResult（紧随对应 ToolCall，无需 flush）。
+    /// 收到工具执行增量输出（ToolProgress）：累积进 `streaming_tool_output`，由流式
+    /// tail 实时渲染（带 ▌ 光标）。工具串行执行，故单缓冲即可。
+    pub fn push_tool_progress(&mut self, chunk: &str) {
+        self.streaming_tool_output.push_str(chunk);
+    }
+
+    /// 收到工具结果事件：push ToolResult（紧随对应 ToolCall，无需 flush），并清空流式输出。
     pub fn push_tool_result(&mut self, id: String, name: String, output: String, is_error: bool) {
+        self.streaming_tool_output.clear();
         self.entries
             .push(ChatEntry::ToolResult { id, name, output, is_error });
     }
@@ -571,6 +597,7 @@ impl ChatState {
     /// buffer 为空时不 push（避免空 assistant 条目；工具链已有 ToolCall/ToolResult 记录）。
     pub fn finalize_stream(&mut self) {
         self.flush_streaming_to_assistant();
+        self.streaming_tool_output.clear();
         self.streaming = false;
     }
 
@@ -578,6 +605,7 @@ impl ChatState {
     pub fn cancel_stream(&mut self) {
         self.streaming_buffer.clear();
         self.thinking_buffer.clear();
+        self.streaming_tool_output.clear();
         self.streaming = false;
     }
 
@@ -586,6 +614,7 @@ impl ChatState {
         self.entries.clear();
         self.streaming_buffer.clear();
         self.thinking_buffer.clear();
+        self.streaming_tool_output.clear();
         self.scroll_to_bottom();
         self.slash_menu.close();
         self.expanded_tool_results.clear();
@@ -682,11 +711,30 @@ pub fn render_entries(
 /// 缓存（量小，每帧随 buffer 变化重建）。
 ///
 /// 若 `thinking_buffer` 非空，在 assistant 标签前渲染思考过程（最新 3 行 + 折叠提示）。
-fn build_streaming_tail(buffer: &str, thinking: &str, theme: &Theme) -> Vec<Line<'static>> {
+///
+/// 若 `tool_out` 非空（工具执行中，streaming_buffer 已 flush），改为渲染工具增量输出：
+/// 每行带 `→` 前缀（首行）/ 缩进（续行），末行带 ▌ 光标，实现「边执行边输出」。
+fn build_streaming_tail(buffer: &str, thinking: &str, tool_out: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     // 思考过程（最新 3 行）
     if !thinking.is_empty() {
         push_thinking_lines_streaming(&mut lines, theme, thinking);
+    }
+    // 工具执行增量输出（与 assistant buffer 互斥：工具运行时 buffer 已 flush 为空）
+    if !tool_out.is_empty() {
+        let all_lines: Vec<&str> = tool_out.lines().collect();
+        for (i, l) in all_lines.iter().enumerate() {
+            let prefix = if i == 0 { "    → " } else { "      " };
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(theme.muted)),
+                Span::styled(l.to_string(), Style::default().fg(theme.fg)),
+            ];
+            if i == all_lines.len() - 1 {
+                spans.push(Span::styled("▌", Style::default().fg(theme.accent)));
+            }
+            lines.push(Line::from(spans));
+        }
+        return lines;
     }
     lines.push(Line::from(Span::styled(
         "[assistant]",

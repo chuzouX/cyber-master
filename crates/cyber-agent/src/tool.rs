@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::{AgentError, Result};
 
@@ -47,6 +48,20 @@ pub trait Tool: Send + Sync {
         input: Value,
         ctx: &'a ToolCtx,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>>;
+
+    /// 流式执行：与 `run` 相同语义，但可通过 `progress` 通道向前端推送增量输出
+    ///（如 shell 逐行 stdout/stderr）。默认实现忽略 `progress` 直接调 `run`，
+    /// 需要流式的工具（shell）覆写。`progress` 为 `None` 时表示调用方不消费流
+    ///（如单测直接调 `run`），实现应跳过推送避免 channel 缓冲无限增长。
+    fn run_streaming<'a>(
+        &'a self,
+        input: Value,
+        ctx: &'a ToolCtx,
+        progress: Option<UnboundedSender<String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+        let _ = progress;
+        self.run(input, ctx)
+    }
 }
 
 /// 统一工具表：持有 `Box<dyn Tool>`，按名查找、批量导出 schema、统一执行。
@@ -88,6 +103,25 @@ impl ToolRegistry {
         match self.get(name) {
             Some(tool) => tool.run(input, ctx),
             None => Box::pin(async move {
+                Err(AgentError::Provider(format!("未知工具: {name}")))
+            }),
+        }
+    }
+
+    /// 流式执行工具：经 `progress` 通道推送增量输出（shell 逐行 stdout/stderr）。
+    /// 不支持流式的工具走 trait 默认实现（忽略 progress，直接 `run`）。
+    /// `progress` 为 `None` 时表示调用方不消费流（如单测），工具应跳过推送。
+    pub fn execute_streaming<'a>(
+        &'a self,
+        name: &'a str,
+        input: Value,
+        ctx: &'a ToolCtx,
+        progress: Option<UnboundedSender<String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+        match self.get(name) {
+            Some(tool) => tool.run_streaming(input, ctx, progress),
+            None => Box::pin(async move {
+                let _ = progress;
                 Err(AgentError::Provider(format!("未知工具: {name}")))
             }),
         }

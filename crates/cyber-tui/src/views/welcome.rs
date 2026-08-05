@@ -86,10 +86,16 @@ pub fn render(
             Style::default().fg(theme.fg)
         };
         let prefix = if idx == selected { "▸ " } else { "  " };
+        // 按钮靠左对齐，左侧留 25% 缩进
+        let btn_cols = Layout::horizontal([
+            Constraint::Percentage(25),
+            Constraint::Min(0),
+        ])
+        .split(rows[i]);
         frame.render_widget(
             Paragraph::new(Line::from(format!("{prefix}{opt}")).style(style))
-                .alignment(Alignment::Center),
-            rows[i],
+                .alignment(Alignment::Left),
+            btn_cols[1],
         );
         i += 1;
     }

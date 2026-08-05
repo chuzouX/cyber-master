@@ -36,6 +36,10 @@ struct LoopDetector {
     last_fingerprint: Option<String>,
     repeat_count: u32,
     threshold: u32,
+    /// 记录本轮 agent turn 中所有出现过的指纹（用于检测非连续重复）。
+    seen_fingerprints: std::collections::HashSet<String>,
+    /// 非连续重复是否已提醒过（避免每轮都提醒）。
+    warned: bool,
 }
 
 impl LoopDetector {
@@ -45,19 +49,33 @@ impl LoopDetector {
             last_fingerprint: None,
             repeat_count: 0,
             threshold: threshold.max(1),
+            seen_fingerprints: std::collections::HashSet::new(),
+            warned: false,
         }
     }
 
     /// 记录本轮工具调用，返回 `true` 表示连续 `threshold` 轮指纹相同（死循环）。
-    fn observe(&mut self, calls: &BTreeMap<u32, ToolCall>) -> bool {
+    /// `repeated` 为 true 表示本轮指纹之前出现过（非连续重复），调用方应注入提醒。
+    fn observe(&mut self, calls: &BTreeMap<u32, ToolCall>) -> (bool, bool) {
         let fp = fingerprint(calls);
-        if Some(&fp) == self.last_fingerprint.as_ref() {
+        let is_consecutive_dup = Some(&fp) == self.last_fingerprint.as_ref();
+        let is_non_consecutive_dup =
+            !is_consecutive_dup && self.seen_fingerprints.contains(&fp);
+
+        if is_consecutive_dup {
             self.repeat_count += 1;
         } else {
             self.repeat_count = 1;
-            self.last_fingerprint = Some(fp);
+            self.last_fingerprint = Some(fp.clone());
         }
-        self.repeat_count >= self.threshold
+        self.seen_fingerprints.insert(fp);
+
+        let loop_triggered = self.repeat_count >= self.threshold;
+        let should_warn = is_non_consecutive_dup && !self.warned;
+        if should_warn {
+            self.warned = true;
+        }
+        (loop_triggered, should_warn)
     }
 }
 
@@ -236,12 +254,36 @@ async fn run_inner(
                 },
             ));
             let input: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-            let out = match registry.execute(&call.name, input, &ctx).await {
-                Ok(o) => o,
-                Err(e) => ToolOutput {
-                    content: e.to_string(),
-                    is_error: true,
-                },
+            // 流式执行：progress 通道把 shell 逐行输出实时推给 TUI；agent 边等结果边转发。
+            // 非流式工具（read_file 等）走 trait 默认实现，progress 通道不会收到任何 chunk。
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let mut exec =
+                Box::pin(registry.execute_streaming(&call.name, input, &ctx, Some(progress_tx)));
+            let out = loop {
+                tokio::select! {
+                    biased;
+                    res = exec.as_mut() => {
+                        break match res {
+                            Ok(o) => o,
+                            Err(e) => ToolOutput {
+                                content: e.to_string(),
+                                is_error: true,
+                            },
+                        };
+                    }
+                    chunk = progress_rx.recv() => {
+                        if let Some(chunk) = chunk {
+                            let _ = tx.send((
+                                gen,
+                                AgentEvent::ToolProgress {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    chunk,
+                                },
+                            ));
+                        }
+                    }
+                }
             };
             let _ = tx.send((
                 gen,
@@ -259,7 +301,15 @@ async fn run_inner(
         emit_context_update(tx, gen, &messages, effective_ctx_len);
 
         // 死循环检测：连续 3 轮相同工具调用指纹 → 提前中止（比空跑 max_steps 省钱省时）
-        if detector.observe(&calls) {
+        // 非连续重复（之前出现过相同指纹）→ 注入提醒，让模型意识到自己在重复
+        let (loop_triggered, should_warn) = detector.observe(&calls);
+        if should_warn {
+            warn!(step, gen, "检测到非连续重复工具调用，注入提醒");
+            messages.push(Message::user(
+                "（系统提醒：你之前已经执行过相同的工具调用，请回顾上方对话历史中的结果，不要重复操作。如果之前的尝试没有成功，请换一个不同的策略。）".to_string(),
+            ));
+        }
+        if loop_triggered {
             warn!(step, gen, repeat_count = detector.repeat_count, "检测到连续重复工具调用，提前中止 agent loop");
             loop_detected = true;
             break;
@@ -716,18 +766,18 @@ mod tests {
     fn loop_detector_no_trigger_on_diverse_calls() {
         let mut d = LoopDetector::new(3);
         // 每轮不同参数 → 不触发
-        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"a\"}")])));
-        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"b\"}")])));
-        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"c\"}")])));
+        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"a\"}")])).0);
+        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"b\"}")])).0);
+        assert!(!d.observe(&calls_map(&[tc("read_file", "{\"p\":\"c\"}")])).0);
     }
 
     #[test]
     fn loop_detector_triggers_on_3_consecutive_same() {
         let mut d = LoopDetector::new(3);
         let c = calls_map(&[tc("shell", "{\"command\":\"ls\"}")]);
-        assert!(!d.observe(&c), "第 1 轮：不触发");
-        assert!(!d.observe(&c), "第 2 轮：不触发");
-        assert!(d.observe(&c), "第 3 轮连续相同：应触发");
+        assert!(!d.observe(&c).0, "第 1 轮：不触发");
+        assert!(!d.observe(&c).0, "第 2 轮：不触发");
+        assert!(d.observe(&c).0, "第 3 轮连续相同：应触发");
     }
 
     #[test]
@@ -735,18 +785,18 @@ mod tests {
         let mut d = LoopDetector::new(3);
         let c1 = calls_map(&[tc("shell", "{\"command\":\"ls\"}")]);
         let c2 = calls_map(&[tc("shell", "{\"command\":\"pwd\"}")]);
-        assert!(!d.observe(&c1));
-        assert!(!d.observe(&c1)); // 2 次相同
-        assert!(!d.observe(&c2)); // 不同 → 重置
-        assert!(!d.observe(&c2)); // 重新 2 次
-        assert!(d.observe(&c2)); // 3 次 → 触发
+        assert!(!d.observe(&c1).0);
+        assert!(!d.observe(&c1).0); // 2 次相同
+        assert!(!d.observe(&c2).0); // 不同 → 重置
+        assert!(!d.observe(&c2).0); // 重新 2 次
+        assert!(d.observe(&c2).0); // 3 次 → 触发
     }
 
     #[test]
     fn loop_detector_threshold_1_triggers_immediately() {
         let mut d = LoopDetector::new(1);
         let c = calls_map(&[tc("list_dir", "{}")]);
-        assert!(d.observe(&c), "threshold=1 第 1 轮就应触发");
+        assert!(d.observe(&c).0, "threshold=1 第 1 轮就应触发");
     }
 
     #[test]
@@ -757,9 +807,9 @@ mod tests {
             tc("read_file", "{\"path\":\"a\"}"),
             tc("list_dir", "{\"path\":\".\"}"),
         ]);
-        assert!(!d.observe(&c));
-        assert!(!d.observe(&c));
-        assert!(d.observe(&c), "连续 3 轮相同组合应触发");
+        assert!(!d.observe(&c).0);
+        assert!(!d.observe(&c).0);
+        assert!(d.observe(&c).0, "连续 3 轮相同组合应触发");
     }
 
     #[test]
@@ -770,11 +820,28 @@ mod tests {
             tc("shell", "{\"command\":\"ls\"}"),
             tc("read_file", "{\"path\":\"x\"}"),
         ]);
-        assert!(!d.observe(&base));
-        assert!(!d.observe(&base));
-        assert!(!d.observe(&extra)); // 组合变了 → 重置
-        assert!(!d.observe(&base));
-        assert!(!d.observe(&base));
+        assert!(!d.observe(&base).0);
+        assert!(!d.observe(&base).0);
+        assert!(!d.observe(&extra).0); // 组合变了 → 重置
+        assert!(!d.observe(&base).0);
+        assert!(!d.observe(&base).0);
         // 仅 2 次 base，不触发
+    }
+
+    #[test]
+    fn loop_detector_non_consecutive_dup_warns() {
+        let mut d = LoopDetector::new(3);
+        let c1 = calls_map(&[tc("shell", "{\"command\":\"ls\"}")]);
+        let c2 = calls_map(&[tc("shell", "{\"command\":\"pwd\"}")]);
+        // c1 → c2 → c1：c1 非连续重复
+        let (looped, warn1) = d.observe(&c1);
+        assert!(!looped && !warn1, "第 1 轮：无重复");
+        let (looped, warn2) = d.observe(&c2);
+        assert!(!looped && !warn2, "第 2 轮：不同指纹，无重复");
+        let (looped, warn3) = d.observe(&c1);
+        assert!(!looped && warn3, "第 3 轮：c1 非连续重复，应提醒");
+        // 再次非连续重复不应重复提醒
+        let (looped, warn4) = d.observe(&c2);
+        assert!(!looped && !warn4, "第 4 轮：已提醒过，不再重复提醒");
     }
 }

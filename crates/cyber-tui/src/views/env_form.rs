@@ -65,7 +65,7 @@ pub struct EnvFormState {
     pub editing: bool,
     /// 编辑模式：true = 编辑已有（保留 index），false = 新增。
     pub edit_index: Option<usize>,
-    textarea: TextArea<'static>,
+    pub textarea: TextArea<'static>,
 }
 
 impl Default for EnvFormState {

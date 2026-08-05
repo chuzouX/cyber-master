@@ -13,13 +13,15 @@
 //! 驱动，事件经 `UnboundedSender<AgentEvent>` 回传主循环；TUI 退出时 `send` 失败，
 //! 任务静默终止，agent 永不 panic TUI（不在任务内 unwrap）。
 
+use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEvent, KeyEventKind, MouseEventKind,
 };
 use crossterm::execute;
 use futures::StreamExt;
@@ -394,6 +396,8 @@ pub struct App {
     ctf_detail_view: bool,
     /// 面板内详情视图滚动偏移。
     ctf_detail_scroll: usize,
+    /// 面板内列表视图滚动偏移（render 时按选中项自动调整，用 Cell 供 &self render 写回）。
+    ctf_list_scroll: Cell<usize>,
     /// Writeup 生成中：待写入的题目名称（None = 未在生成 writeup）。
     ctf_writeup_pending: Option<String>,
     /// Writeup 生成中：累积的流式 token（Done 时整体写入文件）。
@@ -476,6 +480,7 @@ impl App {
             ctf_selected: 0,
             ctf_detail_view: false,
             ctf_detail_scroll: 0,
+            ctf_list_scroll: Cell::new(0),
             ctf_writeup_pending: None,
             ctf_writeup_buffer: String::new(),
             log_viewer: LogViewerState::default(),
@@ -517,6 +522,10 @@ impl App {
             *list = merge_challenges(global_challenges, session_challenges);
         }
         let mut terminal: DefaultTerminal = ratatui::init();
+        // 启用 bracketed paste：终端在粘贴内容前后发送 \e[200~ / \e[201~ 标记，
+        // crossterm 解析为 Event::Paste(String) → 整块插入 textarea，而非逐行
+        // 拆成 KeyEvent(Enter) 触发误提交。与 Claude Code 的粘贴行为一致。
+        execute!(io::stdout(), EnableBracketedPaste)?;
         // 鼠标捕获开关：true 时启用滚轮翻页（默认），false 时不启用（可拖拽选区复制）。
         // F9 在 Chat 模式下随时切换。
         if self.mouse_capture {
@@ -536,8 +545,8 @@ impl App {
         if let Some(mcp) = self.registries.mcp.as_ref() {
             mcp.shutdown_all().await;
         }
-        // 无条件禁用鼠标捕获（幂等），避免中途开启鼠标后退出泄漏。
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        // 无条件禁用鼠标捕获与 bracketed paste（幂等），避免退出后终端状态泄漏。
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         ratatui::restore();
         result?;
         info!(mode = ?self.mode, "TUI 退出");
@@ -650,6 +659,46 @@ impl App {
                 MouseEventKind::ScrollDown => self.chat.scroll_history(3),
                 _ => {}
             },
+            // 粘贴（bracketed paste）：整块插入当前活跃的 textarea，不触发提交。
+            // 未启用 bracketed paste 的终端不会产生此事件，回退为逐字符 KeyEvent。
+            Event::Paste(text) => self.handle_paste(text),
+            _ => {}
+        }
+    }
+
+    /// 处理粘贴事件：把文本整块插入当前活跃的 textarea（不触发提交）。
+    /// Chat 模式插入输入框；表单模式仅在字段编辑态时插入。
+    fn handle_paste(&mut self, text: String) {
+        match self.mode {
+            Mode::Chat => self.chat.paste(&text),
+            Mode::ProviderForm => {
+                if let Some(f) = self.provider_form.as_mut() {
+                    if f.editing {
+                        f.textarea.insert_str(&text);
+                    }
+                }
+            }
+            Mode::McpForm => {
+                if let Some(f) = self.mcp_form.as_mut() {
+                    if f.editing {
+                        f.textarea.insert_str(&text);
+                    }
+                }
+            }
+            Mode::EnvForm => {
+                if let Some(f) = self.env_form.as_mut() {
+                    if f.editing {
+                        f.textarea.insert_str(&text);
+                    }
+                }
+            }
+            Mode::CtfEditForm => {
+                if let Some(f) = self.ctf_edit_form.as_mut() {
+                    if f.editing {
+                        f.textarea.insert_str(&text);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -799,6 +848,11 @@ impl App {
                     self.chat.push_tool_call(id, name, arguments);
                 }
             }
+            AgentEvent::ToolProgress { id: _, name: _, chunk } => {
+                if self.chat.streaming {
+                    self.chat.push_tool_progress(&chunk);
+                }
+            }
             AgentEvent::ToolResult {
                 id,
                 name,
@@ -816,6 +870,7 @@ impl App {
                     self.chat.streaming = false;
                     self.chat.streaming_buffer.clear();
                     self.chat.thinking_buffer.clear();
+                    self.chat.streaming_tool_output.clear();
                     self.agent_handle = None;
                     if writeup_text.trim().is_empty() {
                         self.chat.entries.push(ChatEntry::System(format!(
@@ -910,6 +965,7 @@ impl App {
                     self.chat.streaming = false;
                     self.chat.streaming_buffer.clear();
                     self.chat.thinking_buffer.clear();
+                    self.chat.streaming_tool_output.clear();
                     self.agent_handle = None;
                     self.chat
                         .entries
@@ -1418,6 +1474,7 @@ impl App {
         self.ctf_selected = 0;
         self.ctf_detail_view = false;
         self.ctf_detail_scroll = 0;
+        self.ctf_list_scroll.set(0);
         crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
         let title = self
             .sessions
@@ -1443,6 +1500,7 @@ impl App {
         self.ctf_selected = 0;
         self.ctf_detail_view = false;
         self.ctf_detail_scroll = 0;
+        self.ctf_list_scroll.set(0);
         crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
         crate::history::save_entries(
             &self.paths.history_dir,
@@ -1489,6 +1547,7 @@ impl App {
             self.ctf_selected = 0;
             self.ctf_detail_view = false;
             self.ctf_detail_scroll = 0;
+            self.ctf_list_scroll.set(0);
         }
         self.toast = Some("会话已删除".into());
         true
@@ -1755,6 +1814,25 @@ impl App {
                     }
                 } else {
                     self.ctf_detail_scroll += 1;
+                }
+                Some(true)
+            }
+            KeyCode::PageUp => {
+                if !self.ctf_detail_view {
+                    // 列表视图：上移 5 项
+                    self.ctf_selected = self.ctf_selected.saturating_sub(5);
+                } else {
+                    self.ctf_detail_scroll = self.ctf_detail_scroll.saturating_sub(10);
+                }
+                Some(true)
+            }
+            KeyCode::PageDown => {
+                if !self.ctf_detail_view {
+                    // 列表视图：下移 5 项
+                    let len = self.ctf_challenges.lock().map(|l| l.len()).unwrap_or(0);
+                    self.ctf_selected = (self.ctf_selected + 5).min(len.saturating_sub(1));
+                } else {
+                    self.ctf_detail_scroll += 10;
                 }
                 Some(true)
             }
@@ -3138,6 +3216,7 @@ impl App {
                             self.ctf_detail_view,
                             self.ctf_detail_scroll,
                             self.ctf_panel_focused,
+                            &self.ctf_list_scroll,
                         );
                     } else {
                         let chunks = Layout::horizontal([
@@ -3165,6 +3244,7 @@ impl App {
                             self.ctf_detail_view,
                             self.ctf_detail_scroll,
                             self.ctf_panel_focused,
+                            &self.ctf_list_scroll,
                         );
                     }
                 } else {

@@ -1,4 +1,4 @@
-﻿# Cyber Master 一键安装脚本（Windows / PowerShell）
+﻿﻿# Cyber Master 一键安装脚本（Windows / PowerShell）
 #
 # 用法（PowerShell 5.1+ / PowerShell 7+）：
 #   irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex

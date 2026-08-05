@@ -156,6 +156,13 @@ pub enum AgentEvent {
         name: String,
         arguments: String,
     },
+    /// 工具执行过程中的增量输出（如 shell 逐行 stdout/stderr）。
+    /// TUI 据此实时展示「正在执行」的输出，ToolResult 到达后定稿替换。
+    ToolProgress {
+        id: String,
+        name: String,
+        chunk: String,
+    },
     /// 工具执行完成（含结果或错误）。
     ToolResult {
         id: String,
@@ -261,6 +268,11 @@ mod tests {
             id: "1".into(),
             name: "n".into(),
             arguments: "{}".into(),
+        };
+        let _ = AgentEvent::ToolProgress {
+            id: "1".into(),
+            name: "n".into(),
+            chunk: "line\n".into(),
         };
         let _ = AgentEvent::ToolResult {
             id: "1".into(),
