@@ -615,7 +615,12 @@ impl App {
                         self.handle_fetch_result(fr);
                     }
                 }
-                _ = tick.tick() => {}
+                _ = tick.tick() => {
+                    // 粘贴缓冲兜底：buffer 非空且距上次按键 > 50ms 时 flush
+                    if let Some(text) = self.chat.paste_detector.flush_if_stale() {
+                        self.chat.paste(&text);
+                    }
+                }
             }
             // 排空所有待处理的 agent 事件，合并为一次重绘（避免逐 token 触发 draw 卡顿）。
             while let Ok((gen, ae)) = agent_rx.try_recv() {
@@ -707,6 +712,18 @@ impl App {
     fn handle_chat_key(&mut self, k: KeyEvent) {
         if self.toast.is_some() {
             self.toast = None;
+        }
+        // 粘贴检测：快速连续的 Char/Enter 缓冲为整块粘贴，防止 Enter 误触发 Submit。
+        // 只对非斜杠菜单态生效（菜单打开时走菜单逻辑，不缓冲）。
+        match self.chat.paste_detector.observe(k) {
+            crate::chat::KeyDisposition::Buffer => return,
+            crate::chat::KeyDisposition::FlushThenProcess => {
+                if let Some(text) = self.chat.paste_detector.flush() {
+                    self.chat.paste(&text);
+                }
+                // 继续处理当前键
+            }
+            crate::chat::KeyDisposition::Process => {}
         }
         // 斜杠补全菜单打开时：Up/Down/Enter/Tab/Esc 由菜单消费，不触发其他动作
         if self.chat.slash_menu_key(k) {
@@ -1326,10 +1343,11 @@ impl App {
         let cwd = self.paths.cwd.clone();
         let registry = self.registries.tools.clone();
         let ctf_enabled = self.ctf_enabled;
+        let intensity = self.config.agent.thinking_intensity;
         let handle = tokio::spawn(async move {
             run_stream(
                 config, providers, project, text, history, tx, gen, mock, cwd, registry,
-                ctf_enabled,
+                ctf_enabled, intensity,
             )
             .await;
         });
@@ -2191,6 +2209,31 @@ impl App {
                             self.chat.entries.push(ChatEntry::System(format!(
                                 "无效参数：{arg}（须为 1-1000 的整数，当前 = {}）",
                                 self.config.agent.max_steps
+                            )));
+                        }
+                    }
+                }
+            }
+            SlashCommand::Think(arg) => {
+                if arg.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(format!(
+                        "当前思考强度 = {}（用法：/think <low|middle|high|max|auto>）",
+                        self.config.agent.thinking_intensity.label()
+                    )));
+                } else {
+                    match cyber_core::ThinkingIntensity::from_str(arg.trim()) {
+                        Some(level) => {
+                            self.config.agent.thinking_intensity = level;
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "思考强度已设为 {}（{}）",
+                                level.as_str(),
+                                level.label()
+                            )));
+                        }
+                        None => {
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "无效参数：{arg}（可选值：low / middle / high / max / auto，当前 = {}）",
+                                self.config.agent.thinking_intensity.label()
                             )));
                         }
                     }

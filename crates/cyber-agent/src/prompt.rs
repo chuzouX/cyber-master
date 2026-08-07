@@ -1,17 +1,38 @@
 //! 系统提示词组装：base + 项目 frontmatter + 安全护栏。
 
-use cyber_core::ProjectContext;
+use cyber_core::{ProjectContext, ThinkingIntensity};
 
-/// 基础系统提示词。
-pub const BASE_PROMPT: &str = "你是 Cyber Master，一个网络安全智能体终端助手。\
-你遵循用户 .cyber.md 中声明的授权范围与安全护栏。\n\
-协助授权范围内的安全测试、CTF 竞赛、防御性安全和教学场景。\
-拒绝未授权的破坏性操作（删库、DoS、未授权入侵、供应链攻击）。\n\n\
-# 工作方式\n\
+/// 根据思考强度返回对应的"工作方式"段落。
+fn thinking_section(intensity: ThinkingIntensity) -> &'static str {
+    match intensity {
+        ThinkingIntensity::Low => "# 工作方式\n\
+- 直接执行，不要输出思考过程。先行动后解释。\n\
+- 遇到不确定的问题时，调用工具验证比纯推理更高效。\n\
+- 不要一次性规划所有步骤：先收集信息，再根据结果决定下一步。",
+        ThinkingIntensity::Middle => "# 工作方式\n\
 - 边做边想，想一步做一步：每次思考控制在 3-5 行以内，然后立即调用工具或给出结论。\n\
 - 先行动后解释：遇到不确定的问题时，调用工具验证比纯推理更高效。\n\
 - 思考是为了决定下一步动作，不是为了列举所有可能性。如果思考超过 5 行仍未产生明确的工具调用计划，说明你在过度推理，应立即停下并调用最相关的工具。\n\
-- 不要一次性规划所有步骤：先收集信息，再根据结果决定下一步。\n\n\
+- 不要一次性规划所有步骤：先收集信息，再根据结果决定下一步。",
+        ThinkingIntensity::High => "# 工作方式\n\
+- 允许 10-15 行的深入思考，分析问题根因后再行动。\n\
+- 思考应包含：问题分析 → 可能的方案 → 最优选择 → 执行计划。\n\
+- 遇到复杂问题时，先充分分析再调用工具，避免盲目试错。\n\
+- 思考结束后必须立即行动（调用工具或给出结论），不要只思考不行动。",
+        ThinkingIntensity::Max => "# 工作方式\n\
+- 充分思考，无行数限制。复杂问题应深入分析所有可能性后再行动。\n\
+- 思考应包含：问题根因分析 → 方案对比 → 风险评估 → 最优选择 → 详细执行计划。\n\
+- 简单问题也允许简短思考，但不强制。\n\
+- 思考结束后必须立即行动（调用工具或给出结论）。",
+        ThinkingIntensity::Auto => unreachable!("Auto 应在调用前被 resolve"),
+    }
+}
+
+/// 基础系统提示词（静态部分，不含"工作方式"段落——该部分由 thinking_section 动态注入）。
+pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全智能体终端助手。\
+你遵循用户 .cyber.md 中声明的授权范围与安全护栏。\n\
+协助授权范围内的安全测试、CTF 竞赛、防御性安全和教学场景。\
+拒绝未授权的破坏性操作（删库、DoS、未授权入侵、供应链攻击）。\n\n\
 # 避免重复操作\n\
 - 调用工具前，先回顾上方对话历史中已有的工具调用和结果，确认没有重复。\n\
 - 如果上一次工具调用没有得到预期结果，先诊断原因（读错误信息、检查假设），再决定是修正参数重试还是换策略。不要盲目重试相同的操作，但也不要一次失败就放弃可行方案。\n\
@@ -52,11 +73,17 @@ pub const CTF_PROMPT: &str = "\n\n# CTF 模式\n\
 - 每次获取到新的题目信息（名称、靶机地址、描述等）都应立即 register 更新，防止信息丢失。\n\
 - 解题过程中如发现题目信息有变（如补充描述、更换靶机），也要及时 register 更新。";
 
-/// 组装系统提示词：base + 项目上下文 + rules 护栏段。
+/// 组装系统提示词：thinking_section + base + 项目上下文 + rules 护栏段。
 ///
-/// `body`（.cyber.md 正文）暂不注入，避免上下文膨胀（留 P2.2 按需引用）。
-pub fn build_system_prompt(project: Option<&ProjectContext>) -> String {
-    let mut s = BASE_PROMPT.to_string();
+/// `intensity` 应为已 resolve 的值（非 Auto）。`body`（.cyber.md 正文）暂不注入。
+pub fn build_system_prompt(
+    project: Option<&ProjectContext>,
+    intensity: ThinkingIntensity,
+) -> String {
+    let mut s = String::new();
+    s.push_str(thinking_section(intensity));
+    s.push_str("\n\n");
+    s.push_str(BASE_PROMPT_STATIC);
     let Some(p) = project else {
         return s;
     };
@@ -94,7 +121,7 @@ pub fn build_system_prompt(project: Option<&ProjectContext>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cyber_core::{ProjectContext, ProjectFrontmatter};
+    use cyber_core::{ProjectContext, ProjectFrontmatter, ThinkingIntensity};
 
     fn ctx(fm: ProjectFrontmatter) -> ProjectContext {
         ProjectContext {
@@ -107,7 +134,7 @@ mod tests {
 
     #[test]
     fn no_project_just_base() {
-        let s = build_system_prompt(None);
+        let s = build_system_prompt(None, ThinkingIntensity::Middle);
         assert!(s.contains("Cyber Master"));
         assert!(!s.contains("项目上下文"));
     }
@@ -121,7 +148,7 @@ mod tests {
             owner: Some("sec-team".into()),
             rules: vec!["禁止 DoS".into(), "仅工作时间".into()],
         };
-        let s = build_system_prompt(Some(&ctx(fm)));
+        let s = build_system_prompt(Some(&ctx(fm)), ThinkingIntensity::Middle);
         assert!(s.contains("project: demo"));
         assert!(s.contains("scope: *.example.com"));
         assert!(s.contains("authorization: 书面授权"));
@@ -133,7 +160,7 @@ mod tests {
 
     #[test]
     fn empty_frontmatter_shows_placeholder() {
-        let s = build_system_prompt(Some(&ctx(ProjectFrontmatter::default())));
+        let s = build_system_prompt(Some(&ctx(ProjectFrontmatter::default())), ThinkingIntensity::Middle);
         assert!(s.contains("frontmatter 无结构化字段"));
         // rules 段仅在 frontmatter.rules 非空时追加
         assert!(!s.contains("# 安全护栏（必须遵守）"));

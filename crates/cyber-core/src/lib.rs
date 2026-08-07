@@ -12,7 +12,7 @@ pub mod paths;
 pub mod project;
 pub mod providers;
 
-pub use config::{Config, EnvConfig, EnvVar};
+pub use config::{Config, EnvConfig, EnvVar, ThinkingIntensity};
 pub use ctf::{current_time_str, CtfCategory, CtfChallenge, CtfStatus};
 pub use error::{CoreError, Result};
 pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};

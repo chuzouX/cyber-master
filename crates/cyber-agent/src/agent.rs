@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
-use cyber_core::{Config, ProjectContext, ProviderConfig, ProvidersConfig};
+use cyber_core::{Config, ProjectContext, ProviderConfig, ProvidersConfig, ThinkingIntensity};
 
 use crate::compact::{
     auto_compact_threshold, compact_messages, estimate_messages_tokens,
@@ -110,6 +110,7 @@ pub async fn run_stream(
     cwd: PathBuf,
     registry: Arc<ToolRegistry>,
     ctf_enabled: bool,
+    intensity: ThinkingIntensity,
 ) {
     let _ = tx.send((gen, AgentEvent::Started));
     let res = run_inner(
@@ -124,6 +125,7 @@ pub async fn run_stream(
         cwd,
         registry,
         ctf_enabled,
+        intensity,
     )
     .await;
     if let Err(e) = res {
@@ -145,6 +147,7 @@ async fn run_inner(
     cwd: PathBuf,
     registry: Arc<ToolRegistry>,
     ctf_enabled: bool,
+    intensity: ThinkingIntensity,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
@@ -153,7 +156,8 @@ async fn run_inner(
     debug!(provider = %name, kind = %cfg.kind, mock, gen, "启动 agent loop");
 
     let provider = provider_factory(cfg, mock)?;
-    let mut system = build_system_prompt(project);
+    let resolved = intensity.resolve(ctf_enabled);
+    let mut system = build_system_prompt(project, resolved);
     if ctf_enabled {
         system.push_str(CTF_PROMPT);
     }
@@ -525,7 +529,7 @@ async fn run_compact_inner(
         AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
     })?;
     let provider = provider_factory(cfg, mock)?;
-    let system = build_system_prompt(project);
+    let system = build_system_prompt(project, ThinkingIntensity::Middle);
 
     if history.is_empty() {
         return Err(AgentError::Provider("无消息可压缩".into()));

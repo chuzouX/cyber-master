@@ -60,6 +60,7 @@ pub struct AgentConfig {
     pub default_provider: String,
     pub auto_tool_call: bool,
     pub max_steps: u32,
+    pub thinking_intensity: ThinkingIntensity,
 }
 
 impl Default for AgentConfig {
@@ -68,6 +69,66 @@ impl Default for AgentConfig {
             default_provider: "openai".into(),
             auto_tool_call: true,
             max_steps: 500,
+            thinking_intensity: ThinkingIntensity::default(),
+        }
+    }
+}
+
+/// 思考强度档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingIntensity {
+    /// 不输出思考过程，直接执行。
+    Low,
+    /// 3-5 行思考限制（默认）。
+    #[default]
+    Middle,
+    /// 10-15 行思考，允许深入分析。
+    High,
+    /// 无限制，充分思考。
+    Max,
+    /// 自动：CTF 模式=High，否则=Middle。
+    Auto,
+}
+
+impl ThinkingIntensity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Middle => "middle",
+            Self::High => "high",
+            Self::Max => "max",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "不输出思考过程，直接执行",
+            Self::Middle => "3-5 行思考限制（默认）",
+            Self::High => "10-15 行思考，允许深入分析",
+            Self::Max => "无限制，充分思考",
+            Self::Auto => "自动（CTF=High，否则=Middle）",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "middle" | "mid" => Some(Self::Middle),
+            "high" => Some(Self::High),
+            "max" => Some(Self::Max),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    /// Auto 模式根据 CTF 状态解析为实际档位。
+    pub fn resolve(self, ctf_enabled: bool) -> Self {
+        match self {
+            Self::Auto if ctf_enabled => Self::High,
+            Self::Auto => Self::Middle,
+            other => other,
         }
     }
 }

@@ -11,8 +11,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cyber_agent::Message;
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -24,6 +25,109 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::slash::CommandSpec;
 use crate::theme::Theme;
+
+/// 粘贴检测器：基于按键时间间隔区分人打字与粘贴。
+///
+/// 人打字间隔 > 50ms，粘贴逐字符间隔 < 2ms。用 2ms 阈值区分：
+/// - 快速连续的无修饰键 Char/Enter → 缓冲（粘贴中）
+/// - 间隔 ≥ 2ms → 正常处理
+///
+/// 缓冲期间 Enter 被转为 `\n` 存入 buffer，不触发 Submit。
+/// buffer 在以下情况 flush（整块插入 textarea）：
+/// 1. 非快速键到达（`FlushThenProcess`）
+/// 2. 特殊键到达（Ctrl+C/Esc/方向键等，`FlushThenProcess`）
+/// 3. tick 兜底：距上次按键 > 50ms（`flush_if_stale`）
+pub struct PasteDetector {
+    buffer: String,
+    last_key_time: Option<Instant>,
+}
+
+/// `PasteDetector::observe` 的返回值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDisposition {
+    /// 正常处理当前键（非粘贴、或 buffer 已 flush 后继续处理）。
+    Process,
+    /// 当前键已存入 buffer，不要处理。
+    Buffer,
+    /// 先 flush buffer 整块插入，再正常处理当前键。
+    FlushThenProcess,
+}
+
+/// 快速按键间隔阈值：< 2ms 视为粘贴。
+const RAPID_THRESHOLD: Duration = Duration::from_millis(2);
+/// flush 兜底超时：距上次按键 > 50ms 时 flush（tick 调用）。
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
+
+impl PasteDetector {
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            last_key_time: None,
+        }
+    }
+
+    /// 观察一个按键，返回处理方式。
+    ///
+    /// 只缓冲**无修饰键的 Char 和 Enter**；带修饰键（Ctrl+C 等）或特殊键
+    /// （Esc/方向键等）会先 flush 再正常处理。
+    pub fn observe(&mut self, k: KeyEvent) -> KeyDisposition {
+        let now = Instant::now();
+        let is_rapid = self
+            .last_key_time
+            .map(|t| now.duration_since(t) < RAPID_THRESHOLD)
+            .unwrap_or(false);
+
+        // 只缓冲无修饰键的 Char 和 Enter
+        let bufferable = k.modifiers == KeyModifiers::NONE
+            && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter);
+
+        let disposition = if bufferable && is_rapid {
+            let c = match k.code {
+                KeyCode::Char(c) => c,
+                KeyCode::Enter => '\n',
+                _ => unreachable!(),
+            };
+            self.buffer.push(c);
+            KeyDisposition::Buffer
+        } else if !self.buffer.is_empty() {
+            // 非快速键或特殊键，但 buffer 有内容 → 先 flush 再处理
+            KeyDisposition::FlushThenProcess
+        } else {
+            KeyDisposition::Process
+        };
+
+        self.last_key_time = Some(now);
+        disposition
+    }
+
+    /// 取出 buffer 内容（整块插入 textarea）。
+    pub fn flush(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buffer))
+        }
+    }
+
+    /// tick 兜底：buffer 非空且距上次按键 > 50ms 时 flush。
+    pub fn flush_if_stale(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        if let Some(t) = self.last_key_time {
+            if Instant::now().duration_since(t) >= FLUSH_TIMEOUT {
+                return Some(std::mem::take(&mut self.buffer));
+            }
+        }
+        None
+    }
+}
+
+impl Default for PasteDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// 一条对话条目（user / assistant / 工具调用 / 工具结果 / system）。
 ///
@@ -71,21 +175,40 @@ const TOOL_RESULT_FOLD_THRESHOLD: usize = 3;
 /// 输入以 `/` 开头且不含空格时打开（`update_slash_menu` 每次输入后刷新）；按前缀过滤
 /// `COMMANDS`。Up/Down 选择，Enter/Tab 补全命令名 + 空格（`slash_menu_complete`），
 /// Esc 关闭。菜单打开时 Up/Down 由菜单消费（`slash_menu_key`），不传给 textarea。
+///
+/// 二级参数补全：命令名补全后若输入为 `/cmd <partial_param>`，自动切换到 Param 模式，
+/// 按 `param_suggestions(cmd)` 过滤参数建议，Tab 补全参数。
 #[derive(Debug, Default)]
 pub struct SlashMenu {
     /// 是否打开。
     pub open: bool,
-    /// 当前选中项索引（在 `filtered` 中）。
+    /// 当前选中项索引（在 `filtered` / `params` 中）。
     pub selected: usize,
-    /// 前缀过滤后的命令列表（引用静态目录，无拷贝）。
+    /// 前缀过滤后的命令列表（Command 模式使用）。
     pub filtered: Vec<&'static CommandSpec>,
+    /// 当前菜单模式。
+    pub mode: SlashMenuMode,
+    /// 前缀过滤后的参数建议（Param 模式使用）。
+    pub params: Vec<&'static str>,
+}
+
+/// 菜单模式：命令名补全 or 参数补全。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SlashMenuMode {
+    /// 一级：补全命令名（`/think`）。
+    #[default]
+    Command,
+    /// 二级：补全参数（`/think hi` → `high`）。
+    Param,
 }
 
 impl SlashMenu {
     pub fn close(&mut self) {
         self.open = false;
         self.filtered.clear();
+        self.params.clear();
         self.selected = 0;
+        self.mode = SlashMenuMode::Command;
     }
 }
 
@@ -180,6 +303,8 @@ pub struct ChatState {
     /// 上次 `prepare_render` 使用的终端宽度。宽度变化时须重建 `cached_history`，
     /// 因为工具结果折叠阈值基于可视行数（受宽度影响）。
     last_render_width: u16,
+    /// 粘贴检测器：基于按键时间间隔区分人打字与粘贴。
+    pub paste_detector: PasteDetector,
 }
 
 /// `wrapped` 预折行缓存的载体。
@@ -216,6 +341,7 @@ impl ChatState {
             input_history: InputHistory::default(),
             expanded_tool_results: HashSet::new(),
             last_render_width: 0,
+            paste_detector: PasteDetector::new(),
         }
     }
 
@@ -350,22 +476,68 @@ impl ChatState {
 
     // ── 斜杠命令补全菜单 ────────────────────────────────────────────────────
 
-    /// 根据当前输入刷新补全菜单：首行以 `/` 开头且不含空格 → 按前缀过滤打开；
-    /// 否则关闭。每次输入变动后调用。流式期输入被禁，菜单不会打开。
+    /// 根据当前输入刷新补全菜单：
+    /// - `/cmd`（无空格）→ Command 模式，按前缀过滤命令名
+    /// - `/cmd partial`（含一个空格，cmd 有固定参数集）→ Param 模式，按前缀过滤参数
+    /// - 其他 → 关闭
     pub fn update_slash_menu(&mut self) {
         let line: String = self.input.lines().first().cloned().unwrap_or_default();
         let trimmed = line.trim_start();
         if trimmed.starts_with('/') && !trimmed.contains(' ') {
+            // 一级：命令名补全
             let filtered = crate::slash::filter_commands(trimmed);
             if filtered.is_empty() {
                 self.slash_menu.close();
             } else {
-                if !self.slash_menu.open || self.slash_menu.filtered != filtered {
-                    // 列表变化时保持选中项在范围内
+                if !self.slash_menu.open
+                    || self.slash_menu.mode != SlashMenuMode::Command
+                    || self.slash_menu.filtered != filtered
+                {
                     if self.slash_menu.selected >= filtered.len() {
                         self.slash_menu.selected = 0;
                     }
-                    self.slash_menu.filtered = filtered;
+                    self.slash_menu.filtered = filtered.clone();
+                    self.slash_menu.params.clear();
+                    self.slash_menu.mode = SlashMenuMode::Command;
+                }
+                self.slash_menu.open = true;
+            }
+        } else if trimmed.starts_with('/') {
+            // 二级：参数补全（仅一个空格、参数部分无空格时）
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let cmd = parts.next().unwrap_or("");
+            let param = parts.next().unwrap_or("").trim_start();
+            // 参数中已有空格 → 参数已完成，不再补全
+            if param.contains(' ') {
+                self.slash_menu.close();
+                return;
+            }
+            let suggestions = crate::slash::param_suggestions(cmd);
+            if suggestions.is_empty() {
+                self.slash_menu.close();
+                return;
+            }
+            let filtered: Vec<&'static str> = if param.is_empty() {
+                suggestions
+            } else {
+                suggestions
+                    .into_iter()
+                    .filter(|s| s.starts_with(param))
+                    .collect()
+            };
+            if filtered.is_empty() {
+                self.slash_menu.close();
+            } else {
+                if !self.slash_menu.open
+                    || self.slash_menu.mode != SlashMenuMode::Param
+                    || self.slash_menu.params != filtered
+                {
+                    if self.slash_menu.selected >= filtered.len() {
+                        self.slash_menu.selected = 0;
+                    }
+                    self.slash_menu.params = filtered.clone();
+                    self.slash_menu.filtered.clear();
+                    self.slash_menu.mode = SlashMenuMode::Param;
                 }
                 self.slash_menu.open = true;
             }
@@ -402,26 +574,50 @@ impl ChatState {
     }
 
     fn slash_menu_up(&mut self) {
-        let n = self.slash_menu.filtered.len();
+        let n = match self.slash_menu.mode {
+            SlashMenuMode::Command => self.slash_menu.filtered.len(),
+            SlashMenuMode::Param => self.slash_menu.params.len(),
+        };
         if n > 0 {
             self.slash_menu.selected = (self.slash_menu.selected + n - 1) % n;
         }
     }
 
     fn slash_menu_down(&mut self) {
-        let n = self.slash_menu.filtered.len();
+        let n = match self.slash_menu.mode {
+            SlashMenuMode::Command => self.slash_menu.filtered.len(),
+            SlashMenuMode::Param => self.slash_menu.params.len(),
+        };
         if n > 0 {
             self.slash_menu.selected = (self.slash_menu.selected + 1) % n;
         }
     }
 
-    /// 补全：用选中命令名 + 空格替换输入框内容，关闭菜单。补全后用户继续输参数再 Enter 提交。
+    /// 补全：
+    /// - Command 模式：用选中命令名 + 空格替换输入，然后刷新菜单（若有参数建议则自动进入 Param 模式）
+    /// - Param 模式：用选中参数替换参数部分，关闭菜单
     fn slash_menu_complete(&mut self) {
-        if let Some(spec) = self.slash_menu.filtered.get(self.slash_menu.selected).copied() {
-            self.input.clear();
-            self.input.insert_str(format!("{} ", spec.name));
+        match self.slash_menu.mode {
+            SlashMenuMode::Command => {
+                if let Some(spec) = self.slash_menu.filtered.get(self.slash_menu.selected).copied() {
+                    self.input.clear();
+                    self.input.insert_str(format!("{} ", spec.name));
+                }
+                // 补全命令名后刷新：若有参数建议则自动进入 Param 模式
+                self.update_slash_menu();
+            }
+            SlashMenuMode::Param => {
+                if let Some(param) = self.slash_menu.params.get(self.slash_menu.selected).copied() {
+                    let line: String = self.input.lines().first().cloned().unwrap_or_default();
+                    let trimmed = line.trim_start();
+                    let cmd_end = trimmed.find(' ').unwrap_or(trimmed.len());
+                    let cmd = &trimmed[..cmd_end];
+                    self.input.clear();
+                    self.input.insert_str(format!("{cmd} {param}"));
+                }
+                self.slash_menu.close();
+            }
         }
-        self.slash_menu.close();
     }
 
     // ── 输入历史呼出（↑/↓）──────────────────────────────────────────────────
@@ -1139,7 +1335,96 @@ fn wrap_string_to_visual_lines(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use cyber_agent::Role;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind_and_state(code, KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
+    }
+
+    fn key_with_mods(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind_and_state(code, mods, KeyEventKind::Press, KeyEventState::NONE)
+    }
+
+    #[test]
+    fn paste_detector_first_key_is_process() {
+        let mut pd = PasteDetector::new();
+        assert_eq!(pd.observe(key(KeyCode::Char('a'))), KeyDisposition::Process);
+    }
+
+    #[test]
+    fn paste_detector_rapid_keys_are_buffered() {
+        let mut pd = PasteDetector::new();
+        pd.observe(key(KeyCode::Char('a'))); // 第一次：Process
+        // 第二次立即：Buffer
+        assert_eq!(pd.observe(key(KeyCode::Char('b'))), KeyDisposition::Buffer);
+        assert_eq!(pd.observe(key(KeyCode::Char('c'))), KeyDisposition::Buffer);
+        let flushed = pd.flush().unwrap();
+        assert_eq!(flushed, "bc");
+    }
+
+    #[test]
+    fn paste_detector_enter_becomes_newline_in_buffer() {
+        let mut pd = PasteDetector::new();
+        pd.observe(key(KeyCode::Char('a'))); // 第一次：Process
+        assert_eq!(pd.observe(key(KeyCode::Enter)), KeyDisposition::Buffer);
+        assert_eq!(pd.observe(key(KeyCode::Char('b'))), KeyDisposition::Buffer);
+        let flushed = pd.flush().unwrap();
+        assert_eq!(flushed, "\nb");
+    }
+
+    #[test]
+    fn paste_detector_ctrl_c_not_buffered() {
+        let mut pd = PasteDetector::new();
+        pd.observe(key(KeyCode::Char('a'))); // Process（首次）
+        pd.observe(key(KeyCode::Char('b'))); // Buffer（快速）
+        // Ctrl+C：带修饰键 → 不缓冲，先 flush buffer 再处理 Ctrl+C
+        assert_eq!(
+            pd.observe(key_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            KeyDisposition::FlushThenProcess
+        );
+        let flushed = pd.flush().unwrap();
+        assert_eq!(flushed, "b");
+    }
+
+    #[test]
+    fn paste_detector_esc_flushes_buffer() {
+        let mut pd = PasteDetector::new();
+        pd.observe(key(KeyCode::Char('a'))); // Process
+        pd.observe(key(KeyCode::Char('b'))); // Buffer
+        // Esc：特殊键 → FlushThenProcess
+        assert_eq!(pd.observe(key(KeyCode::Esc)), KeyDisposition::FlushThenProcess);
+        let flushed = pd.flush().unwrap();
+        assert_eq!(flushed, "b");
+    }
+
+    #[test]
+    fn paste_detector_flush_if_stale_returns_none_when_empty() {
+        let mut pd = PasteDetector::new();
+        assert!(pd.flush_if_stale().is_none());
+    }
+
+    #[test]
+    fn paste_detector_flush_if_stale_after_timeout() {
+        let mut pd = PasteDetector::new();
+        pd.observe(key(KeyCode::Char('a'))); // Process
+        pd.observe(key(KeyCode::Char('b'))); // Buffer
+        // 手动设置 last_key_time 为很久以前
+        pd.last_key_time = Some(Instant::now() - Duration::from_millis(100));
+        let flushed = pd.flush_if_stale();
+        assert_eq!(flushed.as_deref(), Some("b"));
+        // 再调应返回 None（buffer 已清）
+        assert!(pd.flush_if_stale().is_none());
+    }
+
+    #[test]
+    fn paste_detector_flush_if_stale_not_yet() {
+        let mut pd = PasteDetector::new();
+        pd.observe(key(KeyCode::Char('a'))); // Process
+        pd.observe(key(KeyCode::Char('b'))); // Buffer
+        // 刚刚按键，还没超时
+        assert!(pd.flush_if_stale().is_none());
+    }
 
     #[test]
     fn wrap_string_to_visual_lines_basic() {
@@ -1701,11 +1986,75 @@ mod tests {
     }
 
     #[test]
-    fn slash_menu_closes_on_space() {
+    fn slash_menu_closes_on_space_for_paramless_command() {
         let mut s = ChatState::new();
-        s.input.insert_str("/mode ");
+        s.input.insert_str("/help ");
         s.update_slash_menu();
-        assert!(!s.slash_menu.open, "含空格（命令名已完成）应关闭菜单");
+        assert!(!s.slash_menu.open, "无参数命令含空格应关闭菜单");
+    }
+
+    #[test]
+    fn slash_menu_param_mode_opens_for_think() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/think ");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open, "/think 应进入参数补全模式");
+        assert_eq!(s.slash_menu.mode, crate::chat::SlashMenuMode::Param);
+        assert_eq!(s.slash_menu.params.len(), 5);
+    }
+
+    #[test]
+    fn slash_menu_param_filters_by_prefix() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/think h");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        assert_eq!(s.slash_menu.params, vec!["high"]);
+    }
+
+    #[test]
+    fn slash_menu_param_closes_on_no_match() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/think xyz");
+        s.update_slash_menu();
+        assert!(!s.slash_menu.open, "参数无匹配应关闭菜单");
+    }
+
+    #[test]
+    fn slash_menu_param_closes_on_second_space() {
+        let mut s = ChatState::new();
+        s.input.insert_str("/think low ");
+        s.update_slash_menu();
+        assert!(!s.slash_menu.open, "参数含空格（已完成）应关闭菜单");
+    }
+
+    #[test]
+    fn slash_menu_param_complete_via_tab() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = ChatState::new();
+        s.input.insert_str("/think au");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        assert_eq!(s.slash_menu.params, vec!["auto"]);
+        // Tab 补全参数
+        assert!(s.slash_menu_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!s.slash_menu.open, "补全后应关闭菜单");
+        assert_eq!(s.input.lines().join(""), "/think auto");
+    }
+
+    #[test]
+    fn slash_menu_command_complete_then_enters_param_mode() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = ChatState::new();
+        s.input.insert_str("/thin");
+        s.update_slash_menu();
+        assert!(s.slash_menu.open);
+        assert_eq!(s.slash_menu.mode, crate::chat::SlashMenuMode::Command);
+        // Enter 补全命令名 → 自动进入 Param 模式
+        assert!(s.slash_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(s.input.lines().join(""), "/think ");
+        assert!(s.slash_menu.open, "有参数建议时应自动进入 Param 模式");
+        assert_eq!(s.slash_menu.mode, crate::chat::SlashMenuMode::Param);
     }
 
     #[test]

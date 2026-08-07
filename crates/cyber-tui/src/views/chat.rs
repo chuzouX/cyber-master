@@ -270,7 +270,45 @@ fn render_slash_menu(
     theme: &Theme,
     menu: &crate::chat::SlashMenu,
 ) {
-    let count = menu.filtered.len();
+    use crate::chat::SlashMenuMode;
+
+    let (count, title, items): (usize, &str, Vec<ListItem<'static>>) = match menu.mode {
+        SlashMenuMode::Command => {
+            let items: Vec<ListItem<'static>> = menu
+                .filtered
+                .iter()
+                .map(|spec| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            spec.usage.to_string(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(spec.desc.to_string(), Style::default().fg(theme.muted)),
+                    ]))
+                })
+                .collect();
+            (menu.filtered.len(), " 命令(↑↓选择 Enter 补全 Esc 关闭) ", items)
+        }
+        SlashMenuMode::Param => {
+            let items: Vec<ListItem<'static>> = menu
+                .params
+                .iter()
+                .map(|p| {
+                    ListItem::new(Line::from(vec![Span::styled(
+                        p.to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )]))
+                })
+                .collect();
+            (menu.params.len(), " 参数(↑↓选择 Enter 补全 Esc 关闭) ", items)
+        }
+    };
+
+    if count == 0 {
+        return;
+    }
+
     let h = (count.min(8) as u16).saturating_add(2); // +2 上下边框
     let menu_area = Rect {
         x: input_area.x,
@@ -284,24 +322,10 @@ fn render_slash_menu(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
         .title(
-            Line::from(" 命令(↑↓选择 Enter 补全 Esc 关闭) ")
+            Line::from(title)
                 .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg));
-    let items: Vec<ListItem<'static>> = menu
-        .filtered
-        .iter()
-        .map(|spec| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    spec.usage.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(spec.desc.to_string(), Style::default().fg(theme.muted)),
-            ]))
-        })
-        .collect();
     let list = List::new(items)
         .block(block)
         .highlight_style(
@@ -312,9 +336,7 @@ fn render_slash_menu(
         )
         .highlight_symbol("▶ ");
     let mut list_state = ListState::default();
-    if count > 0 {
-        list_state.select(Some(menu.selected.min(count - 1)));
-    }
+    list_state.select(Some(menu.selected.min(count - 1)));
     frame.render_stateful_widget(list, menu_area, &mut list_state);
 }
 

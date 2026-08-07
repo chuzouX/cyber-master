@@ -87,6 +87,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "查看或设置工具调用步数上限（1-1000）",
     },
     CommandSpec {
+        name: "/think",
+        usage: "/think [low|middle|high|max|auto]",
+        desc: "查看或设置思考强度",
+    },
+    CommandSpec {
         name: "/new",
         usage: "/new",
         desc: "新建会话",
@@ -108,6 +113,23 @@ pub const COMMANDS: &[CommandSpec] = &[
 pub fn filter_commands(prefix: &str) -> Vec<&'static CommandSpec> {
     let p = prefix.to_lowercase();
     COMMANDS.iter().filter(|c| c.name.starts_with(p.as_str())).collect()
+}
+
+/// 返回命令的二级参数建议（仅固定参数集命令）。无固定参数的命令返回空。
+///
+/// 用于 Tab 补全二级参数：用户输入 `/think l` 时过滤出 `low`。
+/// `/model` `/max_steps` `/compact` 等无固定参数集的命令返回空（不补全）。
+pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
+    match cmd {
+        "/think" => vec!["low", "middle", "high", "max", "auto"],
+        "/ctf" => vec!["enable", "disable", "add", "list", "writeup"],
+        "/mode" => vec!["chat", "workflow", "dashboard"],
+        "/provider" => vec!["list", "add", "edit", "use", "remove"],
+        "/sessions" => vec!["list", "read", "new"],
+        "/mcp" => vec!["list", "status"],
+        "/skill" => vec!["list"],
+        _ => Vec::new(),
+    }
 }
 
 /// 一个已解析的斜杠命令。
@@ -142,6 +164,8 @@ pub enum SlashCommand {
     Ctf(String),
     /// `/max_steps <N>` — 查看或设置工具调用步数上限。空串 = 查看当前值。
     MaxSteps(String),
+    /// `/think [level]` — 查看或设置思考强度。空串 = 查看当前值。
+    Think(String),
     /// `/new` — 新建会话（保存当前 → 切到空会话）。
     New,
     /// `/sessions <list|read <id|关键词>|new>` — 会话管理。
@@ -174,6 +198,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/compact" => SlashCommand::Compact(args.to_string()),
         "/ctf" => SlashCommand::Ctf(args.to_string()),
         "/max_steps" => SlashCommand::MaxSteps(args.to_string()),
+        "/think" => SlashCommand::Think(args.to_string()),
         "/new" => SlashCommand::New,
         "/sessions" => SlashCommand::Sessions(args.to_string()),
         "/quit" => SlashCommand::Quit,
@@ -195,6 +220,7 @@ pub const HELP_TEXT: &str = "\
   /cancel            取消当前生成
   /compact [instr]   手动压缩上下文（可选自定义摘要指令）
   /max_steps <N>     查看或设置工具调用步数上限（1-1000）
+  /think [level]     查看或设置思考强度（low / middle / high / max / auto）
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
   /quit              退出 Cyber Master";
@@ -261,6 +287,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_think_no_arg() {
+        assert_eq!(parse("/think"), SlashCommand::Think(String::new()));
+    }
+
+    #[test]
+    fn parse_think_with_level() {
+        assert_eq!(parse("/think high"), SlashCommand::Think("high".into()));
+    }
+
+    #[test]
     fn parse_compact_no_arg() {
         assert_eq!(parse("/compact"), SlashCommand::Compact(String::new()));
         assert_eq!(parse("/compact   "), SlashCommand::Compact(String::new()));
@@ -306,7 +342,7 @@ mod tests {
 
     #[test]
     fn help_text_lists_all_commands() {
-        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/new", "/sessions", "/quit"] {
+        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/think", "/new", "/sessions", "/quit"] {
             assert!(HELP_TEXT.contains(cmd), "HELP_TEXT 应包含 {cmd}");
         }
     }
@@ -392,12 +428,34 @@ mod tests {
     #[test]
     fn commands_catalog_covers_all_parsed_commands() {
         // 目录应覆盖每个可解析命令名
-        for name in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/new", "/sessions", "/quit"] {
+        for name in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/think", "/new", "/sessions", "/quit"] {
             assert!(
                 COMMANDS.iter().any(|c| c.name == name),
                 "COMMANDS 应包含 {name}"
             );
         }
+    }
+
+    #[test]
+    fn param_suggestions_for_known_commands() {
+        assert_eq!(param_suggestions("/think"), vec!["low", "middle", "high", "max", "auto"]);
+        assert_eq!(param_suggestions("/ctf"), vec!["enable", "disable", "add", "list", "writeup"]);
+        assert_eq!(param_suggestions("/mode"), vec!["chat", "workflow", "dashboard"]);
+        assert_eq!(param_suggestions("/provider"), vec!["list", "add", "edit", "use", "remove"]);
+        assert_eq!(param_suggestions("/sessions"), vec!["list", "read", "new"]);
+        assert_eq!(param_suggestions("/mcp"), vec!["list", "status"]);
+        assert_eq!(param_suggestions("/skill"), vec!["list"]);
+    }
+
+    #[test]
+    fn param_suggestions_empty_for_paramless_commands() {
+        assert!(param_suggestions("/help").is_empty());
+        assert!(param_suggestions("/clear").is_empty());
+        assert!(param_suggestions("/quit").is_empty());
+        assert!(param_suggestions("/model").is_empty());
+        assert!(param_suggestions("/max_steps").is_empty());
+        assert!(param_suggestions("/compact").is_empty());
+        assert!(param_suggestions("/unknown").is_empty());
     }
 
     #[test]
