@@ -167,7 +167,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
     // 仓库
     let repo = env!("CARGO_PKG_REPOSITORY");
     let repo_line = if repo.is_empty() {
-        Line::from(vec![Span::styled("仓库  未指定", muted)])
+        Line::from(vec![Span::styled("仓库  https://github.com/chuzouX/cyber-master", muted)])
     } else {
         Line::from(vec![
             Span::styled("仓库  ", muted),

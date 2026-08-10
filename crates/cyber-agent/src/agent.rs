@@ -22,7 +22,7 @@ use crate::compact::{
     auto_compact_threshold, compact_messages, estimate_messages_tokens,
 };
 use crate::error::{AgentError, Result};
-use crate::prompt::{build_system_prompt, CTF_PROMPT};
+use crate::prompt::{build_system_prompt, CTF_PROMPT, SkillSummary};
 use crate::provider::{provider_factory, Provider, StreamRequest};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Usage};
@@ -157,7 +157,27 @@ async fn run_inner(
 
     let provider = provider_factory(cfg, mock)?;
     let resolved = intensity.resolve(ctf_enabled);
-    let mut system = build_system_prompt(project, resolved);
+    // 从工具注册表中提取 skill 摘要，注入系统提示词的「可用 Skill」索引段落
+    let skill_summaries: Vec<SkillSummary> = registry
+        .schemas()
+        .iter()
+        .filter(|s| s.name.starts_with("skill_"))
+        .filter(|s| !s.description.contains("仅显式调用"))
+        .map(|s| {
+            let name = s.name.strip_prefix("skill_").unwrap_or(&s.name).to_string();
+            // description 格式："[Skill] {actual_desc}\n触发词: ..." — 取首行实际描述
+            let desc = s
+                .description
+                .strip_prefix("[Skill] ")
+                .unwrap_or(&s.description)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            SkillSummary { name, description: desc }
+        })
+        .collect();
+    let mut system = build_system_prompt(project, resolved, &skill_summaries);
     if ctf_enabled {
         system.push_str(CTF_PROMPT);
     }
@@ -529,7 +549,7 @@ async fn run_compact_inner(
         AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
     })?;
     let provider = provider_factory(cfg, mock)?;
-    let system = build_system_prompt(project, ThinkingIntensity::Middle);
+    let system = build_system_prompt(project, ThinkingIntensity::Middle, &[]);
 
     if history.is_empty() {
         return Err(AgentError::Provider("无消息可压缩".into()));

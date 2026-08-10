@@ -59,6 +59,27 @@ impl LineBuf {
     }
 }
 
+/// 从 SSE JSON 数据中提取错误信息（流内 error 事件）。
+///
+/// 常见格式：
+/// - OpenAI/DeepSeek：`{"error":{"message":"...","type":"..."}}`
+/// - Anthropic：`{"type":"error","error":{"type":"...","message":"..."}}`
+/// - 简单：`{"error":"..."}`
+fn extract_sse_error(v: &serde_json::Value) -> Option<String> {
+    let err = v.get("error")?;
+    if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+        let err_type = err.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if err_type.is_empty() {
+            return Some(msg.to_string());
+        }
+        return Some(format!("{msg} ({err_type})"));
+    }
+    if let Some(msg) = err.as_str() {
+        return Some(msg.to_string());
+    }
+    None
+}
+
 /// OpenAI SSE 行解析。返回 0..N 个事件：
 /// - `delta.content` → `Delta`
 /// - `delta.reasoning_content` → `Reasoning`（DeepSeek 思考过程）
@@ -82,6 +103,11 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    // 流内 error 事件（部分兼容端点在流中途发送错误）：
+    // {"error":{"message":"...","type":"..."}} 或 {"error":"..."}
+    if let Some(err_msg) = extract_sse_error(&v) {
+        return vec![StreamEvent::Error(err_msg)];
+    }
     // usage chunk（stream_options.include_usage=true 时，流末尾的独立 chunk）：
     // `{"choices":[],"usage":{...}}`。choices 为空数组，delta 不存在。
     if let Some(usage) = v.get("usage") {
@@ -184,6 +210,12 @@ pub fn parse_anthropic_line(line: &str) -> Vec<StreamEvent> {
     };
     let mut out = Vec::new();
     match v.get("type").and_then(|t| t.as_str()) {
+        // Anthropic error 事件：{"type":"error","error":{"type":"...","message":"..."}}
+        Some("error") => {
+            if let Some(err_msg) = extract_sse_error(&v) {
+                out.push(StreamEvent::Error(err_msg));
+            }
+        }
         Some("content_block_start") => {
             if let Some(block) = v.get("content_block") {
                 let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
@@ -500,6 +532,45 @@ mod tests {
                 assert_eq!(u.cache_miss_tokens, 0);
             }
             other => panic!("应为 Usage，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_parses_stream_error_event() {
+        // OpenAI/DeepSeek 流内错误：{"error":{"message":"...","type":"..."}}
+        let d = r#"data: {"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
+        let r = parse_openai_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::Error(msg) => {
+                assert!(msg.contains("rate limit exceeded"));
+                assert!(msg.contains("rate_limit_error"));
+            }
+            other => panic!("应为 Error，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_parses_stream_error_simple_string() {
+        // 简单错误格式：{"error":"something went wrong"}
+        let d = r#"data: {"error":"something went wrong"}"#;
+        let r = parse_openai_line(d);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0], StreamEvent::Error(msg) if msg == "something went wrong"));
+    }
+
+    #[test]
+    fn anthropic_parses_error_event() {
+        // Anthropic error 事件
+        let d = r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let r = parse_anthropic_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::Error(msg) => {
+                assert!(msg.contains("Overloaded"));
+                assert!(msg.contains("overloaded_error"));
+            }
+            other => panic!("应为 Error，实际 {other:?}"),
         }
     }
 }

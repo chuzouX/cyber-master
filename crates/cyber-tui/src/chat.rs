@@ -28,9 +28,10 @@ use crate::theme::Theme;
 
 /// 粘贴检测器：基于按键时间间隔区分人打字与粘贴。
 ///
-/// 人打字间隔 > 50ms，粘贴逐字符间隔 < 2ms。用 2ms 阈值区分：
+/// 人打字间隔 > 50ms，粘贴逐字符间隔 < 30ms（Windows 终端约 5-20ms，Unix < 2ms）。
+/// 用 30ms 阈值区分：
 /// - 快速连续的无修饰键 Char/Enter → 缓冲（粘贴中）
-/// - 间隔 ≥ 2ms → 正常处理
+/// - 间隔 ≥ 30ms → 正常处理
 ///
 /// 缓冲期间 Enter 被转为 `\n` 存入 buffer，不触发 Submit。
 /// buffer 在以下情况 flush（整块插入 textarea）：
@@ -53,8 +54,12 @@ pub enum KeyDisposition {
     FlushThenProcess,
 }
 
-/// 快速按键间隔阈值：< 2ms 视为粘贴。
-const RAPID_THRESHOLD: Duration = Duration::from_millis(2);
+/// 快速按键间隔阈值：< 30ms 视为粘贴。
+///
+/// 2ms 仅适用 Unix（bracketed paste 不可用时粘贴近瞬时）；Windows 终端粘贴
+/// 字符间隔约 5-20ms，2ms 阈值会导致粘贴的 Enter 被当作普通按键触发 Submit。
+/// 30ms 仍远低于人打字间隔（> 50ms），不会误缓冲正常输入。
+const RAPID_THRESHOLD: Duration = Duration::from_millis(30);
 /// flush 兜底超时：距上次按键 > 50ms 时 flush（tick 调用）。
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
 
