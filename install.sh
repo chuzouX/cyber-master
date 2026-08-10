@@ -104,11 +104,20 @@ echo "→ 下载 $download_url"
 curl -fsSL -o "$tmpdir/$archive" "$download_url"
 
 # ─── 校验 SHA256（可选：若 .sha256 不存在则跳过，不阻断安装）────────────
-if sha256sum --version >/dev/null 2>&1; then
+# macOS 无 sha256sum，用 shasum -a 256 兜底
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256="shasum -a 256"
+else
+  SHA256=""
+fi
+
+if [ -n "$SHA256" ]; then
   if curl -fsSL -o "$tmpdir/$archive.sha256" "$checksum_url"; then
     echo "→ 校验 SHA256…"
-    # sha256sum 校验时需在文件同目录下，且 .sha256 内是相对文件名
-    (cd "$tmpdir" && sha256sum -c "$archive.sha256" 2>/dev/null) \
+    # 校验时需在文件同目录下，且 .sha256 内是相对文件名
+    (cd "$tmpdir" && $SHA256 -c "$archive.sha256" 2>/dev/null) \
       || { echo "SHA256 校验失败，文件可能损坏或被篡改" >&2; exit 1; }
   else
     echo "  (未找到 .sha256 校验文件，跳过校验)"
