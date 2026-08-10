@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["Cyber Master"]
+authors = ["chuzouX"]
 
 [workspace.dependencies]
 # 序列化

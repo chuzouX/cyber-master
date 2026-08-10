@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(block, area);
 
     // 内容自适应居中：上方弹性 + 内容 + 下方弹性
-    let content_height = 22u16;
+    let content_height = 27u16;
     let outer = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(content_height),
@@ -55,6 +55,11 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
         Constraint::Length(1), // 空
         Constraint::Length(1), // 仓库
         Constraint::Length(1), // 协议
+        Constraint::Length(1), // 空
+        Constraint::Length(1), // 作者
+        Constraint::Length(1), // 博客
+        Constraint::Length(1), // 主页
+        Constraint::Length(1), // GitHub
         Constraint::Length(1), // 空
         Constraint::Length(1), // hint
     ])
@@ -187,6 +192,58 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
         Paragraph::new(Line::from(vec![
             Span::styled("协议  ", muted),
             Span::raw(env!("CARGO_PKG_LICENSE")),
+        ]))
+        .style(Style::default().fg(theme.fg))
+        .alignment(Alignment::Center),
+        rows[i],
+    );
+    i += 1;
+
+    // 空
+    frame.render_widget(Paragraph::new(""), rows[i]);
+    i += 1;
+
+    // 作者
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("作者  ", muted),
+            Span::raw("chuzouX"),
+        ]))
+        .style(Style::default().fg(theme.fg))
+        .alignment(Alignment::Center),
+        rows[i],
+    );
+    i += 1;
+
+    // 博客
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("博客  ", muted),
+            Span::raw("https://chuzoux.top/"),
+        ]))
+        .style(Style::default().fg(theme.fg))
+        .alignment(Alignment::Center),
+        rows[i],
+    );
+    i += 1;
+
+    // 主页
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("主页  ", muted),
+            Span::raw("https://space.chuzoux.top/"),
+        ]))
+        .style(Style::default().fg(theme.fg))
+        .alignment(Alignment::Center),
+        rows[i],
+    );
+    i += 1;
+
+    // GitHub
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("GitHub  ", muted),
+            Span::raw("https://github.com/chuzouX"),
         ]))
         .style(Style::default().fg(theme.fg))
         .alignment(Alignment::Center),
