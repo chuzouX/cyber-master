@@ -68,7 +68,7 @@ fn push_output_line(
 /// 剥除 `.PY`/`.PYW` 让 cmd 仅解析原生可执行格式（`.COM/.EXE/.BAT/.CMD/...`）：
 /// 既杜绝「命令在 IDE 里打开」的怪行为，又让被 `.py` 遮蔽的同名 `.exe` 正常生效。
 /// 需跑 `.py` 脚本时显式 `python xxx.py`（python 自带 `.exe` shim 不受影响）。
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn sanitize_pathext(pathext: &str) -> String {
     let filtered: Vec<&str> = pathext
         .split(';')
@@ -83,6 +83,26 @@ fn sanitize_pathext(pathext: &str) -> String {
     } else {
         filtered.join(";")
     }
+}
+
+/// 构建命令：Windows 用 `cmd /C` + raw_arg（避免 Rust arg() 转义引号），
+/// Unix 用 `sh -c`。用 `#[cfg]` 守卫而非 `cfg!()` 运行时检查，
+/// 因为 `std::os::windows::process::CommandExt` 和 `raw_arg` 是编译时 Windows 专有 API。
+#[cfg(target_os = "windows")]
+fn build_shell_command(command: &str) -> tokio::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut std_cmd = std::process::Command::new("cmd");
+    std_cmd.arg("/C").raw_arg(command);
+    let safe_pathext = sanitize_pathext(&std::env::var("PATHEXT").unwrap_or_default());
+    std_cmd.env("PATHEXT", safe_pathext);
+    tokio::process::Command::from(std_cmd)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_shell_command(command: &str) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c").arg(command);
+    c
 }
 
 impl Tool for ShellTool {
@@ -127,25 +147,7 @@ impl Tool for ShellTool {
                     is_error: true,
                 });
             }
-            let mut cmd = if cfg!(windows) {
-                // Windows：用 raw_arg 将命令原样传给 cmd /C，避免 Rust 的 arg() 对引号
-                // 做反斜杠转义（\"），cmd 不认 C runtime 转义 → 带引号的路径（如
-                // "C:\...\julia.exe" args）会被当成命令名的一部分而报「not recognized」。
-                // raw_arg 直接拼接到命令行，cmd 按自身规则解析引号。
-                use std::os::windows::process::CommandExt;
-                let mut std_cmd = std::process::Command::new("cmd");
-                std_cmd.arg("/C").raw_arg(command);
-                // 剥除 PATHEXT 中的 .PY/.PYW，避免裸名命令解析到 .py 脚本后走 IDE 文件
-                // 关联（在 PyCharm/VSCode 里打开源码而非执行），并让被遮蔽的同名 .exe 生效。
-                let safe_pathext =
-                    sanitize_pathext(&std::env::var("PATHEXT").unwrap_or_default());
-                std_cmd.env("PATHEXT", safe_pathext);
-                tokio::process::Command::from(std_cmd)
-            } else {
-                let mut c = tokio::process::Command::new("sh");
-                c.arg("-c").arg(command);
-                c
-            };
+            let mut cmd = build_shell_command(command);
             // 强制子进程不缓冲 stdout/stderr：stdout 是 pipe（非 TTY）时，Python 等
             // 运行时默认块缓冲（4-8KB），导致 print() 输出攒满缓冲区或进程退出才到达
             // 我们的 BufReader::lines() → 流式读取看不到实时输出。
