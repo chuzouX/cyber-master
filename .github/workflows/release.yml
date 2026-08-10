@@ -1,102 +1,105 @@
-name: release
+name: Release
 
-# 触发条件：推送 v* 形式 tag，或在 Actions 页面手动运行
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: '发布 tag（如 v0.1.0），用于手动触发'
+        description: "Release tag (e.g. v0.1.0)"
         required: true
 
-# action-gh-release 需要写权限才能创建 Release 与上传资源
-permissions:
-  contents: write
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64（gnu，绝大多数桌面/服务器 Linux）
-          - os: ubuntu-22.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          # Linux ARM64（GitHub 2025 起 GA 的 arm runner）
-          - os: ubuntu-22.04-arm
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
-          # macOS Intel
-          - os: macos-13
+          - runner: macos-13
             target: x86_64-apple-darwin
             archive: tar.gz
-          # macOS Apple Silicon
-          - os: macos-14
+          - runner: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-          # Windows x86_64
-          - os: windows-2022
+          - runner: windows-2022
             target: x86_64-pc-windows-msvc
             archive: zip
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (release)
+      - name: Get version
+        id: version
         shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }} -p cyber-app
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Package (Unix tar.gz)
+      - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          cd "target/${{ matrix.target }}/release"
-          # 用 owner/group 0 + 确定权限，避免不同 runner 上 tar 元数据漂移
-          tar --owner=0 --group=0 --mode='u=rwx,go=rx' \
-              -czf "../../cyber-${{ matrix.target }}.tar.gz" cyber
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/cyber-${{ matrix.target }}.tar.gz" cyber
+          cd "$GITHUB_WORKSPACE"
+          sha256sum cyber-${{ matrix.target }}.tar.gz > cyber-${{ matrix.target }}.tar.gz.sha256
 
-      - name: Package (Windows zip)
+      - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: bash
         run: |
-          cd "target/${{ matrix.target }}/release"
-          # windows-2022 runner 自带 7z；zip 元数据无 owner 概念
-          7z a -tzip "../../cyber-${{ matrix.target }}.zip" cyber.exe
-
-      - name: Generate SHA256 checksum
-        shell: bash
-        run: |
+          cd target/${{ matrix.target }}/release
+          7z a "$GITHUB_WORKSPACE/cyber-${{ matrix.target }}.zip" cyber.exe
           cd "$GITHUB_WORKSPACE"
-          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            sha256sum "cyber-${{ matrix.target }}.tar.gz" > "cyber-${{ matrix.target }}.tar.gz.sha256"
-          else
-            # Windows runner 上 sha256sum 由 git-bash 自带，输出格式与 Unix 一致
-            sha256sum "cyber-${{ matrix.target }}.zip" > "cyber-${{ matrix.target }}.zip.sha256"
-          fi
+          sha256sum cyber-${{ matrix.target }}.zip > cyber-${{ matrix.target }}.zip.sha256
 
-      - name: Upload to GitHub Release
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyber-${{ matrix.target }}
+          path: |
+            cyber-${{ matrix.target }}.*
+            cyber-${{ matrix.target }}.*.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          # workflow_dispatch 时 inputs.tag 优先；tag push 时用 GITHUB_REF
           tag_name: ${{ inputs.tag || github.ref_name }}
-          name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            cyber-${{ matrix.target }}.*
+          files: artifacts/cyber-*
