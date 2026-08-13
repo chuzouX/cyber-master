@@ -42,7 +42,7 @@ use cyber_agent::{
 };
 use cyber_core::{
     current_time_str, save_config, save_providers, Config, CtfCategory, CtfChallenge, CtfStatus,
-    ProjectContext, ProvidersConfig,
+    MemoryScope, MemoryStore, ProjectContext, ProvidersConfig,
 };
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
@@ -113,6 +113,8 @@ pub struct AppPaths {
     pub cwd: PathBuf,
     pub ctf_dir: PathBuf,
     pub ctf_writeup_dir: PathBuf,
+    /// 全局用户记忆文件（`~/.cyber/memory.md`）。
+    pub memory_file: PathBuf,
 }
 
 /// 异步模型拉取结果（经 mpsc 通道回传主循环第 4 路 select! 分支）。
@@ -1344,10 +1346,17 @@ impl App {
         let registry = self.registries.tools.clone();
         let ctf_enabled = self.ctf_enabled;
         let intensity = self.config.agent.thinking_intensity;
+        // 读取两层用户记忆（全局 + 项目级），注入系统提示词。每次 spawn 重读，
+        // 使 save_memory 工具 / /memory 命令写入的记忆在下次请求即生效。
+        let memory = MemoryStore::new(
+            self.paths.memory_file.clone(),
+            self.paths.cwd.join(".cyber").join("memory.md"),
+        )
+        .load_all();
         let handle = tokio::spawn(async move {
             run_stream(
                 config, providers, project, text, history, tx, gen, mock, cwd, registry,
-                ctf_enabled, intensity,
+                ctf_enabled, intensity, memory,
             )
             .await;
         });
@@ -2255,12 +2264,92 @@ impl App {
             SlashCommand::Sessions(args) => {
                 self.handle_sessions_slash(&args);
             }
+            SlashCommand::Memory(args) => {
+                self.handle_memory_slash(&args);
+            }
             SlashCommand::Ctf(args) => {
                 self.handle_ctf_slash(&args);
             }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
                     "未知命令：{name}（输入 /help 查看可用命令）"
+                )));
+            }
+        }
+    }
+
+    /// 处理 `/memory [list|add <text>|project <text>]`：查看/追加用户记忆。
+    fn handle_memory_slash(&mut self, args: &str) {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").trim().to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        let store = MemoryStore::new(
+            self.paths.memory_file.clone(),
+            self.paths.cwd.join(".cyber").join("memory.md"),
+        );
+
+        match sub.as_str() {
+            "" | "list" => {
+                let global = store.load_global();
+                let project = store.load_project();
+                if global.is_empty() && project.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "暂无用户记忆。用 /memory add <text> 添加全局记忆，或 /memory project <text> 添加项目级记忆。".into(),
+                    ));
+                    return;
+                }
+                let mut lines = String::new();
+                if !global.is_empty() {
+                    lines.push_str("全局记忆：\n");
+                    lines.push_str(global.trim_end());
+                }
+                if !project.is_empty() {
+                    if !global.is_empty() {
+                        lines.push('\n');
+                    }
+                    lines.push_str("\n项目级记忆：\n");
+                    lines.push_str(project.trim_end());
+                }
+                self.chat.entries.push(ChatEntry::System(lines));
+            }
+            "add" => {
+                if rest.is_empty() {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("用法：/memory add <要记住的内容>".into()));
+                    return;
+                }
+                match store.append(MemoryScope::Global, rest) {
+                    Ok(()) => self.chat.entries.push(ChatEntry::System(format!(
+                        "已保存到全局记忆：{rest}"
+                    ))),
+                    Err(e) => self
+                        .chat
+                        .entries
+                        .push(ChatEntry::System(format!("保存记忆失败：{e}"))),
+                }
+            }
+            "project" => {
+                if rest.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "用法：/memory project <要记住的内容>".into(),
+                    ));
+                    return;
+                }
+                match store.append(MemoryScope::Project, rest) {
+                    Ok(()) => self.chat.entries.push(ChatEntry::System(format!(
+                        "已保存到项目级记忆：{rest}"
+                    ))),
+                    Err(e) => self
+                        .chat
+                        .entries
+                        .push(ChatEntry::System(format!("保存记忆失败：{e}"))),
+                }
+            }
+            other => {
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "未知子命令：{other}（可选：list / add <text> / project <text>）"
                 )));
             }
         }
@@ -3622,6 +3711,7 @@ mod tests {
                 cwd: cwd.clone(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
                 ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
+                memory_file: std::env::temp_dir().join(format!("cyber_test_memory_{seed}.md")),
             },
             false,
             false,
@@ -3810,6 +3900,7 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf2"),
                 ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf2").join("writeup"),
+                memory_file: std::env::temp_dir().join("cyber_test_memory2.md"),
             },
             true,
             false,
@@ -3863,6 +3954,7 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf2"),
                 ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf2").join("writeup"),
+                memory_file: std::env::temp_dir().join("cyber_test_memory3.md"),
             },
             false,
             true, // mock
@@ -3911,7 +4003,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_cancel_aborts_and_drops_buffer() {
+    fn chat_cancel_aborts_and_preserves_buffer() {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.chat.streaming = true;
         app.chat.streaming_buffer.push_str("部分");
@@ -3923,7 +4015,9 @@ mod tests {
         );
         app.handle_chat_key(k);
         assert!(!app.chat.streaming);
-        assert!(app.chat.entries.is_empty(), "取消不应追加 assistant 条目");
+        // 取消应保留已生成的文本（flush 为 assistant 条目），而非丢弃——保留上下文
+        assert_eq!(app.chat.entries.len(), 1, "取消应保留 buffer 为 assistant 条目");
+        assert!(matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "部分"));
         assert!(app.chat.streaming_buffer.is_empty());
     }
 
@@ -4032,6 +4126,7 @@ mod tests {
                 cwd: cwd.clone(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
                 ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
+                memory_file: std::env::temp_dir().join("cyber_test_memory4.md"),
             },
             false,
             false,
@@ -4088,6 +4183,7 @@ mod tests {
                 cwd: cwd.clone(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
                 ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
+                memory_file: std::env::temp_dir().join("cyber_test_memory5.md"),
             },
             false,
             false,

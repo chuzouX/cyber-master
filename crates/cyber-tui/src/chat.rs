@@ -802,10 +802,13 @@ impl ChatState {
         self.streaming = false;
     }
 
-    /// 取消流式（Esc）：丢弃 buffer，不追加 assistant 条目，退出 streaming 态。
+    /// 取消流式（Esc）：保留已生成的文本（flush 为条目），退出 streaming 态。
+    ///
+    /// 不能简单丢弃 buffer：截停前的部分文本/思考过程是下次继续的上下文依据。
+    /// 丢弃会导致「截停后失去记忆」——再次提问时模型看不到之前说到哪了。
+    /// 工具调用/结果条目已在事件到达时 push，这里只需 flush 残留文本。
     pub fn cancel_stream(&mut self) {
-        self.streaming_buffer.clear();
-        self.thinking_buffer.clear();
+        self.flush_streaming_to_assistant();
         self.streaming_tool_output.clear();
         self.streaming = false;
     }
@@ -1544,13 +1547,15 @@ mod tests {
     }
 
     #[test]
-    fn cancel_stream_drops_buffer_without_entry() {
+    fn cancel_stream_preserves_buffer_as_assistant_entry() {
         let mut s = ChatState::new();
         s.streaming = true;
         s.streaming_buffer.push_str("部分");
         s.cancel_stream();
         assert!(!s.streaming);
-        assert!(s.entries.is_empty());
+        // 截停不应丢弃已生成的文本，而是 flush 为 assistant 条目（保留上下文）
+        assert_eq!(s.entries.len(), 1);
+        assert!(matches!(&s.entries[0], ChatEntry::Assistant(c) if c == "部分"));
         assert!(s.streaming_buffer.is_empty());
     }
 

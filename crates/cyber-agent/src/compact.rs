@@ -13,8 +13,22 @@ use crate::error::{AgentError, Result};
 use crate::provider::{Provider, StreamRequest};
 use crate::types::{Message, StreamEvent};
 
-/// 默认 token 估算比率（~4 字符/token，与 Claude Code 一致）。
-const BYTES_PER_TOKEN: usize = 4;
+/// 默认 token 估算比率（~4 字符/token，与 Claude Code 一致）。仅用于非 CJK 字符。
+const CHARS_PER_TOKEN: usize = 4;
+
+/// 判断是否为 CJK（中日韩）字符。CJK 字符在 tokenizer 中通常 1 字 ≈ 1 token，
+/// 与 ASCII（~4 字符/token）差异巨大，需单独估算，否则中文 token 数被低估约 4 倍，
+/// 导致自动压缩阈值形同虚设（实际早已超限但估算值迟迟不到阈值）。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3000..=0x303F | // CJK 标点
+        0x3040..=0x30FF | // 日文假名
+        0x3400..=0x4DBF | // 扩展 A
+        0x4E00..=0x9FFF | // 统一表意文字（常用汉字）
+        0xF900..=0xFAFF | // 兼容表意文字
+        0xFF00..=0xFFEF   // 全角形式
+    )
+}
 
 /// 自动压缩触发阈值 = 有效上下文长度 - 缓冲（预留摘要输出空间 + 安全余量）。
 /// 参考 Claude Code 的 `AUTOCOMPACT_BUFFER_TOKENS = 13_000`。
@@ -23,9 +37,18 @@ pub const AUTOCOMPACT_BUFFER_TOKENS: u32 = 13_000;
 /// 压缩摘要输出的 token 上限（参考 Claude Code 的 `MAX_OUTPUT_TOKENS_FOR_SUMMARY`）。
 pub const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
 
-/// 估算文本 token 数（~4 字符/token）。
+/// 估算文本 token 数。CJK 字符按 1 字 ≈ 1 token，非 CJK 按 ~4 字符/token。
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / BYTES_PER_TOKEN
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if is_cjk(c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + other / CHARS_PER_TOKEN
 }
 
 /// 估算消息列表 token 数（含 role/tool_calls 等开销的粗略估计）。
@@ -149,9 +172,15 @@ mod tests {
 
     #[test]
     fn estimate_tokens_cjk() {
-        // 中文字符按 char 计数（非字节），4 字 = 1 token
-        assert_eq!(estimate_tokens("你好世界"), 1);
-        assert_eq!(estimate_tokens("你好世界你好世界"), 2);
+        // CJK 字符 1 字 ≈ 1 token（不再 4 字 1 token 低估）
+        assert_eq!(estimate_tokens("你好世界"), 4);
+        assert_eq!(estimate_tokens("你好世界你好世界"), 8);
+    }
+
+    #[test]
+    fn estimate_tokens_mixed_cjk_ascii() {
+        // 混合：2 个 CJK + 8 个 ASCII（8/4=2） = 4
+        assert_eq!(estimate_tokens("你好abcdefgh"), 4);
     }
 
     #[test]

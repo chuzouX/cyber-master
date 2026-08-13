@@ -102,6 +102,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "会话管理：list 面板 / read 跨会话读取 / new 新建",
     },
     CommandSpec {
+        name: "/memory",
+        usage: "/memory [list|add <text>|project <text>]",
+        desc: "用户记忆：list 查看 / add 追加全局 / project 追加项目级",
+    },
+    CommandSpec {
         name: "/quit",
         usage: "/quit",
         desc: "退出 Cyber Master",
@@ -126,6 +131,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/mode" => vec!["chat", "workflow", "dashboard"],
         "/provider" => vec!["list", "add", "edit", "use", "remove"],
         "/sessions" => vec!["list", "read", "new"],
+        "/memory" => vec!["list", "add", "project"],
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
         _ => Vec::new(),
@@ -171,6 +177,9 @@ pub enum SlashCommand {
     /// `/sessions <list|read <id|关键词>|new>` — 会话管理。
     /// 空串 / list → 打开 session 面板；read → 跨会话读取；new → 同 `/new`。
     Sessions(String),
+    /// `/memory [list|add <text>|project <text>]` — 用户记忆管理。
+    /// 空串 / list → 查看记忆；add <text> → 追加全局；project <text> → 追加项目级。
+    Memory(String),
     /// `/quit` — 退出。
     Quit,
     /// 未知命令（含原始命令名）。
@@ -201,6 +210,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/think" => SlashCommand::Think(args.to_string()),
         "/new" => SlashCommand::New,
         "/sessions" => SlashCommand::Sessions(args.to_string()),
+        "/memory" => SlashCommand::Memory(args.to_string()),
         "/quit" => SlashCommand::Quit,
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
     }
@@ -223,6 +233,7 @@ pub const HELP_TEXT: &str = "\
   /think [level]     查看或设置思考强度（low / middle / high / max / auto）
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
+  /memory <sub>      用户记忆：list 查看 | add <text> 全局 | project <text> 项目级
   /quit              退出 Cyber Master";
 
 #[cfg(test)]
@@ -342,9 +353,20 @@ mod tests {
 
     #[test]
     fn help_text_lists_all_commands() {
-        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/think", "/new", "/sessions", "/quit"] {
+        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/think", "/new", "/sessions", "/memory", "/quit"] {
             assert!(HELP_TEXT.contains(cmd), "HELP_TEXT 应包含 {cmd}");
         }
+    }
+
+    #[test]
+    fn parse_memory_no_arg() {
+        assert_eq!(parse("/memory"), SlashCommand::Memory(String::new()));
+    }
+
+    #[test]
+    fn parse_memory_with_arg() {
+        assert_eq!(parse("/memory add 记住这个"), SlashCommand::Memory("add 记住这个".into()));
+        assert_eq!(parse("/memory project 项目约定"), SlashCommand::Memory("project 项目约定".into()));
     }
 
     #[test]

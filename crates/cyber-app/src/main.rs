@@ -120,6 +120,7 @@ async fn main() -> color_eyre::Result<()> {
         history_dir: ctx.paths.history_dir.clone(),
         ctf_dir: ctx.paths.ctf_dir.clone(),
         ctf_writeup_dir: ctx.paths.ctf_writeup_dir.clone(),
+        memory_file: ctx.paths.memory_file.clone(),
         cwd,
     };
 

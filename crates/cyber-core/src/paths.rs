@@ -26,6 +26,8 @@ pub struct Paths {
     pub ctf_dir: PathBuf,
     /// CTF writeup 输出目录（`~/.cyber/ctf/writeup/`）。
     pub ctf_writeup_dir: PathBuf,
+    /// 全局用户记忆文件（`~/.cyber/memory.md`）。
+    pub memory_file: PathBuf,
 }
 
 impl Paths {
@@ -57,6 +59,7 @@ impl Paths {
             history_dir: cyber_home.join("history"),
             assets_db: cyber_home.join("assets.db"),
             ctf_writeup_dir: ctf_dir.join("writeup"),
+            memory_file: cyber_home.join("memory.md"),
             mcp_dir,
             reports_dir,
             ctf_dir,
@@ -72,6 +75,11 @@ impl Paths {
     /// 项目级 `.cyber.md` 文件路径（CWD 下）。
     pub fn project_md_file(cwd: &Path) -> PathBuf {
         cwd.join(".cyber.md")
+    }
+
+    /// 项目级记忆文件路径（`<cwd>/.cyber/memory.md`，可能不存在）。
+    pub fn project_memory_file(cwd: &Path) -> PathBuf {
+        Self::project_local_dir(cwd).join("memory.md")
     }
 
     /// 项目级 skills 目录（`<cwd>/.cyber/skills/`，可能不存在）。

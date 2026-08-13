@@ -56,6 +56,12 @@ pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全�
 - 优先使用专用工具而非 shell：读文件用 read_file 而非 cat；编辑文件用 write_file 而非 sed；搜索文件用 find_file 而非 find/grep。\n\
 - 无依赖的工具调用应并行：如果多个操作之间没有依赖关系，在同一个响应中一起调用。\n\
 - shell 工具仅用于需要 shell 执行的系统命令和终端操作。\n\n\
+# 记忆（重要）\n\
+- 你有 save_memory 工具用于跨会话记忆。当用户表达**持久性的**偏好、身份、约定、项目背景、常用配置等重要信息时，应主动调用 save_memory 保存，使后续对话能自动引用。\n\
+- 应该记：用户明确说「记住…」；稳定的偏好（如「我偏好 Python」「优先用 dirsearch 而非自写脚本」）；长期约定（目标、授权范围、常用命令、环境信息）。\n\
+- 不应该记：一次性的临时指令；可从对话历史推导的细节；密码/token/flag 等敏感信息（除非用户明确要求）。\n\
+- scope 选择：跨项目通用 → global（默认）；仅当前项目相关 → project。\n\
+- 保存后简要确认即可，不要大段解释。\n\n\
 # Skill 使用（重要）\n\
 - Skill 是经过实战验证的方法论和操作手册。遇到安全测试、CTF 解题、漏洞利用等任务时，**先调用相关 skill 工具获取方法论**，再执行操作。\n\
 - Skill 工具命名为 `skill_<name>`，调用后返回详细使用说明（渐进式披露）。调用成本极低（无参数），但能避免大量试错。\n\
@@ -133,14 +139,16 @@ CTF 解题按以下优先级推进，**严禁跳级**：\n\
 - **HTTP 请求**优先用 `web_fetch` 或 `shell` 运行 `curl`，不要自写脚本发请求。\n\
 - 仅当已有工具无法满足特定需求时才写脚本（如需要特定协议交互、链式利用、自定义 payload 生成）。";
 
-/// 组装系统提示词：thinking_section + base + 项目上下文 + rules 护栏段 + skill 索引。
+/// 组装系统提示词：thinking_section + base + 环境 + 用户记忆 + skill 索引 + 项目上下文 + rules。
 ///
 /// `intensity` 应为已 resolve 的值（非 Auto）。`body`（.cyber.md 正文）暂不注入。
 /// `skills` 为 `(name, description)` 列表，非空时追加「可用 Skill」段落到提示词末尾。
+/// `memory` 为用户记忆（全局 + 项目级合并），非空时追加「用户记忆」段落。
 pub fn build_system_prompt(
     project: Option<&ProjectContext>,
     intensity: ThinkingIntensity,
     skills: &[SkillSummary],
+    memory: &str,
 ) -> String {
     let mut s = String::new();
     s.push_str(thinking_section(intensity));
@@ -148,6 +156,12 @@ pub fn build_system_prompt(
     s.push_str(BASE_PROMPT_STATIC);
     s.push_str("\n\n");
     s.push_str(&env_info_section());
+    // 用户记忆：非空时注入（跨会话持久化的偏好/约定/身份等）
+    if !memory.trim().is_empty() {
+        s.push_str("\n\n# 用户记忆\n");
+        s.push_str("以下是用户之前明确要求记住的信息，请始终遵守并优先参考：\n");
+        s.push_str(memory.trim_end());
+    }
     // Skill 索引：非空时追加，让 agent 一眼看到有哪些 skill 可用
     if !skills.is_empty() {
         s.push_str("\n\n# 可用 Skill\n");
@@ -206,14 +220,14 @@ mod tests {
 
     #[test]
     fn no_project_just_base() {
-        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[]);
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
         assert!(s.contains("Cyber Master"));
         assert!(!s.contains("项目上下文"));
     }
 
     #[test]
     fn env_info_section_is_injected() {
-        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[]);
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
         assert!(s.contains("# 运行环境"), "应包含运行环境段落");
         assert!(s.contains("平台："), "应包含平台信息");
         if cfg!(target_os = "windows") {
@@ -233,7 +247,7 @@ mod tests {
             owner: Some("sec-team".into()),
             rules: vec!["禁止 DoS".into(), "仅工作时间".into()],
         };
-        let s = build_system_prompt(Some(&ctx(fm)), ThinkingIntensity::Middle, &[]);
+        let s = build_system_prompt(Some(&ctx(fm)), ThinkingIntensity::Middle, &[], "");
         assert!(s.contains("project: demo"));
         assert!(s.contains("scope: *.example.com"));
         assert!(s.contains("authorization: 书面授权"));
@@ -245,7 +259,7 @@ mod tests {
 
     #[test]
     fn empty_frontmatter_shows_placeholder() {
-        let s = build_system_prompt(Some(&ctx(ProjectFrontmatter::default())), ThinkingIntensity::Middle, &[]);
+        let s = build_system_prompt(Some(&ctx(ProjectFrontmatter::default())), ThinkingIntensity::Middle, &[], "");
         assert!(s.contains("frontmatter 无结构化字段"));
         // rules 段仅在 frontmatter.rules 非空时追加
         assert!(!s.contains("# 安全护栏（必须遵守）"));
@@ -257,7 +271,7 @@ mod tests {
             SkillSummary { name: "hack".into(), description: "黑客攻击总入口".into() },
             SkillSummary { name: "sqli".into(), description: "SQL 注入攻击".into() },
         ];
-        let s = build_system_prompt(None, ThinkingIntensity::Middle, &skills);
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &skills, "");
         assert!(s.contains("# 可用 Skill"), "应包含 skill 索引段落");
         assert!(s.contains("skill_hack"), "应列出 skill_hack");
         assert!(s.contains("黑客攻击总入口"), "应含 skill 描述");
@@ -267,7 +281,21 @@ mod tests {
 
     #[test]
     fn skill_index_omitted_when_empty() {
-        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[]);
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
         assert!(!s.contains("# 可用 Skill"), "空 skill 列表不应生成索引段落");
+    }
+
+    #[test]
+    fn memory_injected_when_non_empty() {
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "- 用户偏好 Python\n- 项目使用 Rust");
+        assert!(s.contains("# 用户记忆"), "应包含用户记忆段落");
+        assert!(s.contains("用户偏好 Python"));
+        assert!(s.contains("项目使用 Rust"));
+    }
+
+    #[test]
+    fn memory_omitted_when_empty() {
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
+        assert!(!s.contains("# 用户记忆"), "空记忆不应生成记忆段落");
     }
 }

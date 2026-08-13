@@ -27,6 +27,15 @@ use crate::provider::{provider_factory, Provider, StreamRequest};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Usage};
 
+/// 未配置 per-model `context_length` 时的默认回退值（token 数）。
+///
+/// `effective_context_length()` 仅在 providers.toml 的 `[providers.X.models.MODEL]`
+/// 配置了 `context_length` 时才返回 Some；否则返回 None → 自动压缩永不触发，
+/// 导致长对话在真实上下文耗尽时被 provider 突然截断（用户看到「突然停止思考」）。
+/// 取 128_000 作为主流模型（GPT-4o / DeepSeek-V3 / Claude）的通用回退，
+/// 用户可在 providers.toml 精确配置以获得更准确的阈值。
+const DEFAULT_CONTEXT_LENGTH: u32 = 128_000;
+
 /// 连续相同工具调用检测器：记录每轮工具调用指纹，连续 `threshold` 轮相同则判定死循环。
 ///
 /// 指纹 = 本轮所有 ToolCall 的 `name|arguments` 排序后拼接（排序消除顺序差异）。
@@ -111,6 +120,7 @@ pub async fn run_stream(
     registry: Arc<ToolRegistry>,
     ctf_enabled: bool,
     intensity: ThinkingIntensity,
+    memory: String,
 ) {
     let _ = tx.send((gen, AgentEvent::Started));
     let res = run_inner(
@@ -126,6 +136,7 @@ pub async fn run_stream(
         registry,
         ctf_enabled,
         intensity,
+        &memory,
     )
     .await;
     if let Err(e) = res {
@@ -148,6 +159,7 @@ async fn run_inner(
     registry: Arc<ToolRegistry>,
     ctf_enabled: bool,
     intensity: ThinkingIntensity,
+    memory: &str,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
@@ -177,7 +189,7 @@ async fn run_inner(
             SkillSummary { name, description: desc }
         })
         .collect();
-    let mut system = build_system_prompt(project, resolved, &skill_summaries);
+    let mut system = build_system_prompt(project, resolved, &skill_summaries, memory);
     if ctf_enabled {
         system.push_str(CTF_PROMPT);
     }
@@ -204,8 +216,11 @@ async fn run_inner(
     messages.push(Message::user(user_input));
 
     // 有效上下文长度（用于自动压缩阈值 + TUI 剩余百分比显示）。
-    // 未配置时为 None → 不触发自动压缩，TUI 不显示百分比。
-    let effective_ctx_len = cfg.effective_context_length();
+    // 未配置 per-model context_length 时回退到 DEFAULT_CONTEXT_LENGTH，
+    // 确保自动压缩始终能触发，避免长对话被 provider 突然截断。
+    let effective_ctx_len = cfg
+        .effective_context_length()
+        .or(Some(DEFAULT_CONTEXT_LENGTH));
 
     // 首次发送上下文使用情况（TUI 据此显示初始剩余百分比）
     emit_context_update(tx, gen, &messages, effective_ctx_len);
@@ -549,7 +564,7 @@ async fn run_compact_inner(
         AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
     })?;
     let provider = provider_factory(cfg, mock)?;
-    let system = build_system_prompt(project, ThinkingIntensity::Middle, &[]);
+    let system = build_system_prompt(project, ThinkingIntensity::Middle, &[], "");
 
     if history.is_empty() {
         return Err(AgentError::Provider("无消息可压缩".into()));

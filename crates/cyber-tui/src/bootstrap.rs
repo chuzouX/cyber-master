@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cyber_agent::{CtfChallengeTool, ToolRegistry};
+use cyber_agent::{CtfChallengeTool, SaveMemoryTool, ToolRegistry};
 use cyber_core::{CtfChallenge, Paths};
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::{SkillRegistry, SkillTool};
@@ -57,6 +57,9 @@ pub async fn build_registries(
         Arc::clone(&ctf_challenges),
         paths.ctf_dir.clone(),
     )));
+
+    // save_memory 工具：agent 自动保存长期记忆（全局文件路径；项目级从 ctx.cwd 推导）
+    tool_reg.register(Box::new(SaveMemoryTool::new(paths.memory_file.clone())));
 
     // 3. MCP：非 mock 时加载 servers.toml + 并行连接
     let mcp = if !mock {

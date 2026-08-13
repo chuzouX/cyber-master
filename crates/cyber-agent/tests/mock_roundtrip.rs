@@ -41,6 +41,7 @@ fn spawn_run(
         registry,
         false,    // ctf_enabled
         cyber_core::ThinkingIntensity::Middle,
+        String::new(),
     ));
     (handle, rx)
 }
@@ -366,6 +367,7 @@ async fn mock_tool_loop_respects_generation_tag() {
         registry,
         false,    // ctf_enabled
         cyber_core::ThinkingIntensity::Middle,
+        String::new(),
     ));
 
     let mut gens = Vec::new();
