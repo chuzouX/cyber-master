@@ -525,8 +525,17 @@ async fn run_writeup_inner(
     })?;
     let provider = provider_factory(cfg, mock)?;
 
+    // writeup 是纯文本生成任务（不暴露工具），但 DeepSeek 等模型在 system 提示
+    // 中出现「查看 exp 文件」等描述时，可能自发输出 `<function_calls>` 文本而非
+    // 正文。追加一段硬约束，明确禁止工具调用并直接输出 Markdown。
+    let system = format!(
+        "{}\n\n# 输出约束（必须遵守）\n\
+- 这是纯文本撰写任务，你没有可调用的工具，**禁止**输出任何工具调用格式（如 <function_calls>、<invoke>、<parameter>、tool_use 等）。\n\
+- 直接输出完整的 Markdown writeup 正文，从标题开始，不要输出任何与正文无关的说明。",
+        skill_body
+    );
     let req = StreamRequest::new(vec![Message::user(challenge_context)])
-        .with_system(skill_body.to_string());
+        .with_system(system);
     let mut stream = provider.stream(req);
     while let Some(ev) = stream.next().await {
         match ev {

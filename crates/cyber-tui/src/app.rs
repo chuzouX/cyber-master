@@ -885,7 +885,9 @@ impl App {
             AgentEvent::Done => {
                 // writeup 生成完成：保存文件 + 更新题目状态
                 if let Some(name) = self.ctf_writeup_pending.take() {
-                    let writeup_text = std::mem::take(&mut self.ctf_writeup_buffer);
+                    let raw = std::mem::take(&mut self.ctf_writeup_buffer);
+                    // 兜底：剥离模型可能误输出的工具调用标签，仅保留正文
+                    let writeup_text = strip_tool_call_tags(&raw);
                     self.chat.streaming = false;
                     self.chat.streaming_buffer.clear();
                     self.chat.thinking_buffer.clear();
@@ -3552,6 +3554,33 @@ fn fmt_compact_tokens(n: usize) -> String {
     }
 }
 
+/// 剥离 writeup 文本中残留的工具调用标签。
+///
+/// DeepSeek 等模型在无工具场景下，仍可能自发输出 `<function_calls>...</function_calls>`
+/// 这类 XML 标签而非纯文本正文。system 提示词虽已禁止，但此处兜底过滤，
+/// 避免工具调用标签混入最终 writeup。
+fn strip_tool_call_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tool_block = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("<function_calls>") || t.starts_with("<tool_calls>") {
+            in_tool_block = true;
+            continue;
+        }
+        if t.starts_with("</function_calls>") || t.starts_with("</tool_calls>") {
+            in_tool_block = false;
+            continue;
+        }
+        if in_tool_block {
+            continue; // 块内 <invoke>/<parameter> 等标签跳过
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// 合并全局 + session 题目列表，按名称去重。
 ///
 /// 如果同名题目同时存在于全局和 session，保留 session 版本（可能包含更新的数据）。
@@ -3664,6 +3693,24 @@ fn parse_sgr(codes: &str, base: Style, theme: &Theme) -> Style {
 mod tests {
     use super::*;
     use cyber_core::{Config, ProvidersConfig};
+
+    #[test]
+    fn strip_tool_call_tags_removes_function_calls_block() {
+        let text = "# Writeup\n\n<function_calls>\n<invoke name=\"list_dir\">\n<parameter name=\"path\">.cyber/ctf/web</parameter>\n</invoke>\n</function_calls>\n\n## 解题过程\n";
+        let out = strip_tool_call_tags(text);
+        assert!(!out.contains("function_calls"), "应移除 function_calls 块: {out}");
+        assert!(!out.contains("invoke"), "应移除 invoke 标签");
+        assert!(!out.contains("list_dir"), "应移除工具名");
+        assert!(out.contains("# Writeup"), "应保留正文标题");
+        assert!(out.contains("## 解题过程"), "应保留工具块后的正文");
+    }
+
+    #[test]
+    fn strip_tool_call_tags_keeps_plain_text() {
+        let text = "# Writeup\n\n## 解题过程\n正常内容\n";
+        let out = strip_tool_call_tags(text);
+        assert_eq!(out, text, "无工具标签时应原样保留");
+    }
 
     fn temp_config_path() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

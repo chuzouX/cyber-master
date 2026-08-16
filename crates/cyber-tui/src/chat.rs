@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cyber_agent::Message;
+use cyber_agent::{Message, ToolCall};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -833,17 +833,73 @@ impl ChatState {
         text
     }
 
-    /// 把已完成的 User/Assistant 条目转为 agent `Message`（作为下一次请求的 history 上下文）。
-    /// 剥离 ToolCall/ToolResult（工具链仅在单次 spawn 内部维护）。
+    /// 把已完成的条目转为 agent `Message`（作为下一次请求的 history 上下文）。
+    ///
+    /// 保留工具链：`ToolCall` 合并到其前导 assistant 消息的 `tool_calls`，
+    /// `ToolResult` 转为 `role=Tool` 消息（带 `tool_call_id`）。这样被截停或自然结束
+    /// 后，下一次请求能看到之前执行了哪些工具、结果如何，避免 agent「从头再来」。
+    /// 仅剥离 Thinking/System（思考过程与系统提示不回灌跨轮上下文）。
+    ///
+    /// 截停可能留下**孤立的 ToolCall**（已声明调用但工具结果未返回即被 abort）。
+    /// 这类 ToolCall 若转为 assistant(tool_calls) 而无对应 tool 消息，OpenAI 会报
+    /// `tool_calls must be followed by tool messages`。故只保留有对应 ToolResult 的
+    /// 完整工具链，孤立 ToolCall 跳过。
     pub fn history(&self) -> Vec<Message> {
-        self.entries
+        // 收集所有已完成的工具调用 id（有 ToolResult 才算完整）
+        let completed: HashSet<&str> = self
+            .entries
             .iter()
             .filter_map(|e| match e {
-                ChatEntry::User(c) => Some(Message::user(c)),
-                ChatEntry::Assistant(c) => Some(Message::assistant(c)),
+                ChatEntry::ToolResult { id, .. } => Some(id.as_str()),
                 _ => None,
             })
-            .collect()
+            .collect();
+
+        let mut out: Vec<Message> = Vec::new();
+        // 待定 assistant 消息：前导文本已入，后续完整 ToolCall 追加其 tool_calls。
+        // ToolResult 到达时先收尾（flush）再 push tool 消息，保证 tool 紧跟在
+        // 对应 assistant(tool_calls) 之后（OpenAI/Anthropic 协议要求）。
+        let mut pending_assistant: Option<Message> = None;
+
+        for e in &self.entries {
+            match e {
+                ChatEntry::User(c) => {
+                    if let Some(m) = pending_assistant.take() {
+                        out.push(m);
+                    }
+                    out.push(Message::user(c.clone()));
+                }
+                ChatEntry::Assistant(c) => {
+                    if let Some(m) = pending_assistant.take() {
+                        out.push(m);
+                    }
+                    pending_assistant = Some(Message::assistant(c.clone()));
+                }
+                ChatEntry::ToolCall { id, name, arguments } => {
+                    // 仅保留有对应 ToolResult 的完整工具调用；孤立 ToolCall 跳过。
+                    if completed.contains(id.as_str()) {
+                        let m = pending_assistant
+                            .get_or_insert_with(|| Message::assistant(String::new()));
+                        m.tool_calls.push(ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
+                    }
+                }
+                ChatEntry::ToolResult { id, output, .. } => {
+                    if let Some(m) = pending_assistant.take() {
+                        out.push(m);
+                    }
+                    out.push(Message::tool(id.clone(), output.clone()));
+                }
+                _ => {} // Thinking / System 不回灌跨轮上下文
+            }
+        }
+        if let Some(m) = pending_assistant.take() {
+            out.push(m);
+        }
+        out
     }
 }
 
@@ -1572,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn history_strips_tool_entries() {
+    fn history_preserves_tool_chain() {
         let mut s = ChatState::new();
         s.entries.push(ChatEntry::User("q".into()));
         s.entries.push(ChatEntry::ToolCall {
@@ -1588,9 +1644,98 @@ mod tests {
         });
         s.entries.push(ChatEntry::Assistant("done".into()));
         let h = s.history();
-        assert_eq!(h.len(), 2, "history 应只含 User+Assistant，剥离 Tool 条目");
+        // 保留工具链：User + assistant(tool_calls) + tool 结果 + assistant
+        assert_eq!(h.len(), 4, "history 应保留工具链");
+        assert_eq!(h[0].role, Role::User);
         assert_eq!(h[0].content, "q");
-        assert_eq!(h[1].content, "done");
+        // ToolCall 合并为 assistant 消息的 tool_calls
+        assert_eq!(h[1].role, Role::Assistant);
+        assert_eq!(h[1].tool_calls.len(), 1);
+        assert_eq!(h[1].tool_calls[0].name, "list_dir");
+        // ToolResult 转为 tool 消息
+        assert_eq!(h[2].role, Role::Tool);
+        assert_eq!(h[2].tool_call_id.as_deref(), Some("1"));
+        assert_eq!(h[2].content, "a.txt");
+        assert_eq!(h[3].content, "done");
+    }
+
+    #[test]
+    fn history_merges_leading_text_with_tool_call() {
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::User("q".into()));
+        s.entries.push(ChatEntry::Assistant("让我看看".into()));
+        s.entries.push(ChatEntry::ToolCall {
+            id: "2".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        });
+        s.entries.push(ChatEntry::ToolResult {
+            id: "2".into(),
+            name: "shell".into(),
+            output: "ok".into(),
+            is_error: false,
+        });
+        let h = s.history();
+        // 前导文本与 tool_call 合并到同一条 assistant 消息
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[1].role, Role::Assistant);
+        assert_eq!(h[1].content, "让我看看");
+        assert_eq!(h[1].tool_calls.len(), 1);
+        assert_eq!(h[1].tool_calls[0].name, "shell");
+        assert_eq!(h[2].role, Role::Tool);
+    }
+
+    #[test]
+    fn history_skips_orphan_tool_call() {
+        // 截停可能留下孤立 ToolCall（无对应 ToolResult）。它若转成 assistant(tool_calls)
+        // 而无 tool 消息会导致 OpenAI 400。故应被跳过。
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::User("q".into()));
+        s.entries.push(ChatEntry::Assistant("前导".into()));
+        s.entries.push(ChatEntry::ToolCall {
+            id: "orphan".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        });
+        // 无 ToolResult("orphan") → 孤立
+        let h = s.history();
+        assert_eq!(h.len(), 2, "孤立 ToolCall 应被跳过");
+        assert_eq!(h[0].content, "q");
+        assert_eq!(h[1].content, "前导");
+        // 前导文本应是纯文本 assistant（无 tool_calls）
+        assert!(h[1].tool_calls.is_empty());
+    }
+
+    #[test]
+    fn history_keeps_complete_tool_chain_among_orphans() {
+        // 孤立 + 完整的混合：完整的保留，孤立的跳过
+        let mut s = ChatState::new();
+        s.entries.push(ChatEntry::User("q".into()));
+        s.entries.push(ChatEntry::ToolCall {
+            id: "orphan".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        });
+        s.entries.push(ChatEntry::ToolCall {
+            id: "ok".into(),
+            name: "list_dir".into(),
+            arguments: "{}".into(),
+        });
+        s.entries.push(ChatEntry::ToolResult {
+            id: "ok".into(),
+            name: "list_dir".into(),
+            output: "a.txt".into(),
+            is_error: false,
+        });
+        let h = s.history();
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].content, "q");
+        // 只保留完整工具链 ok
+        assert_eq!(h[1].role, Role::Assistant);
+        assert_eq!(h[1].tool_calls.len(), 1);
+        assert_eq!(h[1].tool_calls[0].id, "ok");
+        assert_eq!(h[2].role, Role::Tool);
+        assert_eq!(h[2].tool_call_id.as_deref(), Some("ok"));
     }
 
     #[test]
