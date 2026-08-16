@@ -72,6 +72,7 @@ pub fn provider_factory(cfg: &ProviderConfig, mock: bool) -> Result<Box<dyn Prov
         "openai" | "openai-compatible" => Ok(Box::new(crate::openai::OpenAiProvider::new(cfg)?)),
         "anthropic" => Ok(Box::new(crate::anthropic::AnthropicProvider::new(cfg)?)),
         "ollama" => Ok(Box::new(crate::ollama::OllamaProvider::new(cfg)?)),
+        "responses" => Ok(Box::new(crate::responses::ResponsesProvider::new(cfg)?)),
         other => Err(crate::error::AgentError::Provider(format!("未知 provider kind: {other}"))),
     }
 }
@@ -102,16 +103,23 @@ enum HttpState {
 ///
 /// parser 无状态 `fn(&str) -> Vec<StreamEvent>`：一行可能产出多个事件
 /// （如 OpenAI 一行可同时含 `delta.content` 与多个 `delta.tool_calls[]`）。
+/// `url` 记录请求地址，出错时带进错误消息（定位是哪个 provider / 端点）。
 pub(crate) struct HttpStream {
     state: HttpState,
     parser: fn(&str) -> Vec<StreamEvent>,
+    url: String,
 }
 
 impl HttpStream {
-    pub(crate) fn new(req: reqwest::RequestBuilder, parser: fn(&str) -> Vec<StreamEvent>) -> Self {
+    pub(crate) fn new(
+        req: reqwest::RequestBuilder,
+        parser: fn(&str) -> Vec<StreamEvent>,
+        url: &str,
+    ) -> Self {
         Self {
             state: HttpState::Init { req },
             parser,
+            url: url.to_string(),
         }
     }
 }
@@ -144,7 +152,12 @@ impl Stream for HttpStream {
                             // 累积 body 文本后报错，避免解析器静默丢弃。
                             this.state = HttpState::ErrorBody {
                                 body: Box::pin(resp.bytes_stream()),
-                                buf: format!("HTTP {} {}", status.as_u16(), status.canonical_reason().unwrap_or("")),
+                                buf: format!(
+                                    "HTTP {} {} @ {}",
+                                    status.as_u16(),
+                                    status.canonical_reason().unwrap_or(""),
+                                    this.url,
+                                ),
                             };
                             continue;
                         }
@@ -158,7 +171,10 @@ impl Stream for HttpStream {
                     Poll::Ready(Err(e)) => {
                         warn!(error = %e, "provider HTTP 请求失败");
                         let mut p = VecDeque::new();
-                        p.push_back(StreamEvent::Error(format!("http: {e}")));
+                        p.push_back(StreamEvent::Error(format!(
+                            "http: {e} @ {}",
+                            this.url
+                        )));
                         this.state = HttpState::Done { pending: p };
                         continue;
                     }

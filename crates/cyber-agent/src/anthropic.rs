@@ -126,7 +126,7 @@ impl Provider for AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
-        let s = HttpStream::new(http_req, parse_anthropic_line);
+        let s = HttpStream::new(http_req, parse_anthropic_line, &self.url);
         Box::pin(s)
     }
 }

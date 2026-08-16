@@ -99,7 +99,7 @@ impl Provider for OllamaProvider {
             body["tools"] = json!(tools);
         }
         let http_req = self.client.post(&self.url).json(&body);
-        let s = HttpStream::new(http_req, parse_ollama_line);
+        let s = HttpStream::new(http_req, parse_ollama_line, &self.url);
         Box::pin(s)
     }
 }

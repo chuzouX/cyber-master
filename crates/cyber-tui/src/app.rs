@@ -320,6 +320,8 @@ pub struct LogViewerState {
     pub lines: Vec<String>,
     /// 当前滚动偏移（0 = 尾部最末，增大向上翻）。
     pub scroll: usize,
+    /// 横向滚动偏移（可见字符数，0 = 最左，←→ 调整）。
+    pub hscroll: usize,
 }
 
 pub struct App {
@@ -760,12 +762,15 @@ impl App {
             }
             ChatAction::Back => {
                 if self.chat.streaming {
-                    // 流式期 Esc：取消（abort 任务 + bump gen 隔离 stale 事件 + 丢弃 buffer）
+                    // 流式期 Esc：取消（abort 任务 + bump gen 隔离 stale 事件）
+                    // 先取取消原因（读 buffer），cancel_stream 会 flush buffer 到条目
+                    let reason = cancel_reason(&self.chat);
                     if let Some(h) = self.agent_handle.take() {
                         h.abort();
                     }
                     self.generation = self.generation.wrapping_add(1);
                     self.chat.cancel_stream();
+                    self.chat.entries.push(ChatEntry::System(reason));
                     self.save_history();
                     self.toast = Some("已取消生成".into());
                 } else if self.project.is_none() {
@@ -1748,6 +1753,7 @@ impl App {
         // 读取日志文件尾部（最多 1000 行）
         self.log_viewer.lines = read_log_tail(&self.paths.log_file, 1000);
         self.log_viewer.scroll = 0; // 0 = 定位到最末
+        self.log_viewer.hscroll = 0; // 0 = 最左
         self.form_prev_mode = self.mode;
         self.mode = Mode::LogViewer;
     }
@@ -2042,6 +2048,27 @@ impl App {
             KeyCode::PageUp => {
                 self.log_viewer.scroll = (self.log_viewer.scroll + 20).min(total.saturating_sub(1));
             }
+            // 横向滚动（←→，步进 16 可见字符；Home/End 跳行首/行尾）
+            KeyCode::Left => {
+                self.log_viewer.hscroll = self.log_viewer.hscroll.saturating_sub(16);
+            }
+            KeyCode::Right => {
+                self.log_viewer.hscroll = self.log_viewer.hscroll.saturating_add(16);
+            }
+            KeyCode::Home => {
+                self.log_viewer.hscroll = 0;
+            }
+            KeyCode::End => {
+                // 跳到本屏最长行的可见宽度（近似行尾，按 80 列可视宽估算）
+                let max_w = self
+                    .log_viewer
+                    .lines
+                    .iter()
+                    .map(|l| visible_char_count(l))
+                    .max()
+                    .unwrap_or(0);
+                self.log_viewer.hscroll = max_w.saturating_sub(80);
+            }
             // Ctrl+R 刷新（重新读文件）
             KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.log_viewer.lines = read_log_tail(&self.paths.log_file, 1000);
@@ -2158,14 +2185,13 @@ impl App {
             }
             SlashCommand::Cancel => {
                 if self.chat.streaming {
+                    let reason = cancel_reason(&self.chat);
                     if let Some(h) = self.agent_handle.take() {
                         h.abort();
                     }
                     self.generation = self.generation.wrapping_add(1);
                     self.chat.cancel_stream();
-                    self.chat
-                        .entries
-                        .push(ChatEntry::System("已取消生成".into()));
+                    self.chat.entries.push(ChatEntry::System(reason));
                     self.save_history();
                 } else {
                     self.chat
@@ -3473,7 +3499,7 @@ impl App {
             .border_style(Style::default().fg(self.theme.accent))
             .title(
                 Line::from(format!(
-                    " 日志 {} · {} 行 · Ctrl+R 刷新 · Esc/Ctrl+L 关闭 ",
+                    " 日志 {} · {} 行 · ←→ 横滚 · Ctrl+R 刷新 · Esc/Ctrl+L 关闭 ",
                     self.paths.log_file.display(),
                     self.log_viewer.lines.len()
                 ))
@@ -3496,10 +3522,11 @@ impl App {
         let visible_h = inner.height as usize;
         let end = total.saturating_sub(self.log_viewer.scroll);
         let start = end.saturating_sub(visible_h);
-        // 解析 ANSI 颜色码 → ratatui Span（只解析可见行，避免全量解析开销）
+        // 横向裁剪（跳过 hscroll 个可见字符，ANSI 序列整体保留）+ 解析 ANSI → Span
+        let hscroll = self.log_viewer.hscroll;
         let visible: Vec<Line> = self.log_viewer.lines[start..end.min(total)]
             .iter()
-            .map(|s| ansi_to_line(s, &self.theme))
+            .map(|s| ansi_to_line(skip_visible_chars(s, hscroll), &self.theme))
             .collect();
 
         frame.render_widget(
@@ -3520,7 +3547,7 @@ impl App {
             Mode::CtfEditForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切枚举  Esc 取消",
             Mode::Sessions => " ↑↓ 选会话  Enter 切换  n 新建  d 删除  Esc 返回  q 退出",
             Mode::ModelPicker => " ↑↓ 导航  Tab 切换栏  Enter 选择/确认  Esc 返回  q 退出",
-            Mode::LogViewer => " ↑↓ 翻滚  PageUp/PageDown 翻页  Ctrl+R 刷新  Esc/Ctrl+L 关闭",
+            Mode::LogViewer => " ↑↓ 翻滚  ←→ 横滚  PageUp/PageDown 翻页  Home/End 左右端  Ctrl+R 刷新  Esc/Ctrl+L 关闭",
             Mode::About => " Esc 返回   q 退出",
             _ => " Tab 切换模式   s 设置   Esc 返回 Welcome   q 退出",
         };
@@ -3551,6 +3578,29 @@ fn fmt_compact_tokens(n: usize) -> String {
         format!("{n}")
     } else {
         format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+/// 生成流式取消原因说明（基于当前进度状态）。
+///
+/// 读取 thinking/tool_output/streaming buffer 判断中断时 agent 处于哪个阶段，
+/// 让用户知道「为什么停」以及「停在哪一步」。须在 `cancel_stream()` 之前调用
+/// （cancel_stream 会 flush buffer 到条目，清空这些缓冲）。
+fn cancel_reason(chat: &ChatState) -> String {
+    let mut stages = Vec::new();
+    if !chat.thinking_buffer.trim().is_empty() {
+        stages.push("思考中");
+    }
+    if !chat.streaming_tool_output.trim().is_empty() {
+        stages.push("工具执行中");
+    }
+    if !chat.streaming_buffer.trim().is_empty() {
+        stages.push("回答输出中");
+    }
+    if stages.is_empty() {
+        "已取消生成（生成启动后未产生输出）".to_string()
+    } else {
+        format!("已取消生成（{}）", stages.join("、"))
     }
 }
 
@@ -3614,6 +3664,59 @@ fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// 统计字符串中的可见字符数（ANSI 转义序列整体跳过不计数）。
+/// 用于日志查看器 End 键估算行尾位置。
+fn visible_char_count(s: &str) -> usize {
+    let mut count = 0usize;
+    let mut chars = s.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek().map(|(_, c2)| *c2) == Some('[') {
+                chars.next();
+                for (_, c2) in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// 跳过字符串前 `n` 个可见字符（ANSI 转义序列整体跳过不计数），返回剩余切片。
+///
+/// 用于日志查看器横向滚动：只对可见字符计数，保证返回的切片不切断
+/// ANSI 转义序列（否则 `ansi_to_line` 会解析出半截颜色码）。
+fn skip_visible_chars(s: &str, n: usize) -> &str {
+    if n == 0 {
+        return s;
+    }
+    let mut seen = 0usize;
+    let mut chars = s.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
+        if c == '\x1b' {
+            // CSI 序列（\x1b[...m）整体跳过
+            if chars.peek().map(|(_, c2)| *c2) == Some('[') {
+                chars.next();
+                for (_, c2) in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        seen += 1;
+        if seen >= n {
+            return &s[idx + c.len_utf8()..];
+        }
+    }
+    ""
 }
 
 /// 把带 ANSI SGR 转义码的字符串解析为 ratatui `Line`（多 `Span`，各带样式）。
@@ -4062,10 +4165,59 @@ mod tests {
         );
         app.handle_chat_key(k);
         assert!(!app.chat.streaming);
-        // 取消应保留已生成的文本（flush 为 assistant 条目），而非丢弃——保留上下文
-        assert_eq!(app.chat.entries.len(), 1, "取消应保留 buffer 为 assistant 条目");
+        // 取消应保留已生成的文本（flush 为 assistant 条目）+ 追加取消原因 System 条目
+        assert_eq!(app.chat.entries.len(), 2, "取消应保留 buffer + 原因条目");
         assert!(matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "部分"));
+        assert!(matches!(&app.chat.entries[1], crate::chat::ChatEntry::System(s) if s.contains("取消") && s.contains("回答输出中")));
         assert!(app.chat.streaming_buffer.is_empty());
+    }
+
+    #[test]
+    fn cancel_reason_detects_stage() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        // 工具执行中 → 原因应含「工具执行中」
+        app.chat.streaming_tool_output.push_str("scanning...");
+        let reason = cancel_reason(&app.chat);
+        assert!(reason.contains("工具执行中"), "应识别工具执行阶段: {reason}");
+
+        // 思考中 → 原因应含「思考中」
+        app.chat.streaming_tool_output.clear();
+        app.chat.thinking_buffer.push_str("分析中…");
+        let reason = cancel_reason(&app.chat);
+        assert!(reason.contains("思考中"), "应识别思考阶段: {reason}");
+
+        // 无输出 → 提示未产生输出
+        app.chat.thinking_buffer.clear();
+        let reason = cancel_reason(&app.chat);
+        assert!(reason.contains("未产生输出"), "无输出时应有说明: {reason}");
+    }
+
+    #[test]
+    fn log_viewer_hscroll_navigation() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.log_viewer.lines = vec![
+            "a".repeat(10),
+            format!("{}\u{1b}[31m{}", "b".repeat(20), "c".repeat(5)),
+        ];
+        // Right 前进 16 可见字符
+        let k = crossterm::event::KeyEvent::new_with_kind_and_state(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        app.handle_log_viewer_key(k);
+        assert_eq!(app.log_viewer.hscroll, 16);
+        // Home 回零
+        let k = crossterm::event::KeyEvent::new_with_kind_and_state(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Press,
+            crossterm::event::KeyEventState::NONE,
+        );
+        app.handle_log_viewer_key(k);
+        assert_eq!(app.log_viewer.hscroll, 0);
     }
 
     #[test]

@@ -845,61 +845,7 @@ impl ChatState {
     /// `tool_calls must be followed by tool messages`。故只保留有对应 ToolResult 的
     /// 完整工具链，孤立 ToolCall 跳过。
     pub fn history(&self) -> Vec<Message> {
-        // 收集所有已完成的工具调用 id（有 ToolResult 才算完整）
-        let completed: HashSet<&str> = self
-            .entries
-            .iter()
-            .filter_map(|e| match e {
-                ChatEntry::ToolResult { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        let mut out: Vec<Message> = Vec::new();
-        // 待定 assistant 消息：前导文本已入，后续完整 ToolCall 追加其 tool_calls。
-        // ToolResult 到达时先收尾（flush）再 push tool 消息，保证 tool 紧跟在
-        // 对应 assistant(tool_calls) 之后（OpenAI/Anthropic 协议要求）。
-        let mut pending_assistant: Option<Message> = None;
-
-        for e in &self.entries {
-            match e {
-                ChatEntry::User(c) => {
-                    if let Some(m) = pending_assistant.take() {
-                        out.push(m);
-                    }
-                    out.push(Message::user(c.clone()));
-                }
-                ChatEntry::Assistant(c) => {
-                    if let Some(m) = pending_assistant.take() {
-                        out.push(m);
-                    }
-                    pending_assistant = Some(Message::assistant(c.clone()));
-                }
-                ChatEntry::ToolCall { id, name, arguments } => {
-                    // 仅保留有对应 ToolResult 的完整工具调用；孤立 ToolCall 跳过。
-                    if completed.contains(id.as_str()) {
-                        let m = pending_assistant
-                            .get_or_insert_with(|| Message::assistant(String::new()));
-                        m.tool_calls.push(ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                        });
-                    }
-                }
-                ChatEntry::ToolResult { id, output, .. } => {
-                    if let Some(m) = pending_assistant.take() {
-                        out.push(m);
-                    }
-                    out.push(Message::tool(id.clone(), output.clone()));
-                }
-                _ => {} // Thinking / System 不回灌跨轮上下文
-            }
-        }
-        if let Some(m) = pending_assistant.take() {
-            out.push(m);
-        }
-        out
+        entries_to_messages(&self.entries)
     }
 }
 
@@ -907,6 +853,66 @@ impl Default for ChatState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 把 `ChatEntry` 列表转为 agent `Message`（作为下一次请求的 history 上下文）。
+///
+/// 与 `ChatState::history()` 等价，独立成自由函数供 headless CLI 复用：
+/// - 保留工具链：ToolCall 合并到前导 assistant 的 tool_calls，ToolResult 转 role=Tool
+/// - 跳过孤立 ToolCall（无对应 ToolResult，截停残留，避免 OpenAI 400）
+/// - 剥离 Thinking/System（不回灌跨轮上下文）
+pub fn entries_to_messages(entries: &[ChatEntry]) -> Vec<Message> {
+    // 收集所有已完成的工具调用 id（有 ToolResult 才算完整）
+    let completed: HashSet<&str> = entries
+        .iter()
+        .filter_map(|e| match e {
+            ChatEntry::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<Message> = Vec::new();
+    // 待定 assistant 消息：前导文本已入，后续完整 ToolCall 追加其 tool_calls。
+    let mut pending_assistant: Option<Message> = None;
+
+    for e in entries {
+        match e {
+            ChatEntry::User(c) => {
+                if let Some(m) = pending_assistant.take() {
+                    out.push(m);
+                }
+                out.push(Message::user(c.clone()));
+            }
+            ChatEntry::Assistant(c) => {
+                if let Some(m) = pending_assistant.take() {
+                    out.push(m);
+                }
+                pending_assistant = Some(Message::assistant(c.clone()));
+            }
+            ChatEntry::ToolCall { id, name, arguments } => {
+                if completed.contains(id.as_str()) {
+                    let m = pending_assistant
+                        .get_or_insert_with(|| Message::assistant(String::new()));
+                    m.tool_calls.push(ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                }
+            }
+            ChatEntry::ToolResult { id, output, .. } => {
+                if let Some(m) = pending_assistant.take() {
+                    out.push(m);
+                }
+                out.push(Message::tool(id.clone(), output.clone()));
+            }
+            _ => {} // Thinking / System 不回灌跨轮上下文
+        }
+    }
+    if let Some(m) = pending_assistant.take() {
+        out.push(m);
+    }
+    out
 }
 
 // ── 条目 → 渲染行 ───────────────────────────────────────────────────────────

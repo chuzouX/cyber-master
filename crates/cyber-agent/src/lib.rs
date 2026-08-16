@@ -14,6 +14,7 @@ pub mod ollama;
 pub mod openai;
 pub mod prompt;
 pub mod provider;
+pub mod responses;
 pub mod sse;
 pub mod tool;
 pub mod tools;

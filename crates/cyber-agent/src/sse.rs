@@ -316,6 +316,126 @@ pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
     out
 }
 
+/// OpenAI Responses API SSE 行解析（`/v1/responses`，kind="responses"）。返回 0..N 个事件：
+/// - `response.output_text.delta` → `Delta`（`delta` 字段）
+/// - `response.output_item.added` 且 item.type=function_call → `ToolCallDelta` 首片（id+name）
+/// - `response.function_call_arguments.delta` → `ToolCallDelta` 参数片段
+/// - `response.completed` / `response.incomplete` → `Done`（incomplete = 输出被截断，仍终止）
+/// - `response.failed` → `Error`（提取 `error.message`）
+/// - `response.completed` 携带 `usage` → `Usage`（input_tokens/output_tokens 映射）
+///
+/// 注意：`response.incomplete` 在 `max_output_tokens` 截断时触发，这里同样发 `Done`
+/// 而非 Error——与 OpenAI chat 的 `finish_reason` 语义一致（流正常结束但输出不完整）。
+/// 不用 `function_call_arguments.done`（完整 arguments）兜底：delta 已逐片累积过，
+/// done 再推完整 JSON 会导致参数重复拼接。
+pub fn parse_responses_line(line: &str) -> Vec<StreamEvent> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return Vec::new(); // 空行 / 注释心跳
+    }
+    let data = match line.strip_prefix("data:") {
+        Some(d) => d.trim_start(),
+        None => return Vec::new(),
+    };
+    if data == "[DONE]" {
+        return vec![StreamEvent::Done];
+    }
+    let v: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let mut out = Vec::new();
+    match ty {
+        "response.output_text.delta" => {
+            if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
+                out.push(StreamEvent::Delta(delta.to_string()));
+            }
+        }
+        // 工具调用开始：item.type=function_call，首片带 id + name
+        "response.output_item.added" => {
+            if let Some(item) = v.get("item") {
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    let index = v
+                        .get("output_index")
+                        .and_then(|i| i.as_u64())
+                        .unwrap_or(0) as u32;
+                    let id = item
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .or_else(|| item.get("call_id").and_then(|i| i.as_str()))
+                        .map(str::to_owned);
+                    let name = item.get("name").and_then(|n| n.as_str()).map(str::to_owned);
+                    out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments_fragment: String::new(),
+                    }));
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let index = v
+                .get("output_index")
+                .and_then(|i| i.as_u64())
+                .unwrap_or(0) as u32;
+            let delta = v
+                .get("delta")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_owned();
+            out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
+                index,
+                id: None,
+                name: None,
+                arguments_fragment: delta,
+            }));
+        }
+        "response.completed" => {
+            // usage（input_tokens / output_tokens → prompt/completion）
+            if let Some(usage) = v.get("usage") {
+                if let Some(u) = parse_responses_usage(usage) {
+                    out.push(StreamEvent::Usage(u));
+                }
+            }
+            out.push(StreamEvent::Done);
+        }
+        "response.incomplete" => out.push(StreamEvent::Done),
+        "response.failed" => {
+            let msg = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("response failed");
+            out.push(StreamEvent::Error(msg.to_string()));
+        }
+        _ => {} // response.created / output_item.done 等
+    }
+    out
+}
+
+/// 从 Responses API usage 对象提取 token 用量（input_tokens/output_tokens → prompt/completion）。
+fn parse_responses_usage(usage: &serde_json::Value) -> Option<Usage> {
+    let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())?;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    // cached_tokens 在 input_tokens_details.cached_tokens
+    let cache_hit_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        cache_hit_tokens,
+        cache_miss_tokens: prompt_tokens.saturating_sub(cache_hit_tokens),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +691,84 @@ mod tests {
                 assert!(msg.contains("overloaded_error"));
             }
             other => panic!("应为 Error，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_parses_text_delta_and_done() {
+        let d = r#"data: {"type":"response.output_text.delta","delta":"Hello"}"#;
+        let r = parse_responses_line(d);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0], StreamEvent::Delta(t) if t == "Hello"));
+
+        // completed → Usage + Done
+        let d = r#"data: {"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let r = parse_responses_line(d);
+        assert_eq!(r.len(), 2);
+        assert!(matches!(&r[0], StreamEvent::Usage(_)));
+        assert!(matches!(r[1], StreamEvent::Done));
+
+        // incomplete → Done
+        let r = parse_responses_line(r#"data: {"type":"response.incomplete"}"#);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(r[0], StreamEvent::Done));
+
+        // 无关事件 → 空
+        assert!(parse_responses_line(r#"data: {"type":"response.created"}"#).is_empty());
+        assert!(parse_responses_line(": keep-alive").is_empty());
+    }
+
+    #[test]
+    fn responses_parses_function_call() {
+        // output_item.added type=function_call → 首片带 id+name
+        let start = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"list_dir","arguments":""}}"#;
+        let r = parse_responses_line(start);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 0);
+                assert_eq!(d.id.as_deref(), Some("fc_1"));
+                assert_eq!(d.name.as_deref(), Some("list_dir"));
+                assert!(d.arguments_fragment.is_empty());
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+        // arguments delta → 片段
+        let frag = r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"pa"}"#;
+        let r = parse_responses_line(frag);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 0);
+                assert!(d.id.is_none());
+                assert!(d.name.is_none());
+                assert_eq!(d.arguments_fragment, "{\"pa");
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_parses_failed_error() {
+        let d = r#"data: {"type":"response.failed","error":{"code":"server_error","message":"boom"}}"#;
+        let r = parse_responses_line(d);
+        assert_eq!(r.len(), 1);
+        assert!(matches!(&r[0], StreamEvent::Error(m) if m == "boom"));
+    }
+
+    #[test]
+    fn responses_parses_usage_with_cache_details() {
+        let d = r#"data: {"type":"response.completed","usage":{"input_tokens":100,"output_tokens":50,"input_tokens_details":{"cached_tokens":30}}}"#;
+        let r = parse_responses_line(d);
+        assert_eq!(r.len(), 2);
+        match &r[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.prompt_tokens, 100);
+                assert_eq!(u.completion_tokens, 50);
+                assert_eq!(u.cache_hit_tokens, 30);
+                assert_eq!(u.cache_miss_tokens, 70);
+            }
+            other => panic!("应为 Usage，实际 {other:?}"),
         }
     }
 }

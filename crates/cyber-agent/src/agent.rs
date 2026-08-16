@@ -644,10 +644,14 @@ fn accumulate_tool_delta(calls: &mut BTreeMap<u32, ToolCall>, d: ToolCallDelta) 
         arguments: String::new(),
     });
     if let Some(id) = d.id {
-        entry.id = id;
+        if !id.is_empty() {
+            entry.id = id;
+        }
     }
     if let Some(name) = d.name {
-        entry.name = name;
+        if !name.is_empty() {
+            entry.name = name;
+        }
     }
     entry.arguments.push_str(&d.arguments_fragment);
 }

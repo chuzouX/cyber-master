@@ -112,7 +112,7 @@ impl Provider for OpenAiProvider {
             .post(&self.url)
             .bearer_auth(&self.api_key)
             .json(&body);
-        let s = HttpStream::new(http_req, parse_openai_line);
+        let s = HttpStream::new(http_req, parse_openai_line, &self.url);
         Box::pin(s)
     }
 }

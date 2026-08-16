@@ -3,9 +3,15 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// 支持的 provider kind（format）。TUI 表单的 kind 字段在此循环；
-/// `provider_factory` 接受前三种（openai/anthropic/ollama），
+/// `provider_factory` 接受前四种（openai/anthropic/ollama/responses），
 /// `openai-compatible` 复用 openai 的 SSE 解析路径。
-pub const PROVIDER_KINDS: &[&str] = &["openai", "anthropic", "ollama", "openai-compatible"];
+pub const PROVIDER_KINDS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "ollama",
+    "openai-compatible",
+    "responses",
+];
 
 /// 对应 `~/.cyber/providers.toml`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
