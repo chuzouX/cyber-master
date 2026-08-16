@@ -33,7 +33,7 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(" Cyber Master · v0.1.0 ")
+            Line::from(" Cyber Master · v0.2.0 ")
                 .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
