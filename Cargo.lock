@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cyber-core",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "serde",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cyber-agent",
  "cyber-core",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-skills"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cyber-agent",
  "cyber-core",
@@ -500,15 +500,15 @@ dependencies = [
 
 [[package]]
 name = "cyber-storage"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "cyber-tools"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "cyber-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "color-eyre",
  "crossterm 0.28.1",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-workflow"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "darling"
