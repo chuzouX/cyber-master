@@ -37,6 +37,12 @@ pub struct ProviderConfig {
     /// 每个 model 的专属配置（覆盖 provider 级默认值）。key = model id。
     #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
+    /// 自定义流式对话端点（高级选项）。为空时使用默认 `{base_url}/chat/completions`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_endpoint: Option<String>,
+    /// 自定义模型列表端点（高级选项）。为空时使用默认逻辑（`{base_url}/models`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_endpoint: Option<String>,
 }
 
 /// 单个 model 的专属配置（覆盖 provider 级默认值）。
@@ -90,6 +96,8 @@ impl Default for ProviderConfig {
             temperature: 0.7,
             price: None,
             models: HashMap::new(),
+            chat_endpoint: None,
+            models_endpoint: None,
         }
     }
 }
@@ -218,6 +226,26 @@ impl ProviderConfig {
             .and_then(|m| m.context_length)
             .filter(|&n| n > 0)
     }
+
+    /// 有效的流式对话端点。优先使用 `chat_endpoint`，为空则回退到默认 `{base_url}/chat/completions`。
+    pub fn chat_endpoint(&self) -> String {
+        self.chat_endpoint
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| {
+                let base = self.base_url.trim().trim_end_matches('/');
+                format!("{base}/chat/completions")
+            })
+    }
+
+    /// 有效的模型列表端点。优先使用 `models_endpoint`，为空则回退到默认逻辑（由 models.rs 处理）。
+    pub fn models_endpoint(&self) -> Option<String> {
+        self.models_endpoint
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+    }
 }
 
 /// 展开 `${ENV_VAR}` 引用；无 `${}` 包裹的明文原样返回。
@@ -294,9 +322,10 @@ mod tests {
 
     #[test]
     fn provider_kinds_has_four_entries() {
-        assert_eq!(PROVIDER_KINDS.len(), 4);
+        assert_eq!(PROVIDER_KINDS.len(), 5);
         assert!(PROVIDER_KINDS.contains(&"openai"));
         assert!(PROVIDER_KINDS.contains(&"openai-compatible"));
+        assert!(PROVIDER_KINDS.contains(&"responses"));
     }
 
     #[test]

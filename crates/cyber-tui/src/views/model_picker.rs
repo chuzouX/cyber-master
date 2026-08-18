@@ -70,6 +70,9 @@ pub fn render(
     render_hint(frame, hint_area, theme, state);
 }
 
+/// 每个 provider 项在渲染中的行数：name 行 + kind/model 行 + 空行 = 3
+const PROVIDER_ITEM_LINES: usize = 3;
+
 fn render_providers(
     frame: &mut Frame,
     area: Rect,
@@ -138,8 +141,28 @@ fn render_providers(
             lines.push(Line::from(""));
         }
     }
+
+    // 粘性滚动：选中项溢出视口时自动调整
+    let visible_h = inner.height as usize;
+    let total_lines = lines.len();
+    let prev = state.provider_scroll.get().min(total_lines.saturating_sub(visible_h));
+    let sel_start = state.provider_selected * PROVIDER_ITEM_LINES;
+    let sel_end = (sel_start + PROVIDER_ITEM_LINES).min(total_lines);
+    let scroll = if total_lines <= visible_h {
+        0
+    } else if sel_start < prev {
+        sel_start
+    } else if sel_end > prev + visible_h {
+        sel_end.saturating_sub(visible_h).min(total_lines.saturating_sub(visible_h))
+    } else {
+        prev
+    };
+    state.provider_scroll.set(scroll);
+
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.bg)),
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg))
+            .scroll((scroll as u16, 0)),
         inner,
     );
 }
@@ -212,8 +235,27 @@ fn render_models(
             lines.push(Line::from(format!("{marker}{label}")).style(style));
         }
     }
+
+    // 粘性滚动：选中项溢出视口时自动调整（每项 1 行）
+    let visible_h = inner.height as usize;
+    let total_lines = lines.len();
+    let prev = state.model_scroll.get().min(total_lines.saturating_sub(visible_h));
+    let sel = state.model_selected;
+    let scroll = if total_lines <= visible_h {
+        0
+    } else if sel < prev {
+        sel
+    } else if sel >= prev + visible_h {
+        (sel + 1).saturating_sub(visible_h).min(total_lines.saturating_sub(visible_h))
+    } else {
+        prev
+    };
+    state.model_scroll.set(scroll);
+
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.bg)),
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg))
+            .scroll((scroll as u16, 0)),
         inner,
     );
 }
@@ -262,15 +304,8 @@ mod tests {
 
     #[test]
     fn render_model_picker_does_not_panic() {
-        let state = ModelPickerState {
-            provider_selected: 0,
-            model_selected: 0,
-            models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
-            fetching: false,
-            fetch_id: 0,
-            fetch_error: None,
-            focus_models: false,
-        };
+        let mut state = ModelPickerState::default();
+        state.models = vec!["gpt-4o".into(), "gpt-4o-mini".into()];
         let providers = make_providers();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
@@ -280,15 +315,11 @@ mod tests {
 
     #[test]
     fn render_model_picker_fetching() {
-        let state = ModelPickerState {
-            provider_selected: 1,
-            model_selected: 0,
-            models: vec![],
-            fetching: true,
-            fetch_id: 1,
-            fetch_error: None,
-            focus_models: true,
-        };
+        let mut state = ModelPickerState::default();
+        state.provider_selected = 1;
+        state.fetching = true;
+        state.fetch_id = 1;
+        state.focus_models = true;
         let providers = make_providers();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
@@ -298,15 +329,10 @@ mod tests {
 
     #[test]
     fn render_model_picker_error() {
-        let state = ModelPickerState {
-            provider_selected: 0,
-            model_selected: 0,
-            models: vec![],
-            fetching: false,
-            fetch_id: 1,
-            fetch_error: Some("timeout".into()),
-            focus_models: true,
-        };
+        let mut state = ModelPickerState::default();
+        state.fetch_id = 1;
+        state.fetch_error = Some("timeout".into());
+        state.focus_models = true;
         let providers = make_providers();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal

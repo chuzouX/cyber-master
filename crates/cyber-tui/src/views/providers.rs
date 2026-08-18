@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
+use std::cell::Cell;
 use tui_textarea::TextArea;
 
 use cyber_core::{ModelConfig, PriceConfig, ProviderConfig, ProviderConfig as _Cfg, ProvidersConfig, PROVIDER_KINDS};
@@ -40,8 +41,8 @@ struct FieldDef {
 const CURRENCIES: &[(&str, &str)] = &[("usd", "美元"), ("cny", "人民币")];
 
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
-/// 0-4 provider 基本字段，5-12 为当前 model 的参数，13=价格单位，
-/// 14=拉取模型，15=保存，16=取消。
+/// 0-4 provider 基本字段，5-13 为当前 model 的个性化参数（含价格及单位），
+/// 14-15 高级选项，16=拉取模型，17=保存，18=取消。
 const FIELDS: &[FieldDef] = &[
     FieldDef { label: "名称 name", kind: FieldKind::Text },
     FieldDef { label: "类型 kind", kind: FieldKind::Enum },
@@ -55,18 +56,20 @@ const FIELDS: &[FieldDef] = &[
     FieldDef { label: "输入价格 /M (input_per_m)", kind: FieldKind::Text },
     FieldDef { label: "输出价格 /M (output_per_m)", kind: FieldKind::Text },
     FieldDef { label: "缓存命中价格 /M (cache_hit_per_m)", kind: FieldKind::Text },
-    FieldDef { label: "备注 notes", kind: FieldKind::Text },
     FieldDef { label: "价格单位 currency", kind: FieldKind::Enum },
+    FieldDef { label: "备注 notes", kind: FieldKind::Text },
+    FieldDef { label: "自定义对话端点 chat_endpoint（留空默认 {base_url}/chat/completions）", kind: FieldKind::Text },
+    FieldDef { label: "自定义模型列表端点 models_endpoint（留空默认 {base_url}/models）", kind: FieldKind::Text },
     FieldDef { label: "拉取模型", kind: FieldKind::Button },
     FieldDef { label: "保存", kind: FieldKind::Button },
     FieldDef { label: "取消", kind: FieldKind::Button },
 ];
 const IDX_KIND: usize = 1;
 const IDX_MODEL: usize = 4;
-const IDX_CURRENCY: usize = 13;
-const IDX_FETCH: usize = 14;
-const IDX_SAVE: usize = 15;
-const IDX_CANCEL: usize = 16;
+const IDX_CURRENCY: usize = 12;
+const IDX_FETCH: usize = 16;
+const IDX_SAVE: usize = 17;
+const IDX_CANCEL: usize = 18;
 
 /// 表单按键的副作用意图，由 App 解释执行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +102,10 @@ pub struct ProviderFormState {
     /// 每百万缓存命中输入 token 价格（美元），空串 = 未配置。
     pub price_cache_hit: String,
     pub notes: String,
+    /// 自定义对话端点（高级选项）。空 = 使用默认。
+    pub chat_endpoint: String,
+    /// 自定义模型列表端点（高级选项）。空 = 使用默认。
+    pub models_endpoint: String,
     // ── 工作副本 ──
     /// provider 的 models map 工作副本（编辑期间维护，保存时写回）。
     pub models: std::collections::HashMap<String, ModelConfig>,
@@ -120,6 +127,8 @@ pub struct ProviderFormState {
     pub fetched_models: Vec<String>,
     pub picker_open: bool,
     pub picker_selected: usize,
+    /// Picker 滚动偏移（render 时按选中项自动调整，Cell 供 &self render 写回）。
+    pub picker_scroll: Cell<usize>,
 }
 
 impl ProviderFormState {
@@ -142,6 +151,8 @@ impl ProviderFormState {
             price_output: String::new(),
             price_cache_hit: String::new(),
             notes: String::new(),
+            chat_endpoint: String::new(),
+            models_endpoint: String::new(),
             models: std::collections::HashMap::new(),
             known_models: Vec::new(),
             provider_max_tokens: 4096,
@@ -157,6 +168,7 @@ impl ProviderFormState {
             fetched_models: Vec::new(),
             picker_open: false,
             picker_selected: 0,
+            picker_scroll: Cell::new(0),
         }
     }
 
@@ -185,6 +197,8 @@ impl ProviderFormState {
             provider_max_tokens: cfg.max_tokens,
             provider_temperature: cfg.temperature,
             provider_price: cfg.price.clone(),
+            chat_endpoint: cfg.chat_endpoint.clone().unwrap_or_default(),
+            models_endpoint: cfg.models_endpoint.clone().unwrap_or_default(),
             original_name: Some(name.to_string()),
             ..Self::empty()
         };
@@ -302,6 +316,18 @@ impl ProviderFormState {
         CURRENCIES[self.currency_idx].1
     }
 
+    /// chat_endpoint 转为 Option：空串 → None，否则 Some。
+    fn chat_endpoint_opt(&self) -> Option<String> {
+        let s = self.chat_endpoint.trim();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    }
+
+    /// models_endpoint 转为 Option：空串 → None，否则 Some。
+    fn models_endpoint_opt(&self) -> Option<String> {
+        let s = self.models_endpoint.trim();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    }
+
     /// 当前表单值的快照（用于 fetch，即使未校验通过也能拉取）。
     pub fn to_provider_config_snapshot(&self) -> ProviderConfig {
         ProviderConfig {
@@ -313,6 +339,8 @@ impl ProviderFormState {
             temperature: self.temperature.trim().parse().unwrap_or(0.7),
             price: self.build_price(),
             models: self.models.clone(),
+            chat_endpoint: self.chat_endpoint_opt(),
+            models_endpoint: self.models_endpoint_opt(),
         }
     }
 
@@ -383,6 +411,8 @@ impl ProviderFormState {
                 temperature,
                 price: self.build_price(),
                 models: self.build_models_map(max_tokens, temperature),
+                chat_endpoint: self.chat_endpoint_opt(),
+                models_endpoint: self.models_endpoint_opt(),
             },
         ))
     }
@@ -428,8 +458,10 @@ impl ProviderFormState {
             9 => self.price_input.clone(),
             10 => self.price_output.clone(),
             11 => self.price_cache_hit.clone(),
-            12 => self.notes.clone(),
-            13 => self.currency_label().to_string(),
+            12 => self.currency_label().to_string(),
+            13 => self.notes.clone(),
+            14 => self.chat_endpoint.clone(),
+            15 => self.models_endpoint.clone(),
             _ => String::new(),
         }
     }
@@ -447,13 +479,15 @@ impl ProviderFormState {
             9 => self.price_input = val,
             10 => self.price_output = val,
             11 => self.price_cache_hit = val,
-            12 => self.notes = val,
+            13 => self.notes = val,
+            14 => self.chat_endpoint = val,
+            15 => self.models_endpoint = val,
             _ => {}
         }
     }
 
     fn is_text_field(idx: usize) -> bool {
-        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12)
+        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 13 | 14 | 15)
     }
 
     fn start_editing(&mut self, idx: usize) {
@@ -631,6 +665,7 @@ impl ProviderFormState {
                     }
                     self.known_models.sort();
                     self.picker_selected = 0;
+                    self.picker_scroll = Cell::new(0);
                     self.picker_open = true;
                 }
             }
@@ -714,6 +749,22 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                 ),
             );
         }
+        // 在高级选项前插入分隔线和标题
+        if i == 14 {
+            lines.push(Line::from("").style(Style::default().bg(theme.bg)));
+            lines.push(
+                Line::from("─".repeat(sep_width))
+                    .style(Style::default().fg(theme.border).bg(theme.bg)),
+            );
+            lines.push(
+                Line::from(" 高级选项").style(
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.bg),
+                ),
+            );
+        }
         let selected = i == state.focused && !state.editing && !state.picker_open;
         let marker = if selected { "▸ " } else { "  " };
         let value: String = if i == IDX_KIND {
@@ -778,8 +829,29 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
             };
             lines.push(Line::from(format!("{marker}{m}")).style(style));
         }
+        // 粘性滚动：选中项溢出视口时自动调整（首行是标题，故 +1 偏移）
+        let visible_h = area.height.saturating_sub(1) as usize; // 标题占 1 行
+        let items = state.fetched_models.len();
+        let prev = state.picker_scroll.get().min(items.saturating_sub(visible_h));
+        let sel = state.picker_selected;
+        let scroll = if items <= visible_h {
+            0
+        } else if sel < prev {
+            sel
+        } else if sel >= prev + visible_h {
+            (sel + 1).saturating_sub(visible_h).min(items.saturating_sub(visible_h))
+        } else {
+            prev
+        };
+        state.picker_scroll.set(scroll);
+        // 渲染时跳过标题 + scroll 行
+        let visible_lines: Vec<Line> = lines
+            .into_iter()
+            .skip(1 + scroll) // 1 标题 + scroll 偏移
+            .take(visible_h)
+            .collect();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(theme.bg)),
+            Paragraph::new(visible_lines).style(Style::default().bg(theme.bg)),
             area,
         );
         return;
@@ -903,7 +975,7 @@ mod tests {
         assert_eq!(s.kind(), "openai");
         // 回绕
         s.handle_key(key(KeyCode::Left), &ProvidersConfig::default());
-        assert_eq!(s.kind(), "openai-compatible");
+        assert_eq!(s.kind(), "responses");
     }
 
     #[test]
@@ -1367,7 +1439,8 @@ mod tests {
     fn alias_and_notes_are_text_editable() {
         assert!(ProviderFormState::is_text_field(5));  // alias
         assert!(ProviderFormState::is_text_field(6));  // context_length
-        assert!(ProviderFormState::is_text_field(12)); // notes
+        assert!(!ProviderFormState::is_text_field(12)); // currency (Enum)
+        assert!(ProviderFormState::is_text_field(13)); // notes
     }
 
     #[test]
@@ -1375,10 +1448,10 @@ mod tests {
         let mut s = ProviderFormState::empty();
         s.set_field(5, "别名".into());
         s.set_field(6, "96000".into());
-        s.set_field(12, "备注内容".into());
+        s.set_field(13, "备注内容".into());
         assert_eq!(s.get_field(5), "别名");
         assert_eq!(s.get_field(6), "96000");
-        assert_eq!(s.get_field(12), "备注内容");
+        assert_eq!(s.get_field(13), "备注内容");
     }
 
     #[test]

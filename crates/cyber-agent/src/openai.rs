@@ -35,10 +35,9 @@ impl OpenAiProvider {
                 cfg.api_key
             )));
         }
-        let base = cfg.base_url.trim_end_matches('/');
         Ok(Self {
             client: reqwest::Client::new(),
-            url: format!("{base}/chat/completions"),
+            url: cfg.chat_endpoint(),
             api_key,
             model: cfg.model.clone(),
             max_tokens: cfg.effective_max_tokens(),

@@ -259,7 +259,7 @@ impl SessionsPanelState {
 ///
 /// 左栏（providers）选中项变化时自动拉取该 provider 的模型列表；右栏（models）
 /// 列出拉取结果，Enter 确认 → 保存 `default_provider` + 更新 `providers[name].model`。
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ModelPickerState {
     /// 当前选中的 provider 索引（在 `sorted_names` 内）。
     pub provider_selected: usize,
@@ -275,6 +275,26 @@ pub struct ModelPickerState {
     pub fetch_error: Option<String>,
     /// 焦点：false=provider 列表，true=model 列表。
     pub focus_models: bool,
+    /// Provider 列表滚动偏移（render 时按选中项自动调整，用 Cell 供 &self render 写回）。
+    pub provider_scroll: Cell<usize>,
+    /// Model 列表滚动偏移（render 时按选中项自动调整，用 Cell 供 &self render 写回）。
+    pub model_scroll: Cell<usize>,
+}
+
+impl Default for ModelPickerState {
+    fn default() -> Self {
+        Self {
+            provider_selected: 0,
+            model_selected: 0,
+            models: Vec::new(),
+            fetching: false,
+            fetch_id: 0,
+            fetch_error: None,
+            focus_models: false,
+            provider_scroll: Cell::new(0),
+            model_scroll: Cell::new(0),
+        }
+    }
 }
 
 impl ModelPickerState {
@@ -285,6 +305,7 @@ impl ModelPickerState {
         self.fetch_error = None;
         self.models.clear();
         self.model_selected = 0;
+        self.model_scroll = Cell::new(0);
         self.fetch_id
     }
 
@@ -301,6 +322,7 @@ impl ModelPickerState {
                 } else {
                     self.models = models;
                     self.model_selected = 0;
+                    self.model_scroll = Cell::new(0);
                 }
             }
             Err(e) => {
@@ -1148,6 +1170,7 @@ impl App {
                 } else if provider_count > 0 {
                     self.model_picker.provider_selected =
                         (self.model_picker.provider_selected + provider_count - 1) % provider_count;
+                    self.model_picker.provider_scroll = Cell::new(0);
                     self.start_model_fetch();
                 }
             }
@@ -1159,6 +1182,7 @@ impl App {
                 } else if provider_count > 0 {
                     self.model_picker.provider_selected =
                         (self.model_picker.provider_selected + 1) % provider_count;
+                    self.model_picker.provider_scroll = Cell::new(0);
                     self.start_model_fetch();
                 }
             }

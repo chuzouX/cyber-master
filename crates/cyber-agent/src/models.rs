@@ -26,7 +26,11 @@ pub async fn fetch_models(cfg: &ProviderConfig) -> Result<Vec<String>> {
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
     let headers = fetch_headers(cfg);
-    let endpoints = fetch_endpoints(&cfg.kind, &cfg.base_url);
+    let endpoints = if let Some(custom) = cfg.models_endpoint() {
+        vec![custom]
+    } else {
+        fetch_endpoints(&cfg.kind, &cfg.base_url)
+    };
 
     let mut last_error = AgentError::Provider("无模型端点响应成功".into());
     for endpoint in endpoints {
