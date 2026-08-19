@@ -108,11 +108,14 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
     if let Some(err_msg) = extract_sse_error(&v) {
         return vec![StreamEvent::Error(err_msg)];
     }
-    // usage chunk（stream_options.include_usage=true 时，流末尾的独立 chunk）：
-    // `{"choices":[],"usage":{...}}`。choices 为空数组，delta 不存在。
+    let mut out = Vec::new();
+    // usage（stream_options.include_usage=true）：标准 OpenAI 是流末尾独立 chunk
+    // （`{"choices":[],"usage":{...}}`）；部分兼容端点（vLLM / 硅基流动等）把 usage
+    // 附在最后一个 content chunk 上。只收集事件、不提前返回——否则同行的
+    // delta.content 被丢弃，导致回复末尾被截断。
     if let Some(usage) = v.get("usage") {
         if let Some(u) = parse_usage(usage) {
-            return vec![StreamEvent::Usage(u)];
+            out.push(StreamEvent::Usage(u));
         }
     }
     let delta = match v
@@ -121,9 +124,8 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
         .and_then(|c| c.get("delta"))
     {
         Some(d) => d,
-        None => return Vec::new(),
+        None => return out, // 无 delta（如独立 usage chunk）→ 只返回已收集事件
     };
-    let mut out = Vec::new();
     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
         out.push(StreamEvent::Delta(content.to_string()));
     }
@@ -620,6 +622,17 @@ mod tests {
             }
             other => panic!("应为 ToolCallDelta，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_parses_content_and_usage_in_same_chunk() {
+        // 部分兼容端点（vLLM / 硅基流动等）把 usage 附在最后一个 content chunk 上：
+        // 两者都要保留——提前返回会丢弃 content，导致回复末尾被截断。
+        let d = r#"data: {"choices":[{"delta":{"content":"end"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let r = parse_openai_line(d);
+        assert_eq!(r.len(), 2);
+        assert!(matches!(&r[0], StreamEvent::Usage(u) if u.prompt_tokens == 10));
+        assert!(matches!(&r[1], StreamEvent::Delta(t) if t == "end"));
     }
 
     #[test]
