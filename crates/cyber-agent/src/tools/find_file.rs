@@ -20,6 +20,7 @@ impl Tool for FindFileTool {
         ToolSchema {
             name: "find_file".into(),
             description: "在指定目录中按文件名或内容关键词查找文件（跨平台、无编码问题，替代 grep/find）".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {

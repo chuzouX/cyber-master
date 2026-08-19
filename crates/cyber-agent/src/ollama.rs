@@ -149,6 +149,7 @@ mod tests {
             .with_tools(vec![ToolSchema {
                 name: "list_dir".into(),
                 description: "d".into(),
+                tags: vec![],
                 parameters: json!({"type": "object"}),
             }]);
         let _stream = p.stream(req);

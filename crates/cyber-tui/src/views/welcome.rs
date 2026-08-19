@@ -3,7 +3,7 @@
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
@@ -33,51 +33,65 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(" Cyber Master · v0.2.0 ")
+            Line::from(concat!(" Cyber Master · v", env!("CARGO_PKG_VERSION"), " "))
                 .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
-        .padding(Padding::vertical(1));
+        .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // 上下居中：上方弹性留白 + 内容块 + 下方弹性留白
-    let content_height = 2 /*副标题+空行*/ + OPTIONS.len() as u16 + 2 /*空行+hint*/ + if toast.is_some() { 2 } else { 0 };
-    let outer = Layout::vertical([
+    // Keep the landing content centered and readable on wide terminals.
+    let content_height = 3 + 1 + (OPTIONS.len() as u16 * 3) + 1 + 1
+        + if toast.is_some() { 2 } else { 0 };
+    let content_area = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(content_height),
         Constraint::Min(0),
     ])
-    .split(inner);
-    let content_area = outer[1];
+    .split(inner)[1];
+    let content_width = content_area.width.min(76);
+    let centered = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(content_width),
+        Constraint::Min(0),
+    ])
+    .split(content_area)[1];
 
-    let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
-    for _ in OPTIONS {
-        constraints.push(Constraint::Length(1));
-    }
-    constraints.push(Constraint::Length(1)); // 空行
+    let mut constraints = vec![
+        Constraint::Length(3), // brand + subtitle
+        Constraint::Length(1), // spacer
+    ];
+    constraints.extend((0..OPTIONS.len()).map(|_| Constraint::Length(3)));
+    constraints.push(Constraint::Length(1)); // spacer
     constraints.push(Constraint::Length(1)); // hint
     if toast.is_some() {
-        constraints.push(Constraint::Length(1));
-        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(2));
     }
-    let rows = Layout::vertical(constraints).split(content_area);
-    let mut i = 0usize;
+    let rows = Layout::vertical(constraints).split(centered);
+    let mut row = 0usize;
+
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.muted);
 
     frame.render_widget(
-        Paragraph::new(Line::from(
-            "欢迎使用 Cyber Master — 选择一个入口开始（未检测到 .cyber.md）",
-        ))
-        .style(Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC))
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("◈  CYBER MASTER", accent),
+                Span::styled("  SECURITY WORKSPACE", muted),
+            ]),
+            Line::from("Select a workspace to begin"),
+        ])
         .alignment(Alignment::Center),
-        rows[i],
+        rows[row],
     );
-    i += 1;
-    frame.render_widget(Paragraph::new(""), rows[i]);
-    i += 1;
+    row += 2;
 
     for (idx, opt) in OPTIONS.iter().enumerate() {
-        let style = if idx == selected {
+        let is_selected = idx == selected;
+        let item_style = if is_selected {
             Style::default()
                 .fg(theme.sel_fg)
                 .bg(theme.sel_bg)
@@ -85,38 +99,49 @@ pub fn render(
         } else {
             Style::default().fg(theme.fg)
         };
-        let prefix = if idx == selected { "▸ " } else { "  " };
-        // 按钮靠左对齐，左侧留 25% 缩进
-        let btn_cols = Layout::horizontal([
-            Constraint::Percentage(25),
-            Constraint::Min(0),
-        ])
-        .split(rows[i]);
+        let marker = if is_selected { "▸  " } else { "   " };
+        let item_block = if is_selected {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent))
+                .style(Style::default().bg(theme.sel_bg))
+        } else {
+            Block::default().borders(Borders::NONE)
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(format!("{prefix}{opt}")).style(style))
-                .alignment(Alignment::Left),
-            btn_cols[1],
+            Paragraph::new(Line::from(vec![
+                Span::styled(marker, item_style),
+                Span::styled(*opt, item_style),
+            ]))
+            .block(item_block)
+            .alignment(Alignment::Left),
+            rows[row],
         );
-        i += 1;
+        row += 1;
     }
 
-    frame.render_widget(Paragraph::new(""), rows[i]);
-    i += 1;
+    row += 1;
     frame.render_widget(
-        Paragraph::new(Line::from("↑/↓ 导航   Enter 确认   s 设置   q 退出"))
-            .style(Style::default().fg(theme.muted))
-            .alignment(Alignment::Center),
-        rows[i],
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑↓", accent),
+            Span::styled(" navigate   ", muted),
+            Span::styled("Enter", accent),
+            Span::styled(" select   ", muted),
+            Span::styled("s", accent),
+            Span::styled(" settings   ", muted),
+            Span::styled("q", accent),
+            Span::styled(" quit", muted),
+        ]))
+        .alignment(Alignment::Center),
+        rows[row],
     );
-    i += 1;
+    row += 1;
 
-    if let Some(t) = toast {
-        frame.render_widget(Paragraph::new(""), rows[i]);
-        i += 1;
+    if let Some(message) = toast {
         frame.render_widget(
-            Paragraph::new(Line::from(t).style(Style::default().fg(theme.accent)))
+            Paragraph::new(Line::from(message).style(Style::default().fg(theme.accent)))
                 .alignment(Alignment::Center),
-            rows[i],
+            rows[row],
         );
     }
 }

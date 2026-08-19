@@ -42,7 +42,7 @@ use cyber_agent::{
 };
 use cyber_core::{
     current_time_str, save_config, save_providers, Config, CtfCategory, CtfChallenge, CtfStatus,
-    MemoryScope, MemoryStore, ProjectContext, ProvidersConfig,
+    LoadedCustomTool, MemoryScope, MemoryStore, ProjectContext, ProvidersConfig,
 };
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
@@ -134,6 +134,8 @@ pub struct AppRegistries {
     pub tools: Arc<ToolRegistry>,
     /// Skill 注册表（`/skill` 查找 + 展示用）。
     pub skills: Arc<SkillRegistry>,
+    /// 已加载的自定义工具，供 Settings 只读展示。
+    pub custom_tools: Arc<Vec<LoadedCustomTool>>,
     /// MCP 连接注册表（`/mcp` 展示 + 退出 shutdown）。mock 模式或无 server 时为 None。
     pub mcp: Option<Arc<McpRegistry>>,
     /// CTF 题目共享状态（工具与 App 共享）。
@@ -145,6 +147,7 @@ impl std::fmt::Debug for AppRegistries {
         f.debug_struct("AppRegistries")
             .field("tools", &self.tools.schemas().len())
             .field("skills", &self.skills.len())
+            .field("custom_tools", &self.custom_tools.len())
             .field("mcp", &self.mcp.as_ref().map(|m| m.len()))
             .field(
                 "ctf_challenges",
@@ -160,6 +163,7 @@ impl AppRegistries {
         Self {
             tools: Arc::new(ToolRegistry::with_builtins()),
             skills: Arc::new(SkillRegistry::new()),
+            custom_tools: Arc::new(Vec::new()),
             mcp: None,
             ctf_challenges: None,
         }
@@ -2335,7 +2339,6 @@ impl App {
         let mut parts = args.splitn(2, char::is_whitespace);
         let sub = parts.next().unwrap_or("").trim().to_lowercase();
         let rest = parts.next().unwrap_or("").trim();
-
         let store = MemoryStore::new(
             self.paths.memory_file.clone(),
             self.paths.cwd.join(".cyber").join("memory.md"),
@@ -2343,71 +2346,61 @@ impl App {
 
         match sub.as_str() {
             "" | "list" => {
-                let global = store.load_global();
-                let project = store.load_project();
+                let global = store.entries(MemoryScope::Global);
+                let project = store.entries(MemoryScope::Project);
                 if global.is_empty() && project.is_empty() {
-                    self.chat.entries.push(ChatEntry::System(
-                        "暂无用户记忆。用 /memory add <text> 添加全局记忆，或 /memory project <text> 添加项目级记忆。".into(),
-                    ));
+                    self.chat.entries.push(ChatEntry::System("暂无可管理的记忆。".into()));
                     return;
                 }
-                let mut lines = String::new();
+                let mut out = String::new();
                 if !global.is_empty() {
-                    lines.push_str("全局记忆：\n");
-                    lines.push_str(global.trim_end());
+                    out.push_str("全局记忆：\n");
+                    for e in global { out.push_str(&format!("  {}. {}\n", e.index, e.content)); }
                 }
                 if !project.is_empty() {
-                    if !global.is_empty() {
-                        lines.push('\n');
-                    }
-                    lines.push_str("\n项目级记忆：\n");
-                    lines.push_str(project.trim_end());
+                    out.push_str("项目级记忆：\n");
+                    for e in project { out.push_str(&format!("  {}. {}\n", e.index, e.content)); }
                 }
-                self.chat.entries.push(ChatEntry::System(lines));
+                self.chat.entries.push(ChatEntry::System(out));
             }
-            "add" => {
+            "add" | "project" => {
+                let scope = if sub == "project" { MemoryScope::Project } else { MemoryScope::Global };
                 if rest.is_empty() {
-                    self.chat
-                        .entries
-                        .push(ChatEntry::System("用法：/memory add <要记住的内容>".into()));
-                    return;
-                }
-                match store.append(MemoryScope::Global, rest) {
-                    Ok(()) => self.chat.entries.push(ChatEntry::System(format!(
-                        "已保存到全局记忆：{rest}"
-                    ))),
-                    Err(e) => self
-                        .chat
-                        .entries
-                        .push(ChatEntry::System(format!("保存记忆失败：{e}"))),
+                    self.chat.entries.push(ChatEntry::System("用法：/memory add <text> 或 /memory project <text>".into()));
+                } else if let Err(e) = store.append(scope, rest) {
+                    self.chat.entries.push(ChatEntry::System(format!("保存记忆失败：{e}")));
+                } else {
+                    self.chat.entries.push(ChatEntry::System("记忆已保存".into()));
                 }
             }
-            "project" => {
-                if rest.is_empty() {
-                    self.chat.entries.push(ChatEntry::System(
-                        "用法：/memory project <要记住的内容>".into(),
-                    ));
-                    return;
-                }
-                match store.append(MemoryScope::Project, rest) {
-                    Ok(()) => self.chat.entries.push(ChatEntry::System(format!(
-                        "已保存到项目级记忆：{rest}"
-                    ))),
-                    Err(e) => self
-                        .chat
-                        .entries
-                        .push(ChatEntry::System(format!("保存记忆失败：{e}"))),
+            "edit" => {
+                let mut p = rest.splitn(3, char::is_whitespace);
+                let scope = MemoryScope::parse(p.next().unwrap_or(""));
+                let index = p.next().and_then(|v| v.parse::<usize>().ok());
+                let content = p.next().map(str::trim).filter(|v| !v.is_empty());
+                match (index, content) {
+                    (Some(i), Some(text)) => match store.update(scope, i, text) {
+                        Ok(()) => self.chat.entries.push(ChatEntry::System("记忆已更新".into())),
+                        Err(e) => self.chat.entries.push(ChatEntry::System(format!("更新记忆失败：{e}"))),
+                    },
+                    _ => self.chat.entries.push(ChatEntry::System("用法：/memory edit <global|project> <编号> <新内容>".into())),
                 }
             }
-            other => {
-                self.chat.entries.push(ChatEntry::System(format!(
-                    "未知子命令：{other}（可选：list / add <text> / project <text>）"
-                )));
+            "delete" | "remove" => {
+                let mut p = rest.split_whitespace();
+                let scope = MemoryScope::parse(p.next().unwrap_or(""));
+                let index = p.next().and_then(|v| v.parse::<usize>().ok());
+                match index {
+                    Some(i) => match store.delete(scope, i) {
+                        Ok(()) => self.chat.entries.push(ChatEntry::System("记忆已删除".into())),
+                        Err(e) => self.chat.entries.push(ChatEntry::System(format!("删除记忆失败：{e}"))),
+                    },
+                    None => self.chat.entries.push(ChatEntry::System("用法：/memory delete <global|project> <编号>".into())),
+                }
             }
+            other => self.chat.entries.push(ChatEntry::System(format!("未知记忆子命令：{other}"))),
         }
     }
-
-    /// 处理 `/ctf <subcommand>`：enable / disable / add / list / writeup / status。
     fn handle_ctf_slash(&mut self, args: &str) {
         let mut parts = args.splitn(2, char::is_whitespace);
         let sub = parts.next().unwrap_or("").trim();
@@ -3043,6 +3036,8 @@ impl App {
                         self.settings.prev_env(self.config.env.vars.len());
                     } else if self.settings.on_skills_section() {
                         self.settings.prev_skill(self.registries.skills.len());
+                    } else if self.settings.on_custom_tools_section() {
+                        self.settings.prev_custom_tool(self.registries.custom_tools.len());
                     } else {
                         self.settings.prev_field();
                     }
@@ -3061,6 +3056,8 @@ impl App {
                         self.settings.next_env(self.config.env.vars.len());
                     } else if self.settings.on_skills_section() {
                         self.settings.next_skill(self.registries.skills.len());
+                    } else if self.settings.on_custom_tools_section() {
+                        self.settings.next_custom_tool(self.registries.custom_tools.len());
                     } else {
                         self.settings.next_field();
                     }
@@ -3470,6 +3467,7 @@ impl App {
                 &self.mcp_config,
                 self.registries.mcp.as_deref(),
                 &self.registries.skills,
+                &self.registries.custom_tools,
                 &self.settings,
                 self.has_project_config,
                 self.toast.as_deref(),

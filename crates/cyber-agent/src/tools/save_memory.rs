@@ -38,6 +38,7 @@ impl Tool for SaveMemoryTool {
         ToolSchema {
             name: "save_memory".into(),
             description: "把重要信息保存到长期记忆，供后续对话自动引用。当用户表达偏好、身份、约定、项目背景等需要记住的内容时调用。scope=global（默认，跨项目）或 project（仅当前项目）。".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -76,6 +77,13 @@ impl Tool for SaveMemoryTool {
                 .unwrap_or(MemoryScope::Global);
 
             let store = self.store(ctx);
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("add");
+            if action == "update" || action == "delete" {
+                let index = input.get("index").and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| AgentError::Provider("编辑/删除记忆需要 index".into()))?;
+                let result = if action == "update" { store.update(scope, index, content) } else { store.delete(scope, index) };
+                result.map_err(|e| AgentError::Provider(format!("记忆操作失败: {e}")))?;
+                return Ok(ToolOutput { content: format!("记忆已{}", if action == "update" { "更新" } else { "删除" }), is_error: false });
+            }
             store.append(scope, content).map_err(|e| {
                 AgentError::Provider(format!("保存记忆失败: {e}"))
             })?;

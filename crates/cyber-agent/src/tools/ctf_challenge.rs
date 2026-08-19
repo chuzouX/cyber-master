@@ -60,6 +60,7 @@ impl Tool for CtfChallengeTool {
         ToolSchema {
             name: "ctf_challenge".into(),
             description: "CTF 题目管理工具。action=register 注册/更新题目（按 name 匹配），action=solve 标记题目已解出并记录 flag，action=list 列出所有题目。".into(),
+            tags: vec!["ctf".into()],
             parameters: json!({
                 "type": "object",
                 "properties": {

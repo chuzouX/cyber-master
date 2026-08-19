@@ -10,6 +10,7 @@ pub struct Paths {
     pub cyber_home: PathBuf,
     pub config_file: PathBuf,
     pub providers_file: PathBuf,
+    pub tools_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub mcp_dir: PathBuf,
     pub mcp_servers_file: PathBuf,
@@ -49,6 +50,7 @@ impl Paths {
         Ok(Self {
             config_file: cyber_home.join("config.toml"),
             providers_file: cyber_home.join("providers.toml"),
+            tools_dir: cyber_home.join("tools"),
             skills_dir: cyber_home.join("skills"),
             mcp_servers_file: mcp_dir.join("servers.toml"),
             workflows_dir: cyber_home.join("workflows"),

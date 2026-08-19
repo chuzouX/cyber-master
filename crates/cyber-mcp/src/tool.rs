@@ -36,6 +36,7 @@ impl McpTool {
             } else {
                 format!("[MCP/{}] {}", server.server_name(), mcp_schema.description)
             },
+            tags: vec![],
             parameters: mcp_schema.input_schema,
         };
         Self {

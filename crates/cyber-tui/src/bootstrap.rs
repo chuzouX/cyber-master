@@ -11,8 +11,10 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cyber_agent::{CtfChallengeTool, SaveMemoryTool, ToolRegistry};
-use cyber_core::{CtfChallenge, Paths};
+use cyber_agent::{
+    CtfChallengeTool, CustomTool, SaveMemoryTool, SearchToolsTool, ToolRegistry,
+};
+use cyber_core::{load_custom_tools, CtfChallenge, Paths};
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::{SkillRegistry, SkillTool};
 use tracing::warn;
@@ -43,6 +45,12 @@ pub async fn build_registries(
         errors.push(format!("Skill 加载失败 {}: {e}", path.display()));
     }
 
+    let (custom_tools, custom_errors) = load_custom_tools(&paths.tools_dir);
+    for (path, e) in custom_errors {
+        warn!(path = %path.display(), error = %e, "自定义工具加载失败");
+        errors.push(format!("自定义工具加载失败 {}: {e}", path.display()));
+    }
+
     // 2. 工具表：内置工具 + Skill 工具
     let mut tool_reg = ToolRegistry::with_builtins();
     for skill in skills.iter() {
@@ -60,6 +68,9 @@ pub async fn build_registries(
 
     // save_memory 工具：agent 自动保存长期记忆（全局文件路径；项目级从 ctx.cwd 推导）
     tool_reg.register(Box::new(SaveMemoryTool::new(paths.memory_file.clone())));
+    for tool in &custom_tools {
+        tool_reg.register(Box::new(CustomTool::new(tool.config.clone())));
+    }
 
     // 3. MCP：非 mock 时加载 servers.toml + 并行连接
     let mcp = if !mock {
@@ -84,10 +95,14 @@ pub async fn build_registries(
         None
     };
 
+    let catalog = tool_reg.catalog();
+    tool_reg.register(Box::new(SearchToolsTool::new(catalog)));
+
     (
         AppRegistries {
             tools: Arc::new(tool_reg),
             skills: Arc::new(skills),
+            custom_tools: Arc::new(custom_tools),
             mcp,
             ctf_challenges: Some(ctf_challenges),
         },

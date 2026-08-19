@@ -177,6 +177,7 @@ mod tests {
             .with_tools(vec![ToolSchema {
                 name: "list_dir".into(),
                 description: "d".into(),
+                tags: vec![],
                 parameters: json!({"type": "object"}),
             }]);
         // stream 不被驱动，仅构造（HttpStream::Init 状态，未发请求）

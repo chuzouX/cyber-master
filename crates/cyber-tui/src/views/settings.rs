@@ -5,7 +5,7 @@
 //! 保存由右侧面板底部「保存设置」行 + `Enter` 触发（不用 `Ctrl+S`，避开 §9.2 会话保存冲突）。
 //! Esc 双击回退到进入时的快照（见 `app.rs` 的 `config_at_entry`）。
 
-use cyber_core::{Config, ProvidersConfig};
+use cyber_core::{Config, LoadedCustomTool, ProvidersConfig};
 use cyber_mcp::{McpRegistry, McpServersConfig, McpTransport};
 use cyber_skills::{Skill, SkillRegistry, SkillSource};
 use ratatui::{
@@ -352,6 +352,11 @@ static SECTIONS: &[SectionDef] = &[
         editable: false,
         fields: &[],
     },
+    SectionDef {
+        name: "Custom Tools",
+        editable: false,
+        fields: &[],
+    },
 ];
 
 /// 设置页视图状态。App 持有，跨次进入保留位置。
@@ -376,6 +381,8 @@ pub struct SettingsState {
     pub mcp_pending_delete_idx: Option<usize>,
     /// Skills 段 cursor（在 skills 列表中）。
     pub skills_selected: usize,
+    /// Custom Tools 段 cursor（在工具列表中）。
+    pub custom_tools_selected: usize,
     /// Providers 段 cursor 是否停在保存按钮行。
     pub provider_on_save: bool,
     /// MCP 段 cursor 是否停在保存按钮行。
@@ -398,6 +405,8 @@ pub const MCP_SECTION_IDX: usize = 6;
 pub const ENV_SECTION_IDX: usize = 7;
 /// Skills 段在 SECTIONS 中的索引。
 pub const SKILLS_SECTION_IDX: usize = 8;
+/// Custom Tools 段在 SECTIONS 中的索引。
+pub const CUSTOM_TOOLS_SECTION_IDX: usize = 9;
 
 impl SettingsState {
     pub fn new() -> Self {
@@ -438,7 +447,11 @@ impl SettingsState {
         self.section == SKILLS_SECTION_IDX
     }
 
-    /// 当前是否在 Env 段。
+    /// 当前是否在 Custom Tools 段。
+    pub fn on_custom_tools_section(&self) -> bool {
+        self.section == CUSTOM_TOOLS_SECTION_IDX
+    }
+
     pub fn on_env_section(&self) -> bool {
         self.section == ENV_SECTION_IDX
     }
@@ -541,6 +554,16 @@ impl SettingsState {
     }
 
     /// Skills 段 cursor 上移。
+    pub fn next_custom_tool(&mut self, len: usize) {
+        if len == 0 { self.custom_tools_selected = 0; return; }
+        self.custom_tools_selected = (self.custom_tools_selected + 1).min(len - 1);
+    }
+
+    pub fn prev_custom_tool(&mut self, len: usize) {
+        if len == 0 { self.custom_tools_selected = 0; return; }
+        self.custom_tools_selected = self.custom_tools_selected.saturating_sub(1);
+    }
+
     pub fn prev_skill(&mut self, len: usize) {
         if len == 0 {
             self.skills_selected = 0;
@@ -698,6 +721,7 @@ pub fn render(
     mcp_config: &McpServersConfig,
     mcp_registry: Option<&McpRegistry>,
     skills: &SkillRegistry,
+    custom_tools: &[LoadedCustomTool],
     state: &SettingsState,
     has_project_config: bool,
     toast: Option<&str>,
@@ -756,7 +780,7 @@ pub fn render(
 
     let cols = Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
     render_sidebar(frame, cols[0], theme, state);
-    render_fields(frame, cols[1], theme, config, providers, mcp_config, mcp_registry, skills, state);
+    render_fields(frame, cols[1], theme, config, providers, mcp_config, mcp_registry, skills, custom_tools, state);
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, theme: &Theme, state: &SettingsState) {
@@ -788,6 +812,7 @@ fn render_fields(
     mcp_config: &McpServersConfig,
     mcp_registry: Option<&McpRegistry>,
     skills: &SkillRegistry,
+    custom_tools: &[LoadedCustomTool],
     state: &SettingsState,
 ) {
     let section = &SECTIONS[state.section];
@@ -932,6 +957,10 @@ fn render_fields(
             Line::from(" ↑↓ 选择  Skills 为文件型配置（编辑 SKILL.md 后重启生效）")
                 .style(Style::default().fg(theme.muted)),
         );
+    } else if state.on_custom_tools_section() {
+        render_custom_tools_lines(&mut lines, theme, custom_tools, state);
+        lines.push(Line::from(""));
+        lines.push(Line::from(" ↑↓ 选择  文件型配置：编辑 ~/.cyber/tools/*.toml 后重启生效").style(Style::default().fg(theme.muted)));
     } else if state.on_env_section() {
         // Env 段：交互式（a 新增 / e 编辑 / d 删除 / ↑↓ 选择）
         render_env_lines(&mut lines, theme, &config.env, state);
@@ -957,10 +986,19 @@ fn render_fields(
         lines.push(Line::from(hint).style(hint_style));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.bg).fg(theme.fg)),
-        area,
-    );
+    let visible_rows = area.height as usize;
+    let focus_line = if state.on_providers_section() {
+        2 + state.provider_selected.saturating_mul(3)
+    } else if state.on_custom_tools_section() {
+        2 + custom_tools.iter().take(state.custom_tools_selected).map(|tool| {
+            4 + usize::from(!tool.config.parameters.is_empty())
+        }).sum::<usize>()
+    } else if state.on_skills_section() {
+        let all: Vec<&Skill> = skills.iter().map(|s| s.as_ref()).collect();
+        2 + all.iter().take(state.skills_selected).map(|skill| 2 + usize::from(!skill.frontmatter.triggers.is_empty()) + usize::from(!skill.frontmatter.allowed_tools.is_empty())).sum::<usize>()
+    } else { 0 };
+    let scroll = focus_line.saturating_sub(visible_rows.saturating_sub(1)).min(lines.len().saturating_sub(visible_rows)).min(u16::MAX as usize) as u16;
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.bg).fg(theme.fg)).scroll((scroll, 0)), area);
 }
 
 fn display_value(field: &FieldDef, config: &Config) -> String {
@@ -1207,6 +1245,27 @@ fn mask_env_value(val: &str) -> String {
         let prefix: String = val.chars().take(2).collect();
         let suffix: String = val.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
         format!("{prefix}****{suffix}")
+    }
+}
+
+fn render_custom_tools_lines(lines: &mut Vec<Line>, theme: &Theme, tools: &[LoadedCustomTool], state: &SettingsState) {
+    if tools.is_empty() {
+        lines.push(Line::from("（未加载自定义工具；在 ~/.cyber/tools/*.toml 中添加定义）").style(Style::default().fg(theme.muted)));
+        return;
+    }
+    for (i, tool) in tools.iter().enumerate() {
+        let cfg = &tool.config;
+        let selected = i == state.custom_tools_selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let row_style = if selected { Style::default().bg(theme.sel_bg) } else { Style::default().bg(theme.bg) };
+        lines.push(Line::from(format!("{}{}", marker, cfg.name)).style(row_style.fg(theme.title).add_modifier(Modifier::BOLD)));
+        lines.push(Line::from(format!("   tags: {}", if cfg.tags.is_empty() { "(none)".into() } else { cfg.tags.join(", ") })).style(Style::default().fg(theme.muted)));
+        lines.push(Line::from(format!("   command: {}", cfg.command)).style(Style::default().fg(theme.fg)));
+        if !cfg.parameters.is_empty() {
+            let names = cfg.parameters.iter().map(|p| if p.required { format!("{}*", p.name) } else { p.name.clone() }).collect::<Vec<_>>().join(", ");
+            lines.push(Line::from(format!("   parameters: {}", names)).style(Style::default().fg(theme.muted)));
+        }
+        lines.push(Line::from(format!("   source: {}", tool.path.display())).style(Style::default().fg(theme.muted)));
     }
 }
 
@@ -1465,6 +1524,7 @@ mod tests {
                     &McpServersConfig::default(),
                     None,
                     &SkillRegistry::new(),
+                    &[],
                     &st,
                     false,
                     None,
@@ -1492,6 +1552,7 @@ mod tests {
                     &McpServersConfig::default(),
                     None,
                     &SkillRegistry::new(),
+                    &[],
                     &st,
                     false,
                     None,
@@ -1544,6 +1605,7 @@ mod tests {
                     &McpServersConfig::default(),
                     None,
                     &SkillRegistry::new(),
+                    &[],
                     &st,
                     false,
                     None,

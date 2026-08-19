@@ -27,6 +27,7 @@ fn create_global_layout(paths: &Paths) -> Result<()> {
     for dir in [
         paths.cyber_home.as_path(),
         paths.skills_dir.as_path(),
+        paths.tools_dir.as_path(),
         paths.mcp_dir.as_path(),
         paths.workflows_dir.as_path(),
         paths.sessions_dir.as_path(),
@@ -94,6 +95,7 @@ mod tests {
         assert!(paths.providers_file.exists());
         assert!(paths.mcp_servers_file.exists());
         assert!(paths.skills_dir.exists());
+        assert!(paths.tools_dir.exists());
         assert!(paths.workflows_dir.exists());
         assert!(paths.logs_dir.exists());
 

@@ -16,6 +16,7 @@ impl Tool for WriteFileTool {
         ToolSchema {
             name: "write_file".into(),
             description: "写文本文件（相对工作目录或绝对路径，禁止逃逸出工作目录）".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {

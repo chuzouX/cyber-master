@@ -19,6 +19,7 @@ impl Tool for ReadFileTool {
         ToolSchema {
             name: "read_file".into(),
             description: "读取文本文件内容（相对工作目录或绝对路径，分页读取每页 64KB。offset 为字节偏移量，默认 0。文件超过一页时返回值会提示总大小和下一页 offset）".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {

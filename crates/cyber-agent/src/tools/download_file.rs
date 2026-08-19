@@ -33,6 +33,7 @@ impl Tool for DownloadFileTool {
         ToolSchema {
             name: "download_file".into(),
             description: "下载文件到本地（支持 HTTP/SOCKS5 代理、自定义 headers、跳过 SSL 验证）。默认带 SSRF 保护，下载内网资源时设 no_ssrf_check=true。".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {

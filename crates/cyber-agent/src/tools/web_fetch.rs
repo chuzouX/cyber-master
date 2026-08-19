@@ -28,6 +28,7 @@ impl Tool for WebFetchTool {
         ToolSchema {
             name: "web_fetch".into(),
             description: "抓取指定 URL 的网页内容并转为纯文本返回（带 SSRF 保护，禁止访问内网地址）。适合读取文档、API 响应、漏洞说明等网页内容。".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -29,6 +29,8 @@ pub use compact::{
 pub use error::{AgentError, Result};
 pub use models::{extract_model_ids, fetch_models};
 pub use provider::{provider_factory, Provider, StreamRequest};
-pub use tool::{Tool, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
-pub use tools::{builtin_tool_names, CtfChallengeTool, SaveMemoryTool};
+pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
+pub use tools::{
+    builtin_tool_names, CtfChallengeTool, CustomTool, SaveMemoryTool, SearchToolsTool,
+};
 pub use types::{AgentEvent, Message, Role, StreamEvent, ToolCall, ToolCallDelta, Usage};

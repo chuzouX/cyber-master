@@ -28,6 +28,12 @@ impl MemoryScope {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub index: usize,
+    pub content: String,
+}
+
 
 /// 记忆存储：封装两层记忆文件的读写。
 #[derive(Debug, Clone)]
@@ -74,8 +80,23 @@ impl MemoryStore {
         };
         append_memory(path, text)
     }
-}
 
+    pub fn entries(&self, scope: MemoryScope) -> Vec<MemoryEntry> {
+        let path = match scope { MemoryScope::Global => &self.global_file, MemoryScope::Project => &self.project_file };
+        read_if_exists(path).lines().filter_map(|line| line.strip_prefix("- ")).enumerate().map(|(i, content)| MemoryEntry { index: i + 1, content: content.to_string() }).collect()
+    }
+
+    pub fn update(&self, scope: MemoryScope, index: usize, text: &str) -> Result<()> {
+        let path = match scope { MemoryScope::Global => &self.global_file, MemoryScope::Project => &self.project_file };
+        rewrite_entry(path, index, Some(text))
+    }
+
+    pub fn delete(&self, scope: MemoryScope, index: usize) -> Result<()> {
+        let path = match scope { MemoryScope::Global => &self.global_file, MemoryScope::Project => &self.project_file };
+        rewrite_entry(path, index, None)
+    }
+
+}
 /// 读取文件内容；不存在或读取失败返回空串（记忆非关键，失败静默降级）。
 fn read_if_exists(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
@@ -105,6 +126,26 @@ fn append_memory(path: &Path, text: &str) -> Result<()> {
         .append(true)
         .open(path)?;
     f.write_all(content.as_bytes())?;
+    Ok(())
+}
+
+fn rewrite_entry(path: &Path, index: usize, replacement: Option<&str>) -> Result<()> {
+    if index == 0 { return Err(crate::error::CoreError::Config("记忆编号从 1 开始".into())); }
+    let source = std::fs::read_to_string(path)?;
+    let trailing_newline = source.ends_with('\n');
+    let mut lines: Vec<String> = source.split('\n').map(ToString::to_string).collect();
+    if trailing_newline { lines.pop(); }
+    let line_index = lines.iter().enumerate().filter(|(_, line)| line.starts_with("- ")).nth(index - 1).map(|(i, _)| i).ok_or_else(|| crate::error::CoreError::Config(format!("未找到第 {index} 条记忆")))?;
+    if let Some(text) = replacement {
+        let content = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
+        if content.is_empty() { return Err(crate::error::CoreError::Config("记忆内容不能为空".into())); }
+        lines[line_index] = format!("- {content}");
+    } else {
+        lines.remove(line_index);
+    }
+    let mut rewritten = lines.join("\n");
+    if trailing_newline && !rewritten.is_empty() { rewritten.push('\n'); }
+    std::fs::write(path, rewritten)?;
     Ok(())
 }
 

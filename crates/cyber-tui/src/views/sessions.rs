@@ -105,8 +105,18 @@ pub fn render(
         }
     }
 
+    let visible_rows = list_area.height as usize;
+    let selected_row = if state.list.is_empty() { 0 } else { 2 + state.selected };
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let scroll = selected_row
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(max_scroll)
+        .min(u16::MAX as usize) as u16;
+
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.bg).fg(theme.fg)),
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .scroll((scroll, 0)),
         list_area,
     );
 

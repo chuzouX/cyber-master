@@ -4,12 +4,14 @@
 //! 统一工具表。本模块仅注册 P2.2 的基础工具。
 
 mod ctf_challenge;
+mod custom_tool;
 mod download_file;
 mod find_file;
 mod guard;
 mod list_dir;
 mod read_file;
 mod save_memory;
+mod search_tools;
 mod shell;
 mod web_fetch;
 mod write_file;
@@ -22,7 +24,7 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(write_file::WriteFileTool));
     reg.register(Box::new(list_dir::ListDirTool));
     reg.register(Box::new(find_file::FindFileTool));
-    reg.register(Box::new(shell::ShellTool));
+    reg.register(Box::new(shell::ShellTool::default()));
     reg.register(Box::new(web_fetch::WebFetchTool));
     reg.register(Box::new(download_file::DownloadFileTool));
 }
@@ -33,4 +35,6 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
 }
 
 pub use ctf_challenge::CtfChallengeTool;
+pub use custom_tool::CustomTool;
 pub use save_memory::SaveMemoryTool;
+pub use search_tools::SearchToolsTool;

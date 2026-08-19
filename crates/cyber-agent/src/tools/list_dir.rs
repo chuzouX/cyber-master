@@ -16,6 +16,7 @@ impl Tool for ListDirTool {
         ToolSchema {
             name: "list_dir".into(),
             description: "列出目录条目（相对工作目录或绝对路径）".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {

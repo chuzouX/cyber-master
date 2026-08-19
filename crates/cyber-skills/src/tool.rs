@@ -46,6 +46,7 @@ impl Tool for SkillTool {
         ToolSchema {
             name: format!("skill_{}", s.name()),
             description: desc,
+            tags: vec![],
             // Skill 工具无需参数
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }

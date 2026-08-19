@@ -131,7 +131,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/mode" => vec!["chat", "workflow", "dashboard"],
         "/provider" => vec!["list", "add", "edit", "use", "remove"],
         "/sessions" => vec!["list", "read", "new"],
-        "/memory" => vec!["list", "add", "project"],
+        "/memory" => vec!["list", "add", "project", "edit", "delete"],
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
         _ => Vec::new(),

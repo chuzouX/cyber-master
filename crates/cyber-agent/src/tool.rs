@@ -7,6 +7,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,9 +19,13 @@ use crate::error::{AgentError, Result};
 pub struct ToolSchema {
     pub name: String,
     pub description: String,
-    /// 参数的 JSON Schema（`parameters`）。
+    /// 参数的 JSON Schema。
     pub parameters: Value,
+    /// 仅供本地工具发现使用，不发送给 provider。
+    pub tags: Vec<String>,
 }
+
+pub type ToolCatalog = Arc<RwLock<Vec<ToolSchema>>>;
 
 /// 工具执行结果。`content` 回灌给 LLM（作为 tool 结果消息）。
 #[derive(Debug, Clone)]
@@ -67,19 +72,35 @@ pub trait Tool: Send + Sync {
 /// 统一工具表：持有 `Box<dyn Tool>`，按名查找、批量导出 schema、统一执行。
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    catalog: ToolCatalog,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            catalog: Arc::new(RwLock::new(Vec::new())),
+        }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        let schema = tool.schema();
+        let mut catalog = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = catalog.iter().position(|item| item.name == schema.name) {
+            self.tools[index] = tool;
+            catalog[index] = schema;
+        } else {
+            self.tools.push(tool);
+            catalog.push(schema);
+        }
     }
 
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools.iter().map(|t| t.schema()).collect()
+        self.catalog.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn catalog(&self) -> ToolCatalog {
+        Arc::clone(&self.catalog)
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
@@ -153,6 +174,7 @@ mod tests {
                 name: "echo".into(),
                 description: "echo input".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                tags: vec![],
             }
         }
         fn run<'a>(
@@ -181,9 +203,8 @@ mod tests {
 
     #[tokio::test]
     async fn registry_lookup_and_execute() {
-        let reg = ToolRegistry {
-            tools: vec![Box::new(EchoTool)],
-        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(EchoTool));
         assert!(!reg.is_empty());
         assert_eq!(reg.schemas().len(), 1);
         assert_eq!(reg.schemas()[0].name, "echo");

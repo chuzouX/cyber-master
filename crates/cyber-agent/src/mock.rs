@@ -96,6 +96,7 @@ mod tests {
         StreamRequest::new(messages).with_tools(vec![ToolSchema {
             name: "list_dir".into(),
             description: "list directory".into(),
+            tags: vec![],
             parameters: serde_json::json!({"type": "object"}),
         }])
     }

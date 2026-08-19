@@ -27,7 +27,23 @@ const DRAIN_GRACE_MS: u64 = 500;
 /// 撑爆 TUI 缓冲与 LLM 上下文。流式推送与最终回灌共享此上限。
 const MAX_OUTPUT_BYTES: usize = 65536;
 
-pub struct ShellTool;
+pub struct ShellTool {
+    enforce_guard: bool,
+}
+
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self { enforce_guard: true }
+    }
+}
+
+impl ShellTool {
+    pub(crate) fn unchecked() -> Self {
+        Self {
+            enforce_guard: false,
+        }
+    }
+}
 
 /// 处理一行子进程输出：先经 `progress` 流式推送（若调用方消费），再累积进 `buf`。
 /// `buf` 超过 `MAX_OUTPUT_BYTES` 时截断头部保留尾部（在字符边界），并置 `truncated=true`；
@@ -110,6 +126,7 @@ impl Tool for ShellTool {
         ToolSchema {
             name: "shell".into(),
             description: "执行 shell 命令（受安全护栏约束；危险命令会被拒绝）。Windows 用 cmd /C，Unix 用 sh -c".into(),
+            tags: vec![],
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -141,11 +158,13 @@ impl Tool for ShellTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| AgentError::Provider("shell 缺少 command 参数".into()))?;
             // 护栏：denylist 命中 → 拒绝（结果回灌给 LLM，让其修正）
-            if let Err(reason) = check_command(command, ctx) {
-                return Ok(ToolOutput {
-                    content: reason,
-                    is_error: true,
-                });
+            if self.enforce_guard {
+                if let Err(reason) = check_command(command, ctx) {
+                    return Ok(ToolOutput {
+                        content: reason,
+                        is_error: true,
+                    });
+                }
             }
             let mut cmd = build_shell_command(command);
             // 强制子进程不缓冲 stdout/stderr：stdout 是 pipe（非 TTY）时，Python 等
@@ -194,7 +213,7 @@ impl Tool for ShellTool {
                     tokio::select! {
                         biased;
                         line = stdout_lines.next_line(), if !stdout_done => match line {
-                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
+                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
                             Ok(None) | Err(_) => stdout_done = true,
                         },
                         line = stderr_lines.next_line(), if !stderr_done => match line {
@@ -220,7 +239,7 @@ impl Tool for ShellTool {
                                     tokio::select! {
                                         biased;
                                         line = stdout_lines.next_line(), if !stdout_done => match line {
-                                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
+                                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
                                             Ok(None) | Err(_) => stdout_done = true,
                                         },
                                         line = stderr_lines.next_line(), if !stderr_done => match line {
@@ -295,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_echo() {
-        let out = ShellTool
+        let out = ShellTool::default()
             .run(json!({"command": "echo cyber_master"}), &ctx())
             .await
             .unwrap();
@@ -305,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_dangerous() {
-        let out = ShellTool
+        let out = ShellTool::default()
             .run(json!({"command": "rm -rf /"}), &ctx())
             .await
             .unwrap();
@@ -316,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_error() {
         let cmd = if cfg!(windows) { "exit /B 1" } else { "false" };
-        let out = ShellTool
+        let out = ShellTool::default()
             .run(json!({"command": cmd}), &ctx())
             .await
             .unwrap();
