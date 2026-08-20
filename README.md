@@ -134,6 +134,68 @@ history_retention_days = 90
 log_level = "info"
 ```
 
+### 自定义工具
+
+自定义工具通过 TOML 文件把安全、可重复的 shell 命令注册为 LLM 可调用工具。启动时扫描以下目录的顶层 `.toml` 文件：
+
+- 全局工具：`~/.cyber/tools/`
+- 项目工具：当前项目的 `.cyber/tools/`（若该目录存在）
+
+每个 TOML 文件定义一个工具。`name` 和 `command` 为必填项；`description`、`tags` 和 `parameters` 可选，但建议填写清晰的 `description`；解析失败、名称为空或命令为空的文件会被跳过，并在启动提示中报告错误。
+
+#### TOML 语法
+
+```toml
+# ~/.cyber/tools/ifconfig.toml
+name = "ifconfig"                              # 必填：小写字母、数字和下划线，建议唯一且语义清晰
+description = "查看本机网络接口配置"             # 必填：告诉模型工具做什么、何时使用
+command = "ipconfig /all"                       # 必填：在 shell 中执行的命令
+tags = ["recon", "network"]                    # 可选：供 search_tools 按标签发现
+
+[[parameters]]
+name = "target"                                 # 在 command 中对应 {target}
+description = "目标主机或 URL"                   # 参数说明
+required = true                                  # 可选，默认 false
+default = ""                                     # 可选；未提供参数时使用
+```
+
+参数使用 `[[parameters]]` 数组定义，并通过 `{参数名}`占位符写入 `command`。调用时工具名称自动加上 `custom_` 前缀，例如上例注册为 `custom_ifconfig`。参数值按“调用参数 → default → 空字符串”的顺序替换；因此可选参数可以省略。
+
+一个带默认值的完整例子：
+
+```toml
+name = "dirsearch"
+description = "对目标 URL 执行目录枚举"
+command = "python dirsearch.py -u {url} -e {extensions} -t {threads}"
+tags = ["web", "recon"]
+
+[[parameters]]
+name = "url"
+description = "目标 URL"
+required = true
+
+[[parameters]]
+name = "extensions"
+description = "扩展名列表"
+default = "php,html,js"
+
+[[parameters]]
+name = "threads"
+description = "并发线程数"
+default = "20"
+```
+
+保存文件后重启 Cyber Master，或从设置栏的 Custom Tools 面板确认是否加载。可用 `/tools` 查看已注册工具；带标签的工具也可通过 `search_tools` 发现。
+
+#### 安全与命名规范
+
+- 只加载可信来源的 TOML；`command` 会直接交给 Windows `cmd /C` 或 Unix `sh -c` 执行。
+- 参数值是字符串替换，不会自动转义或 Shell quoting；不要把不可信输入直接拼入命令。
+- 自定义工具不继承内置工具的 scope/rules 命令拦截，仅有 300 秒执行超时，因此请自行限制命令权限和输入范围。
+- 建议 `name` 使用 `^[a-z0-9_]+$`，避免与其他工具重名；注册后的完整名称为 `custom_<name>`。
+- `tags` 使用短的小写标签，例如 `ctf`、`web`、`recon`、`pwn`、`crypto`、`misc`；自定义标签也可以使用。
+
+更多执行流程、Schema 规则和排错说明见 [`docs/FEATURES.md`](docs/FEATURES.md) 的“自定义工具”章节。
 ### Provider 配置
 
 编辑 `~/.cyber/providers.toml`：
