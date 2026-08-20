@@ -14,7 +14,7 @@ pub mod paths;
 pub mod project;
 pub mod providers;
 
-pub use config::{Config, EnvConfig, EnvVar, ThinkingIntensity};
+pub use config::{Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity};
 pub use custom_tool::{
     load_custom_tools, CustomToolConfig, CustomToolParam, LoadedCustomTool,
 };

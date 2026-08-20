@@ -357,6 +357,11 @@ static SECTIONS: &[SectionDef] = &[
         editable: false,
         fields: &[],
     },
+    SectionDef {
+        name: "Memory",
+        editable: false,
+        fields: &[],
+    },
 ];
 
 /// 设置页视图状态。App 持有，跨次进入保留位置。
@@ -383,6 +388,7 @@ pub struct SettingsState {
     pub skills_selected: usize,
     /// Custom Tools 段 cursor（在工具列表中）。
     pub custom_tools_selected: usize,
+    pub memory_selected: usize,
     /// Providers 段 cursor 是否停在保存按钮行。
     pub provider_on_save: bool,
     /// MCP 段 cursor 是否停在保存按钮行。
@@ -407,6 +413,8 @@ pub const ENV_SECTION_IDX: usize = 7;
 pub const SKILLS_SECTION_IDX: usize = 8;
 /// Custom Tools 段在 SECTIONS 中的索引。
 pub const CUSTOM_TOOLS_SECTION_IDX: usize = 9;
+/// Memory section index.
+pub const MEMORY_SECTION_IDX: usize = 10;
 
 impl SettingsState {
     pub fn new() -> Self {
@@ -451,6 +459,11 @@ impl SettingsState {
     pub fn on_custom_tools_section(&self) -> bool {
         self.section == CUSTOM_TOOLS_SECTION_IDX
     }
+
+    pub fn on_memory_section(&self) -> bool { self.section == MEMORY_SECTION_IDX }
+
+    pub fn prev_memory(&mut self, len: usize) { if len > 0 { self.memory_selected = (self.memory_selected + len - 1) % len; } }
+    pub fn next_memory(&mut self, len: usize) { if len > 0 { self.memory_selected = (self.memory_selected + 1) % len; } }
 
     pub fn on_env_section(&self) -> bool {
         self.section == ENV_SECTION_IDX
@@ -823,7 +836,17 @@ fn render_fields(
     );
     lines.push(Line::from(""));
 
-    if section.editable {
+    if section.name == "Memory" {
+        if config.memory.rules.is_empty() {
+            lines.push(Line::from("(暂无 Memory Rule，使用 /memory rule add <scope> <提示> 添加)").style(Style::default().fg(theme.muted)));
+        } else {
+            for (i, rule) in config.memory.rules.iter().enumerate() {
+                let style = if i == state.memory_selected { Style::default().bg(theme.sel_bg).fg(theme.sel_fg) } else { Style::default().fg(theme.fg) };
+                lines.push(Line::from(format!("{}. [{}] {} {}", i + 1, if rule.enabled { "on" } else { "off" }, rule.scope, rule.prompt)).style(style));
+            }
+        }
+        lines.push(Line::from("规则通过自然语言提示控制哪些内容可写入记忆；可用 /memory rule 管理").style(Style::default().fg(theme.muted)));
+    } else     if section.editable {
         for (i, field) in section.fields.iter().enumerate() {
             let selected = i == state.selected && !state.on_save_row();
             let value = display_value(field, config);

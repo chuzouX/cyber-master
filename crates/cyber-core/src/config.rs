@@ -10,9 +10,27 @@ pub struct Config {
     pub tools: ToolsConfig,
     pub storage: StorageConfig,
     pub env: EnvConfig,
+    pub memory: MemoryConfig,
 }
 
 /// 环境变量配置：存储用户自定义 env vars，供 shell/agent 子进程注入。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    pub rules: Vec<MemoryRule>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self { Self { rules: vec![MemoryRule { enabled: true, scope: "both".into(), prompt: "只记录用户长期偏好、身份和项目约定。".into() }] } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRule {
+    pub enabled: bool,
+    pub scope: String,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnvConfig {

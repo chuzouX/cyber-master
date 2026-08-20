@@ -10,6 +10,7 @@ pub mod ctf_panel;
 pub mod env_form;
 pub mod mcp_form;
 pub mod model_picker;
+pub mod memory_rule_form;
 pub mod providers;
 pub mod sessions;
 pub mod settings;

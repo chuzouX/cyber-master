@@ -103,7 +103,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/memory",
-        usage: "/memory [list|add <text>|project <text>]",
+        usage: "/memory [list|add <text>|project <text>|edit <scope> <index> <text>|delete <scope> <index>|rule]",
         desc: "用户记忆：list 查看 / add 追加全局 / project 追加项目级",
     },
     CommandSpec {
@@ -131,7 +131,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/mode" => vec!["chat", "workflow", "dashboard"],
         "/provider" => vec!["list", "add", "edit", "use", "remove"],
         "/sessions" => vec!["list", "read", "new"],
-        "/memory" => vec!["list", "add", "project", "edit", "delete"],
+        "/memory" => vec!["list", "add", "project", "edit", "delete", "rule"],
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
         _ => Vec::new(),
@@ -177,7 +177,7 @@ pub enum SlashCommand {
     /// `/sessions <list|read <id|关键词>|new>` — 会话管理。
     /// 空串 / list → 打开 session 面板；read → 跨会话读取；new → 同 `/new`。
     Sessions(String),
-    /// `/memory [list|add <text>|project <text>]` — 用户记忆管理。
+    /// `/memory [list|add <text>|project <text>|edit <scope> <index> <text>|delete <scope> <index>|rule]` — 用户记忆管理。
     /// 空串 / list → 查看记忆；add <text> → 追加全局；project <text> → 追加项目级。
     Memory(String),
     /// `/quit` — 退出。
@@ -233,7 +233,7 @@ pub const HELP_TEXT: &str = "\
   /think [level]     查看或设置思考强度（low / middle / high / max / auto）
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
-  /memory <sub>      用户记忆：list 查看 | add <text> 全局 | project <text> 项目级
+  /memory <sub>      记忆管理：list | add | project | edit | delete | rule
   /quit              退出 Cyber Master";
 
 #[cfg(test)]

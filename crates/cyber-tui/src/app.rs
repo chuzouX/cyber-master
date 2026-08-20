@@ -58,6 +58,7 @@ use crate::views::ctf_edit_form::{CtfEditFormAction, CtfEditFormState};
 use crate::views::ctf_panel;
 use crate::views::mcp_form::{McpFormAction, McpFormState};
 use crate::views::env_form::{EnvFormAction, EnvFormState};
+use crate::views::memory_rule_form::{MemoryRuleFormAction, MemoryRuleFormState};
 use crate::views::providers::{FormAction, ProviderFormState};
 use crate::views::settings::{LiveApply, SettingsState};
 
@@ -79,6 +80,7 @@ pub enum Mode {
     Sessions,
     LogViewer,
     CtfEditForm,
+    MemoryRuleForm,
     About,
 }
 
@@ -94,6 +96,7 @@ impl Mode {
             Mode::McpForm => "MCP Form",
             Mode::EnvForm => "Env Form",
             Mode::CtfEditForm => "CTF Edit",
+            Mode::MemoryRuleForm => "Memory Rule",
             Mode::ModelPicker => "Model Picker",
             Mode::Sessions => "Sessions",
             Mode::LogViewer => "Logs",
@@ -394,6 +397,7 @@ pub struct App {
     env_form: Option<EnvFormState>,
     /// CTF 题目编辑表单状态（Mode::CtfEditForm 时 Some）。
     ctf_edit_form: Option<CtfEditFormState>,
+    memory_rule_form: Option<MemoryRuleFormState>,
     /// 是否强制使用 MockProvider（离线冒烟）。
     mock: bool,
     /// 统一工具表 + Skill / MCP 注册表（P3：跨 agent turn 共享）。
@@ -495,6 +499,7 @@ impl App {
             mcp_form: None,
             env_form: None,
             ctf_edit_form: None,
+            memory_rule_form: None,
             mock,
             registries,
             sessions: SessionIndex::default(),
@@ -680,6 +685,7 @@ impl App {
                     Mode::McpForm => self.handle_mcp_form_key(k),
                     Mode::EnvForm => self.handle_env_form_key(k),
                     Mode::CtfEditForm => self.handle_ctf_edit_form_key(k),
+                    Mode::MemoryRuleForm => self.handle_memory_rule_form_key(k),
                     Mode::ModelPicker => self.handle_model_picker_key(k),
                     Mode::Sessions => self.handle_sessions_key(k),
                     Mode::LogViewer => self.handle_log_viewer_key(k),
@@ -1310,6 +1316,21 @@ impl App {
     }
 
     /// CTF 编辑表单按键分发：委托 `form.handle_key`，按 `CtfEditFormAction` 执行副作用。
+    fn handle_memory_rule_form_key(&mut self, k: KeyEvent) {
+        let Some(form) = self.memory_rule_form.as_mut() else { return; };
+        match form.handle_key(k) {
+            MemoryRuleFormAction::None => {}
+            MemoryRuleFormAction::Cancel => { self.memory_rule_form = None; self.mode = Mode::Settings; }
+            MemoryRuleFormAction::Save => {
+                let form = self.memory_rule_form.take().unwrap();
+                let prompt = form.prompt.trim().to_string();
+                if prompt.is_empty() { self.toast = Some("empty rule".into()); self.memory_rule_form = Some(form); return; }
+                let rule = cyber_core::MemoryRule { enabled: form.enabled, scope: form.scope, prompt };
+                if let Some(i) = form.index { if i < self.config.memory.rules.len() { self.config.memory.rules[i] = rule; } } else { self.config.memory.rules.push(rule); self.settings.memory_selected = self.config.memory.rules.len().saturating_sub(1); }
+                self.settings.dirty = true; self.mode = Mode::Settings;
+            }
+        }
+    }
     fn handle_ctf_edit_form_key(&mut self, k: KeyEvent) {
         let Some(form) = self.ctf_edit_form.as_mut() else {
             return;
@@ -3008,7 +3029,7 @@ impl App {
                         Mode::Chat => Mode::Workflow,
                         Mode::Workflow => Mode::Dashboard,
                         Mode::Dashboard => Mode::Chat,
-                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::EnvForm | Mode::CtfEditForm | Mode::ModelPicker | Mode::Sessions | Mode::LogViewer | Mode::About => {
+                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::EnvForm | Mode::CtfEditForm | Mode::MemoryRuleForm | Mode::ModelPicker | Mode::Sessions | Mode::LogViewer | Mode::About => {
                             self.mode
                         }
                     };
@@ -3167,6 +3188,10 @@ impl App {
                     && !self.settings.env_on_save
                 {
                     self.open_env_form_add();
+                } else if self.mode == Mode::Settings && self.settings.on_memory_section() {
+                    self.memory_rule_form = Some(MemoryRuleFormState::new(None, None));
+                    self.form_prev_mode = Mode::Settings;
+                    self.mode = Mode::MemoryRuleForm;
                 }
             }
             Action::EditProvider => {
@@ -3508,6 +3533,7 @@ impl App {
                 &self.sessions,
             ),
             Mode::LogViewer => self.render_log_viewer(frame, area),
+            Mode::MemoryRuleForm => { if let Some(form) = &self.memory_rule_form { views::memory_rule_form::render(frame, area, &self.theme, form); } }
             Mode::About => views::about::render(frame, area, &self.theme),
         }
     }
