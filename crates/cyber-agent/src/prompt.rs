@@ -64,7 +64,7 @@ pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全�
 - 保存后简要确认即可，不要大段解释。\n\n\
 # Skill 使用（重要）\n\
 - Skill 是经过实战验证的方法论和操作手册。遇到安全测试、CTF 解题、漏洞利用等任务时，**先调用相关 skill 工具获取方法论**，再执行操作。\n\
-- Skill 工具命名为 `skill_<name>`，调用后返回详细使用说明（渐进式披露）。调用成本极低（无参数），但能避免大量试错。\n\
+- 可通过调用 `use_skill(name=\"<name>\")` 或 `skill_<name>()` 工具获取详细使用说明（渐进式披露）。调用成本极低，但能避免大量试错。\n\
 - 下方「可用 Skill」段落列出了所有 skill 的名称和简介。开始任务前扫描该列表，匹配到相关 skill 时**必须先调用**。\n\
 - 不要跳过 skill 直接用 curl/Python 操作——skill 中包含的关键步骤、检查点和常见坑能节省大量时间。\n\
 - 调用 skill 后按其指引执行；skill 引用的 .md 资源文件可用 read_file 读取获取更多细节。\n\n\
@@ -126,7 +126,7 @@ pub const CTF_PROMPT: &str = "\n\n# CTF 模式\n\
 ## 测试优先级（必须遵守）\n\
 CTF 解题按以下优先级推进，**严禁跳级**：\n\
 1. **信息收集**：先从题目描述、靶机响应、页面源码、HTTP 头、注释、robots.txt 等提取线索。每个线索都可能直接指向漏洞点。\n\
-2. **Skill 知识库**：根据线索匹配调用对应 `skill_<name>` 工具获取方法论。skill 中包含该类漏洞的检查清单和利用路径，按其指引执行。\n\
+2. **Skill 知识库**：根据线索匹配调用对应 `use_skill`（或 `skill_<name>`）工具获取方法论。skill 中包含该类漏洞的检查清单和利用路径，按其指引执行。\n\
 3. **工具测试**：基于前两步的线索和 skill 指引，用已有工具进行针对性测试。\n\
 4. **脚本/爆破**：仅当前三步均未突破时才考虑。且必须基于已有线索缩小范围，不做盲目爆破。\n\n\
 **禁止的行为：**\n\
@@ -165,7 +165,7 @@ pub fn build_system_prompt(
     // Skill 索引：非空时追加，让 agent 一眼看到有哪些 skill 可用
     if !skills.is_empty() {
         s.push_str("\n\n# 可用 Skill\n");
-        s.push_str("开始任务前扫描此列表，匹配到相关 skill 时先调用 `skill_<name>` 获取方法论：\n");
+        s.push_str("开始任务前扫描此列表，匹配到相关 skill 时先调用 `use_skill(name=\"...\")` 获取方法论：\n");
         for sk in skills {
             s.push_str(&format!("- skill_{}: {}\n", sk.name, sk.description));
         }
@@ -259,7 +259,12 @@ mod tests {
 
     #[test]
     fn empty_frontmatter_shows_placeholder() {
-        let s = build_system_prompt(Some(&ctx(ProjectFrontmatter::default())), ThinkingIntensity::Middle, &[], "");
+        let s = build_system_prompt(
+            Some(&ctx(ProjectFrontmatter::default())),
+            ThinkingIntensity::Middle,
+            &[],
+            "",
+        );
         assert!(s.contains("frontmatter 无结构化字段"));
         // rules 段仅在 frontmatter.rules 非空时追加
         assert!(!s.contains("# 安全护栏（必须遵守）"));
@@ -268,8 +273,14 @@ mod tests {
     #[test]
     fn skill_index_injected_when_non_empty() {
         let skills = vec![
-            SkillSummary { name: "hack".into(), description: "黑客攻击总入口".into() },
-            SkillSummary { name: "sqli".into(), description: "SQL 注入攻击".into() },
+            SkillSummary {
+                name: "hack".into(),
+                description: "黑客攻击总入口".into(),
+            },
+            SkillSummary {
+                name: "sqli".into(),
+                description: "SQL 注入攻击".into(),
+            },
         ];
         let s = build_system_prompt(None, ThinkingIntensity::Middle, &skills, "");
         assert!(s.contains("# 可用 Skill"), "应包含 skill 索引段落");
@@ -287,7 +298,12 @@ mod tests {
 
     #[test]
     fn memory_injected_when_non_empty() {
-        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "- 用户偏好 Python\n- 项目使用 Rust");
+        let s = build_system_prompt(
+            None,
+            ThinkingIntensity::Middle,
+            &[],
+            "- 用户偏好 Python\n- 项目使用 Rust",
+        );
         assert!(s.contains("# 用户记忆"), "应包含用户记忆段落");
         assert!(s.contains("用户偏好 Python"));
         assert!(s.contains("项目使用 Rust"));

@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 use crate::error::{McpError, Result};
 use crate::proto::{
     client_info, InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    McpToolSchema, PROTOCOL_VERSION, ToolListResult,
+    McpToolSchema, ToolListResult, PROTOCOL_VERSION,
 };
 use crate::sse::{extract_jsonrpc_responses, parse_sse_text, SseEvent, SseParser};
 use crate::transport::StdioTransport;
@@ -48,10 +48,7 @@ enum McpRequest {
         reply: oneshot::Sender<Result<Value>>,
     },
     /// 通知（无 id，无响应）：fire-and-forget 写 stdin。
-    Notification {
-        method: String,
-        params: Value,
-    },
+    Notification { method: String, params: Value },
     /// 关闭 actor：shutdown writer + 退出。
     Shutdown,
 }
@@ -81,11 +78,7 @@ impl McpConnection {
             tools: Vec::new(),
         };
         // 握手带 spec 超时（防子进程卡死）
-        let tools = match tokio::time::timeout(
-            Duration::from_secs(timeout),
-            conn.handshake(),
-        )
-        .await
+        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await
         {
             Ok(res) => res?,
             Err(_) => {
@@ -136,7 +129,8 @@ impl McpConnection {
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         };
-        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await {
+        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await
+        {
             Ok(res) => res?,
             Err(_) => {
                 return Err(McpError::Timeout {
@@ -174,14 +168,21 @@ impl McpConnection {
                 detail: format!("构建 HTTP client 失败: {e}"),
             })?;
         let headers = expand_env_headers(&spec.headers);
-        let (tx, handle) = start_sse_actor(server_name.clone(), client, sse_url.to_string(), headers, timeout);
+        let (tx, handle) = start_sse_actor(
+            server_name.clone(),
+            client,
+            sse_url.to_string(),
+            headers,
+            timeout,
+        );
         let conn = Self {
             server_name: server_name.clone(),
             tx,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         };
-        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await {
+        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await
+        {
             Ok(res) => res?,
             Err(_) => {
                 return Err(McpError::Timeout {
@@ -221,22 +222,20 @@ impl McpConnection {
         let init_val = self
             .call("initialize", serde_json::to_value(init_params)?)
             .await?;
-        let _init: InitializeResult = serde_json::from_value(init_val).map_err(|e| {
-            McpError::InitFailed {
+        let _init: InitializeResult =
+            serde_json::from_value(init_val).map_err(|e| McpError::InitFailed {
                 server: self.server_name.clone(),
                 detail: format!("initialize 响应解析失败: {e}"),
-            }
-        })?;
+            })?;
         // 通知 server 已初始化（spec 要求；fire-and-forget）
         self.send_notification("notifications/initialized", Value::Null);
         // tools/list
         let list_val = self.call("tools/list", Value::Null).await?;
-        let list: ToolListResult = serde_json::from_value(list_val).map_err(|e| {
-            McpError::InitFailed {
+        let list: ToolListResult =
+            serde_json::from_value(list_val).map_err(|e| McpError::InitFailed {
                 server: self.server_name.clone(),
                 detail: format!("tools/list 响应解析失败: {e}"),
-            }
-        })?;
+            })?;
         Ok(list.tools)
     }
 
@@ -567,26 +566,22 @@ async fn do_http_call(
         .unwrap_or("")
         .to_string();
 
-    let bytes = match tokio::time::timeout(
-        Duration::from_secs(CALL_TIMEOUT_SECS),
-        resp.bytes(),
-    )
-    .await
-    {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            return Err(McpError::Network {
-                server: server_name.into(),
-                detail: format!("读取 HTTP 响应 body 失败: {e}"),
-            })
-        }
-        Err(_) => {
-            return Err(McpError::Timeout {
-                server: server_name.into(),
-                secs: CALL_TIMEOUT_SECS,
-            })
-        }
-    };
+    let bytes =
+        match tokio::time::timeout(Duration::from_secs(CALL_TIMEOUT_SECS), resp.bytes()).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                return Err(McpError::Network {
+                    server: server_name.into(),
+                    detail: format!("读取 HTTP 响应 body 失败: {e}"),
+                })
+            }
+            Err(_) => {
+                return Err(McpError::Timeout {
+                    server: server_name.into(),
+                    secs: CALL_TIMEOUT_SECS,
+                })
+            }
+        };
 
     if content_type.contains("text/event-stream") {
         let text = String::from_utf8_lossy(&bytes);
@@ -1055,8 +1050,7 @@ mod tests {
         // actor 用 server_side_read（读 client 发的请求）+ server_side_write（写响应给 client）
         let (server_side_read, client_write) = duplex(8 * 1024);
         let (server_side_write, client_read) = duplex(8 * 1024);
-        let (tx, _handle) =
-            McpConnection::start_actor(server_side_read, server_side_write);
+        let (tx, _handle) = McpConnection::start_actor(server_side_read, server_side_write);
         let conn = Arc::new(McpConnection {
             server_name: "test".into(),
             tx,
@@ -1082,9 +1076,7 @@ mod tests {
 
         // 发起调用（后台）
         let conn_clone = conn.clone();
-        let task = tokio::spawn(async move {
-            conn_clone.call("tools/list", Value::Null).await
-        });
+        let task = tokio::spawn(async move { conn_clone.call("tools/list", Value::Null).await });
 
         // 模拟 server：读取请求，回响应
         let req = read_request(&mut client_read).await;
@@ -1105,7 +1097,9 @@ mod tests {
         let (conn, mut client_write, mut client_read) = make_test_conn().await;
         let conn_clone = conn.clone();
         let task = tokio::spawn(async move {
-            conn_clone.call_tool("ls", serde_json::json!({"path": "."})).await
+            conn_clone
+                .call_tool("ls", serde_json::json!({"path": "."}))
+                .await
         });
 
         let _req = read_request(&mut client_read).await;
@@ -1127,7 +1121,8 @@ mod tests {
         let task = tokio::spawn(async move { conn_clone.call("tools/list", Value::Null).await });
 
         let _req = read_request(&mut client_read).await;
-        let resp = r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let resp =
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}"#;
         client_write.write_all(resp.as_bytes()).await.unwrap();
         client_write.write_all(b"\n").await.unwrap();
         client_write.flush().await.unwrap();
@@ -1183,13 +1178,15 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_url_absolute_unchanged() {
-        let url = resolve_endpoint_url("http://127.0.0.1:9876/message", "http://127.0.0.1:9876/sse");
+        let url =
+            resolve_endpoint_url("http://127.0.0.1:9876/message", "http://127.0.0.1:9876/sse");
         assert_eq!(url, "http://127.0.0.1:9876/message");
     }
 
     #[test]
     fn resolve_endpoint_url_https_absolute_unchanged() {
-        let url = resolve_endpoint_url("https://api.example.com/mcp", "https://api.example.com/sse");
+        let url =
+            resolve_endpoint_url("https://api.example.com/mcp", "https://api.example.com/sse");
         assert_eq!(url, "https://api.example.com/mcp");
     }
 
@@ -1396,10 +1393,7 @@ mod http_sse_tests {
                 }),
                 false,
             ),
-            _ => (
-                serde_json::json!(null),
-                false,
-            ),
+            _ => (serde_json::json!(null), false),
         };
 
         let resp_obj = if method == "initialize" || method == "tools/list" || method == "tools/call"
@@ -1486,7 +1480,9 @@ mod http_sse_tests {
         );
         // 后续请求应回带 session id
         assert!(
-            ids.iter().skip(1).all(|id| id.as_deref() == Some("test-session-123")),
+            ids.iter()
+                .skip(1)
+                .all(|id| id.as_deref() == Some("test-session-123")),
             "后续请求应回带 Mcp-Session-Id=test-session-123，实际 {:?}",
             ids
         );
@@ -1566,10 +1562,7 @@ mod http_sse_tests {
 
     /// 从已读的整段请求文本中抽 body（split \r\n\r\n）。
     async fn read_body(_sock: &mut tokio::net::TcpStream, full: &str) -> String {
-        full.split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or("")
-            .to_string()
+        full.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
     }
 
     async fn handle_sse_get(

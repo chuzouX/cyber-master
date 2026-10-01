@@ -28,6 +28,7 @@ pub const CTF_PANEL_WIDTH: u16 = 52;
 /// - `detail_view`：false=列表视图, true=详情视图
 /// - `detail_scroll`：详情视图的垂直滚动偏移
 /// - `focused`：面板是否聚焦（影响边框颜色）
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -49,8 +50,11 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(
-            Line::from(title)
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(title).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(1, 1, 1, 1));
@@ -63,12 +67,30 @@ pub fn render(
     let hint_area = chunks[1];
 
     if detail_view {
-        render_detail(frame, content_area, hint_area, theme, challenges, selected, detail_scroll);
+        render_detail(
+            frame,
+            content_area,
+            hint_area,
+            theme,
+            challenges,
+            selected,
+            detail_scroll,
+        );
     } else {
-        render_list(frame, content_area, hint_area, theme, challenges, selected, focused, list_scroll);
+        render_list(
+            frame,
+            content_area,
+            hint_area,
+            theme,
+            challenges,
+            selected,
+            focused,
+            list_scroll,
+        );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list(
     frame: &mut Frame,
     content_area: Rect,
@@ -99,7 +121,11 @@ fn render_list(
             };
 
             // 第 1 行：序号 [分类]名称 状态（名称超长时自动换行）
-            let status_str = if c.is_solved() { "已完成" } else { "进行中" };
+            let status_str = if c.is_solved() {
+                "已完成"
+            } else {
+                "进行中"
+            };
             let status_color = if c.is_solved() {
                 theme.accent
             } else {
@@ -112,10 +138,7 @@ fn render_list(
             let global_marker = if c.is_global { "★" } else { " " };
             lines.push(Line::from(vec![
                 Span::raw(marker),
-                Span::styled(
-                    format!("{}. ", i + 1),
-                    Style::default().fg(theme.muted),
-                ),
+                Span::styled(format!("{}. ", i + 1), Style::default().fg(theme.muted)),
                 Span::styled(
                     format!("[{}]", c.category),
                     Style::default()
@@ -135,10 +158,7 @@ fn render_list(
             for extra in &name_parts[1..] {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(
-                        extra.clone(),
-                        row_style.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(extra.clone(), row_style.add_modifier(Modifier::BOLD)),
                 ]));
             }
 
@@ -148,10 +168,7 @@ fn render_list(
             let wp = if c.has_writeup() { "已写WP" } else { "" };
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(
-                    &c.start_time,
-                    Style::default().fg(theme.muted),
-                ),
+                Span::styled(&c.start_time, Style::default().fg(theme.muted)),
                 Span::raw("  "),
                 Span::styled(end_str, Style::default().fg(theme.muted)),
                 Span::raw("  "),
@@ -170,7 +187,10 @@ fn render_list(
         let prev = list_scroll.get().min(max_scroll);
 
         let sel_start = item_starts.get(selected).copied().unwrap_or(0);
-        let sel_end = item_starts.get(selected + 1).copied().unwrap_or(total_lines);
+        let sel_end = item_starts
+            .get(selected + 1)
+            .copied()
+            .unwrap_or(total_lines);
 
         let scroll = if total_lines <= visible_h {
             0
@@ -240,10 +260,15 @@ fn render_detail(
     lines.push(Line::raw(""));
 
     // 题目描述
-    lines.push(Span::styled(
-        "题目描述",
-        Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
-    ).into());
+    lines.push(
+        Span::styled(
+            "题目描述",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )
+        .into(),
+    );
     for l in wrap_text_by_width(&c.description, w) {
         lines.push(Line::from(l).style(Style::default().fg(theme.fg)));
     }
@@ -251,10 +276,15 @@ fn render_detail(
 
     // 靶机
     if let Some(target) = &c.target {
-        lines.push(Span::styled(
-            "靶机",
-            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
-        ).into());
+        lines.push(
+            Span::styled(
+                "靶机",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .into(),
+        );
         for l in wrap_text_by_width(target, w) {
             lines.push(Line::from(l).style(Style::default().fg(theme.fg)));
         }
@@ -263,10 +293,15 @@ fn render_detail(
 
     // Flag
     if let Some(flag) = &c.flag {
-        lines.push(Span::styled(
-            "Flag",
-            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
-        ).into());
+        lines.push(
+            Span::styled(
+                "Flag",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .into(),
+        );
         for l in wrap_text_by_width(flag, w) {
             lines.push(Line::from(l).style(Style::default().fg(theme.accent)));
         }
@@ -275,10 +310,15 @@ fn render_detail(
 
     // 标签
     if !c.tags.is_empty() {
-        lines.push(Span::styled(
-            "Tag",
-            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
-        ).into());
+        lines.push(
+            Span::styled(
+                "Tag",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .into(),
+        );
         for l in wrap_text_by_width(&c.tags.join("、"), w) {
             lines.push(Line::from(l).style(Style::default().fg(theme.fg)));
         }
@@ -288,11 +328,10 @@ fn render_detail(
     // 时间
     let end_str = c.end_time.as_deref().unwrap_or("--");
     let dur = c.duration_str().unwrap_or_else(|| "--".into());
-    lines.push(Line::from(format!(
-        "{} - {}  {}",
-        c.start_time, end_str, dur
-    ))
-    .style(Style::default().fg(theme.muted)));
+    lines.push(
+        Line::from(format!("{} - {}  {}", c.start_time, end_str, dur))
+            .style(Style::default().fg(theme.muted)),
+    );
     lines.push(Line::raw(""));
 
     // 分割线
@@ -300,10 +339,15 @@ fn render_detail(
     lines.push(Line::from(sep).style(Style::default().fg(theme.border)));
 
     // Writeup（Markdown 渲染）
-    lines.push(Span::styled(
-        "Writeup",
-        Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
-    ).into());
+    lines.push(
+        Span::styled(
+            "Writeup",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )
+        .into(),
+    );
     if let Some(wp) = &c.writeup {
         let wp_lines = crate::markdown::render(wp, theme);
         if wp_lines.is_empty() {
@@ -321,10 +365,15 @@ fn render_detail(
     lines.push(Line::from(sep).style(Style::default().fg(theme.border)));
 
     // 关键知识点
-    lines.push(Span::styled(
-        "关键知识点 / 卡点",
-        Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
-    ).into());
+    lines.push(
+        Span::styled(
+            "关键知识点 / 卡点",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )
+        .into(),
+    );
     if let Some(kp) = &c.key_points {
         for line in kp.lines() {
             for l in wrap_text_by_width(line, w) {

@@ -33,7 +33,10 @@ impl MockProvider {
 }
 
 impl Provider for MockProvider {
-    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+    fn stream(
+        &self,
+        req: StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let has_tool_result = req.messages.iter().any(|m| m.role == Role::Tool);
 
         // tool-loop 模式：tools 非空

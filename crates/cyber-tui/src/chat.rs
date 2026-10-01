@@ -392,7 +392,11 @@ impl ChatState {
         };
         let new = (cur as i32 + delta).clamp(0, max_scroll as i32) as usize;
         // 到底部 → 跟随；否则记录绝对偏移（内容增长时视图钉在原内容，不滑向新内容）
-        self.scroll_y = if new >= max_scroll { SCROLL_FOLLOW } else { new };
+        self.scroll_y = if new >= max_scroll {
+            SCROLL_FOLLOW
+        } else {
+            new
+        };
     }
 
     /// 跳到最新（底部）并恢复 auto-follow。submit/clear/cancel 后调用。
@@ -433,7 +437,11 @@ impl ChatState {
 
     /// 返回按 `width` 预折行的全部历史行（entries + 流式 tail）。key 命中则复用缓存。
     /// 调用方持 `Ref` 期间不可再 `borrow_mut`（render 切片后立即 drop）。
-    pub fn wrapped_lines(&self, theme: &Theme, width: u16) -> std::cell::Ref<'_, Vec<Line<'static>>> {
+    pub fn wrapped_lines(
+        &self,
+        theme: &Theme,
+        width: u16,
+    ) -> std::cell::Ref<'_, Vec<Line<'static>>> {
         {
             let mut wc = self.wrapped.borrow_mut();
             let key = (
@@ -604,7 +612,12 @@ impl ChatState {
     fn slash_menu_complete(&mut self) {
         match self.slash_menu.mode {
             SlashMenuMode::Command => {
-                if let Some(spec) = self.slash_menu.filtered.get(self.slash_menu.selected).copied() {
+                if let Some(spec) = self
+                    .slash_menu
+                    .filtered
+                    .get(self.slash_menu.selected)
+                    .copied()
+                {
                     self.input.clear();
                     self.input.insert_str(format!("{} ", spec.name));
                 }
@@ -612,7 +625,12 @@ impl ChatState {
                 self.update_slash_menu();
             }
             SlashMenuMode::Param => {
-                if let Some(param) = self.slash_menu.params.get(self.slash_menu.selected).copied() {
+                if let Some(param) = self
+                    .slash_menu
+                    .params
+                    .get(self.slash_menu.selected)
+                    .copied()
+                {
                     let line: String = self.input.lines().first().cloned().unwrap_or_default();
                     let trimmed = line.trim_start();
                     let cmd_end = trimmed.find(' ').unwrap_or(trimmed.len());
@@ -760,7 +778,11 @@ impl ChatState {
         self.flush_streaming_to_assistant();
         // 防御：新工具调用开始前清空残留的流式输出（正常情况下上一工具的 ToolResult 已清空）
         self.streaming_tool_output.clear();
-        self.entries.push(ChatEntry::ToolCall { id, name, arguments });
+        self.entries.push(ChatEntry::ToolCall {
+            id,
+            name,
+            arguments,
+        });
     }
 
     /// 收到工具执行增量输出（ToolProgress）：累积进 `streaming_tool_output`，由流式
@@ -772,8 +794,12 @@ impl ChatState {
     /// 收到工具结果事件：push ToolResult（紧随对应 ToolCall，无需 flush），并清空流式输出。
     pub fn push_tool_result(&mut self, id: String, name: String, output: String, is_error: bool) {
         self.streaming_tool_output.clear();
-        self.entries
-            .push(ChatEntry::ToolResult { id, name, output, is_error });
+        self.entries.push(ChatEntry::ToolResult {
+            id,
+            name,
+            output,
+            is_error,
+        });
     }
 
     /// 切换最后一个可折叠条目（工具结果或思考过程）的展开/折叠状态（Ctrl+O）。
@@ -782,9 +808,11 @@ impl ChatState {
     /// 下标为准（条目只追加不插入，下标稳定）。无可折叠条目时 no-op。
     /// 切换后 `invalidate_cache` 强制重渲染。
     pub fn toggle_last_tool_result_expansion(&mut self) {
-        if let Some(idx) = self.entries.iter().rposition(|e| {
-            matches!(e, ChatEntry::ToolResult { .. } | ChatEntry::Thinking(_))
-        }) {
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, ChatEntry::ToolResult { .. } | ChatEntry::Thinking(_)))
+        {
             if self.expanded_tool_results.contains(&idx) {
                 self.expanded_tool_results.remove(&idx);
             } else {
@@ -889,10 +917,14 @@ pub fn entries_to_messages(entries: &[ChatEntry]) -> Vec<Message> {
                 }
                 pending_assistant = Some(Message::assistant(c.clone()));
             }
-            ChatEntry::ToolCall { id, name, arguments } => {
+            ChatEntry::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 if completed.contains(id.as_str()) {
-                    let m = pending_assistant
-                        .get_or_insert_with(|| Message::assistant(String::new()));
+                    let m =
+                        pending_assistant.get_or_insert_with(|| Message::assistant(String::new()));
                     m.tool_calls.push(ToolCall {
                         id: id.clone(),
                         name: name.clone(),
@@ -980,7 +1012,12 @@ pub fn render_entries(
 ///
 /// 若 `tool_out` 非空（工具执行中，streaming_buffer 已 flush），改为渲染工具增量输出：
 /// 每行带 `→` 前缀（首行）/ 缩进（续行），末行带 ▌ 光标，实现「边执行边输出」。
-fn build_streaming_tail(buffer: &str, thinking: &str, tool_out: &str, theme: &Theme) -> Vec<Line<'static>> {
+fn build_streaming_tail(
+    buffer: &str,
+    thinking: &str,
+    tool_out: &str,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     // 思考过程（最新 3 行）
     if !thinking.is_empty() {
@@ -1004,7 +1041,9 @@ fn build_streaming_tail(buffer: &str, thinking: &str, tool_out: &str, theme: &Th
     }
     lines.push(Line::from(Span::styled(
         "[assistant]",
-        Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
     )));
     if buffer.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1032,9 +1071,7 @@ fn push_thinking_lines_streaming(lines: &mut Vec<Line<'static>>, theme: &Theme, 
         Span::styled("💭 ", Style::default()),
         Span::styled(
             "思考过程",
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
         ),
     ]));
     let show_count = 3.min(all_lines.len());
@@ -1154,7 +1191,9 @@ fn push_role_lines(
 fn push_assistant_lines(lines: &mut Vec<Line<'static>>, theme: &Theme, content: &str) {
     lines.push(Line::from(Span::styled(
         "[assistant]",
-        Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
     )));
     let md_lines = crate::markdown::render(content, theme);
     lines.extend(md_lines);
@@ -1166,7 +1205,9 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, theme: &Theme, name: &str, arg
     let mut spans = vec![
         Span::styled(
             "  ▶ ",
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("[tool] {name}"),
@@ -1180,10 +1221,7 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, theme: &Theme, name: &str, arg
     } else {
         format!("({arguments})")
     };
-    spans.push(Span::styled(
-        args_display,
-        Style::default().fg(theme.muted),
-    ));
+    spans.push(Span::styled(args_display, Style::default().fg(theme.muted)));
     lines.push(Line::from(spans));
 }
 
@@ -1224,9 +1262,7 @@ fn push_thinking_lines(
             Span::styled("  ⋮ ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("+{hidden} 行已折叠 · Ctrl+O 展开"),
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::DIM),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ),
         ]));
     } else {
@@ -1241,9 +1277,7 @@ fn push_thinking_lines(
                 Span::styled("  ⋮ ", Style::default().fg(theme.muted)),
                 Span::styled(
                     format!("共 {count} 行 · Ctrl+O 折叠"),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::DIM),
+                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
                 ),
             ]));
         }
@@ -1284,9 +1318,7 @@ fn push_tool_result(
             Span::styled("    ⋮ ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("+{hidden} 行已折叠 · Ctrl+O 展开"),
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::DIM),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ),
         ]));
     };
@@ -1295,9 +1327,7 @@ fn push_tool_result(
             Span::styled("    ⋮ ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("共 {total} 行 · Ctrl+O 折叠"),
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::DIM),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ),
         ]));
     };
@@ -1409,7 +1439,12 @@ mod tests {
     use cyber_agent::Role;
 
     fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new_with_kind_and_state(code, KeyModifiers::NONE, KeyEventKind::Press, KeyEventState::NONE)
+        KeyEvent::new_with_kind_and_state(
+            code,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+            KeyEventState::NONE,
+        )
     }
 
     fn key_with_mods(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -1426,7 +1461,7 @@ mod tests {
     fn paste_detector_rapid_keys_are_buffered() {
         let mut pd = PasteDetector::new();
         pd.observe(key(KeyCode::Char('a'))); // 第一次：Process
-        // 第二次立即：Buffer
+                                             // 第二次立即：Buffer
         assert_eq!(pd.observe(key(KeyCode::Char('b'))), KeyDisposition::Buffer);
         assert_eq!(pd.observe(key(KeyCode::Char('c'))), KeyDisposition::Buffer);
         let flushed = pd.flush().unwrap();
@@ -1448,7 +1483,7 @@ mod tests {
         let mut pd = PasteDetector::new();
         pd.observe(key(KeyCode::Char('a'))); // Process（首次）
         pd.observe(key(KeyCode::Char('b'))); // Buffer（快速）
-        // Ctrl+C：带修饰键 → 不缓冲，先 flush buffer 再处理 Ctrl+C
+                                             // Ctrl+C：带修饰键 → 不缓冲，先 flush buffer 再处理 Ctrl+C
         assert_eq!(
             pd.observe(key_with_mods(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             KeyDisposition::FlushThenProcess
@@ -1462,8 +1497,11 @@ mod tests {
         let mut pd = PasteDetector::new();
         pd.observe(key(KeyCode::Char('a'))); // Process
         pd.observe(key(KeyCode::Char('b'))); // Buffer
-        // Esc：特殊键 → FlushThenProcess
-        assert_eq!(pd.observe(key(KeyCode::Esc)), KeyDisposition::FlushThenProcess);
+                                             // Esc：特殊键 → FlushThenProcess
+        assert_eq!(
+            pd.observe(key(KeyCode::Esc)),
+            KeyDisposition::FlushThenProcess
+        );
         let flushed = pd.flush().unwrap();
         assert_eq!(flushed, "b");
     }
@@ -1479,7 +1517,7 @@ mod tests {
         let mut pd = PasteDetector::new();
         pd.observe(key(KeyCode::Char('a'))); // Process
         pd.observe(key(KeyCode::Char('b'))); // Buffer
-        // 手动设置 last_key_time 为很久以前
+                                             // 手动设置 last_key_time 为很久以前
         pd.last_key_time = Some(Instant::now() - Duration::from_millis(100));
         let flushed = pd.flush_if_stale();
         assert_eq!(flushed.as_deref(), Some("b"));
@@ -1492,7 +1530,7 @@ mod tests {
         let mut pd = PasteDetector::new();
         pd.observe(key(KeyCode::Char('a'))); // Process
         pd.observe(key(KeyCode::Char('b'))); // Buffer
-        // 刚刚按键，还没超时
+                                             // 刚刚按键，还没超时
         assert!(pd.flush_if_stale().is_none());
     }
 
@@ -1538,7 +1576,10 @@ mod tests {
         s.input.insert_str("你好");
         let (text, history) = s.submit().expect("非空非流式应返回 Some");
         assert_eq!(text, "你好");
-        assert!(history.is_empty(), "首次提交 history 应为空（不含当前输入）");
+        assert!(
+            history.is_empty(),
+            "首次提交 history 应为空（不含当前输入）"
+        );
         assert_eq!(s.entries.len(), 1);
         assert!(matches!(s.entries[0], ChatEntry::User(ref c) if c == "你好"));
         assert!(s.streaming, "submit 后应进入 streaming 态");
@@ -1775,7 +1816,9 @@ mod tests {
         s.push_tool_call("c1".into(), "list_dir".into(), "{}".into());
         s.push_tool_result("c1".into(), "list_dir".into(), "a.txt".into(), false);
         assert_eq!(s.entries.len(), 2);
-        assert!(matches!(&s.entries[1], ChatEntry::ToolResult { output, is_error, .. } if output == "a.txt" && !is_error));
+        assert!(
+            matches!(&s.entries[1], ChatEntry::ToolResult { output, is_error, .. } if output == "a.txt" && !is_error)
+        );
     }
 
     /// 工具字符串转单行拼接（含 marker），便于断言折叠提示是否出现。
@@ -1801,7 +1844,10 @@ mod tests {
         let lines = render_entries(&entries, &theme, &expanded, 80);
         let text = tool_lines_to_text(&lines);
         // 5 行 > 3 → 折叠，出现提示与 +2（隐藏 2 行）
-        assert!(text.contains("Ctrl+O 展开"), "折叠态应含 Ctrl+O 展开提示: {text}");
+        assert!(
+            text.contains("Ctrl+O 展开"),
+            "折叠态应含 Ctrl+O 展开提示: {text}"
+        );
         assert!(text.contains("+2 行已折叠"), "应显示隐藏行数: {text}");
         // 仅显示最后 3 行（l3/l4/l5），不含 l1/l2
         assert!(!text.contains("l1"), "折叠态不应含 l1: {text}");
@@ -1853,7 +1899,8 @@ mod tests {
         // 窄宽度（20 列）下，80 字符的单行会折为多行 → 触发折叠。
         let theme = Theme::resolve("cyberpunk");
         let expanded = HashSet::new();
-        let long_json = "{\"has_response\":true,\"url\":\"http://example.com/view.php\",\"status_code\":200}";
+        let long_json =
+            "{\"has_response\":true,\"url\":\"http://example.com/view.php\",\"status_code\":200}";
         let entries = vec![ChatEntry::ToolResult {
             id: "c1".into(),
             name: "mcp_tool".into(),
@@ -2094,7 +2141,11 @@ mod tests {
         s.set_scroll_metrics(40, 10);
         // PageUp: delta = -(visible=10)
         s.scroll_history(-10);
-        assert_eq!(s.resolved_scroll_offset(30), 20, "max=30, 上滚 10 → 偏移 20");
+        assert_eq!(
+            s.resolved_scroll_offset(30),
+            20,
+            "max=30, 上滚 10 → 偏移 20"
+        );
     }
 
     #[test]
@@ -2285,10 +2336,7 @@ mod tests {
         s.input.insert_str("/");
         s.update_slash_menu();
         // 字母键未被菜单消费 → 返回 false（App 会把字符送 textarea 再 refilter）
-        assert!(!s.slash_menu_key(KeyEvent::new(
-            KeyCode::Char('m'),
-            KeyModifiers::NONE,
-        )));
+        assert!(!s.slash_menu_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE,)));
     }
 
     #[test]
@@ -2383,7 +2431,10 @@ mod tests {
         assert_eq!(s.input.lines().join("\n"), "b");
         // ↓ 到头 → 清空 + 退出浏览
         assert!(s.history_next());
-        assert!(s.input.lines().iter().all(|l| l.is_empty()), "到头应清空输入");
+        assert!(
+            s.input.lines().iter().all(|l| l.is_empty()),
+            "到头应清空输入"
+        );
         // 再 ↓：未浏览态 → 返回 false
         assert!(!s.history_next());
     }
@@ -2410,7 +2461,11 @@ mod tests {
         s.entries.push(ChatEntry::Assistant("a1".into()));
         s.entries.push(ChatEntry::User("q2".into()));
         s.seed_input_history();
-        assert_eq!(s.input_history.entries, vec!["q1", "q2"], "应只取 User 条目");
+        assert_eq!(
+            s.input_history.entries,
+            vec!["q1", "q2"],
+            "应只取 User 条目"
+        );
     }
 
     #[test]

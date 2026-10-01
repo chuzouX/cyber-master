@@ -123,19 +123,15 @@ impl Tool for DownloadFileTool {
             // 检查文件是否已存在
             if output_path.exists() && !overwrite {
                 return Ok(ToolOutput {
-                    content: format!(
-                        "文件已存在且 overwrite=false：{}",
-                        output_path.display()
-                    ),
+                    content: format!("文件已存在且 overwrite=false：{}", output_path.display()),
                     is_error: false,
                 });
             }
 
             // 创建父目录
             if let Some(parent) = output_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    AgentError::Provider(format!("创建目录失败: {e}"))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| AgentError::Provider(format!("创建目录失败: {e}")))?;
             }
 
             // 构建 HTTP 客户端
@@ -149,9 +145,8 @@ impl Tool for DownloadFileTool {
             }
 
             if let Some(proxy_url) = proxy {
-                let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
-                    AgentError::Provider(format!("代理配置失败: {e}"))
-                })?;
+                let proxy = reqwest::Proxy::all(proxy_url)
+                    .map_err(|e| AgentError::Provider(format!("代理配置失败: {e}")))?;
                 client_builder = client_builder.proxy(proxy);
             }
 
@@ -189,9 +184,8 @@ impl Tool for DownloadFileTool {
             let elapsed = start.elapsed();
 
             // 写入文件
-            std::fs::write(&output_path, &body).map_err(|e| {
-                AgentError::Provider(format!("写入文件失败: {e}"))
-            })?;
+            std::fs::write(&output_path, &body)
+                .map_err(|e| AgentError::Provider(format!("写入文件失败: {e}")))?;
 
             let size = body.len();
             let size_str = if size >= 1024 * 1024 {
@@ -229,13 +223,12 @@ impl Tool for DownloadFileTool {
 
 /// 解析输出路径：如果是目录，从 URL 提取文件名。
 fn resolve_output_path(output: &str, url: &str, cwd: &std::path::Path) -> Result<PathBuf> {
-    let resolved = resolve_under_cwd(std::path::Path::new(output), cwd)
-        .map_err(AgentError::Provider)?;
+    let resolved =
+        resolve_under_cwd(std::path::Path::new(output), cwd).map_err(AgentError::Provider)?;
 
     // 如果路径以 / 或 \ 结尾，或者已存在且是目录，从 URL 提取文件名
-    let needs_filename = output.ends_with('/')
-        || output.ends_with('\\')
-        || (resolved.exists() && resolved.is_dir());
+    let needs_filename =
+        output.ends_with('/') || output.ends_with('\\') || (resolved.exists() && resolved.is_dir());
 
     if needs_filename {
         let filename = extract_filename_from_url(url)
@@ -321,10 +314,7 @@ mod tests {
 
     #[test]
     fn extract_filename_trailing_slash() {
-        assert_eq!(
-            extract_filename_from_url("https://example.com/dir/"),
-            None
-        );
+        assert_eq!(extract_filename_from_url("https://example.com/dir/"), None);
     }
 
     #[test]
@@ -337,9 +327,11 @@ mod tests {
     #[test]
     fn resolve_output_path_directory_appends_filename() {
         let cwd = std::path::Path::new("/tmp");
-        let path =
-            resolve_output_path("downloads/", "https://x.com/archive.tar.gz", cwd).unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/tmp/downloads/archive.tar.gz"));
+        let path = resolve_output_path("downloads/", "https://x.com/archive.tar.gz", cwd).unwrap();
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/downloads/archive.tar.gz")
+        );
     }
 
     #[test]

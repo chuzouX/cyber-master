@@ -18,11 +18,9 @@ use tracing::{debug, warn};
 
 use cyber_core::{Config, ProjectContext, ProviderConfig, ProvidersConfig, ThinkingIntensity};
 
-use crate::compact::{
-    auto_compact_threshold, compact_messages, estimate_messages_tokens,
-};
+use crate::compact::{auto_compact_threshold, compact_messages, estimate_messages_tokens};
 use crate::error::{AgentError, Result};
-use crate::prompt::{build_system_prompt, CTF_PROMPT, SkillSummary};
+use crate::prompt::{build_system_prompt, SkillSummary, CTF_PROMPT};
 use crate::provider::{provider_factory, Provider, StreamRequest};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Usage};
@@ -68,8 +66,7 @@ impl LoopDetector {
     fn observe(&mut self, calls: &BTreeMap<u32, ToolCall>) -> (bool, bool) {
         let fp = fingerprint(calls);
         let is_consecutive_dup = Some(&fp) == self.last_fingerprint.as_ref();
-        let is_non_consecutive_dup =
-            !is_consecutive_dup && self.seen_fingerprints.contains(&fp);
+        let is_non_consecutive_dup = !is_consecutive_dup && self.seen_fingerprints.contains(&fp);
 
         if is_consecutive_dup {
             self.repeat_count += 1;
@@ -163,7 +160,9 @@ async fn run_inner(
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
-        AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
+        AgentError::Provider(format!(
+            "default_provider '{name}' 未在 providers.toml 配置"
+        ))
     })?;
     debug!(provider = %name, kind = %cfg.kind, mock, gen, "启动 agent loop");
 
@@ -171,7 +170,7 @@ async fn run_inner(
     let resolved = intensity.resolve(ctf_enabled);
     // 从工具注册表中提取 skill 摘要，注入系统提示词的「可用 Skill」索引段落
     let skill_summaries: Vec<SkillSummary> = registry
-        .schemas()
+        .all_schemas()
         .iter()
         .filter(|s| s.name.starts_with("skill_"))
         .filter(|s| !s.description.contains("仅显式调用"))
@@ -186,7 +185,10 @@ async fn run_inner(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            SkillSummary { name, description: desc }
+            SkillSummary {
+                name,
+                description: desc,
+            }
         })
         .collect();
     let mut system = build_system_prompt(project, resolved, &skill_summaries, memory);
@@ -203,7 +205,12 @@ async fn run_inner(
         .iter()
         .map(|v| (v.key.clone(), v.value.clone()))
         .collect();
-    let ctx = ToolCtx { cwd, rules, scope, env };
+    let ctx = ToolCtx {
+        cwd,
+        rules,
+        scope,
+        env,
+    };
 
     // tools：auto_tool_call 开启且注册表非空时才暴露工具
     let tools = if config.agent.auto_tool_call && !registry.is_empty() {
@@ -277,52 +284,110 @@ async fn run_inner(
             return Ok(());
         }
 
-        // 有工具调用：push assistant(text + tool_calls)
+        // 有工具调用：先保证写入历史的 arguments 一定是合法 JSON。
+        // provider 会在下一轮严格校验 assistant.tool_calls，不能把原始非法字符串带回去。
+        let history_calls = sanitized_tool_calls(&calls);
         let mut assistant_msg = Message::assistant(text);
-        assistant_msg.tool_calls = calls.values().cloned().collect();
+        assistant_msg.tool_calls = history_calls.values().cloned().collect();
         messages.push(assistant_msg);
 
         // 逐个执行工具调用，结果回灌
-        for call in calls.values() {
+        for (index, call) in &calls {
+            let raw_args = call.arguments.trim();
+            let parsed_input = if raw_args.is_empty() {
+                Some(Value::Object(serde_json::Map::new()))
+            } else {
+                match serde_json::from_str::<Value>(raw_args) {
+                    Ok(Value::Object(input)) => Some(Value::Object(input)),
+                    Ok(other) => {
+                        warn!(
+                            gen,
+                            tool = %call.name,
+                            call_id = %call.id,
+                            arguments = %truncate_for_log(raw_args),
+                            json_type = %json_type_name(&other),
+                            "工具调用参数不是 JSON 对象，拒绝执行"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(
+                            gen,
+                            tool = %call.name,
+                            call_id = %call.id,
+                            arguments = %truncate_for_log(raw_args),
+                            error = %error,
+                            "工具调用参数不是合法 JSON，拒绝执行"
+                        );
+                        None
+                    }
+                }
+            };
+
+            debug!(
+                gen,
+                tool = %call.name,
+                call_id = %call.id,
+                arguments = %truncate_for_log(raw_args),
+                valid_json_object = parsed_input.is_some(),
+                "执行工具前记录最终参数"
+            );
             let _ = tx.send((
                 gen,
                 AgentEvent::ToolCall {
                     id: call.id.clone(),
                     name: call.name.clone(),
-                    arguments: call.arguments.clone(),
+                    arguments: history_calls
+                        .get(index)
+                        .map(|c| c.arguments.clone())
+                        .unwrap_or_else(|| "{}".into()),
                 },
             ));
-            let input: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-            // 流式执行：progress 通道把 shell 逐行输出实时推给 TUI；agent 边等结果边转发。
-            // 非流式工具（read_file 等）走 trait 默认实现，progress 通道不会收到任何 chunk。
-            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let mut exec =
-                Box::pin(registry.execute_streaming(&call.name, input, &ctx, Some(progress_tx)));
-            let out = loop {
-                tokio::select! {
-                    biased;
-                    res = exec.as_mut() => {
-                        break match res {
-                            Ok(o) => o,
-                            Err(e) => ToolOutput {
-                                content: e.to_string(),
-                                is_error: true,
-                            },
-                        };
-                    }
-                    chunk = progress_rx.recv() => {
-                        if let Some(chunk) = chunk {
-                            let _ = tx.send((
-                                gen,
-                                AgentEvent::ToolProgress {
-                                    id: call.id.clone(),
-                                    name: call.name.clone(),
-                                    chunk,
-                                },
-                            ));
+            let out = match parsed_input {
+                Some(input) => {
+                    // 流式执行：progress 通道把 shell 逐行输出实时推给 TUI；agent 边等结果边转发。
+                    // 非流式工具（read_file 等）走 trait 默认实现，progress 通道不会收到任何 chunk。
+                    let (progress_tx, mut progress_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let mut exec = Box::pin(registry.execute_streaming(
+                        &call.name,
+                        input,
+                        &ctx,
+                        Some(progress_tx),
+                    ));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            res = exec.as_mut() => {
+                                break match res {
+                                    Ok(o) => o,
+                                    Err(e) => ToolOutput {
+                                        content: e.to_string(),
+                                        is_error: true,
+                                    },
+                                };
+                            }
+                            chunk = progress_rx.recv() => {
+                                if let Some(chunk) = chunk {
+                                    let _ = tx.send((
+                                        gen,
+                                        AgentEvent::ToolProgress {
+                                            id: call.id.clone(),
+                                            name: call.name.clone(),
+                                            chunk,
+                                        },
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
+                None => ToolOutput {
+                    content:
+                        "工具调用参数不是合法 JSON 对象，未执行工具；请重新发送完整 JSON 参数。"
+                            .into(),
+                    is_error: true,
+                },
             };
             let _ = tx.send((
                 gen,
@@ -349,7 +414,12 @@ async fn run_inner(
             ));
         }
         if loop_triggered {
-            warn!(step, gen, repeat_count = detector.repeat_count, "检测到连续重复工具调用，提前中止 agent loop");
+            warn!(
+                step,
+                gen,
+                repeat_count = detector.repeat_count,
+                "检测到连续重复工具调用，提前中止 agent loop"
+            );
             loop_detected = true;
             break;
         }
@@ -362,7 +432,10 @@ async fn run_inner(
     // `accumulate_stream` → `AgentEvent::Token` 流式回传 TUI。发 `Done` 而非 `Error`
     // → TUI 走正常定稿（总结文本成为 assistant 条目进入 history，使「继续」有上下文）。
     let wrap = if loop_detected {
-        warn!(max_steps, gen, "agent loop 因连续重复工具调用提前中止，进入收尾总结");
+        warn!(
+            max_steps,
+            gen, "agent loop 因连续重复工具调用提前中止，进入收尾总结"
+        );
         "（系统提示：检测到连续多次相同的工具调用，可能已陷入循环。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）".to_string()
     } else {
         warn!(max_steps, gen, "agent loop 超过最大步数，进入收尾总结");
@@ -423,7 +496,7 @@ async fn do_compact(
     let before_tokens = estimate_messages_tokens(messages);
     let _ = tx.send((gen, AgentEvent::Compacting { is_auto }));
     let summary_msg = compact_messages(provider, system, messages, custom_instructions).await?;
-    let after_tokens = estimate_messages_tokens(&[summary_msg.clone()]);
+    let after_tokens = estimate_messages_tokens(std::slice::from_ref(&summary_msg));
     *messages = vec![summary_msg.clone()];
     let _ = tx.send((
         gen,
@@ -521,7 +594,9 @@ async fn run_writeup_inner(
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
-        AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
+        AgentError::Provider(format!(
+            "default_provider '{name}' 未在 providers.toml 配置"
+        ))
     })?;
     let provider = provider_factory(cfg, mock)?;
 
@@ -534,8 +609,7 @@ async fn run_writeup_inner(
 - 直接输出完整的 Markdown writeup 正文，从标题开始，不要输出任何与正文无关的说明。",
         skill_body
     );
-    let req = StreamRequest::new(vec![Message::user(challenge_context)])
-        .with_system(system);
+    let req = StreamRequest::new(vec![Message::user(challenge_context)]).with_system(system);
     let mut stream = provider.stream(req);
     while let Some(ev) = stream.next().await {
         match ev {
@@ -558,6 +632,7 @@ async fn run_writeup_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact_inner(
     config: &Config,
     providers: &ProvidersConfig,
@@ -570,7 +645,9 @@ async fn run_compact_inner(
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
-        AgentError::Provider(format!("default_provider '{name}' 未在 providers.toml 配置"))
+        AgentError::Provider(format!(
+            "default_provider '{name}' 未在 providers.toml 配置"
+        ))
     })?;
     let provider = provider_factory(cfg, mock)?;
     let system = build_system_prompt(project, ThinkingIntensity::Middle, &[], "");
@@ -635,6 +712,50 @@ async fn accumulate_stream(
     (text, calls, usage)
 }
 
+/// 将工具调用参数规范化后写入 assistant 历史，避免非法 JSON 被 provider 拒绝。
+fn sanitized_tool_calls(calls: &BTreeMap<u32, ToolCall>) -> BTreeMap<u32, ToolCall> {
+    calls
+        .iter()
+        .map(|(index, call)| {
+            let arguments = match serde_json::from_str::<Value>(call.arguments.trim()) {
+                Ok(Value::Object(_)) => call.arguments.clone(),
+                _ => "{}".to_string(),
+            };
+            (
+                *index,
+                ToolCall {
+                    arguments,
+                    ..call.clone()
+                },
+            )
+        })
+        .collect()
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn truncate_for_log(value: &str) -> String {
+    const MAX: usize = 512;
+    let mut end = value.len().min(MAX);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = value[..end].to_string();
+    if end < value.len() {
+        result.push_str("...");
+    }
+    result
+}
+
 /// 把一个 `ToolCallDelta` 片段合并进 `calls` 累积器（按 index）。
 /// 首片带 id+name 时初始化；后续片段只 append arguments_fragment。
 fn accumulate_tool_delta(calls: &mut BTreeMap<u32, ToolCall>, d: ToolCallDelta) {
@@ -643,14 +764,18 @@ fn accumulate_tool_delta(calls: &mut BTreeMap<u32, ToolCall>, d: ToolCallDelta) 
         name: String::new(),
         arguments: String::new(),
     });
-    if let Some(id) = d.id {
-        if !id.is_empty() {
-            entry.id = id;
+    if entry.id.is_empty() {
+        if let Some(id) = d.id {
+            if !id.is_empty() {
+                entry.id = id;
+            }
         }
     }
-    if let Some(name) = d.name {
-        if !name.is_empty() {
-            entry.name = name;
+    if entry.name.is_empty() {
+        if let Some(name) = d.name {
+            if !name.is_empty() {
+                entry.name = name;
+            }
         }
     }
     entry.arguments.push_str(&d.arguments_fragment);
@@ -698,6 +823,39 @@ mod tests {
         assert_eq!(tc.id, "call_1");
         assert_eq!(tc.name, "list_dir");
         assert_eq!(tc.arguments, "{\"path\":\".\"}");
+    }
+
+    #[test]
+    fn sanitized_tool_calls_replaces_invalid_arguments() {
+        let mut calls = BTreeMap::new();
+        calls.insert(
+            0,
+            ToolCall {
+                id: "ok".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            },
+        );
+        calls.insert(
+            1,
+            ToolCall {
+                id: "bad".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.txt""#.into(),
+            },
+        );
+        calls.insert(
+            2,
+            ToolCall {
+                id: "array".into(),
+                name: "read_file".into(),
+                arguments: "[]".into(),
+            },
+        );
+        let sanitized = sanitized_tool_calls(&calls);
+        assert_eq!(sanitized[&0].arguments, r#"{"path":"a.txt"}"#);
+        assert_eq!(sanitized[&1].arguments, "{}");
+        assert_eq!(sanitized[&2].arguments, "{}");
     }
 
     #[test]

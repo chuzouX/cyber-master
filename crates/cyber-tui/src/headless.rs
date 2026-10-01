@@ -19,9 +19,7 @@ use cyber_core::{load_app_context, MemoryStore, ThinkingIntensity};
 
 use crate::bootstrap::build_registries;
 use crate::chat::{entries_to_messages, ChatEntry};
-use crate::history::{
-    create_session_meta, load_entries, load_index, save_current, save_index,
-};
+use crate::history::{create_session_meta, load_entries, load_index, save_current, save_index};
 
 /// `cyber run` 的参数。
 #[derive(Debug, Clone)]
@@ -183,7 +181,11 @@ pub async fn run_headless(cwd: &Path, args: HeadlessArgs) -> HeadlessOutcome {
                     eprint!("{t}");
                 }
             }
-            AgentEvent::ToolCall { id, name, arguments } => {
+            AgentEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 tool_calls.push(ToolCallRecord {
                     id,
                     name,
@@ -192,7 +194,12 @@ pub async fn run_headless(cwd: &Path, args: HeadlessArgs) -> HeadlessOutcome {
                     is_error: false,
                 });
             }
-            AgentEvent::ToolResult { id, name, output, is_error } => {
+            AgentEvent::ToolResult {
+                id,
+                name,
+                output,
+                is_error,
+            } => {
                 // 按工具调用 id 关联结果（工具串行执行，id 唯一）
                 if let Some(rec) = tool_calls.iter_mut().find(|r| r.id == id) {
                     rec.output = output.clone();

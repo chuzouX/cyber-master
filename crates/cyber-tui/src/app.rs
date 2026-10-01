@@ -48,16 +48,16 @@ use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
 
 use crate::chat::{ChatEntry, ChatState};
+use crate::ctf_store;
 use crate::event::{chat_key_to_action, key_to_action, Action, ChatAction};
 use crate::history::{SessionIndex, SessionMeta};
 use crate::slash::{parse as parse_slash, SlashCommand, HELP_TEXT as SLASH_HELP};
 use crate::theme::Theme;
-use crate::ctf_store;
 use crate::views;
 use crate::views::ctf_edit_form::{CtfEditFormAction, CtfEditFormState};
 use crate::views::ctf_panel;
-use crate::views::mcp_form::{McpFormAction, McpFormState};
 use crate::views::env_form::{EnvFormAction, EnvFormState};
+use crate::views::mcp_form::{McpFormAction, McpFormState};
 use crate::views::memory_rule_form::{MemoryRuleFormAction, MemoryRuleFormState};
 use crate::views::providers::{FormAction, ProviderFormState};
 use crate::views::settings::{LiveApply, SettingsState};
@@ -154,7 +154,10 @@ impl std::fmt::Debug for AppRegistries {
             .field("mcp", &self.mcp.as_ref().map(|m| m.len()))
             .field(
                 "ctf_challenges",
-                &self.ctf_challenges.as_ref().map(|c| c.lock().map(|g| g.len()).unwrap_or(0)),
+                &self
+                    .ctf_challenges
+                    .as_ref()
+                    .map(|c| c.lock().map(|g| g.len()).unwrap_or(0)),
             )
             .finish()
     }
@@ -205,10 +208,7 @@ impl UsageStats {
     /// 计算成本（美元）。需提供价格配置。
     pub(crate) fn cost(&self, price: &cyber_core::PriceConfig) -> f64 {
         let miss_cost = price.input_per_m.unwrap_or(0.0) * self.cache_miss as f64 / 1_000_000.0;
-        let hit_cost = price
-            .cache_hit_per_m
-            .or(price.input_per_m)
-            .unwrap_or(0.0)
+        let hit_cost = price.cache_hit_per_m.or(price.input_per_m).unwrap_or(0.0)
             * self.cache_hit as f64
             / 1_000_000.0;
         let out_cost = price.output_per_m.unwrap_or(0.0) * self.completion as f64 / 1_000_000.0;
@@ -610,11 +610,7 @@ impl App {
             .cloned()
             .collect();
         ctf_store::save_challenges(&self.paths.ctf_dir, &global);
-        ctf_store::save_session_challenges(
-            &self.paths.ctf_dir,
-            &self.sessions.current,
-            &session,
-        );
+        ctf_store::save_session_challenges(&self.paths.ctf_dir, &self.sessions.current, &session);
     }
 
     async fn main_loop(
@@ -689,7 +685,11 @@ impl App {
                     Mode::ModelPicker => self.handle_model_picker_key(k),
                     Mode::Sessions => self.handle_sessions_key(k),
                     Mode::LogViewer => self.handle_log_viewer_key(k),
-                    Mode::Welcome | Mode::Workflow | Mode::Dashboard | Mode::Settings | Mode::About => {
+                    Mode::Welcome
+                    | Mode::Workflow
+                    | Mode::Dashboard
+                    | Mode::Settings
+                    | Mode::About => {
                         self.handle_action(key_to_action(k));
                     }
                 }
@@ -899,12 +899,20 @@ impl App {
                     self.chat.thinking_buffer.push_str(&t);
                 }
             }
-            AgentEvent::ToolCall { id, name, arguments } => {
+            AgentEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 if self.chat.streaming {
                     self.chat.push_tool_call(id, name, arguments);
                 }
             }
-            AgentEvent::ToolProgress { id: _, name: _, chunk } => {
+            AgentEvent::ToolProgress {
+                id: _,
+                name: _,
+                chunk,
+            } => {
                 if self.chat.streaming {
                     self.chat.push_tool_progress(&chunk);
                 }
@@ -941,12 +949,7 @@ impl App {
                     let saved_path = if let Ok(mut list) = self.ctf_challenges.lock() {
                         if let Some(c) = list.iter_mut().find(|c| c.name == name) {
                             c.writeup = Some(writeup_text.clone());
-                            let path = ctf_store::save_writeup(
-                                &proj_ctf_dir,
-                                c,
-                                &writeup_text,
-                            );
-                            path
+                            ctf_store::save_writeup(&proj_ctf_dir, c, &writeup_text)
                         } else {
                             None
                         }
@@ -989,9 +992,9 @@ impl App {
                 // 自动压缩在 streaming 期间发生，仅追加 System 提示；
                 // 手动压缩 compacting 已在 spawn_compact 置 true。
                 if is_auto {
-                    self.chat.entries.push(ChatEntry::System(
-                        "上下文已超过阈值，正在自动压缩…".into(),
-                    ));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("上下文已超过阈值，正在自动压缩…".into()));
                 } else {
                     self.chat
                         .entries
@@ -1090,9 +1093,7 @@ impl App {
         };
         let tx = self.fetch_tx.clone();
         tokio::spawn(async move {
-            let result = fetch_models(&cfg_snapshot)
-                .await
-                .map_err(|e| e.to_string());
+            let result = fetch_models(&cfg_snapshot).await.map_err(|e| e.to_string());
             let _ = tx.send(FetchResult { fetch_id, result });
         });
     }
@@ -1110,9 +1111,7 @@ impl App {
         let fetch_id = self.model_picker.start_fetch();
         let tx = self.fetch_tx.clone();
         tokio::spawn(async move {
-            let result = fetch_models(&cfg_snapshot)
-                .await
-                .map_err(|e| e.to_string());
+            let result = fetch_models(&cfg_snapshot).await.map_err(|e| e.to_string());
             let _ = tx.send(FetchResult { fetch_id, result });
         });
     }
@@ -1123,7 +1122,12 @@ impl App {
         let Some(name) = names.get(self.model_picker.provider_selected).cloned() else {
             return;
         };
-        let Some(model) = self.model_picker.models.get(self.model_picker.model_selected).cloned() else {
+        let Some(model) = self
+            .model_picker
+            .models
+            .get(self.model_picker.model_selected)
+            .cloned()
+        else {
             self.toast = Some("无模型可选".into());
             return;
         };
@@ -1223,7 +1227,10 @@ impl App {
             let Some(form) = self.provider_form.as_ref() else {
                 return;
             };
-            (form.into_provider(&self.providers), form.original_name.clone())
+            (
+                form.into_provider(&self.providers),
+                form.original_name.clone(),
+            )
         };
         match result {
             Err(msg) => {
@@ -1287,7 +1294,12 @@ impl App {
             let Some(form) = self.mcp_form.as_ref() else {
                 return;
             };
-            let names: Vec<&str> = self.mcp_config.servers.iter().map(|s| s.name.as_str()).collect();
+            let names: Vec<&str> = self
+                .mcp_config
+                .servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
             form.into_spec(&names)
         };
         match result {
@@ -1296,10 +1308,7 @@ impl App {
             }
             Ok(spec) => {
                 let name = spec.name.clone();
-                let original = self
-                    .mcp_form
-                    .as_ref()
-                    .and_then(|f| f.original_name.clone());
+                let original = self.mcp_form.as_ref().and_then(|f| f.original_name.clone());
                 // 处理重命名：先删旧名再 upsert 新名
                 if let Some(orig) = &original {
                     if orig != &name {
@@ -1308,7 +1317,9 @@ impl App {
                 }
                 self.mcp_config.upsert(spec);
                 self.settings.dirty_mcp = true;
-                self.toast = Some(format!("MCP server '{name}' 已暂存（保存设置后写入，重启生效）"));
+                self.toast = Some(format!(
+                    "MCP server '{name}' 已暂存（保存设置后写入，重启生效）"
+                ));
                 self.mcp_form = None;
                 self.mode = self.form_prev_mode;
             }
@@ -1317,17 +1328,39 @@ impl App {
 
     /// CTF 编辑表单按键分发：委托 `form.handle_key`，按 `CtfEditFormAction` 执行副作用。
     fn handle_memory_rule_form_key(&mut self, k: KeyEvent) {
-        let Some(form) = self.memory_rule_form.as_mut() else { return; };
+        let Some(form) = self.memory_rule_form.as_mut() else {
+            return;
+        };
         match form.handle_key(k) {
             MemoryRuleFormAction::None => {}
-            MemoryRuleFormAction::Cancel => { self.memory_rule_form = None; self.mode = Mode::Settings; }
+            MemoryRuleFormAction::Cancel => {
+                self.memory_rule_form = None;
+                self.mode = Mode::Settings;
+            }
             MemoryRuleFormAction::Save => {
                 let form = self.memory_rule_form.take().unwrap();
                 let prompt = form.prompt.trim().to_string();
-                if prompt.is_empty() { self.toast = Some("empty rule".into()); self.memory_rule_form = Some(form); return; }
-                let rule = cyber_core::MemoryRule { enabled: form.enabled, scope: form.scope, prompt };
-                if let Some(i) = form.index { if i < self.config.memory.rules.len() { self.config.memory.rules[i] = rule; } } else { self.config.memory.rules.push(rule); self.settings.memory_selected = self.config.memory.rules.len().saturating_sub(1); }
-                self.settings.dirty = true; self.mode = Mode::Settings;
+                if prompt.is_empty() {
+                    self.toast = Some("empty rule".into());
+                    self.memory_rule_form = Some(form);
+                    return;
+                }
+                let rule = cyber_core::MemoryRule {
+                    enabled: form.enabled,
+                    scope: form.scope,
+                    prompt,
+                };
+                if let Some(i) = form.index {
+                    if i < self.config.memory.rules.len() {
+                        self.config.memory.rules[i] = rule;
+                    }
+                } else {
+                    self.config.memory.rules.push(rule);
+                    self.settings.memory_selected =
+                        self.config.memory.rules.len().saturating_sub(1);
+                }
+                self.settings.dirty = true;
+                self.mode = Mode::Settings;
             }
         }
     }
@@ -1411,8 +1444,19 @@ impl App {
         .load_all();
         let handle = tokio::spawn(async move {
             run_stream(
-                config, providers, project, text, history, tx, gen, mock, cwd, registry,
-                ctf_enabled, intensity, memory,
+                config,
+                providers,
+                project,
+                text,
+                history,
+                tx,
+                gen,
+                mock,
+                cwd,
+                registry,
+                ctf_enabled,
+                intensity,
+                memory,
             )
             .await;
         });
@@ -1437,7 +1481,17 @@ impl App {
         let mock = self.mock;
         self.compacting = true;
         let handle = tokio::spawn(async move {
-            run_compact_stream(config, providers, project, history, custom_instructions, tx, gen, mock).await;
+            run_compact_stream(
+                config,
+                providers,
+                project,
+                history,
+                custom_instructions,
+                tx,
+                gen,
+                mock,
+            )
+            .await;
         });
         self.agent_handle = Some(handle);
     }
@@ -1539,8 +1593,7 @@ impl App {
         // 保存当前 session（含 CTF 题目）
         self.save_history();
         // 加载目标 session
-        let entries =
-            crate::history::load_entries(&self.paths.history_dir, &self.paths.cwd, id);
+        let entries = crate::history::load_entries(&self.paths.history_dir, &self.paths.cwd, id);
         self.chat = ChatState::new();
         self.chat.entries.extend(entries);
         self.chat.seed_input_history();
@@ -1548,8 +1601,7 @@ impl App {
         self.sessions.current = id.to_string();
         // 加载目标 session 的 CTF 题目（全局题目保留不动）
         let global_challenges = ctf_store::load_challenges(&self.paths.ctf_dir);
-        let session_challenges =
-            ctf_store::load_session_challenges(&self.paths.ctf_dir, id);
+        let session_challenges = ctf_store::load_session_challenges(&self.paths.ctf_dir, id);
         if let Ok(mut list) = self.ctf_challenges.lock() {
             *list = merge_challenges(global_challenges, session_challenges);
         }
@@ -1585,12 +1637,7 @@ impl App {
         self.ctf_detail_scroll = 0;
         self.ctf_list_scroll.set(0);
         crate::history::save_index(&self.paths.history_dir, &self.paths.cwd, &self.sessions);
-        crate::history::save_entries(
-            &self.paths.history_dir,
-            &self.paths.cwd,
-            &new_id,
-            &[],
-        );
+        crate::history::save_entries(&self.paths.history_dir, &self.paths.cwd, &new_id, &[]);
         self.toast = Some("新会话已创建".into());
     }
 
@@ -1604,11 +1651,8 @@ impl App {
         let was_current = id == self.sessions.current;
         // 删除 session 的 CTF 题目文件
         ctf_store::delete_session_challenges(&self.paths.ctf_dir, id);
-        let _remaining = crate::history::delete_session(
-            &self.paths.history_dir,
-            &self.paths.cwd,
-            id,
-        );
+        let _remaining =
+            crate::history::delete_session(&self.paths.history_dir, &self.paths.cwd, id);
         // 重新加载索引（delete_session 已处理 current 重指 + 写盘）
         self.sessions = crate::history::load_index(&self.paths.history_dir, &self.paths.cwd);
         if was_current {
@@ -1679,12 +1723,11 @@ impl App {
                         .filter(|s| s.id == rest || s.title.contains(rest))
                         .collect();
                     if matches.is_empty() {
-                        self.chat.entries.push(ChatEntry::System(format!(
-                            "未找到匹配「{rest}」的会话"
-                        )));
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System(format!("未找到匹配「{rest}」的会话")));
                     } else if matches.len() > 1 {
-                        let mut lines =
-                            format!("多个会话匹配「{rest}」，请用 id 指定：");
+                        let mut lines = format!("多个会话匹配「{rest}」，请用 id 指定：");
                         for s in matches {
                             lines.push_str(&format!(
                                 "\n  {} [{}] · {} 条消息",
@@ -1706,10 +1749,9 @@ impl App {
                                 )));
                             }
                             None => {
-                                self.chat.entries.push(ChatEntry::System(format!(
-                                    "会话「{}」为空",
-                                    s.title
-                                )));
+                                self.chat
+                                    .entries
+                                    .push(ChatEntry::System(format!("会话「{}」为空", s.title)));
                             }
                         }
                     }
@@ -1743,8 +1785,11 @@ impl App {
         if matches!(k.code, KeyCode::Char('d')) {
             if self.sessions_panel.pending_delete == Some(self.sessions_panel.selected) {
                 // 二次确认：执行删除
-                if let Some(meta) =
-                    self.sessions_panel.list.get(self.sessions_panel.selected).cloned()
+                if let Some(meta) = self
+                    .sessions_panel
+                    .list
+                    .get(self.sessions_panel.selected)
+                    .cloned()
                 {
                     let id = meta.id.clone();
                     if self.delete_session(&id) {
@@ -1764,8 +1809,7 @@ impl App {
         match k.code {
             KeyCode::Up => {
                 if len > 0 {
-                    self.sessions_panel.selected =
-                        (self.sessions_panel.selected + len - 1) % len;
+                    self.sessions_panel.selected = (self.sessions_panel.selected + len - 1) % len;
                 }
             }
             KeyCode::Down => {
@@ -1774,8 +1818,11 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(meta) =
-                    self.sessions_panel.list.get(self.sessions_panel.selected).cloned()
+                if let Some(meta) = self
+                    .sessions_panel
+                    .list
+                    .get(self.sessions_panel.selected)
+                    .cloned()
                 {
                     let id = meta.id.clone();
                     self.switch_session(&id);
@@ -1934,19 +1981,15 @@ impl App {
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 // 列表视图：删除选中题目
                 if !self.ctf_detail_view {
-                    let removed_name = self
-                        .ctf_challenges
-                        .lock()
-                        .ok()
-                        .and_then(|mut list| {
-                            if self.ctf_selected < list.len() {
-                                let name = list[self.ctf_selected].name.clone();
-                                list.remove(self.ctf_selected);
-                                Some(name)
-                            } else {
-                                None
-                            }
-                        });
+                    let removed_name = self.ctf_challenges.lock().ok().and_then(|mut list| {
+                        if self.ctf_selected < list.len() {
+                            let name = list[self.ctf_selected].name.clone();
+                            list.remove(self.ctf_selected);
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    });
                     if let Some(name) = removed_name {
                         // 调整选中索引
                         let len = self.ctf_challenges.lock().map(|l| l.len()).unwrap_or(0);
@@ -1961,25 +2004,21 @@ impl App {
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 // 切换选中题目状态（进行中 ↔ 已完成）
-                let toggled = self
-                    .ctf_challenges
-                    .lock()
-                    .ok()
-                    .and_then(|mut list| {
-                        let c = list.get_mut(self.ctf_selected)?;
-                        let was_solved = c.is_solved();
-                        c.status = if was_solved {
-                            CtfStatus::InProgress
-                        } else {
-                            CtfStatus::Solved
-                        };
-                        if !was_solved {
-                            c.end_time = Some(current_time_str());
-                        } else {
-                            c.end_time = None;
-                        }
-                        Some((c.name.clone(), c.is_solved()))
-                    });
+                let toggled = self.ctf_challenges.lock().ok().and_then(|mut list| {
+                    let c = list.get_mut(self.ctf_selected)?;
+                    let was_solved = c.is_solved();
+                    c.status = if was_solved {
+                        CtfStatus::InProgress
+                    } else {
+                        CtfStatus::Solved
+                    };
+                    if !was_solved {
+                        c.end_time = Some(current_time_str());
+                    } else {
+                        c.end_time = None;
+                    }
+                    Some((c.name.clone(), c.is_solved()))
+                });
                 if let Some((name, solved)) = toggled {
                     self.toast = Some(format!(
                         "「{name}」→ {}",
@@ -1991,19 +2030,19 @@ impl App {
             }
             KeyCode::Char('g') => {
                 // 切换选中题目的全局/Session 范围
-                let toggled = self
-                    .ctf_challenges
-                    .lock()
-                    .ok()
-                    .and_then(|mut list| {
-                        let c = list.get_mut(self.ctf_selected)?;
-                        c.is_global = !c.is_global;
-                        Some((c.name.clone(), c.is_global))
-                    });
+                let toggled = self.ctf_challenges.lock().ok().and_then(|mut list| {
+                    let c = list.get_mut(self.ctf_selected)?;
+                    c.is_global = !c.is_global;
+                    Some((c.name.clone(), c.is_global))
+                });
                 if let Some((name, is_global)) = toggled {
                     self.toast = Some(format!(
                         "「{name}」→ {}",
-                        if is_global { "全局 ★" } else { "仅本 session" }
+                        if is_global {
+                            "全局 ★"
+                        } else {
+                            "仅本 session"
+                        }
                     ));
                     self.save_history();
                 }
@@ -2051,15 +2090,11 @@ impl App {
                 // 在详情视图中按 w 触发 writeup 生成
                 if self.ctf_detail_view {
                     // 先取出题目名（释放锁后再调用可变方法，避免借用冲突）
-                    let name_to_write = self
-                        .ctf_challenges
-                        .lock()
-                        .ok()
-                        .and_then(|list| {
-                            list.get(self.ctf_selected)
-                                .filter(|c| c.is_solved() && !c.has_writeup())
-                                .map(|c| c.name.clone())
-                        });
+                    let name_to_write = self.ctf_challenges.lock().ok().and_then(|list| {
+                        list.get(self.ctf_selected)
+                            .filter(|c| c.is_solved() && !c.has_writeup())
+                            .map(|c| c.name.clone())
+                    });
                     if let Some(name) = name_to_write {
                         self.handle_ctf_slash(&format!("writeup {name}"));
                         return Some(true);
@@ -2135,7 +2170,9 @@ impl App {
     fn handle_slash_command(&mut self, raw: &str) {
         let cmd = parse_slash(raw);
         // 记录命令本身（/clear 会随后清空，无妨）
-        self.chat.entries.push(ChatEntry::User(raw.trim().to_string()));
+        self.chat
+            .entries
+            .push(ChatEntry::User(raw.trim().to_string()));
         match cmd {
             SlashCommand::Help => {
                 self.chat
@@ -2281,9 +2318,9 @@ impl App {
                     match arg.trim().parse::<u32>() {
                         Ok(n) if (1..=1000).contains(&n) => {
                             self.config.agent.max_steps = n;
-                            self.chat.entries.push(ChatEntry::System(format!(
-                                "max_steps 已设为 {n}"
-                            )));
+                            self.chat
+                                .entries
+                                .push(ChatEntry::System(format!("max_steps 已设为 {n}")));
                         }
                         Ok(n) => {
                             self.chat.entries.push(ChatEntry::System(format!(
@@ -2370,28 +2407,44 @@ impl App {
                 let global = store.entries(MemoryScope::Global);
                 let project = store.entries(MemoryScope::Project);
                 if global.is_empty() && project.is_empty() {
-                    self.chat.entries.push(ChatEntry::System("暂无可管理的记忆。".into()));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("暂无可管理的记忆。".into()));
                     return;
                 }
                 let mut out = String::new();
                 if !global.is_empty() {
                     out.push_str("全局记忆：\n");
-                    for e in global { out.push_str(&format!("  {}. {}\n", e.index, e.content)); }
+                    for e in global {
+                        out.push_str(&format!("  {}. {}\n", e.index, e.content));
+                    }
                 }
                 if !project.is_empty() {
                     out.push_str("项目级记忆：\n");
-                    for e in project { out.push_str(&format!("  {}. {}\n", e.index, e.content)); }
+                    for e in project {
+                        out.push_str(&format!("  {}. {}\n", e.index, e.content));
+                    }
                 }
                 self.chat.entries.push(ChatEntry::System(out));
             }
             "add" | "project" => {
-                let scope = if sub == "project" { MemoryScope::Project } else { MemoryScope::Global };
-                if rest.is_empty() {
-                    self.chat.entries.push(ChatEntry::System("用法：/memory add <text> 或 /memory project <text>".into()));
-                } else if let Err(e) = store.append(scope, rest) {
-                    self.chat.entries.push(ChatEntry::System(format!("保存记忆失败：{e}")));
+                let scope = if sub == "project" {
+                    MemoryScope::Project
                 } else {
-                    self.chat.entries.push(ChatEntry::System("记忆已保存".into()));
+                    MemoryScope::Global
+                };
+                if rest.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "用法：/memory add <text> 或 /memory project <text>".into(),
+                    ));
+                } else if let Err(e) = store.append(scope, rest) {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("保存记忆失败：{e}")));
+                } else {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("记忆已保存".into()));
                 }
             }
             "edit" => {
@@ -2401,10 +2454,18 @@ impl App {
                 let content = p.next().map(str::trim).filter(|v| !v.is_empty());
                 match (index, content) {
                     (Some(i), Some(text)) => match store.update(scope, i, text) {
-                        Ok(()) => self.chat.entries.push(ChatEntry::System("记忆已更新".into())),
-                        Err(e) => self.chat.entries.push(ChatEntry::System(format!("更新记忆失败：{e}"))),
+                        Ok(()) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System("记忆已更新".into())),
+                        Err(e) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System(format!("更新记忆失败：{e}"))),
                     },
-                    _ => self.chat.entries.push(ChatEntry::System("用法：/memory edit <global|project> <编号> <新内容>".into())),
+                    _ => self.chat.entries.push(ChatEntry::System(
+                        "用法：/memory edit <global|project> <编号> <新内容>".into(),
+                    )),
                 }
             }
             "delete" | "remove" => {
@@ -2413,13 +2474,24 @@ impl App {
                 let index = p.next().and_then(|v| v.parse::<usize>().ok());
                 match index {
                     Some(i) => match store.delete(scope, i) {
-                        Ok(()) => self.chat.entries.push(ChatEntry::System("记忆已删除".into())),
-                        Err(e) => self.chat.entries.push(ChatEntry::System(format!("删除记忆失败：{e}"))),
+                        Ok(()) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System("记忆已删除".into())),
+                        Err(e) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System(format!("删除记忆失败：{e}"))),
                     },
-                    None => self.chat.entries.push(ChatEntry::System("用法：/memory delete <global|project> <编号>".into())),
+                    None => self.chat.entries.push(ChatEntry::System(
+                        "用法：/memory delete <global|project> <编号>".into(),
+                    )),
                 }
             }
-            other => self.chat.entries.push(ChatEntry::System(format!("未知记忆子命令：{other}"))),
+            other => self
+                .chat
+                .entries
+                .push(ChatEntry::System(format!("未知记忆子命令：{other}"))),
         }
     }
     fn handle_ctf_slash(&mut self, args: &str) {
@@ -2434,12 +2506,14 @@ impl App {
                 ));
             }
             "disable" => {
-                    self.ctf_enabled = false;
-                    self.ctf_panel_visible = false;
-                    self.ctf_panel_focused = false;
-                    self.ctf_panel_fullscreen = false;
-                    self.chat.entries.push(ChatEntry::System("CTF 模式已关闭".into()));
-                }
+                self.ctf_enabled = false;
+                self.ctf_panel_visible = false;
+                self.ctf_panel_focused = false;
+                self.ctf_panel_fullscreen = false;
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("CTF 模式已关闭".into()));
+            }
             "add" => {
                 // /ctf add <name> <category>
                 let mut p = rest.splitn(2, char::is_whitespace);
@@ -2465,7 +2539,9 @@ impl App {
             "list" => {
                 if let Ok(list) = self.ctf_challenges.lock() {
                     if list.is_empty() {
-                        self.chat.entries.push(ChatEntry::System("当前无 CTF 题目".into()));
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System("当前无 CTF 题目".into()));
                     } else {
                         let mut lines = String::from("CTF 题目列表：");
                         for (i, c) in list.iter().enumerate() {
@@ -2483,9 +2559,9 @@ impl App {
             }
             "writeup" => {
                 if rest.is_empty() {
-                    self.chat.entries.push(ChatEntry::System(
-                        "用法：/ctf writeup <题目名称>".into(),
-                    ));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("用法：/ctf writeup <题目名称>".into()));
                     return;
                 }
                 if self.chat.streaming || self.compacting || self.ctf_writeup_pending.is_some() {
@@ -2515,15 +2591,18 @@ impl App {
                         )));
                     }
                     None => {
-                        self.chat.entries.push(ChatEntry::System(format!(
-                            "题目 {} 不存在",
-                            rest
-                        )));
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System(format!("题目 {} 不存在", rest)));
                     }
                 }
             }
             "" | "status" => {
-                let status = if self.ctf_enabled { "已开启" } else { "已关闭" };
+                let status = if self.ctf_enabled {
+                    "已开启"
+                } else {
+                    "已关闭"
+                };
                 self.chat.entries.push(ChatEntry::System(format!(
                     "CTF 模式：{}（/ctf enable|disable 切换）",
                     status
@@ -2541,9 +2620,9 @@ impl App {
     /// 流式期阻止（与 /model 一致）。add/edit 进入 ProviderForm（prev_mode=Chat，立即持久化）。
     fn handle_provider_slash(&mut self, args: &str) {
         if self.chat.streaming {
-            self.chat
-                .entries
-                .push(ChatEntry::System("生成中，无法管理 provider（先 /cancel）".into()));
+            self.chat.entries.push(ChatEntry::System(
+                "生成中，无法管理 provider（先 /cancel）".into(),
+            ));
             return;
         }
         let mut parts = args.splitn(2, char::is_whitespace);
@@ -2553,9 +2632,9 @@ impl App {
             "" | "list" => {
                 let names = self.providers.sorted_names();
                 if names.is_empty() {
-                    self.chat
-                        .entries
-                        .push(ChatEntry::System("（无 provider，用 /provider add 新增）".into()));
+                    self.chat.entries.push(ChatEntry::System(
+                        "（无 provider，用 /provider add 新增）".into(),
+                    ));
                 } else {
                     let mut lines = String::from("Providers：");
                     for name in &names {
@@ -2580,17 +2659,17 @@ impl App {
             }
             "edit" => {
                 if rest.is_empty() {
-                    self.chat.entries.push(ChatEntry::System(
-                        "用法：/provider edit <name>".into(),
-                    ));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("用法：/provider edit <name>".into()));
                 } else if let Some(cfg) = self.providers.providers.get(rest).cloned() {
                     self.form_prev_mode = Mode::Chat;
                     self.provider_form = Some(ProviderFormState::from_provider(rest, &cfg));
                     self.mode = Mode::ProviderForm;
                 } else {
-                    self.chat.entries.push(ChatEntry::System(format!(
-                        "未知 provider：{rest}"
-                    )));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("未知 provider：{rest}")));
                 }
             }
             "use" => {
@@ -2602,12 +2681,14 @@ impl App {
                 } else if self.providers.providers.contains_key(rest) {
                     self.config.agent.default_provider = rest.to_string();
                     match save_config(&self.config, &self.paths.config_file) {
-                        Ok(()) => self.chat.entries.push(ChatEntry::System(format!(
-                            "已切换 provider 到 {rest}"
-                        ))),
-                        Err(e) => self.chat.entries.push(ChatEntry::System(format!(
-                            "切换成功但保存失败: {e}"
-                        ))),
+                        Ok(()) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System(format!("已切换 provider 到 {rest}"))),
+                        Err(e) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System(format!("切换成功但保存失败: {e}"))),
                     }
                 } else {
                     self.chat.entries.push(ChatEntry::System(format!(
@@ -2618,28 +2699,29 @@ impl App {
             }
             "remove" => {
                 if rest.is_empty() {
-                    self.chat.entries.push(ChatEntry::System(
-                        "用法：/provider remove <name>".into(),
-                    ));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("用法：/provider remove <name>".into()));
                 } else if self.providers.remove(rest).is_some() {
                     // default_provider 防悬空
                     if self.config.agent.default_provider == rest {
                         let fallback = self.providers.sorted_names().into_iter().next();
-                        self.config.agent.default_provider =
-                            fallback.unwrap_or_default();
+                        self.config.agent.default_provider = fallback.unwrap_or_default();
                     }
                     match save_providers(&self.providers, &self.paths.providers_file) {
-                        Ok(()) => self.chat.entries.push(ChatEntry::System(format!(
-                            "已删除 provider：{rest}"
-                        ))),
-                        Err(e) => self.chat.entries.push(ChatEntry::System(format!(
-                            "删除成功但保存失败: {e}"
-                        ))),
+                        Ok(()) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System(format!("已删除 provider：{rest}"))),
+                        Err(e) => self
+                            .chat
+                            .entries
+                            .push(ChatEntry::System(format!("删除成功但保存失败: {e}"))),
                     }
                 } else {
-                    self.chat.entries.push(ChatEntry::System(format!(
-                        "未知 provider：{rest}"
-                    )));
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("未知 provider：{rest}")));
                 }
             }
             other => {
@@ -2697,9 +2779,9 @@ impl App {
     fn handle_mcp_slash(&mut self, _args: &str) {
         match &self.registries.mcp {
             None => {
-                self.chat
-                    .entries
-                    .push(ChatEntry::System("MCP 未启用（mock 模式或无 server 配置）".into()));
+                self.chat.entries.push(ChatEntry::System(
+                    "MCP 未启用（mock 模式或无 server 配置）".into(),
+                ));
             }
             Some(mcp) if mcp.is_empty() => {
                 self.chat
@@ -2773,9 +2855,7 @@ impl App {
             let fallback = self.providers.sorted_names().into_iter().next();
             let new = fallback.unwrap_or_default();
             self.config.agent.default_provider = new.clone();
-            self.toast = Some(format!(
-                "已删除 '{name}'，默认 provider 回退到 '{new}'"
-            ));
+            self.toast = Some(format!("已删除 '{name}'，默认 provider 回退到 '{new}'"));
         } else {
             self.toast = Some(format!("已删除 provider：{name}"));
         }
@@ -2818,7 +2898,12 @@ impl App {
 
     /// 从 Settings MCP 段打开编辑表单（按 mcp_selected 选中项）。
     fn open_mcp_form_edit(&mut self) {
-        let Some(spec) = self.mcp_config.servers.get(self.settings.mcp_selected).cloned() else {
+        let Some(spec) = self
+            .mcp_config
+            .servers
+            .get(self.settings.mcp_selected)
+            .cloned()
+        else {
             return;
         };
         self.form_prev_mode = self.mode;
@@ -2887,7 +2972,13 @@ impl App {
 
     /// 从 Settings Env 段打开编辑表单。
     fn open_env_form_edit(&mut self) {
-        let Some(var) = self.config.env.vars.get(self.settings.env_selected).cloned() else {
+        let Some(var) = self
+            .config
+            .env
+            .vars
+            .get(self.settings.env_selected)
+            .cloned()
+        else {
             return;
         };
         self.form_prev_mode = self.mode;
@@ -2942,7 +3033,10 @@ impl App {
             return;
         }
         // LogViewer / Sessions / ModelPicker 模式：无 textarea，跳过
-        if self.mode == Mode::LogViewer || self.mode == Mode::Sessions || self.mode == Mode::ModelPicker {
+        if self.mode == Mode::LogViewer
+            || self.mode == Mode::Sessions
+            || self.mode == Mode::ModelPicker
+        {
             return;
         }
         // 历史区可用宽度 = 终端宽 - 2(边框) - 2(左右 padding)，用于工具结果折叠阈值的
@@ -2982,7 +3076,12 @@ impl App {
         }
         // Settings 下：除 Esc/Quit/Other/Enter 外的任何动作取消"待丢弃"状态
         //（Enter 在 pending_discard 态用于"保存并退出"，不应取消）
-        if self.mode == Mode::Settings && !matches!(a, Action::Esc | Action::Quit | Action::Other | Action::Enter) {
+        if self.mode == Mode::Settings
+            && !matches!(
+                a,
+                Action::Esc | Action::Quit | Action::Other | Action::Enter
+            )
+        {
             self.settings.pending_discard = false;
         }
         // Providers 段：非 DeleteProvider 的动作清除待删除确认（"任一其他键取消"）
@@ -3029,9 +3128,17 @@ impl App {
                         Mode::Chat => Mode::Workflow,
                         Mode::Workflow => Mode::Dashboard,
                         Mode::Dashboard => Mode::Chat,
-                        Mode::Welcome | Mode::Settings | Mode::ProviderForm | Mode::McpForm | Mode::EnvForm | Mode::CtfEditForm | Mode::MemoryRuleForm | Mode::ModelPicker | Mode::Sessions | Mode::LogViewer | Mode::About => {
-                            self.mode
-                        }
+                        Mode::Welcome
+                        | Mode::Settings
+                        | Mode::ProviderForm
+                        | Mode::McpForm
+                        | Mode::EnvForm
+                        | Mode::CtfEditForm
+                        | Mode::MemoryRuleForm
+                        | Mode::ModelPicker
+                        | Mode::Sessions
+                        | Mode::LogViewer
+                        | Mode::About => self.mode,
                     };
                 }
             }
@@ -3049,8 +3156,7 @@ impl App {
             Action::Up => {
                 if self.mode == Mode::Settings {
                     if self.settings.on_providers_section() {
-                        self.settings
-                            .prev_provider(self.providers.providers.len());
+                        self.settings.prev_provider(self.providers.providers.len());
                     } else if self.settings.on_mcp_section() {
                         self.settings.prev_mcp(self.mcp_config.servers.len());
                     } else if self.settings.on_env_section() {
@@ -3058,7 +3164,8 @@ impl App {
                     } else if self.settings.on_skills_section() {
                         self.settings.prev_skill(self.registries.skills.len());
                     } else if self.settings.on_custom_tools_section() {
-                        self.settings.prev_custom_tool(self.registries.custom_tools.len());
+                        self.settings
+                            .prev_custom_tool(self.registries.custom_tools.len());
                     } else {
                         self.settings.prev_field();
                     }
@@ -3069,8 +3176,7 @@ impl App {
             Action::Down => {
                 if self.mode == Mode::Settings {
                     if self.settings.on_providers_section() {
-                        self.settings
-                            .next_provider(self.providers.providers.len());
+                        self.settings.next_provider(self.providers.providers.len());
                     } else if self.settings.on_mcp_section() {
                         self.settings.next_mcp(self.mcp_config.servers.len());
                     } else if self.settings.on_env_section() {
@@ -3078,7 +3184,8 @@ impl App {
                     } else if self.settings.on_skills_section() {
                         self.settings.next_skill(self.registries.skills.len());
                     } else if self.settings.on_custom_tools_section() {
-                        self.settings.next_custom_tool(self.registries.custom_tools.len());
+                        self.settings
+                            .next_custom_tool(self.registries.custom_tools.len());
                     } else {
                         self.settings.next_field();
                     }
@@ -3093,7 +3200,9 @@ impl App {
                     && !self.settings.on_env_section()
                     && !self.settings.on_skills_section()
                 {
-                    let live = self.settings.apply_edit(&mut self.config, &self.providers, false);
+                    let live = self
+                        .settings
+                        .apply_edit(&mut self.config, &self.providers, false);
                     self.apply_live(live);
                 }
             }
@@ -3104,7 +3213,9 @@ impl App {
                     && !self.settings.on_env_section()
                     && !self.settings.on_skills_section()
                 {
-                    let live = self.settings.apply_edit(&mut self.config, &self.providers, true);
+                    let live = self
+                        .settings
+                        .apply_edit(&mut self.config, &self.providers, true);
                     self.apply_live(live);
                 }
             }
@@ -3144,7 +3255,8 @@ impl App {
                         self.save_settings();
                     } else {
                         let live =
-                            self.settings.apply_edit(&mut self.config, &self.providers, true);
+                            self.settings
+                                .apply_edit(&mut self.config, &self.providers, true);
                         self.apply_live(live);
                     }
                 } else if self.mode == Mode::Welcome {
@@ -3164,8 +3276,7 @@ impl App {
                             self.prev_mode = Mode::Welcome;
                             self.mode = Mode::About;
                         }
-                        0 => self.toast =
-                            Some("（P1 占位：新建项目向导将在后续阶段实现）".into()),
+                        0 => self.toast = Some("（P1 占位：新建项目向导将在后续阶段实现）".into()),
                         1 => self.toast = Some("（P1 占位：工作流编辑器将在 P4 实现）".into()),
                         _ => {}
                     }
@@ -3533,7 +3644,11 @@ impl App {
                 &self.sessions,
             ),
             Mode::LogViewer => self.render_log_viewer(frame, area),
-            Mode::MemoryRuleForm => { if let Some(form) = &self.memory_rule_form { views::memory_rule_form::render(frame, area, &self.theme, form); } }
+            Mode::MemoryRuleForm => {
+                if let Some(form) = &self.memory_rule_form {
+                    views::memory_rule_form::render(frame, area, &self.theme, form);
+                }
+            }
             Mode::About => views::about::render(frame, area, &self.theme),
         }
     }
@@ -3603,8 +3718,8 @@ impl App {
         // 右下角 Ctrl+L 热键提示（所有模式常驻）
         let right_hint = " Ctrl+L 日志 ";
         let right_len = right_hint.len() as u16;
-        let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_len)])
-            .split(area);
+        let chunks =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(right_len)]).split(area);
 
         frame.render_widget(
             Paragraph::new(Line::from(hint))
@@ -3708,10 +3823,7 @@ fn read_log_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
     };
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(max_lines);
-    lines[start..]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// 统计字符串中的可见字符数（ANSI 转义序列整体跳过不计数）。
@@ -3849,7 +3961,10 @@ mod tests {
     fn strip_tool_call_tags_removes_function_calls_block() {
         let text = "# Writeup\n\n<function_calls>\n<invoke name=\"list_dir\">\n<parameter name=\"path\">.cyber/ctf/web</parameter>\n</invoke>\n</function_calls>\n\n## 解题过程\n";
         let out = strip_tool_call_tags(text);
-        assert!(!out.contains("function_calls"), "应移除 function_calls 块: {out}");
+        assert!(
+            !out.contains("function_calls"),
+            "应移除 function_calls 块: {out}"
+        );
         assert!(!out.contains("invoke"), "应移除 invoke 标签");
         assert!(!out.contains("list_dir"), "应移除工具名");
         assert!(out.contains("# Writeup"), "应保留正文标题");
@@ -3901,14 +4016,14 @@ mod tests {
                 config_file,
                 providers_file: std::env::temp_dir()
                     .join(format!("cyber_test_providers_{seed}.toml")),
-                mcp_servers_file: std::env::temp_dir()
-                    .join(format!("cyber_test_mcp_{seed}.toml")),
-                log_file: std::env::temp_dir()
-                    .join(format!("cyber_test_log_{seed}.log")),
+                mcp_servers_file: std::env::temp_dir().join(format!("cyber_test_mcp_{seed}.toml")),
+                log_file: std::env::temp_dir().join(format!("cyber_test_log_{seed}.log")),
                 history_dir: history_dir.clone(),
                 cwd: cwd.clone(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
-                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
+                ctf_writeup_dir: std::env::temp_dir()
+                    .join("cyber_test_ctf_tmp")
+                    .join("writeup"),
                 memory_file: std::env::temp_dir().join(format!("cyber_test_memory_{seed}.md")),
             },
             false,
@@ -3932,7 +4047,11 @@ mod tests {
         app.prev_mode = Mode::Workflow;
         app.handle_action(Action::OpenSettings);
         assert_eq!(app.mode, Mode::Settings);
-        assert_eq!(app.prev_mode, Mode::Workflow, "重复 OpenSettings 不应改 prev_mode");
+        assert_eq!(
+            app.prev_mode,
+            Mode::Workflow,
+            "重复 OpenSettings 不应改 prev_mode"
+        );
     }
 
     #[test]
@@ -4186,7 +4305,9 @@ mod tests {
         app.handle_agent_event(0, AgentEvent::Done);
         assert!(!app.chat.streaming, "Done 后应退出 streaming");
         assert_eq!(app.chat.entries.len(), 1);
-        assert!(matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "收到：hi（续）"));
+        assert!(
+            matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "收到：hi（续）")
+        );
     }
 
     #[test]
@@ -4196,7 +4317,11 @@ mod tests {
         app.chat.streaming_buffer.push_str("部分");
         app.handle_agent_event(0, AgentEvent::Error("boom".into()));
         assert!(!app.chat.streaming);
-        assert_eq!(app.chat.entries.len(), 1, "应定稿部分 buffer 为 assistant 条目");
+        assert_eq!(
+            app.chat.entries.len(),
+            1,
+            "应定稿部分 buffer 为 assistant 条目"
+        );
         assert!(app.toast.as_deref().unwrap_or("").contains("boom"));
     }
 
@@ -4215,8 +4340,12 @@ mod tests {
         assert!(!app.chat.streaming);
         // 取消应保留已生成的文本（flush 为 assistant 条目）+ 追加取消原因 System 条目
         assert_eq!(app.chat.entries.len(), 2, "取消应保留 buffer + 原因条目");
-        assert!(matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "部分"));
-        assert!(matches!(&app.chat.entries[1], crate::chat::ChatEntry::System(s) if s.contains("取消") && s.contains("回答输出中")));
+        assert!(
+            matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "部分")
+        );
+        assert!(
+            matches!(&app.chat.entries[1], crate::chat::ChatEntry::System(s) if s.contains("取消") && s.contains("回答输出中"))
+        );
         assert!(app.chat.streaming_buffer.is_empty());
     }
 
@@ -4227,7 +4356,10 @@ mod tests {
         // 工具执行中 → 原因应含「工具执行中」
         app.chat.streaming_tool_output.push_str("scanning...");
         let reason = cancel_reason(&app.chat);
-        assert!(reason.contains("工具执行中"), "应识别工具执行阶段: {reason}");
+        assert!(
+            reason.contains("工具执行中"),
+            "应识别工具执行阶段: {reason}"
+        );
 
         // 思考中 → 原因应含「思考中」
         app.chat.streaming_tool_output.clear();
@@ -4273,12 +4405,15 @@ mod tests {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.chat.streaming = true;
         app.generation = 1; // 模拟已 spawn（gen=1）
-        // cancel：bump generation 到 2（与 Back 路径一致）
+                            // cancel：bump generation 到 2（与 Back 路径一致）
         app.generation = app.generation.wrapping_add(1);
         app.chat.cancel_stream();
         // 旧任务（gen=1）的 stale token 应被 generation 守卫忽略
         app.handle_agent_event(1, AgentEvent::Token("late".into()));
-        assert!(app.chat.streaming_buffer.is_empty(), "stale gen 的 token 应被忽略");
+        assert!(
+            app.chat.streaming_buffer.is_empty(),
+            "stale gen 的 token 应被忽略"
+        );
     }
 
     #[test]
@@ -4306,10 +4441,20 @@ mod tests {
             },
         );
         assert!(app.chat.streaming, "工具调用后仍应 streaming");
-        assert_eq!(app.chat.entries.len(), 3, "应含 assistant + toolcall + toolresult");
-        assert!(matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "让我看看"));
-        assert!(matches!(&app.chat.entries[1], crate::chat::ChatEntry::ToolCall { name, .. } if name == "list_dir"));
-        assert!(matches!(&app.chat.entries[2], crate::chat::ChatEntry::ToolResult { output, .. } if output == "a.txt"));
+        assert_eq!(
+            app.chat.entries.len(),
+            3,
+            "应含 assistant + toolcall + toolresult"
+        );
+        assert!(
+            matches!(&app.chat.entries[0], crate::chat::ChatEntry::Assistant(c) if c == "让我看看")
+        );
+        assert!(
+            matches!(&app.chat.entries[1], crate::chat::ChatEntry::ToolCall { name, .. } if name == "list_dir")
+        );
+        assert!(
+            matches!(&app.chat.entries[2], crate::chat::ChatEntry::ToolResult { output, .. } if output == "a.txt")
+        );
     }
 
     #[test]
@@ -4372,7 +4517,9 @@ mod tests {
                 history_dir: hist_dir.clone(),
                 cwd: cwd.clone(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
-                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
+                ctf_writeup_dir: std::env::temp_dir()
+                    .join("cyber_test_ctf_tmp")
+                    .join("writeup"),
                 memory_file: std::env::temp_dir().join("cyber_test_memory4.md"),
             },
             false,
@@ -4387,8 +4534,8 @@ mod tests {
         app.chat.entries.push(ChatEntry::Assistant("收到".into()));
         app.save_history();
 
-        let file = history::session_dir(&hist_dir, &cwd)
-            .join(format!("{}.json", app.sessions.current));
+        let file =
+            history::session_dir(&hist_dir, &cwd).join(format!("{}.json", app.sessions.current));
         assert!(file.exists(), "save_history 应写入当前 session 文件");
         let loaded = history::load_entries(&hist_dir, &cwd, &app.sessions.current);
         assert_eq!(loaded.len(), 2, "重新加载应得到相同条目数");
@@ -4429,7 +4576,9 @@ mod tests {
                 history_dir: hist_dir.clone(),
                 cwd: cwd.clone(),
                 ctf_dir: std::env::temp_dir().join("cyber_test_ctf_tmp"),
-                ctf_writeup_dir: std::env::temp_dir().join("cyber_test_ctf_tmp").join("writeup"),
+                ctf_writeup_dir: std::env::temp_dir()
+                    .join("cyber_test_ctf_tmp")
+                    .join("writeup"),
                 memory_file: std::env::temp_dir().join("cyber_test_memory5.md"),
             },
             false,
@@ -4476,11 +4625,11 @@ mod tests {
         // /new：记录命令 → 保存当前 → 新建并切到空会话
         app.handle_slash_command("/new");
         assert_eq!(app.sessions.sessions.len(), 2, "/new 后应有 2 个 session");
-        assert_ne!(app.sessions.current, old_current, "current 应切到新 session");
-        assert!(
-            app.chat.entries.is_empty(),
-            "新会话的 chat 应被重置为空"
+        assert_ne!(
+            app.sessions.current, old_current,
+            "current 应切到新 session"
         );
+        assert!(app.chat.entries.is_empty(), "新会话的 chat 应被重置为空");
         assert!(
             app.toast.as_deref().unwrap_or("").contains("新会话"),
             "应 toast 新会话已创建"
@@ -4540,11 +4689,7 @@ mod tests {
         assert_eq!(app.sessions_panel.pending_delete, Some(0));
         // 二次 d：拒绝删除（仅 1 个）
         app.handle_sessions_key(key(crossterm::event::KeyCode::Char('d')));
-        assert_eq!(
-            app.sessions.sessions.len(),
-            1,
-            "单 session 时不应删除"
-        );
+        assert_eq!(app.sessions.sessions.len(), 1, "单 session 时不应删除");
         assert!(
             app.toast.as_deref().unwrap_or("").contains("至少保留"),
             "应提示至少保留 1 个"
@@ -4565,11 +4710,7 @@ mod tests {
         app.handle_sessions_key(key(crossterm::event::KeyCode::Char('d')));
         assert_eq!(app.sessions.sessions.len(), 1, "应删到 1 个 session");
         assert_eq!(app.sessions.current, s2, "删非 current 不应改 current");
-        assert_eq!(
-            app.sessions_panel.list.len(),
-            1,
-            "面板 list 应刷新为 1 项"
-        );
+        assert_eq!(app.sessions_panel.list.len(), 1, "面板 list 应刷新为 1 项");
     }
 
     #[test]
@@ -4578,7 +4719,9 @@ mod tests {
         let s1 = app.sessions.current.clone();
         // 在 s1 写入对话并保存
         app.chat.entries.push(ChatEntry::User("hello".into()));
-        app.chat.entries.push(ChatEntry::Assistant("hi there".into()));
+        app.chat
+            .entries
+            .push(ChatEntry::Assistant("hi there".into()));
         app.save_history();
         // 新建 s2（current 切走），chat 重置为空
         app.handle_slash_command("/new");
@@ -4614,11 +4757,7 @@ mod tests {
         app.chat.streaming = true;
         let before = app.sessions.sessions.len();
         app.handle_slash_command("/new");
-        assert_eq!(
-            app.sessions.sessions.len(),
-            before,
-            "流式期 /new 应被阻止"
-        );
+        assert_eq!(app.sessions.sessions.len(), before, "流式期 /new 应被阻止");
         assert!(app.chat.streaming, "流式态不应被改变");
     }
 
@@ -4701,7 +4840,11 @@ mod tests {
     async fn model_no_arg_opens_picker_panel() {
         let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
         app.handle_slash_command("/model");
-        assert_eq!(app.mode, Mode::ModelPicker, "/model 无参数应打开 ModelPicker 面板");
+        assert_eq!(
+            app.mode,
+            Mode::ModelPicker,
+            "/model 无参数应打开 ModelPicker 面板"
+        );
         assert_eq!(app.form_prev_mode, Mode::Chat);
         // 选中项应指向当前 default_provider（openai）
         // sorted_names = ["anthropic", "ollama", "openai"] → openai 在 idx=2
@@ -4709,7 +4852,10 @@ mod tests {
         let expected_idx = names.iter().position(|n| n == "openai").unwrap();
         assert_eq!(app.model_picker.provider_selected, expected_idx);
         // 应自动发起拉取
-        assert!(app.model_picker.fetching, "打开面板应自动拉取当前 provider 模型");
+        assert!(
+            app.model_picker.fetching,
+            "打开面板应自动拉取当前 provider 模型"
+        );
     }
 
     #[test]
@@ -4747,7 +4893,8 @@ mod tests {
         app.handle_slash_command("/model");
         // 模拟拉取成功
         let fid = app.model_picker.fetch_id;
-        app.model_picker.deliver_fetch(fid, Ok(vec!["gpt-4o".into(), "gpt-4o-mini".into()]));
+        app.model_picker
+            .deliver_fetch(fid, Ok(vec!["gpt-4o".into(), "gpt-4o-mini".into()]));
         assert!(!app.model_picker.fetching);
         assert_eq!(app.model_picker.models.len(), 2);
         // 切到 model 栏选第二个模型
@@ -4769,7 +4916,10 @@ mod tests {
         // openai 在 sorted_names idx=2，Down 后 wrap 到 idx=0（anthropic）
         app.handle_model_picker_key(key(crossterm::event::KeyCode::Down));
         let names = app.providers.sorted_names();
-        assert_eq!(app.model_picker.provider_selected, 0, "Down 应切到 sorted_names[0]");
+        assert_eq!(
+            app.model_picker.provider_selected, 0,
+            "Down 应切到 sorted_names[0]"
+        );
         assert_eq!(names[0], "anthropic");
         assert!(app.model_picker.fetching, "切换 provider 应触发拉取");
         assert_ne!(app.model_picker.fetch_id, fid0, "fetch_id 应 bump");
@@ -4793,8 +4943,10 @@ mod tests {
 
     #[test]
     fn model_picker_state_start_fetch_bumps_id() {
-        let mut s = ModelPickerState::default();
-        s.models = vec!["old".into()];
+        let mut s = ModelPickerState {
+            models: vec!["old".into()],
+            ..Default::default()
+        };
         let id1 = s.start_fetch();
         assert!(s.fetching);
         assert!(s.models.is_empty(), "start_fetch 应清空旧 models");

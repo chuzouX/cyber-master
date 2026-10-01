@@ -35,8 +35,11 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(" 会话管理 / Sessions ")
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(" 会话管理 / Sessions ").style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
@@ -62,7 +65,9 @@ pub fn render(
             Line::from(vec![
                 Span::styled(
                     "标题",
-                    Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  · 消息  · id"),
             ])
@@ -89,7 +94,9 @@ pub fn render(
                     Span::raw(marker),
                     Span::styled(
                         format!("{}{}", meta.title, star),
-                        Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(title_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("  · {} 条  · [{}]", meta.message_count, id_short),
@@ -97,7 +104,9 @@ pub fn render(
                     ),
                     Span::styled(
                         delete_tag.to_string(),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ])
                 .style(row_style),
@@ -106,7 +115,11 @@ pub fn render(
     }
 
     let visible_rows = list_area.height as usize;
-    let selected_row = if state.list.is_empty() { 0 } else { 2 + state.selected };
+    let selected_row = if state.list.is_empty() {
+        0
+    } else {
+        2 + state.selected
+    };
     let max_scroll = lines.len().saturating_sub(visible_rows);
     let scroll = selected_row
         .saturating_sub(visible_rows.saturating_sub(1))
@@ -122,11 +135,7 @@ pub fn render(
 
     // 底部 hint：待删除态切换提示文案
     let hint = if let Some(i) = state.pending_delete {
-        let name = state
-            .list
-            .get(i)
-            .map(|m| m.title.as_str())
-            .unwrap_or("?");
+        let name = state.list.get(i).map(|m| m.title.as_str()).unwrap_or("?");
         format!(" 再按 d 确认删除「{name}」· 其他键取消")
     } else {
         " ↑↓ 选择  Enter 切换  n 新建  d 删除  Esc 返回".to_string()

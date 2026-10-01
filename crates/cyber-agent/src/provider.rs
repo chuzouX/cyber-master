@@ -60,7 +60,10 @@ impl StreamRequest {
 pub trait Provider: Send + Sync {
     /// 发起流式对话。返回 `'static` 流（impl 持有 owned reqwest::Client），
     /// 可直接 `tokio::spawn` 驱动。`req.tools` 空 = 不发 tools 字段。
-    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
+    fn stream(
+        &self,
+        req: StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
 }
 
 /// 按 `kind` 分发；`mock=true` 或 `kind=="mock"` 时返回 MockProvider。
@@ -73,7 +76,9 @@ pub fn provider_factory(cfg: &ProviderConfig, mock: bool) -> Result<Box<dyn Prov
         "anthropic" => Ok(Box::new(crate::anthropic::AnthropicProvider::new(cfg)?)),
         "ollama" => Ok(Box::new(crate::ollama::OllamaProvider::new(cfg)?)),
         "responses" => Ok(Box::new(crate::responses::ResponsesProvider::new(cfg)?)),
-        other => Err(crate::error::AgentError::Provider(format!("未知 provider kind: {other}"))),
+        other => Err(crate::error::AgentError::Provider(format!(
+            "未知 provider kind: {other}"
+        ))),
     }
 }
 
@@ -171,10 +176,7 @@ impl Stream for HttpStream {
                     Poll::Ready(Err(e)) => {
                         warn!(error = %e, "provider HTTP 请求失败");
                         let mut p = VecDeque::new();
-                        p.push_back(StreamEvent::Error(format!(
-                            "http: {e} @ {}",
-                            this.url
-                        )));
+                        p.push_back(StreamEvent::Error(format!("http: {e} @ {}", this.url)));
                         this.state = HttpState::Done { pending: p };
                         continue;
                     }
@@ -190,7 +192,11 @@ impl Stream for HttpStream {
                 } => {
                     // 先吐已解析事件
                     if let Some(ev) = pending.pop_front() {
-                        this.state = HttpState::Streaming { body, lines, pending };
+                        this.state = HttpState::Streaming {
+                            body,
+                            lines,
+                            pending,
+                        };
                         return Poll::Ready(Some(ev));
                     }
                     match body.as_mut().poll_next(cx) {
@@ -198,7 +204,11 @@ impl Stream for HttpStream {
                             for line in lines.push_bytes(&chunk) {
                                 pending.extend((this.parser)(&line));
                             }
-                            this.state = HttpState::Streaming { body, lines, pending };
+                            this.state = HttpState::Streaming {
+                                body,
+                                lines,
+                                pending,
+                            };
                             continue; // 可能立刻有 pending，或继续读下一块
                         }
                         Poll::Ready(Some(Err(e))) => {
@@ -218,7 +228,11 @@ impl Stream for HttpStream {
                             continue;
                         }
                         Poll::Pending => {
-                            this.state = HttpState::Streaming { body, lines, pending };
+                            this.state = HttpState::Streaming {
+                                body,
+                                lines,
+                                pending,
+                            };
                             return Poll::Pending;
                         }
                     }
@@ -271,6 +285,7 @@ impl Stream for HttpStream {
 /// - OpenAI/DeepSeek：`{"error":{"message":"..."}}`
 /// - Anthropic：`{"type":"error","error":{"type":"...","message":"..."}}`
 /// - 通用：`{"message":"..."}` / `{"error":"..."}`
+///
 /// 解析失败返回 None（调用方使用原始 body 文本）。
 fn extract_error_message(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;

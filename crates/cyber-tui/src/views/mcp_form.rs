@@ -23,11 +23,7 @@ use cyber_mcp::{McpServerSpec, McpTransport};
 use crate::theme::Theme;
 
 /// transport 选项（←→ 循环）。
-const TRANSPORTS: &[McpTransport] = &[
-    McpTransport::Stdio,
-    McpTransport::Http,
-    McpTransport::Sse,
-];
+const TRANSPORTS: &[McpTransport] = &[McpTransport::Stdio, McpTransport::Http, McpTransport::Sse];
 
 /// 字段类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,16 +41,46 @@ struct FieldDef {
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
 /// 0=name 1=transport 2=command 3=args 4=env 5=url 6=headers 7=timeout 8=保存 9=取消
 const FIELDS: &[FieldDef] = &[
-    FieldDef { label: "名称 name", kind: FieldKind::Text },
-    FieldDef { label: "传输 transport", kind: FieldKind::Enum },
-    FieldDef { label: "命令 command (stdio)", kind: FieldKind::Text },
-    FieldDef { label: "参数 args (每行一个, stdio)", kind: FieldKind::Text },
-    FieldDef { label: "环境变量 env (每行 KEY=VALUE, stdio)", kind: FieldKind::Text },
-    FieldDef { label: "URL url (http/sse)", kind: FieldKind::Text },
-    FieldDef { label: "请求头 headers (每行 KEY=VALUE, http/sse)", kind: FieldKind::Text },
-    FieldDef { label: "超时 timeout_secs", kind: FieldKind::Text },
-    FieldDef { label: "保存", kind: FieldKind::Button },
-    FieldDef { label: "取消", kind: FieldKind::Button },
+    FieldDef {
+        label: "名称 name",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "传输 transport",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "命令 command (stdio)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "参数 args (每行一个, stdio)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "环境变量 env (每行 KEY=VALUE, stdio)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "URL url (http/sse)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "请求头 headers (每行 KEY=VALUE, http/sse)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "超时 timeout_secs",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "保存",
+        kind: FieldKind::Button,
+    },
+    FieldDef {
+        label: "取消",
+        kind: FieldKind::Button,
+    },
 ];
 const IDX_TRANSPORT: usize = 1;
 const IDX_SAVE: usize = 8;
@@ -176,10 +202,7 @@ impl McpFormState {
 
     /// 校验并构造 `McpServerSpec`。失败返回错误文案（App 弹 toast）。
     /// `existing_names` 用于重名校验（编辑模式排除自身原名）。
-    pub fn into_spec(
-        &self,
-        existing_names: &[&str],
-    ) -> Result<McpServerSpec, String> {
+    pub fn into_spec(&self, existing_names: &[&str]) -> Result<McpServerSpec, String> {
         let name = self.name.trim().to_string();
         if name.is_empty() {
             return Err("名称不能为空".into());
@@ -196,8 +219,7 @@ impl McpFormState {
                     return Err("stdio 模式 command 不能为空".into());
                 }
                 let args = parse_lines(&self.args);
-                let env = parse_map(&self.env)
-                    .map_err(|e| format!("env 解析失败: {e}"))?;
+                let env = parse_map(&self.env).map_err(|e| format!("env 解析失败: {e}"))?;
                 (Some(cmd), args, env, None, Default::default())
             }
             McpTransport::Http | McpTransport::Sse => {
@@ -205,8 +227,8 @@ impl McpFormState {
                 if url.is_empty() {
                     return Err("http/sse 模式 url 不能为空".into());
                 }
-                let headers = parse_map(&self.headers)
-                    .map_err(|e| format!("headers 解析失败: {e}"))?;
+                let headers =
+                    parse_map(&self.headers).map_err(|e| format!("headers 解析失败: {e}"))?;
                 (None, Vec::new(), Default::default(), Some(url), headers)
             }
         };
@@ -299,18 +321,16 @@ impl McpFormState {
                 }
                 McpFormAction::None
             }
-            KeyCode::Enter => {
-                match self.focused {
-                    IDX_SAVE => McpFormAction::Save,
-                    IDX_CANCEL => McpFormAction::Cancel,
-                    IDX_TRANSPORT => McpFormAction::None,
-                    idx if Self::is_text_field(idx) && self.is_field_visible(idx) => {
-                        self.start_editing(idx);
-                        McpFormAction::None
-                    }
-                    _ => McpFormAction::None,
+            KeyCode::Enter => match self.focused {
+                IDX_SAVE => McpFormAction::Save,
+                IDX_CANCEL => McpFormAction::Cancel,
+                IDX_TRANSPORT => McpFormAction::None,
+                idx if Self::is_text_field(idx) && self.is_field_visible(idx) => {
+                    self.start_editing(idx);
+                    McpFormAction::None
                 }
-            }
+                _ => McpFormAction::None,
+            },
             KeyCode::Esc => McpFormAction::Cancel,
             _ => McpFormAction::None,
         }
@@ -361,11 +381,18 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &McpForm
         .border_style(Style::default().fg(theme.accent))
         .title(
             Line::from(if state.is_edit() {
-                format!(" 编辑 MCP Server: {} ", state.original_name.as_deref().unwrap_or(""))
+                format!(
+                    " 编辑 MCP Server: {} ",
+                    state.original_name.as_deref().unwrap_or("")
+                )
             } else {
                 " 添加 MCP Server ".to_string()
             })
-            .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            .style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
@@ -400,7 +427,11 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &McpFormSt
         } else {
             state.get_field(i)
         };
-        let editing_marker = if selected && state.editing { " [编辑中]" } else { "" };
+        let editing_marker = if selected && state.editing {
+            " [编辑中]"
+        } else {
+            ""
+        };
         let row_style = if selected {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -425,7 +456,9 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &McpFormSt
                 Span::raw(" : "),
                 Span::styled(
                     display_value,
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
             .style(row_style),
@@ -547,7 +580,10 @@ mod tests {
             name: "filesystem".into(),
             transport: McpTransport::Stdio,
             command: Some("npx".into()),
-            args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+            ],
             env: [("FOO".into(), "bar".into())].into_iter().collect(),
             url: None,
             headers: Default::default(),
@@ -641,7 +677,10 @@ mod tests {
         let spec = s.into_spec(&[]).unwrap();
         assert_eq!(spec.transport, McpTransport::Stdio);
         assert_eq!(spec.command.as_deref(), Some("npx"));
-        assert_eq!(spec.args, vec!["-y", "@modelcontextprotocol/server-filesystem", "."]);
+        assert_eq!(
+            spec.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "."]
+        );
         assert_eq!(spec.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(spec.env.get("BAZ"), Some(&"qux".to_string()));
         assert!(spec.url.is_none());
@@ -734,7 +773,7 @@ mod tests {
         let mut s = McpFormState::empty();
         s.transport_idx = 1; // http
         s.focused = 1; // transport
-        // Down 应跳过 command/args/env（2/3/4）直达 url（5）
+                       // Down 应跳过 command/args/env（2/3/4）直达 url（5）
         s.handle_key(key(KeyCode::Down));
         assert_eq!(s.focused, 5);
     }

@@ -36,7 +36,11 @@ enum FieldKind {
     Enum(&'static [&'static str]),
     /// 选项来自 `providers.keys()`（运行时动态，排序后循环）。
     ProviderEnum,
-    Number { min: u64, max: u64, step: u64 },
+    Number {
+        min: u64,
+        max: u64,
+        step: u64,
+    },
     ReadOnly,
 }
 
@@ -460,10 +464,20 @@ impl SettingsState {
         self.section == CUSTOM_TOOLS_SECTION_IDX
     }
 
-    pub fn on_memory_section(&self) -> bool { self.section == MEMORY_SECTION_IDX }
+    pub fn on_memory_section(&self) -> bool {
+        self.section == MEMORY_SECTION_IDX
+    }
 
-    pub fn prev_memory(&mut self, len: usize) { if len > 0 { self.memory_selected = (self.memory_selected + len - 1) % len; } }
-    pub fn next_memory(&mut self, len: usize) { if len > 0 { self.memory_selected = (self.memory_selected + 1) % len; } }
+    pub fn prev_memory(&mut self, len: usize) {
+        if len > 0 {
+            self.memory_selected = (self.memory_selected + len - 1) % len;
+        }
+    }
+    pub fn next_memory(&mut self, len: usize) {
+        if len > 0 {
+            self.memory_selected = (self.memory_selected + 1) % len;
+        }
+    }
 
     pub fn on_env_section(&self) -> bool {
         self.section == ENV_SECTION_IDX
@@ -568,12 +582,18 @@ impl SettingsState {
 
     /// Skills 段 cursor 上移。
     pub fn next_custom_tool(&mut self, len: usize) {
-        if len == 0 { self.custom_tools_selected = 0; return; }
+        if len == 0 {
+            self.custom_tools_selected = 0;
+            return;
+        }
         self.custom_tools_selected = (self.custom_tools_selected + 1).min(len - 1);
     }
 
     pub fn prev_custom_tool(&mut self, len: usize) {
-        if len == 0 { self.custom_tools_selected = 0; return; }
+        if len == 0 {
+            self.custom_tools_selected = 0;
+            return;
+        }
         self.custom_tools_selected = self.custom_tools_selected.saturating_sub(1);
     }
 
@@ -739,10 +759,7 @@ pub fn render(
     has_project_config: bool,
     toast: Option<&str>,
 ) {
-    let dirty_marker = if state.dirty
-        || state.dirty_providers
-        || state.dirty_mcp
-        || state.dirty_env
+    let dirty_marker = if state.dirty || state.dirty_providers || state.dirty_mcp || state.dirty_env
     {
         " *"
     } else {
@@ -752,8 +769,11 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(format!(" Settings{dirty_marker} "))
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(format!(" Settings{dirty_marker} ")).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(1, 1, 0, 0));
@@ -782,7 +802,9 @@ pub fn render(
         }
         if let Some(t) = toast {
             frame.render_widget(
-                Paragraph::new(Line::from(format!(" {t}")).style(Style::default().fg(theme.accent))),
+                Paragraph::new(
+                    Line::from(format!(" {t}")).style(Style::default().fg(theme.accent)),
+                ),
                 chunks[2],
             );
         }
@@ -791,9 +813,21 @@ pub fn render(
         inner
     };
 
-    let cols = Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
+    let cols =
+        Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
     render_sidebar(frame, cols[0], theme, state);
-    render_fields(frame, cols[1], theme, config, providers, mcp_config, mcp_registry, skills, custom_tools, state);
+    render_fields(
+        frame,
+        cols[1],
+        theme,
+        config,
+        providers,
+        mcp_config,
+        mcp_registry,
+        skills,
+        custom_tools,
+        state,
+    );
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, theme: &Theme, state: &SettingsState) {
@@ -802,17 +836,23 @@ fn render_sidebar(frame: &mut Frame, area: Rect, theme: &Theme, state: &Settings
         let marker = if i == state.section { "▸ " } else { "  " };
         let mut line = Line::from(format!("{marker}{}", s.name));
         line = if i == state.section {
-            line.style(Style::default().bg(theme.sel_bg).fg(theme.sel_fg).add_modifier(Modifier::BOLD))
+            line.style(
+                Style::default()
+                    .bg(theme.sel_bg)
+                    .fg(theme.sel_fg)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             line.style(Style::default().fg(theme.fg))
         };
         lines.push(line);
     }
     lines.push(Line::from(""));
-    lines.push(
-        Line::from("Tab 切段  ↑↓ 行").style(Style::default().fg(theme.muted)),
+    lines.push(Line::from("Tab 切段  ↑↓ 行").style(Style::default().fg(theme.muted)));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.bg)),
+        area,
     );
-    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.bg)), area);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -831,22 +871,44 @@ fn render_fields(
     let section = &SECTIONS[state.section];
     let mut lines: Vec<Line> = Vec::new();
     lines.push(
-        Line::from(format!(" {} ", section.name))
-            .style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Line::from(format!(" {} ", section.name)).style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
     );
     lines.push(Line::from(""));
 
     if section.name == "Memory" {
         if config.memory.rules.is_empty() {
-            lines.push(Line::from("(暂无 Memory Rule，使用 /memory rule add <scope> <提示> 添加)").style(Style::default().fg(theme.muted)));
+            lines.push(
+                Line::from("(暂无 Memory Rule，使用 /memory rule add <scope> <提示> 添加)")
+                    .style(Style::default().fg(theme.muted)),
+            );
         } else {
             for (i, rule) in config.memory.rules.iter().enumerate() {
-                let style = if i == state.memory_selected { Style::default().bg(theme.sel_bg).fg(theme.sel_fg) } else { Style::default().fg(theme.fg) };
-                lines.push(Line::from(format!("{}. [{}] {} {}", i + 1, if rule.enabled { "on" } else { "off" }, rule.scope, rule.prompt)).style(style));
+                let style = if i == state.memory_selected {
+                    Style::default().bg(theme.sel_bg).fg(theme.sel_fg)
+                } else {
+                    Style::default().fg(theme.fg)
+                };
+                lines.push(
+                    Line::from(format!(
+                        "{}. [{}] {} {}",
+                        i + 1,
+                        if rule.enabled { "on" } else { "off" },
+                        rule.scope,
+                        rule.prompt
+                    ))
+                    .style(style),
+                );
             }
         }
-        lines.push(Line::from("规则通过自然语言提示控制哪些内容可写入记忆；可用 /memory rule 管理").style(Style::default().fg(theme.muted)));
-    } else     if section.editable {
+        lines.push(
+            Line::from("规则通过自然语言提示控制哪些内容可写入记忆；可用 /memory rule 管理")
+                .style(Style::default().fg(theme.muted)),
+        );
+    } else if section.editable {
         for (i, field) in section.fields.iter().enumerate() {
             let selected = i == state.selected && !state.on_save_row();
             let value = display_value(field, config);
@@ -861,7 +923,12 @@ fn render_fields(
                     Span::raw(marker.to_string()),
                     Span::styled(field.label.to_string(), Style::default().fg(theme.fg)),
                     Span::raw(" : "),
-                    Span::styled(value, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        value,
+                        Style::default()
+                            .fg(theme.title)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("   ["),
                     Span::styled(field.effect.to_string(), Style::default().fg(theme.muted)),
                     Span::raw("]"),
@@ -873,7 +940,11 @@ fn render_fields(
         let on_save = state.on_save_row();
         let save_marker = if on_save { "▸ " } else { "  " };
         let any_dirty = state.dirty || state.dirty_providers || state.dirty_mcp;
-        let save_label = if any_dirty { "保存设置 *" } else { "保存设置" };
+        let save_label = if any_dirty {
+            "保存设置 *"
+        } else {
+            "保存设置"
+        };
         let save_style = if on_save {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -883,7 +954,12 @@ fn render_fields(
         lines.push(
             Line::from(vec![
                 Span::raw(save_marker.to_string()),
-                Span::styled(save_label.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    save_label.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("   (Enter 保存)"),
             ])
             .style(save_style),
@@ -895,7 +971,10 @@ fn render_fields(
                     .style(Style::default().fg(theme.muted)),
             );
         } else {
-            lines.push(Line::from("Enter 编辑字段  ←→ 调整  Esc 返回").style(Style::default().fg(theme.muted)));
+            lines.push(
+                Line::from("Enter 编辑字段  ←→ 调整  Esc 返回")
+                    .style(Style::default().fg(theme.muted)),
+            );
         }
     } else if state.on_providers_section() {
         // Providers 段：交互式（a 新增 / e 编辑 / d 删除 / Enter 设默认）
@@ -905,7 +984,11 @@ fn render_fields(
         let on_save = state.provider_on_save;
         let save_marker = if on_save { "▸ " } else { "  " };
         let any_dirty = state.dirty || state.dirty_providers || state.dirty_mcp;
-        let save_label = if any_dirty { "保存设置 *" } else { "保存设置" };
+        let save_label = if any_dirty {
+            "保存设置 *"
+        } else {
+            "保存设置"
+        };
         let save_style = if on_save {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -914,7 +997,12 @@ fn render_fields(
         lines.push(
             Line::from(vec![
                 Span::raw(save_marker.to_string()),
-                Span::styled(save_label.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    save_label.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("   (Enter 保存)"),
             ])
             .style(save_style),
@@ -941,7 +1029,11 @@ fn render_fields(
         let on_save = state.mcp_on_save;
         let save_marker = if on_save { "▸ " } else { "  " };
         let any_dirty = state.dirty || state.dirty_providers || state.dirty_mcp;
-        let save_label = if any_dirty { "保存设置 *" } else { "保存设置" };
+        let save_label = if any_dirty {
+            "保存设置 *"
+        } else {
+            "保存设置"
+        };
         let save_style = if on_save {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -950,7 +1042,12 @@ fn render_fields(
         lines.push(
             Line::from(vec![
                 Span::raw(save_marker.to_string()),
-                Span::styled(save_label.to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    save_label.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("   (Enter 保存)"),
             ])
             .style(save_style),
@@ -983,7 +1080,10 @@ fn render_fields(
     } else if state.on_custom_tools_section() {
         render_custom_tools_lines(&mut lines, theme, custom_tools, state);
         lines.push(Line::from(""));
-        lines.push(Line::from(" ↑↓ 选择  文件型配置：编辑 ~/.cyber/tools/*.toml 后重启生效").style(Style::default().fg(theme.muted)));
+        lines.push(
+            Line::from(" ↑↓ 选择  文件型配置：编辑 ~/.cyber/tools/*.toml 后重启生效")
+                .style(Style::default().fg(theme.muted)),
+        );
     } else if state.on_env_section() {
         // Env 段：交互式（a 新增 / e 编辑 / d 删除 / ↑↓ 选择）
         render_env_lines(&mut lines, theme, &config.env, state);
@@ -1013,15 +1113,34 @@ fn render_fields(
     let focus_line = if state.on_providers_section() {
         2 + state.provider_selected.saturating_mul(3)
     } else if state.on_custom_tools_section() {
-        2 + custom_tools.iter().take(state.custom_tools_selected).map(|tool| {
-            4 + usize::from(!tool.config.parameters.is_empty())
-        }).sum::<usize>()
+        2 + custom_tools
+            .iter()
+            .take(state.custom_tools_selected)
+            .map(|tool| 4 + usize::from(!tool.config.parameters.is_empty()))
+            .sum::<usize>()
     } else if state.on_skills_section() {
         let all: Vec<&Skill> = skills.iter().map(|s| s.as_ref()).collect();
-        2 + all.iter().take(state.skills_selected).map(|skill| 2 + usize::from(!skill.frontmatter.triggers.is_empty()) + usize::from(!skill.frontmatter.allowed_tools.is_empty())).sum::<usize>()
-    } else { 0 };
-    let scroll = focus_line.saturating_sub(visible_rows.saturating_sub(1)).min(lines.len().saturating_sub(visible_rows)).min(u16::MAX as usize) as u16;
-    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.bg).fg(theme.fg)).scroll((scroll, 0)), area);
+        2 + all
+            .iter()
+            .take(state.skills_selected)
+            .map(|skill| {
+                2 + usize::from(!skill.frontmatter.triggers.is_empty())
+                    + usize::from(!skill.frontmatter.allowed_tools.is_empty())
+            })
+            .sum::<usize>()
+    } else {
+        0
+    };
+    let scroll = focus_line
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(lines.len().saturating_sub(visible_rows))
+        .min(u16::MAX as usize) as u16;
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .scroll((scroll, 0)),
+        area,
+    );
 }
 
 fn display_value(field: &FieldDef, config: &Config) -> String {
@@ -1047,9 +1166,8 @@ fn render_providers_lines(
 ) {
     let names = providers.sorted_names();
     if names.is_empty() {
-        lines.push(
-            Line::from("（无 provider，按 a 新增）").style(Style::default().fg(theme.muted)),
-        );
+        lines
+            .push(Line::from("（无 provider，按 a 新增）").style(Style::default().fg(theme.muted)));
         return;
     }
     for (i, name) in names.iter().enumerate() {
@@ -1065,7 +1183,11 @@ fn render_providers_lines(
         } else {
             Style::default().bg(theme.bg)
         };
-        let name_color = if pending_delete { theme.accent } else { theme.title };
+        let name_color = if pending_delete {
+            theme.accent
+        } else {
+            theme.title
+        };
         lines.push(
             Line::from(vec![
                 Span::raw(marker.to_string()),
@@ -1073,14 +1195,18 @@ fn render_providers_lines(
                     format!("{name}{star}"),
                     Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("  [{}] {} · {}{}", p.kind, p.base_url, p.model_display_name(), delete_tag)),
+                Span::raw(format!(
+                    "  [{}] {} · {}{}",
+                    p.kind,
+                    p.base_url,
+                    p.model_display_name(),
+                    delete_tag
+                )),
             ])
             .style(row_style),
         );
         let key_line = format!("    api_key: {}", mask_key(&p.api_key));
-        lines.push(
-            Line::from(key_line).style(Style::default().fg(theme.muted)),
-        );
+        lines.push(Line::from(key_line).style(Style::default().fg(theme.muted)));
         // 价格配置行：显示单价（$/M），未配置则标「未设置」。使用 effective_price（per-model 优先）
         let price_line = match p.effective_price() {
             None => "    price: 未设置".to_string(),
@@ -1096,9 +1222,7 @@ fn render_providers_lines(
                 )
             }
         };
-        lines.push(
-            Line::from(price_line).style(Style::default().fg(theme.muted)),
-        );
+        lines.push(Line::from(price_line).style(Style::default().fg(theme.muted)));
     }
 }
 
@@ -1116,9 +1240,7 @@ fn render_mcp_lines(
         );
         return;
     }
-    let connected_names: Vec<&str> = mcp_registry
-        .map(|r| r.server_names())
-        .unwrap_or_default();
+    let connected_names: Vec<&str> = mcp_registry.map(|r| r.server_names()).unwrap_or_default();
     for (i, spec) in mcp_config.servers.iter().enumerate() {
         let selected = i == state.mcp_selected && !state.mcp_on_save;
         let pending_delete = state.mcp_pending_delete_idx == Some(i);
@@ -1129,7 +1251,11 @@ fn render_mcp_lines(
         } else {
             Style::default().bg(theme.bg)
         };
-        let name_color = if pending_delete { theme.accent } else { theme.title };
+        let name_color = if pending_delete {
+            theme.accent
+        } else {
+            theme.title
+        };
         // 传输摘要：stdio → command + args；http/sse → url
         let transport_summary = match spec.transport {
             McpTransport::Stdio => {
@@ -1164,10 +1290,12 @@ fn render_mcp_lines(
                     "  [{}] {} · timeout={}s",
                     spec.transport, transport_summary, spec.timeout_secs,
                 )),
-                Span::raw(format!("  · ")),
+                Span::raw("  · "),
                 Span::styled(
                     format!("[{}]", status_text),
-                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(delete_tag.to_string()),
             ])
@@ -1228,7 +1356,9 @@ fn render_skills_lines(
                 Span::raw(marker.to_string()),
                 Span::styled(
                     skill.name().to_string(),
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  [{source_tag}]{manual_tag}")),
             ])
@@ -1242,8 +1372,11 @@ fn render_skills_lines(
         // 触发词
         if !skill.frontmatter.triggers.is_empty() {
             lines.push(
-                Line::from(format!("    触发词: {}", skill.frontmatter.triggers.join(", ")))
-                    .style(Style::default().fg(theme.muted)),
+                Line::from(format!(
+                    "    触发词: {}",
+                    skill.frontmatter.triggers.join(", ")
+                ))
+                .style(Style::default().fg(theme.muted)),
             );
         }
         // 预批准工具（Claude Code 风格 allowed-tools）
@@ -1266,29 +1399,80 @@ fn mask_env_value(val: &str) -> String {
         "****".into()
     } else {
         let prefix: String = val.chars().take(2).collect();
-        let suffix: String = val.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+        let suffix: String = val
+            .chars()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         format!("{prefix}****{suffix}")
     }
 }
 
-fn render_custom_tools_lines(lines: &mut Vec<Line>, theme: &Theme, tools: &[LoadedCustomTool], state: &SettingsState) {
+fn render_custom_tools_lines(
+    lines: &mut Vec<Line>,
+    theme: &Theme,
+    tools: &[LoadedCustomTool],
+    state: &SettingsState,
+) {
     if tools.is_empty() {
-        lines.push(Line::from("（未加载自定义工具；在 ~/.cyber/tools/*.toml 中添加定义）").style(Style::default().fg(theme.muted)));
+        lines.push(
+            Line::from("（未加载自定义工具；在 ~/.cyber/tools/*.toml 中添加定义）")
+                .style(Style::default().fg(theme.muted)),
+        );
         return;
     }
     for (i, tool) in tools.iter().enumerate() {
         let cfg = &tool.config;
         let selected = i == state.custom_tools_selected;
         let marker = if selected { "▸ " } else { "  " };
-        let row_style = if selected { Style::default().bg(theme.sel_bg) } else { Style::default().bg(theme.bg) };
-        lines.push(Line::from(format!("{}{}", marker, cfg.name)).style(row_style.fg(theme.title).add_modifier(Modifier::BOLD)));
-        lines.push(Line::from(format!("   tags: {}", if cfg.tags.is_empty() { "(none)".into() } else { cfg.tags.join(", ") })).style(Style::default().fg(theme.muted)));
-        lines.push(Line::from(format!("   command: {}", cfg.command)).style(Style::default().fg(theme.fg)));
+        let row_style = if selected {
+            Style::default().bg(theme.sel_bg)
+        } else {
+            Style::default().bg(theme.bg)
+        };
+        lines.push(
+            Line::from(format!("{}{}", marker, cfg.name))
+                .style(row_style.fg(theme.title).add_modifier(Modifier::BOLD)),
+        );
+        lines.push(
+            Line::from(format!(
+                "   tags: {}",
+                if cfg.tags.is_empty() {
+                    "(none)".into()
+                } else {
+                    cfg.tags.join(", ")
+                }
+            ))
+            .style(Style::default().fg(theme.muted)),
+        );
+        lines.push(
+            Line::from(format!("   command: {}", cfg.command)).style(Style::default().fg(theme.fg)),
+        );
         if !cfg.parameters.is_empty() {
-            let names = cfg.parameters.iter().map(|p| if p.required { format!("{}*", p.name) } else { p.name.clone() }).collect::<Vec<_>>().join(", ");
-            lines.push(Line::from(format!("   parameters: {}", names)).style(Style::default().fg(theme.muted)));
+            let names = cfg
+                .parameters
+                .iter()
+                .map(|p| {
+                    if p.required {
+                        format!("{}*", p.name)
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(
+                Line::from(format!("   parameters: {}", names))
+                    .style(Style::default().fg(theme.muted)),
+            );
         }
-        lines.push(Line::from(format!("   source: {}", tool.path.display())).style(Style::default().fg(theme.muted)));
+        lines.push(
+            Line::from(format!("   source: {}", tool.path.display()))
+                .style(Style::default().fg(theme.muted)),
+        );
     }
 }
 
@@ -1300,9 +1484,7 @@ fn render_env_lines(
     state: &SettingsState,
 ) {
     if env_config.vars.is_empty() {
-        lines.push(
-            Line::from("（无环境变量，按 a 新增）").style(Style::default().fg(theme.muted)),
-        );
+        lines.push(Line::from("（无环境变量，按 a 新增）").style(Style::default().fg(theme.muted)));
         return;
     }
     for (i, var) in env_config.vars.iter().enumerate() {
@@ -1315,7 +1497,11 @@ fn render_env_lines(
         } else {
             Style::default().bg(theme.bg)
         };
-        let key_color = if pending_delete { theme.accent } else { theme.title };
+        let key_color = if pending_delete {
+            theme.accent
+        } else {
+            theme.title
+        };
         // 敏感变量脱敏展示
         let display_value = if var.sensitive {
             mask_env_value(&var.value)

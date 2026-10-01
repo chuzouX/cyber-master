@@ -176,7 +176,8 @@ mod tests {
     #[test]
     fn merge_tables_overrides_scalars_and_recurses() {
         let base: Value =
-            toml::from_str("ui = { theme = \"a\", mouse = true }\n[agent]\nmax_steps = 10").unwrap();
+            toml::from_str("ui = { theme = \"a\", mouse = true }\n[agent]\nmax_steps = 10")
+                .unwrap();
         let over: Value = toml::from_str("ui = { theme = \"b\" }").unwrap();
         let merged = merge_tables(base, over);
         let s = toml::to_string(&merged).unwrap();
@@ -304,7 +305,10 @@ mod tests {
         assert_eq!(loaded.default_provider, "ollama");
         assert!(loaded.providers.contains_key("custom"));
         assert_eq!(loaded.providers["custom"].kind, "openai-compatible");
-        assert_eq!(loaded.providers["custom"].base_url, "https://gateway.local/v1");
+        assert_eq!(
+            loaded.providers["custom"].base_url,
+            "https://gateway.local/v1"
+        );
         assert_eq!(loaded.providers["custom"].api_key, "${CUSTOM_KEY}");
         assert_eq!(loaded.providers["custom"].max_tokens, 8192);
 

@@ -11,12 +11,10 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cyber_agent::{
-    CtfChallengeTool, CustomTool, SaveMemoryTool, SearchToolsTool, ToolRegistry,
-};
+use cyber_agent::{CtfChallengeTool, CustomTool, SaveMemoryTool, SearchToolsTool, ToolRegistry};
 use cyber_core::{load_custom_tools, CtfChallenge, Paths};
 use cyber_mcp::{McpRegistry, McpServersConfig};
-use cyber_skills::{SkillRegistry, SkillTool};
+use cyber_skills::{SkillRegistry, SkillTool, UseSkillTool};
 use tracing::warn;
 
 use crate::app::AppRegistries;
@@ -53,8 +51,22 @@ pub async fn build_registries(
 
     // 2. 工具表：内置工具 + Skill 工具
     let mut tool_reg = ToolRegistry::with_builtins();
-    for skill in skills.iter() {
-        tool_reg.register(Box::new(SkillTool::new(skill.clone())));
+    let skills_arc = Arc::new(skills);
+
+    if !skills_arc.is_empty() {
+        tool_reg.register(Box::new(UseSkillTool::new(Arc::clone(&skills_arc))));
+    }
+
+    // 当 Skill 总数较多（超过 32 个）时，避免海量工具撑爆 LLM 接口限制（如 OpenAI 最大 128 个）
+    // 且消耗大量 schema token。此时注册为 hidden 工具（仍可直接按名执行，但不暴露到 LLM tools 数组）。
+    let hide_individual_skills = skills_arc.len() > 32;
+    for skill in skills_arc.iter() {
+        let tool = Box::new(SkillTool::new(skill.clone()));
+        if hide_individual_skills {
+            tool_reg.register_hidden(tool);
+        } else {
+            tool_reg.register(tool);
+        }
     }
 
     // CTF 题目共享状态（工具与 App 共享）
@@ -101,7 +113,7 @@ pub async fn build_registries(
     (
         AppRegistries {
             tools: Arc::new(tool_reg),
-            skills: Arc::new(skills),
+            skills: skills_arc,
             custom_tools: Arc::new(custom_tools),
             mcp,
             ctf_challenges: Some(ctf_challenges),

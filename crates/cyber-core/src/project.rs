@@ -87,8 +87,7 @@ pub fn parse(raw: &str) -> Result<(ProjectFrontmatter, String)> {
 
     let fm_src = fm_lines.join("\n");
     let body: String = lines.collect::<Vec<_>>().join("\n");
-    let frontmatter: ProjectFrontmatter =
-        serde_yaml::from_str(&fm_src).map_err(CoreError::Yaml)?;
+    let frontmatter: ProjectFrontmatter = serde_yaml::from_str(&fm_src).map_err(CoreError::Yaml)?;
     Ok((frontmatter, body))
 }
 

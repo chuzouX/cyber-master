@@ -39,7 +39,7 @@ fn spawn_run(
         mock,
         cwd,
         registry,
-        false,    // ctf_enabled
+        false, // ctf_enabled
         cyber_core::ThinkingIntensity::Middle,
         String::new(),
     ));
@@ -223,10 +223,7 @@ async fn mock_tool_loop_roundtrip() {
     }
 
     assert!(started, "应先收到 Started");
-    assert!(
-        !first_text.is_empty(),
-        "第一步应先发文本（tool call 前导）"
-    );
+    assert!(!first_text.is_empty(), "第一步应先发文本（tool call 前导）");
     assert!(tool_call_seen, "应收到 list_dir 工具调用");
     assert!(tool_result_seen, "应收到工具结果");
     assert!(
@@ -292,7 +289,7 @@ async fn mock_tool_loop_not_loop_detected() {
 async fn mock_max_steps_exhaustion_does_graceful_summary() {
     let mut config = Config::default();
     config.agent.max_steps = 1; // step 0 有工具调用 → 循环耗尽 → 收尾总结
-    // auto_tool_call 保持默认 true（tools 非空 → mock tool-loop 第一步发工具调用）
+                                // auto_tool_call 保持默认 true（tools 非空 → mock tool-loop 第一步发工具调用）
     let providers = ProvidersConfig::default_template();
     let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
 
@@ -365,7 +362,7 @@ async fn mock_tool_loop_respects_generation_tag() {
         true,
         cwd,
         registry,
-        false,    // ctf_enabled
+        false, // ctf_enabled
         cyber_core::ThinkingIntensity::Middle,
         String::new(),
     ));

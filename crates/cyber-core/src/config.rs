@@ -21,7 +21,15 @@ pub struct MemoryConfig {
 }
 
 impl Default for MemoryConfig {
-    fn default() -> Self { Self { rules: vec![MemoryRule { enabled: true, scope: "both".into(), prompt: "只记录用户长期偏好、身份和项目约定。".into() }] } }
+    fn default() -> Self {
+        Self {
+            rules: vec![MemoryRule {
+                enabled: true,
+                scope: "both".into(),
+                prompt: "只记录用户长期偏好、身份和项目约定。".into(),
+            }],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +138,7 @@ impl ThinkingIntensity {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "low" => Some(Self::Low),

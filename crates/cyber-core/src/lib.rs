@@ -3,8 +3,8 @@
 //! P1 范围：配置层加载（全局 `~/.cyber` + 项目级 `.cyber/` + `.cyber.md`）。
 
 pub mod config;
-pub mod custom_tool;
 pub mod ctf;
+pub mod custom_tool;
 pub mod error;
 pub mod fsutil;
 pub mod init;
@@ -15,13 +15,13 @@ pub mod project;
 pub mod providers;
 
 pub use config::{Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity};
-pub use custom_tool::{
-    load_custom_tools, CustomToolConfig, CustomToolParam, LoadedCustomTool,
-};
 pub use ctf::{current_time_str, CtfCategory, CtfChallenge, CtfStatus};
+pub use custom_tool::{load_custom_tools, CustomToolConfig, CustomToolParam, LoadedCustomTool};
 pub use error::{CoreError, Result};
 pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};
 pub use memory::{MemoryEntry, MemoryScope, MemoryStore};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
-pub use providers::{resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS};
+pub use providers::{
+    resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS,
+};

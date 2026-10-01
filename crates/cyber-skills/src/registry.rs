@@ -16,7 +16,7 @@ use crate::skill::{Skill, SkillSource};
 /// 「调用」——渐进式披露每次返回 body 副本，Skill 本身不可变）。
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
-    skills: Vec<Arc<Skill>>,
+    pub(crate) skills: Vec<Arc<Skill>>,
 }
 
 impl SkillRegistry {
@@ -44,7 +44,11 @@ impl SkillRegistry {
         // 去重：项目级覆盖全局同名（保留 Project，丢弃 Global）
         skills = dedup_by_name(skills);
 
-        debug!(count = skills.len(), errors = errors.len(), "Skill 注册表加载完成");
+        debug!(
+            count = skills.len(),
+            errors = errors.len(),
+            "Skill 注册表加载完成"
+        );
         (Self { skills }, errors)
     }
 
@@ -204,7 +208,11 @@ mod tests {
         let g = tmpdir("err_g");
         let bad_dir = g.join("bad");
         fs::create_dir_all(&bad_dir).unwrap();
-        fs::write(bad_dir.join("SKILL.md"), "---\ndescription: no name\n---\nbody\n").unwrap();
+        fs::write(
+            bad_dir.join("SKILL.md"),
+            "---\ndescription: no name\n---\nbody\n",
+        )
+        .unwrap();
         write_skill(&g, "good", "ok");
         let (reg, errs) = SkillRegistry::load_all(&g, None);
         assert_eq!(reg.len(), 1, "有效 skill 应加载");
@@ -240,7 +248,10 @@ mod tests {
         write_skill(&g, "real", "ok");
         let (reg, errs) = SkillRegistry::load_all(&g, None);
         assert_eq!(reg.len(), 1, "仅 real 应加载");
-        assert!(errs.is_empty(), "无 SKILL.md 的子目录应静默跳过，不入 errors");
+        assert!(
+            errs.is_empty(),
+            "无 SKILL.md 的子目录应静默跳过，不入 errors"
+        );
         let _ = fs::remove_dir_all(&g);
     }
 }

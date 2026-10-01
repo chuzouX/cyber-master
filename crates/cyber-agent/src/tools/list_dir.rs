@@ -41,11 +41,7 @@ impl Tool for ListDirTool {
             let mut entries: Vec<String> = Vec::new();
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let suffix = if entry
-                    .file_type()
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-                {
+                let suffix = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     "/"
                 } else {
                     ""
@@ -84,10 +80,7 @@ mod tests {
             scope: None,
             env: Vec::new(),
         };
-        let out = ListDirTool
-            .run(json!({"path": "."}), &ctx)
-            .await
-            .unwrap();
+        let out = ListDirTool.run(json!({"path": "."}), &ctx).await.unwrap();
         assert!(out.content.contains("a.txt"));
         assert!(out.content.contains("sub/"));
         let _ = std::fs::remove_dir_all(&dir);

@@ -119,7 +119,10 @@ mod tests {
         assert_eq!(schema.name, "custom_echo_value");
         assert_eq!(schema.tags, vec!["ctf", "misc"]);
         assert_eq!(schema.parameters["required"], json!(["value"]));
-        assert_eq!(schema.parameters["properties"]["optional"]["default"], "fallback");
+        assert_eq!(
+            schema.parameters["properties"]["optional"]["default"],
+            "fallback"
+        );
     }
 
     #[test]

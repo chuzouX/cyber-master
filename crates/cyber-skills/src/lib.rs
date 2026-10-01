@@ -20,4 +20,4 @@ pub use error::{Result, SkillError};
 pub use frontmatter::SkillFrontmatter;
 pub use registry::SkillRegistry;
 pub use skill::{Skill, SkillSource};
-pub use tool::SkillTool;
+pub use tool::{SkillTool, UseSkillTool};

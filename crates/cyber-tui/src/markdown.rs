@@ -137,17 +137,12 @@ fn render_block_line(raw: &str, md: &MdColors) -> Line<'static> {
 
     // 分隔线：--- / *** / ___（≥3 个相同字符，允许空白）
     if is_hr(trimmed) {
-        return Line::from(Span::styled(
-            "─".repeat(30),
-            Style::default().fg(md.hr),
-        ));
+        return Line::from(Span::styled("─".repeat(30), Style::default().fg(md.hr)));
     }
 
     // 标题：# .. ######
     if let Some((level, content)) = parse_header(trimmed) {
-        let style = Style::default()
-            .fg(md.header)
-            .add_modifier(Modifier::BOLD);
+        let style = Style::default().fg(md.header).add_modifier(Modifier::BOLD);
         return Line::from(Span::styled(
             format!("{} {content}", "#".repeat(level)),
             style,
@@ -269,7 +264,7 @@ fn try_match(s: &str, md: &MdColors) -> Option<(usize, Vec<Span<'static>>)> {
             if let Some(rel) = rest[search..].find('*') {
                 let abs_in_rest = search + rel;
                 let abs_in_s = abs_in_rest + 1; // 补回被 strip 的开头 *
-                // 跳过 **（由粗体分支处理）
+                                                // 跳过 **（由粗体分支处理）
                 if abs_in_s + 1 < s.len() && bytes[abs_in_s + 1] == b'*' {
                     search = abs_in_rest + 2;
                     continue;
@@ -600,9 +595,10 @@ mod tests {
         let spans = &lines[0].spans;
         // 应存在携带 BOLD|ITALIC 的 span
         assert!(
-            spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD | Modifier::ITALIC)),
+            spans.iter().any(|s| s
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC)),
             "应存在粗斜体 span"
         );
     }
@@ -646,8 +642,10 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
         assert!(
-            spans.iter().any(|s| &*s.content == "x^2 + y^2"
-                && s.style.add_modifier.contains(Modifier::ITALIC)),
+            spans
+                .iter()
+                .any(|s| &*s.content == "x^2 + y^2"
+                    && s.style.add_modifier.contains(Modifier::ITALIC)),
             "应存在斜体数学 span"
         );
     }
@@ -694,6 +692,9 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
         // 应有一个 span 内容为 "a * b"（含 *）
-        assert!(spans.iter().any(|s| &*s.content == "a * b"), "数学内容应原样含 *");
+        assert!(
+            spans.iter().any(|s| &*s.content == "a * b"),
+            "数学内容应原样含 *"
+        );
     }
 }

@@ -89,7 +89,10 @@ fn message_to_anthropic(m: Message) -> Option<Value> {
 }
 
 impl Provider for AnthropicProvider {
-    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+    fn stream(
+        &self,
+        req: StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // system 移到顶层；messages 过滤 System + 翻译 Role::Tool
         let msgs: Vec<Value> = req
             .messages
@@ -110,12 +113,16 @@ impl Provider for AnthropicProvider {
             let tools: Vec<Value> = req
                 .tools
                 .iter()
-                .map(|t| {
-                    json!({
-                        "name": t.name,
+                .filter_map(|t| {
+                    let sanitized = crate::tool::sanitize_tool_name(&t.name);
+                    if sanitized.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "name": sanitized,
                         "description": t.description,
                         "input_schema": t.parameters,
-                    })
+                    }))
                 })
                 .collect();
             body["tools"] = json!(tools);

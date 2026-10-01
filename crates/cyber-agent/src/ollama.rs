@@ -26,10 +26,18 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
-        let base = cfg.base_url.trim_end_matches('/');
+        let url = cfg
+            .chat_endpoint
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| {
+                let base = cfg.base_url.trim().trim_end_matches('/');
+                format!("{base}/api/chat")
+            });
         Ok(Self {
             client: reqwest::Client::new(),
-            url: format!("{base}/api/chat"),
+            url,
             model: cfg.model.clone(),
             max_tokens: cfg.effective_max_tokens(),
             temperature: cfg.effective_temperature(),
@@ -37,26 +45,41 @@ impl OllamaProvider {
     }
 }
 
-/// 将内部 `Message` 翻译为 Ollama（OpenAI 兼容）messages 数组条目：
-/// - `Tool` → `{role:"tool", tool_call_id, content}`
-/// - `Assistant` 带 tool_calls → `{role:"assistant", content, tool_calls:[{id,type:"function",function:{name,arguments}}]}`
+/// 将内部 `Message` 翻译为 Ollama messages 数组条目：
+/// - `Tool` → `{role:"tool", content, tool_call_id?}`
+/// - `Assistant` 带 tool_calls → `{role:"assistant", content, tool_calls:[{function:{name,arguments}}]}`
+///   注意：Ollama Go 端的 `api.ToolCallFunctionArguments` 是 `map[string]interface{}`，
+///   因此 `arguments` 必须序列化为 JSON Object 而非 JSON String，否则会报 HTTP 400：
+///   `cannot unmarshal string into Go struct field ChatRequest.messages.tool_calls.function.arguments`。
 /// - 其余 → `{role, content}`
 fn message_to_ollama(m: Message) -> Value {
     match m.role {
-        Role::Tool => json!({
-            "role": "tool",
-            "tool_call_id": m.tool_call_id.unwrap_or_default(),
-            "content": m.content,
-        }),
+        Role::Tool => {
+            let mut obj = json!({
+                "role": "tool",
+                "content": m.content,
+            });
+            if let Some(id) = m.tool_call_id.as_deref().filter(|s| !s.is_empty()) {
+                obj["tool_call_id"] = json!(id);
+            }
+            obj
+        }
         Role::Assistant if !m.tool_calls.is_empty() => {
             let tcs: Vec<Value> = m
                 .tool_calls
                 .iter()
                 .map(|tc| {
+                    let arguments =
+                        serde_json::from_str::<Value>(&tc.arguments).unwrap_or_else(|_| json!({}));
+                    let arguments_obj = match arguments {
+                        Value::Object(map) => Value::Object(map),
+                        _ => json!({}),
+                    };
                     json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": tc.arguments}
+                        "function": {
+                            "name": tc.name,
+                            "arguments": arguments_obj,
+                        }
                     })
                 })
                 .collect();
@@ -67,7 +90,10 @@ fn message_to_ollama(m: Message) -> Value {
 }
 
 impl Provider for OllamaProvider {
-    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+    fn stream(
+        &self,
+        req: StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // Ollama 接受 system 在 messages 数组中
         let mut msgs: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
         if let Some(s) = req.system {
@@ -89,11 +115,15 @@ impl Provider for OllamaProvider {
             let tools: Vec<Value> = req
                 .tools
                 .iter()
-                .map(|t| {
-                    json!({
+                .filter_map(|t| {
+                    let sanitized = crate::tool::sanitize_tool_name(&t.name);
+                    if sanitized.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
                         "type": "function",
-                        "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
-                    })
+                        "function": {"name": sanitized, "description": t.description, "parameters": t.parameters}
+                    }))
                 })
                 .collect();
             body["tools"] = json!(tools);
@@ -125,6 +155,25 @@ mod tests {
         let v = message_to_ollama(m);
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["tool_calls"][0]["function"]["name"], "list_dir");
+        // Ollama Go 端反序列化必须是 JSON Object，不能是 String
+        assert!(v["tool_calls"][0]["function"]["arguments"].is_object());
+        assert_eq!(v["tool_calls"][0]["function"]["arguments"]["path"], ".");
+    }
+
+    #[test]
+    fn assistant_with_invalid_arguments_serializes_as_empty_object() {
+        let m = Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c".into(),
+                name: "list_dir".into(),
+                arguments: "not valid json".into(),
+            }],
+            tool_call_id: None,
+        };
+        let v = message_to_ollama(m);
+        assert_eq!(v["tool_calls"][0]["function"]["arguments"], json!({}));
     }
 
     #[test]
@@ -133,6 +182,30 @@ mod tests {
         let v = message_to_ollama(m);
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "c1");
+        assert_eq!(v["content"], "结果");
+
+        // 无 tool_call_id 时不产生空的 tool_call_id 字段
+        let m_no_id = Message {
+            role: Role::Tool,
+            content: "结果2".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let v_no_id = message_to_ollama(m_no_id);
+        assert_eq!(v_no_id["role"], "tool");
+        assert!(v_no_id.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn ollama_provider_new_respects_custom_chat_endpoint() {
+        let cfg = ProviderConfig {
+            kind: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            chat_endpoint: Some("http://localhost:11434/custom/chat".into()),
+            ..Default::default()
+        };
+        let p = OllamaProvider::new(&cfg).unwrap();
+        assert_eq!(p.url, "http://localhost:11434/custom/chat");
     }
 
     #[test]

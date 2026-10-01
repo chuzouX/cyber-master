@@ -327,7 +327,9 @@ pub fn read_session_text(history_dir: &Path, cwd: &Path, id: &str) -> Option<Str
                 out.push_str(t);
                 out.push('\n');
             }
-            ChatEntry::ToolCall { name, arguments, .. } => {
+            ChatEntry::ToolCall {
+                name, arguments, ..
+            } => {
                 out.push_str(&format!("▶ [{name}] {arguments}\n"));
             }
             ChatEntry::ToolResult { name, output, .. } => {

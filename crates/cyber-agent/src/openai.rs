@@ -76,7 +76,10 @@ fn message_to_openai(m: Message) -> Value {
 }
 
 impl Provider for OpenAiProvider {
-    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+    fn stream(
+        &self,
+        req: StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // system 作为 messages 数组首条（OpenAI 约定）
         let mut msgs: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
         if let Some(s) = req.system {
@@ -94,16 +97,27 @@ impl Provider for OpenAiProvider {
             "stream_options": {"include_usage": true},
         });
         if !req.tools.is_empty() {
-            let tools: Vec<Value> = req
+            let mut tools: Vec<Value> = req
                 .tools
                 .iter()
-                .map(|t| {
-                    json!({
+                .filter_map(|t| {
+                    let sanitized = crate::tool::sanitize_tool_name(&t.name);
+                    if sanitized.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
                         "type": "function",
-                        "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
-                    })
+                        "function": {"name": sanitized, "description": t.description, "parameters": t.parameters}
+                    }))
                 })
                 .collect();
+            if tools.len() > 128 {
+                tracing::warn!(
+                    total = tools.len(),
+                    "工具总数超过 OpenAI 接口上限 128，已截断保留前 128 个"
+                );
+                tools.truncate(128);
+            }
             body["tools"] = json!(tools);
         }
         let http_req = self
@@ -140,7 +154,10 @@ mod tests {
         assert_eq!(v["tool_calls"][0]["id"], "call_1");
         assert_eq!(v["tool_calls"][0]["type"], "function");
         assert_eq!(v["tool_calls"][0]["function"]["name"], "list_dir");
-        assert_eq!(v["tool_calls"][0]["function"]["arguments"], "{\"path\":\".\"}");
+        assert_eq!(
+            v["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\".\"}"
+        );
     }
 
     #[test]

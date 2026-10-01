@@ -117,7 +117,10 @@ pub const COMMANDS: &[CommandSpec] = &[
 /// 返回 `&'static CommandSpec` 切片引用，供补全菜单复用（无拷贝）。
 pub fn filter_commands(prefix: &str) -> Vec<&'static CommandSpec> {
     let p = prefix.to_lowercase();
-    COMMANDS.iter().filter(|c| c.name.starts_with(p.as_str())).collect()
+    COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(p.as_str()))
+        .collect()
 }
 
 /// 返回命令的二级参数建议（仅固定参数集命令）。无固定参数的命令返回空。
@@ -294,7 +297,10 @@ mod tests {
 
     #[test]
     fn parse_max_steps_with_number() {
-        assert_eq!(parse("/max_steps 100"), SlashCommand::MaxSteps("100".into()));
+        assert_eq!(
+            parse("/max_steps 100"),
+            SlashCommand::MaxSteps("100".into())
+        );
     }
 
     #[test]
@@ -353,7 +359,24 @@ mod tests {
 
     #[test]
     fn help_text_lists_all_commands() {
-        for cmd in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/think", "/new", "/sessions", "/memory", "/quit"] {
+        for cmd in [
+            "/help",
+            "/clear",
+            "/mode",
+            "/model",
+            "/provider",
+            "/tools",
+            "/skill",
+            "/mcp",
+            "/cancel",
+            "/compact",
+            "/max_steps",
+            "/think",
+            "/new",
+            "/sessions",
+            "/memory",
+            "/quit",
+        ] {
             assert!(HELP_TEXT.contains(cmd), "HELP_TEXT 应包含 {cmd}");
         }
     }
@@ -365,8 +388,14 @@ mod tests {
 
     #[test]
     fn parse_memory_with_arg() {
-        assert_eq!(parse("/memory add 记住这个"), SlashCommand::Memory("add 记住这个".into()));
-        assert_eq!(parse("/memory project 项目约定"), SlashCommand::Memory("project 项目约定".into()));
+        assert_eq!(
+            parse("/memory add 记住这个"),
+            SlashCommand::Memory("add 记住这个".into())
+        );
+        assert_eq!(
+            parse("/memory project 项目约定"),
+            SlashCommand::Memory("project 项目约定".into())
+        );
     }
 
     #[test]
@@ -377,17 +406,32 @@ mod tests {
 
     #[test]
     fn parse_provider_subcommands() {
-        assert_eq!(parse("/provider list"), SlashCommand::Provider("list".into()));
+        assert_eq!(
+            parse("/provider list"),
+            SlashCommand::Provider("list".into())
+        );
         assert_eq!(parse("/provider add"), SlashCommand::Provider("add".into()));
-        assert_eq!(parse("/provider use openai"), SlashCommand::Provider("use openai".into()));
-        assert_eq!(parse("/provider edit anthropic"), SlashCommand::Provider("edit anthropic".into()));
-        assert_eq!(parse("/provider remove ollama"), SlashCommand::Provider("remove ollama".into()));
+        assert_eq!(
+            parse("/provider use openai"),
+            SlashCommand::Provider("use openai".into())
+        );
+        assert_eq!(
+            parse("/provider edit anthropic"),
+            SlashCommand::Provider("edit anthropic".into())
+        );
+        assert_eq!(
+            parse("/provider remove ollama"),
+            SlashCommand::Provider("remove ollama".into())
+        );
     }
 
     #[test]
     fn parse_provider_case_insensitive() {
         assert_eq!(parse("/PROVIDER"), SlashCommand::Provider(String::new()));
-        assert_eq!(parse("/Provider List"), SlashCommand::Provider("List".into()));
+        assert_eq!(
+            parse("/Provider List"),
+            SlashCommand::Provider("List".into())
+        );
     }
 
     #[test]
@@ -398,7 +442,10 @@ mod tests {
 
     #[test]
     fn parse_skill_with_name() {
-        assert_eq!(parse("/skill src-recon"), SlashCommand::Skill("src-recon".into()));
+        assert_eq!(
+            parse("/skill src-recon"),
+            SlashCommand::Skill("src-recon".into())
+        );
         assert_eq!(parse("/skill list"), SlashCommand::Skill("list".into()));
     }
 
@@ -450,7 +497,23 @@ mod tests {
     #[test]
     fn commands_catalog_covers_all_parsed_commands() {
         // 目录应覆盖每个可解析命令名
-        for name in ["/help", "/clear", "/mode", "/model", "/provider", "/tools", "/skill", "/mcp", "/cancel", "/compact", "/max_steps", "/think", "/new", "/sessions", "/quit"] {
+        for name in [
+            "/help",
+            "/clear",
+            "/mode",
+            "/model",
+            "/provider",
+            "/tools",
+            "/skill",
+            "/mcp",
+            "/cancel",
+            "/compact",
+            "/max_steps",
+            "/think",
+            "/new",
+            "/sessions",
+            "/quit",
+        ] {
             assert!(
                 COMMANDS.iter().any(|c| c.name == name),
                 "COMMANDS 应包含 {name}"
@@ -460,10 +523,22 @@ mod tests {
 
     #[test]
     fn param_suggestions_for_known_commands() {
-        assert_eq!(param_suggestions("/think"), vec!["low", "middle", "high", "max", "auto"]);
-        assert_eq!(param_suggestions("/ctf"), vec!["enable", "disable", "add", "list", "writeup"]);
-        assert_eq!(param_suggestions("/mode"), vec!["chat", "workflow", "dashboard"]);
-        assert_eq!(param_suggestions("/provider"), vec!["list", "add", "edit", "use", "remove"]);
+        assert_eq!(
+            param_suggestions("/think"),
+            vec!["low", "middle", "high", "max", "auto"]
+        );
+        assert_eq!(
+            param_suggestions("/ctf"),
+            vec!["enable", "disable", "add", "list", "writeup"]
+        );
+        assert_eq!(
+            param_suggestions("/mode"),
+            vec!["chat", "workflow", "dashboard"]
+        );
+        assert_eq!(
+            param_suggestions("/provider"),
+            vec!["list", "add", "edit", "use", "remove"]
+        );
         assert_eq!(param_suggestions("/sessions"), vec!["list", "read", "new"]);
         assert_eq!(param_suggestions("/mcp"), vec!["list", "status"]);
         assert_eq!(param_suggestions("/skill"), vec!["list"]);
@@ -487,8 +562,14 @@ mod tests {
 
     #[test]
     fn parse_sessions_with_subcommand() {
-        assert_eq!(parse("/sessions list"), SlashCommand::Sessions("list".into()));
-        assert_eq!(parse("/sessions read abc"), SlashCommand::Sessions("read abc".into()));
+        assert_eq!(
+            parse("/sessions list"),
+            SlashCommand::Sessions("list".into())
+        );
+        assert_eq!(
+            parse("/sessions read abc"),
+            SlashCommand::Sessions("read abc".into())
+        );
         assert_eq!(parse("/sessions new"), SlashCommand::Sessions("new".into()));
     }
 }

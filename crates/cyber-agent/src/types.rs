@@ -181,7 +181,9 @@ pub enum AgentEvent {
     },
     /// 即将开始上下文压缩（自动或手动触发）。TUI 可展示「正在压缩…」状态。
     /// `is_auto` 区分自动触发（达到阈值）与手动 `/compact`。
-    Compacting { is_auto: bool },
+    Compacting {
+        is_auto: bool,
+    },
     /// 上下文压缩已完成。`summary` 为压缩后的摘要文本（供 TUI 展示）。
     /// `before_tokens` / `after_tokens` 为压缩前后的 token 估算。
     Compacted {
@@ -200,7 +202,10 @@ mod tests {
     #[test]
     fn role_serializes_lowercase() {
         assert_eq!(serde_json::to_string(&Role::System).unwrap(), "\"system\"");
-        assert_eq!(serde_json::to_string(&Role::Assistant).unwrap(), "\"assistant\"");
+        assert_eq!(
+            serde_json::to_string(&Role::Assistant).unwrap(),
+            "\"assistant\""
+        );
         assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"tool\"");
     }
 

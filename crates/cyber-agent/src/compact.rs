@@ -77,7 +77,10 @@ pub fn auto_compact_threshold(effective_context_length: Option<u32>) -> Option<u
 /// 计算上下文剩余百分比（0-100）。
 /// `used_tokens` 当前已用 token；`effective_context_length` 有效上下文长度。
 /// 返回 None 表示有效上下文长度未知。
-pub fn context_remaining_percent(used_tokens: usize, effective_context_length: Option<u32>) -> Option<u32> {
+pub fn context_remaining_percent(
+    used_tokens: usize,
+    effective_context_length: Option<u32>,
+) -> Option<u32> {
     let total = effective_context_length? as usize;
     if total == 0 {
         return None;
@@ -153,9 +156,7 @@ pub async fn compact_messages(
         return Err(AgentError::Provider("压缩未生成有效摘要".into()));
     }
     // 摘要包装为 user 消息（与 Claude Code 的 isCompactSummary 一致）
-    let content = format!(
-        "（上下文已压缩：以下是之前对话的摘要）\n\n{summary}"
-    );
+    let content = format!("（上下文已压缩：以下是之前对话的摘要）\n\n{summary}");
     Ok(Message::user(content))
 }
 
@@ -191,7 +192,7 @@ mod tests {
     #[test]
     fn estimate_messages_tokens_includes_content() {
         let msgs = vec![
-            Message::user("abcd"),    // 1
+            Message::user("abcd"),      // 1
             Message::assistant("efgh"), // 1
         ];
         assert_eq!(estimate_messages_tokens(&msgs), 2);
@@ -201,8 +202,8 @@ mod tests {
     fn estimate_messages_tokens_includes_tool_calls() {
         let mut m = Message::assistant("ab"); // 0 (整数除法)
         m.tool_calls.push(crate::types::ToolCall {
-            id: "call_1".into(),     // 不计入 id（仅 name + arguments）
-            name: "list_dir".into(), // 2
+            id: "call_1".into(),                  // 不计入 id（仅 name + arguments）
+            name: "list_dir".into(),              // 2
             arguments: "{\"path\":\".\"}".into(), // 3
         });
         // 0 + 2 + 3 = 5（id 不参与估算）
@@ -231,35 +232,23 @@ mod tests {
     #[test]
     fn context_remaining_percent_basic() {
         // 100 tokens used out of 1000 → 90%
-        assert_eq!(
-            context_remaining_percent(100, Some(1000)),
-            Some(90)
-        );
+        assert_eq!(context_remaining_percent(100, Some(1000)), Some(90));
     }
 
     #[test]
     fn context_remaining_percent_full() {
-        assert_eq!(
-            context_remaining_percent(0, Some(1000)),
-            Some(100)
-        );
+        assert_eq!(context_remaining_percent(0, Some(1000)), Some(100));
     }
 
     #[test]
     fn context_remaining_percent_zero_remaining() {
-        assert_eq!(
-            context_remaining_percent(1000, Some(1000)),
-            Some(0)
-        );
+        assert_eq!(context_remaining_percent(1000, Some(1000)), Some(0));
     }
 
     #[test]
     fn context_remaining_percent_clamps_overflow() {
         // used > total → 0%
-        assert_eq!(
-            context_remaining_percent(2000, Some(1000)),
-            Some(0)
-        );
+        assert_eq!(context_remaining_percent(2000, Some(1000)), Some(0));
     }
 
     #[test]

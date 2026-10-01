@@ -99,7 +99,10 @@ fn message_to_responses(m: Message) -> Vec<Value> {
 }
 
 impl Provider for ResponsesProvider {
-    fn stream(&self, req: StreamRequest) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+    fn stream(
+        &self,
+        req: StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // system → 顶层 instructions（Responses API 约定）
         let mut body = json!({
             "model": self.model,
@@ -118,18 +121,29 @@ impl Provider for ResponsesProvider {
             .collect();
         body["input"] = json!(input);
         if !req.tools.is_empty() {
-            let tools: Vec<Value> = req
+            let mut tools: Vec<Value> = req
                 .tools
                 .iter()
-                .map(|t| {
-                    json!({
+                .filter_map(|t| {
+                    let sanitized = crate::tool::sanitize_tool_name(&t.name);
+                    if sanitized.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
                         "type": "function",
-                        "name": t.name,
+                        "name": sanitized,
                         "description": t.description,
                         "parameters": t.parameters,
-                    })
+                    }))
                 })
                 .collect();
+            if tools.len() > 128 {
+                tracing::warn!(
+                    total = tools.len(),
+                    "工具总数超过 OpenAI Responses 接口上限 128，已截断保留前 128 个"
+                );
+                tools.truncate(128);
+            }
             body["tools"] = json!(tools);
         }
         let http_req = self

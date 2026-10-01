@@ -40,9 +40,7 @@ pub struct LoadedCustomTool {
 }
 
 /// 扫描目录顶层 TOML 文件。单文件失败不会阻断其余工具。
-pub fn load_custom_tools(
-    dir: &Path,
-) -> (Vec<LoadedCustomTool>, Vec<(PathBuf, CoreError)>) {
+pub fn load_custom_tools(dir: &Path) -> (Vec<LoadedCustomTool>, Vec<(PathBuf, CoreError)>) {
     if !dir.exists() {
         return (Vec::new(), Vec::new());
     }
@@ -61,11 +59,9 @@ pub fn load_custom_tools(
         .map(|entry| entry.path())
         .filter(|path| {
             path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|ext| {
-                        ext.eq_ignore_ascii_case(['t', 'o', 'm', 'l'].iter().collect::<String>())
-                    })
+                && path.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case(['t', 'o', 'm', 'l'].iter().collect::<String>())
+                })
         })
         .collect();
     paths.sort();
@@ -99,10 +95,14 @@ fn load_one(path: &Path) -> Result<CustomToolConfig, CoreError> {
     })?;
     let config: CustomToolConfig = toml::from_str(&raw)?;
     if config.name.trim().is_empty() {
-        return Err(CoreError::Config("custom tool name must not be empty".into()));
+        return Err(CoreError::Config(
+            "custom tool name must not be empty".into(),
+        ));
     }
     if config.command.trim().is_empty() {
-        return Err(CoreError::Config("custom tool command must not be empty".into()));
+        return Err(CoreError::Config(
+            "custom tool command must not be empty".into(),
+        ));
     }
     Ok(config)
 }

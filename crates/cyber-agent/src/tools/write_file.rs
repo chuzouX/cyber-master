@@ -81,7 +81,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "hello"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

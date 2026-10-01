@@ -171,7 +171,9 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
     match k.code {
         KeyCode::Enter => {
             // Shift/Alt+Enter → 换行；无修饰 Enter → 提交
-            if k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+            if k.modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            {
                 ChatAction::Newline
             } else {
                 ChatAction::Submit
@@ -207,27 +209,54 @@ mod tests {
 
     #[test]
     fn ctrl_c_maps_to_quit() {
-        assert_eq!(key_to_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL)), Action::Quit);
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        );
     }
 
     #[test]
     fn plain_c_is_other() {
-        assert_eq!(key_to_action(key(KeyCode::Char('c'), KeyModifiers::NONE)), Action::Other);
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::Other
+        );
     }
 
     #[test]
     fn enter_tab_esc_mapped() {
-        assert_eq!(key_to_action(key(KeyCode::Enter, KeyModifiers::NONE)), Action::Enter);
-        assert_eq!(key_to_action(key(KeyCode::Tab, KeyModifiers::NONE)), Action::Tab);
-        assert_eq!(key_to_action(key(KeyCode::Esc, KeyModifiers::NONE)), Action::Esc);
-        assert_eq!(key_to_action(key(KeyCode::Up, KeyModifiers::NONE)), Action::Up);
-        assert_eq!(key_to_action(key(KeyCode::Down, KeyModifiers::NONE)), Action::Down);
+        assert_eq!(
+            key_to_action(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Enter
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::Tab
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Esc
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Up, KeyModifiers::NONE)),
+            Action::Up
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Down, KeyModifiers::NONE)),
+            Action::Down
+        );
     }
 
     #[test]
     fn s_opens_settings_ctrl_s_does_not() {
-        assert_eq!(key_to_action(key(KeyCode::Char('s'), KeyModifiers::NONE)), Action::OpenSettings);
-        assert_eq!(key_to_action(key(KeyCode::Char('S'), KeyModifiers::SHIFT)), Action::OpenSettings);
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Action::OpenSettings
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            Action::OpenSettings
+        );
         assert_eq!(
             key_to_action(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Action::Other
@@ -236,17 +265,35 @@ mod tests {
 
     #[test]
     fn a_e_d_map_to_provider_actions() {
-        assert_eq!(key_to_action(key(KeyCode::Char('a'), KeyModifiers::NONE)), Action::AddProvider);
-        assert_eq!(key_to_action(key(KeyCode::Char('e'), KeyModifiers::NONE)), Action::EditProvider);
-        assert_eq!(key_to_action(key(KeyCode::Char('d'), KeyModifiers::NONE)), Action::DeleteProvider);
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Action::AddProvider
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Action::EditProvider
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Action::DeleteProvider
+        );
     }
 
     #[test]
     fn ctrl_a_e_d_are_other() {
         // 带修饰键的 a/e/d 不触发 provider 动作（避免与未来快捷键冲突）
-        assert_eq!(key_to_action(key(KeyCode::Char('a'), KeyModifiers::CONTROL)), Action::Other);
-        assert_eq!(key_to_action(key(KeyCode::Char('e'), KeyModifiers::CONTROL)), Action::Other);
-        assert_eq!(key_to_action(key(KeyCode::Char('d'), KeyModifiers::CONTROL)), Action::Other);
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Action::Other
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Action::Other
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Action::Other
+        );
     }
 
     // ---- Chat 模式（chat_key_to_action）----

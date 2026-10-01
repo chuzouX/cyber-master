@@ -203,10 +203,7 @@ impl CtfChallengeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Provider("ctf_challenge solve 缺少 name".into()))?;
 
-        let flag = input
-            .get("flag")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let flag = input.get("flag").and_then(|v| v.as_str()).map(String::from);
 
         let key_points = input
             .get("key_points")
@@ -217,9 +214,7 @@ impl CtfChallengeTool {
         let c = challenges
             .iter_mut()
             .find(|c| c.name == name)
-            .ok_or_else(|| {
-                AgentError::Provider(format!("题目 {name} 不存在，无法标记为已解出"))
-            })?;
+            .ok_or_else(|| AgentError::Provider(format!("题目 {name} 不存在，无法标记为已解出")))?;
 
         c.status = CtfStatus::Solved;
         if let Some(f) = &flag {
@@ -349,7 +344,8 @@ mod tests {
         let reg = json!({"action": "register", "name": "c1", "category": "crypto"});
         tool.run(reg, &ctx()).await.unwrap();
 
-        let solve = json!({"action": "solve", "name": "c1", "flag": "flag{test}", "key_points": "RSA"});
+        let solve =
+            json!({"action": "solve", "name": "c1", "flag": "flag{test}", "key_points": "RSA"});
         let out = tool.run(solve, &ctx()).await.unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("flag{test}"));
@@ -371,8 +367,18 @@ mod tests {
     #[tokio::test]
     async fn list_returns_summary() {
         let (tool, _challenges) = make_tool();
-        tool.run(json!({"action": "register", "name": "c1", "category": "web"}), &ctx()).await.unwrap();
-        tool.run(json!({"action": "register", "name": "c2", "category": "pwn"}), &ctx()).await.unwrap();
+        tool.run(
+            json!({"action": "register", "name": "c1", "category": "web"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        tool.run(
+            json!({"action": "register", "name": "c2", "category": "pwn"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
 
         let out = tool.run(json!({"action": "list"}), &ctx()).await.unwrap();
         assert!(out.content.contains("c1"));

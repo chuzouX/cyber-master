@@ -51,10 +51,13 @@ impl StdioTransport {
     ///
     /// `command` 缺失或 spawn 失败 → `McpError::SpawnFailed`。
     pub fn spawn(spec: &McpServerSpec) -> Result<Self> {
-        let command = spec.command.as_deref().ok_or_else(|| McpError::SpawnFailed {
-            server: spec.name.clone(),
-            detail: "stdio 传输缺少 `command` 字段".into(),
-        })?;
+        let command = spec
+            .command
+            .as_deref()
+            .ok_or_else(|| McpError::SpawnFailed {
+                server: spec.name.clone(),
+                detail: "stdio 传输缺少 `command` 字段".into(),
+            })?;
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(&spec.args)
             .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -67,21 +70,19 @@ impl StdioTransport {
             server: spec.name.clone(),
             detail: format!("spawn `{command}` 失败: {e}"),
         })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::SpawnFailed {
-                server: spec.name.clone(),
-                detail: "子进程 stdin 不可用".into(),
-            })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::SpawnFailed {
-                server: spec.name.clone(),
-                detail: "子进程 stdout 不可用".into(),
-            })?;
-        Ok(Self { child, stdin, stdout })
+        let stdin = child.stdin.take().ok_or_else(|| McpError::SpawnFailed {
+            server: spec.name.clone(),
+            detail: "子进程 stdin 不可用".into(),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| McpError::SpawnFailed {
+            server: spec.name.clone(),
+            detail: "子进程 stdout 不可用".into(),
+        })?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
     }
 }
 

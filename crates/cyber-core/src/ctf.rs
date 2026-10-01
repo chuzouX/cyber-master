@@ -46,6 +46,7 @@ impl CtfCategory {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "misc" => Some(Self::Misc),
@@ -58,6 +59,7 @@ impl CtfCategory {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for CtfCategory {
     fn default() -> Self {
         Self::Misc
@@ -207,7 +209,7 @@ fn duration_between(start: &str, end: &str) -> String {
     };
     let s = parse(start).unwrap_or(0);
     let e = parse(end).unwrap_or(s);
-    let diff = if e >= s { e - s } else { 0 };
+    let diff = e.saturating_sub(s);
     let h = diff / 60;
     let m = diff % 60;
     if h > 0 {

@@ -155,7 +155,10 @@ Authorization = "Bearer ${MCP_TOKEN}"
         let s = &cfg.servers[0];
         assert_eq!(s.transport, McpTransport::Http);
         assert_eq!(s.url.as_deref(), Some("https://scanner.internal/mcp"));
-        assert_eq!(s.headers.get("Authorization").unwrap(), "Bearer ${MCP_TOKEN}");
+        assert_eq!(
+            s.headers.get("Authorization").unwrap(),
+            "Bearer ${MCP_TOKEN}"
+        );
     }
 
     #[test]

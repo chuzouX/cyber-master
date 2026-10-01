@@ -22,19 +22,16 @@ const OPTIONS: &[&str] = &[
 ///
 /// - `selected`：当前选中项索引（0..OPTIONS.len()）
 /// - `toast`：一次性提示（如占位功能说明），有值时显示在底部
-pub fn render(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    selected: usize,
-    toast: Option<&str>,
-) {
+pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, selected: usize, toast: Option<&str>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(concat!(" Cyber Master · v", env!("CARGO_PKG_VERSION"), " "))
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(concat!(" Cyber Master · v", env!("CARGO_PKG_VERSION"), " ")).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
@@ -42,8 +39,8 @@ pub fn render(
     frame.render_widget(block, area);
 
     // Keep the landing content centered and readable on wide terminals.
-    let content_height = 3 + 1 + (OPTIONS.len() as u16 * 3) + 1 + 1
-        + if toast.is_some() { 2 } else { 0 };
+    let content_height =
+        3 + 1 + (OPTIONS.len() as u16 * 3) + 1 + 1 + if toast.is_some() { 2 } else { 0 };
     let content_area = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(content_height),

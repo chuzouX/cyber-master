@@ -33,7 +33,9 @@ pub struct ShellTool {
 
 impl Default for ShellTool {
     fn default() -> Self {
-        Self { enforce_guard: true }
+        Self {
+            enforce_guard: true,
+        }
     }
 }
 
@@ -174,7 +176,7 @@ impl Tool for ShellTool {
             // 通过环境变量达到同等效果（PYTHONUNBUFFERED 对 Python 等价于 python -u）。
             // 放在用户 env 注入前，用户可在 Settings → Env 中覆盖。
             cmd.env("PYTHONUNBUFFERED", "1"); // Python: stdout/stderr 不缓冲
-            // 注入用户在 Settings → Env 配置的环境变量（可覆盖上面的默认值）
+                                              // 注入用户在 Settings → Env 配置的环境变量（可覆盖上面的默认值）
             for (k, v) in &ctx.env {
                 cmd.env(k, v);
             }
@@ -292,7 +294,10 @@ impl Tool for ShellTool {
                     content.push_str(&format!(
                         "[命令执行超时（{SHELL_TIMEOUT_SECS}s），已终止子进程]"
                     ));
-                    Ok(ToolOutput { content, is_error: true })
+                    Ok(ToolOutput {
+                        content,
+                        is_error: true,
+                    })
                 }
             }
         })

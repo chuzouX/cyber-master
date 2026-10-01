@@ -52,15 +52,15 @@ pub async fn fetch_models(cfg: &ProviderConfig) -> Result<Vec<String>> {
                 let payload: Value = match resp.json().await {
                     Ok(v) => v,
                     Err(e) => {
-                        last_error = AgentError::Provider(format!("GET {endpoint} 解析 JSON 失败: {e}"));
+                        last_error =
+                            AgentError::Provider(format!("GET {endpoint} 解析 JSON 失败: {e}"));
                         continue;
                     }
                 };
                 let models = extract_model_ids(&payload);
                 if models.is_empty() {
-                    last_error = AgentError::Provider(format!(
-                        "GET {endpoint} 成功但未返回模型 id"
-                    ));
+                    last_error =
+                        AgentError::Provider(format!("GET {endpoint} 成功但未返回模型 id"));
                     continue;
                 }
                 return Ok(models);
@@ -76,14 +76,19 @@ pub async fn fetch_models(cfg: &ProviderConfig) -> Result<Vec<String>> {
 /// 按 kind 返回候选端点（已规范化 base_url 去尾 `/`）。
 ///
 /// - anthropic：先 `/v1/models`（Anthropic 标准），后 `/models`
-/// - 其余（openai / openai-compatible / ollama）：先 `/models`，后 `/v1/models`（ollama
-///   的 OpenAI 兼容端点）
+/// - ollama：先 `/api/tags`（Ollama 原生端点），后 `/v1/models`（Ollama 的 OpenAI 兼容端点）
+/// - 其余（openai / openai-compatible）：先 `/models`，后 `/v1/models`
 pub fn fetch_endpoints(kind: &str, base_url: &str) -> Vec<String> {
     let normalized = base_url.trim().trim_end_matches('/');
     if kind == "anthropic" {
         vec![
             format!("{normalized}/v1/models"),
             format!("{normalized}/models"),
+        ]
+    } else if kind == "ollama" {
+        vec![
+            format!("{normalized}/api/tags"),
+            format!("{normalized}/v1/models"),
         ]
     } else {
         vec![
@@ -102,7 +107,10 @@ pub fn fetch_endpoints(kind: &str, base_url: &str) -> Vec<String> {
 pub fn fetch_headers(cfg: &ProviderConfig) -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut h = HeaderMap::new();
-    h.insert(HeaderName::from_static("accept"), HeaderValue::from_static("application/json"));
+    h.insert(
+        HeaderName::from_static("accept"),
+        HeaderValue::from_static("application/json"),
+    );
     let key = resolve_api_key(&cfg.api_key);
     match cfg.kind.as_str() {
         "anthropic" => {
@@ -263,9 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn fetch_endpoints_ollama_models_first() {
+    fn fetch_endpoints_ollama_tags_first() {
         let eps = fetch_endpoints("ollama", "http://localhost:11434/");
-        assert_eq!(eps[0], "http://localhost:11434/models");
+        assert_eq!(eps[0], "http://localhost:11434/api/tags");
         assert_eq!(eps[1], "http://localhost:11434/v1/models");
     }
 

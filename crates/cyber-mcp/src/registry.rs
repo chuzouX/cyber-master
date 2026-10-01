@@ -87,7 +87,9 @@ impl McpRegistry {
 
     /// 空注册表（mock 模式或无 server 时用）。
     pub fn empty() -> Self {
-        Self { servers: Vec::new() }
+        Self {
+            servers: Vec::new(),
+        }
     }
 
     /// 已连接的 server 名称列表（供 `/mcp` 展示，顺序同 `servers.toml`）。

@@ -11,7 +11,7 @@
 //! 4. 建 tokio 通道（agent 事件回传），按是否有项目上下文路由初始模式
 //! 5. 进入 ratatui TUI 异步主循环（`tokio::select!` 事件总线）
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use cyber_agent::AgentEvent;
@@ -125,7 +125,7 @@ async fn main() -> color_eyre::Result<()> {
 }
 
 /// headless 执行：`cyber run`。
-async fn run_headless_command(cwd: &PathBuf, args: RunArgs) -> color_eyre::Result<()> {
+async fn run_headless_command(cwd: &Path, args: RunArgs) -> color_eyre::Result<()> {
     let outcome = run_headless(
         cwd,
         HeadlessArgs {
@@ -157,7 +157,7 @@ async fn run_headless_command(cwd: &PathBuf, args: RunArgs) -> color_eyre::Resul
 }
 
 /// TUI 启动。
-async fn run_tui(cwd: &PathBuf, mock_flag: bool, log_level: Option<&str>) -> color_eyre::Result<()> {
+async fn run_tui(cwd: &Path, mock_flag: bool, log_level: Option<&str>) -> color_eyre::Result<()> {
     let ctx = load_app_context(cwd)?;
 
     // 日志写文件（~/.cyber/logs/cyber.log），不输出到终端——避免干扰 TUI 渲染。
@@ -167,7 +167,11 @@ async fn run_tui(cwd: &PathBuf, mock_flag: bool, log_level: Option<&str>) -> col
     let default_filter = log_level.unwrap_or("info");
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    match std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
         Ok(f) => {
             tracing_subscriber::fmt()
                 .with_env_filter(env_filter)
@@ -175,10 +179,11 @@ async fn run_tui(cwd: &PathBuf, mock_flag: bool, log_level: Option<&str>) -> col
                 .init();
         }
         Err(e) => {
-            eprintln!("警告：无法打开日志文件 {}: {e}，回退 stderr（可能干扰 TUI）", log_file.display());
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
+            eprintln!(
+                "警告：无法打开日志文件 {}: {e}，回退 stderr（可能干扰 TUI）",
+                log_file.display()
+            );
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     }
 
@@ -231,7 +236,7 @@ async fn run_tui(cwd: &PathBuf, mock_flag: bool, log_level: Option<&str>) -> col
         ctf_dir: ctx.paths.ctf_dir.clone(),
         ctf_writeup_dir: ctx.paths.ctf_writeup_dir.clone(),
         memory_file: ctx.paths.memory_file.clone(),
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
     };
 
     // 构建统一工具表（builtins + Skills + MCP）。注意在 `paths` move 前 borrow ctx.paths + cwd。
@@ -269,5 +274,8 @@ fn init_tracing(log_level: Option<&str>) {
     let default_filter = log_level.unwrap_or("info");
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    tracing_subscriber::fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
 }

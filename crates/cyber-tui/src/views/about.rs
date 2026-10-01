@@ -16,8 +16,11 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(" 关于 / About ")
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(" 关于 / About ").style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(4, 4, 2, 1));
@@ -66,9 +69,13 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
     .split(content_area);
 
     let mut i = 0usize;
-    let accent = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(theme.muted);
-    let title = Style::default().fg(theme.title).add_modifier(Modifier::BOLD);
+    let title = Style::default()
+        .fg(theme.title)
+        .add_modifier(Modifier::BOLD);
 
     // 应用名
     frame.render_widget(
@@ -114,15 +121,29 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
 
     // 核心能力
     frame.render_widget(
-        Paragraph::new(Line::from("核心能力")).style(title).alignment(Alignment::Center),
+        Paragraph::new(Line::from("核心能力"))
+            .style(title)
+            .alignment(Alignment::Center),
         rows[i],
     );
     i += 1;
     let features = [
-        ("多 Provider 流式对话", "DeepSeek 思考链 · 上下文自动压缩 · 历史持久化"),
-        ("统一工具表", "内置工具 + MCP（stdio/HTTP/SSE）+ Skill 渐进式披露"),
-        ("工作流 DAG", "节点编排 · 并行执行 · tokio mpsc 流式资产传递"),
-        ("CTF 协作面板", "题目管理 · writeup 归档 · 会话隔离 · 全局/会话作用域"),
+        (
+            "多 Provider 流式对话",
+            "DeepSeek 思考链 · 上下文自动压缩 · 历史持久化",
+        ),
+        (
+            "统一工具表",
+            "内置工具 + MCP（stdio/HTTP/SSE）+ Skill 渐进式披露",
+        ),
+        (
+            "工作流 DAG",
+            "节点编排 · 并行执行 · tokio mpsc 流式资产传递",
+        ),
+        (
+            "CTF 协作面板",
+            "题目管理 · writeup 归档 · 会话隔离 · 全局/会话作用域",
+        ),
     ];
     for (name, desc) in features {
         frame.render_widget(
@@ -142,7 +163,9 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
 
     // 快捷键
     frame.render_widget(
-        Paragraph::new(Line::from("常用快捷键")).style(title).alignment(Alignment::Center),
+        Paragraph::new(Line::from("常用快捷键"))
+            .style(title)
+            .alignment(Alignment::Center),
         rows[i],
     );
     i += 1;
@@ -172,12 +195,12 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
     // 仓库
     let repo = env!("CARGO_PKG_REPOSITORY");
     let repo_line = if repo.is_empty() {
-        Line::from(vec![Span::styled("仓库  https://github.com/chuzouX/cyber-master", muted)])
+        Line::from(vec![Span::styled(
+            "仓库  https://github.com/chuzouX/cyber-master",
+            muted,
+        )])
     } else {
-        Line::from(vec![
-            Span::styled("仓库  ", muted),
-            Span::raw(repo),
-        ])
+        Line::from(vec![Span::styled("仓库  ", muted), Span::raw(repo)])
     };
     frame.render_widget(
         Paragraph::new(repo_line)
@@ -257,7 +280,9 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
 
     // hint
     frame.render_widget(
-        Paragraph::new(Line::from("Esc 返回   q 退出")).style(muted).alignment(Alignment::Center),
+        Paragraph::new(Line::from("Esc 返回   q 退出"))
+            .style(muted)
+            .alignment(Alignment::Center),
         rows[i],
     );
 }

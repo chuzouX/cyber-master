@@ -227,7 +227,7 @@ impl ProviderConfig {
             .filter(|&n| n > 0)
     }
 
-    /// 有效的流式对话端点。优先使用 `chat_endpoint`，为空则回退到默认 `{base_url}/chat/completions`。
+    /// 有效的流式对话端点。优先使用 `chat_endpoint`，为空则回退到默认（ollama 为 `{base_url}/api/chat`，其余为 `{base_url}/chat/completions`）。
     pub fn chat_endpoint(&self) -> String {
         self.chat_endpoint
             .as_deref()
@@ -235,7 +235,11 @@ impl ProviderConfig {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| {
                 let base = self.base_url.trim().trim_end_matches('/');
-                format!("{base}/chat/completions")
+                if self.kind == "ollama" {
+                    format!("{base}/api/chat")
+                } else {
+                    format!("{base}/chat/completions")
+                }
             })
     }
 
@@ -267,6 +271,7 @@ pub fn resolve_api_key(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -279,14 +284,20 @@ mod tests {
     #[test]
     fn resolve_env_var_reference() {
         std::env::set_var("CYBER_TEST_KEY_RESOLVE", "secret-value-42");
-        assert_eq!(resolve_api_key("${CYBER_TEST_KEY_RESOLVE}"), "secret-value-42");
+        assert_eq!(
+            resolve_api_key("${CYBER_TEST_KEY_RESOLVE}"),
+            "secret-value-42"
+        );
         std::env::remove_var("CYBER_TEST_KEY_RESOLVE");
     }
 
     #[test]
     fn resolve_unset_env_var_returns_empty() {
         // 极不可能存在的变量名
-        assert_eq!(resolve_api_key("${CYBER_TEST_KEY_DEFINITELY_UNSET_XYZ}"), "");
+        assert_eq!(
+            resolve_api_key("${CYBER_TEST_KEY_DEFINITELY_UNSET_XYZ}"),
+            ""
+        );
     }
 
     #[test]
@@ -636,5 +647,39 @@ temperature = 0.7
         assert_eq!(p.model, "gpt-4o");
         assert!(p.models.is_empty());
         assert_eq!(p.effective_max_tokens(), 4096);
+    }
+
+    #[test]
+    fn chat_endpoint_defaults_correctly() {
+        let openai_cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            openai_cfg.chat_endpoint(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+
+        let ollama_cfg = ProviderConfig {
+            kind: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ollama_cfg.chat_endpoint(),
+            "http://localhost:11434/api/chat"
+        );
+
+        let custom_cfg = ProviderConfig {
+            kind: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            chat_endpoint: Some("http://localhost:11434/v1/chat/completions".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            custom_cfg.chat_endpoint(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 }

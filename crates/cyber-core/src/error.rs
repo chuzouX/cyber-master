@@ -14,7 +14,9 @@ pub enum CoreError {
         source: std::io::Error,
     },
 
-    #[error("文件 {path} 不是有效的 UTF-8（请用 UTF-8 保存，避免记事本 Unicode/ANSI 模式）: {source}")]
+    #[error(
+        "文件 {path} 不是有效的 UTF-8（请用 UTF-8 保存，避免记事本 Unicode/ANSI 模式）: {source}"
+    )]
     FileEncoding {
         path: String,
         #[source]

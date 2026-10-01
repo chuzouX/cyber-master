@@ -47,7 +47,11 @@ impl Tool for SearchToolsTool {
             .map(str::trim)
             .filter(|tag| !tag.is_empty())
             .map(str::to_lowercase);
-        let schemas = self.catalog.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let schemas = self
+            .catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Box::pin(async move {
             let matches: Vec<_> = schemas
                 .into_iter()

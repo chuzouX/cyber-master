@@ -31,7 +31,17 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
 
 /// 内置工具名（供 TUI `/tools` 命令展示，避免重复构造 registry）。
 pub fn builtin_tool_names() -> &'static [&'static str] {
-    &["read_file", "write_file", "list_dir", "find_file", "shell", "web_fetch", "download_file", "ctf_challenge", "save_memory"]
+    &[
+        "read_file",
+        "write_file",
+        "list_dir",
+        "find_file",
+        "shell",
+        "web_fetch",
+        "download_file",
+        "ctf_challenge",
+        "save_memory",
+    ]
 }
 
 pub use ctf_challenge::CtfChallengeTool;

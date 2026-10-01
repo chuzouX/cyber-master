@@ -34,11 +34,26 @@ struct FieldDef {
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
 /// 0=key 1=value 2=sensitive 3=保存 4=取消
 const FIELDS: &[FieldDef] = &[
-    FieldDef { label: "名称 key", kind: FieldKind::Text },
-    FieldDef { label: "值 value", kind: FieldKind::Text },
-    FieldDef { label: "敏感内容 sensitive", kind: FieldKind::Bool },
-    FieldDef { label: "保存", kind: FieldKind::Button },
-    FieldDef { label: "取消", kind: FieldKind::Button },
+    FieldDef {
+        label: "名称 key",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "值 value",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "敏感内容 sensitive",
+        kind: FieldKind::Bool,
+    },
+    FieldDef {
+        label: "保存",
+        kind: FieldKind::Button,
+    },
+    FieldDef {
+        label: "取消",
+        kind: FieldKind::Button,
+    },
 ];
 const IDX_KEY: usize = 0;
 const IDX_VALUE: usize = 1;
@@ -217,7 +232,14 @@ fn mask_value(val: &str) -> String {
         "****".into()
     } else {
         let prefix: String = val.chars().take(2).collect();
-        let suffix: String = val.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+        let suffix: String = val
+            .chars()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         format!("{prefix}****{suffix}")
     }
 }
@@ -232,7 +254,13 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &EnvForm
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Line::from(title).style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)))
+        .title(
+            Line::from(title).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
@@ -258,7 +286,11 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &EnvForm
         } else {
             state.get_field(i)
         };
-        let editing_marker = if selected && state.editing { " [编辑中]" } else { "" };
+        let editing_marker = if selected && state.editing {
+            " [编辑中]"
+        } else {
+            ""
+        };
         let row_style = if selected {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -271,7 +303,9 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &EnvForm
                 Span::raw(" : "),
                 Span::styled(
                     format!("{value}{editing_marker}"),
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
             .style(row_style),
@@ -280,8 +314,16 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &EnvForm
 
     // 按钮行
     lines.push(Line::from(""));
-    let save_marker = if state.focused == IDX_SAVE { "▸ " } else { "  " };
-    let cancel_marker = if state.focused == IDX_CANCEL { "▸ " } else { "  " };
+    let save_marker = if state.focused == IDX_SAVE {
+        "▸ "
+    } else {
+        "  "
+    };
+    let cancel_marker = if state.focused == IDX_CANCEL {
+        "▸ "
+    } else {
+        "  "
+    };
     let save_style = if state.focused == IDX_SAVE {
         Style::default().bg(theme.sel_bg).fg(theme.sel_fg)
     } else {
@@ -292,13 +334,17 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &EnvForm
     } else {
         Style::default().fg(theme.fg)
     };
-    lines.push(
-        Line::from(vec![
-            Span::styled(format!("{save_marker}保存"), save_style.add_modifier(Modifier::BOLD)),
-            Span::raw("    "),
-            Span::styled(format!("{cancel_marker}取消"), cancel_style.add_modifier(Modifier::BOLD)),
-        ]),
-    );
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{save_marker}保存"),
+            save_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("    "),
+        Span::styled(
+            format!("{cancel_marker}取消"),
+            cancel_style.add_modifier(Modifier::BOLD),
+        ),
+    ]));
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.bg)),

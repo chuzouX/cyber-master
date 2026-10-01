@@ -137,10 +137,7 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
     }
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
-            let index = tc
-                .get("index")
-                .and_then(|i| i.as_u64())
-                .unwrap_or(0) as u32;
+            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
             let function = tc.get("function");
             let id = tc.get("id").and_then(|i| i.as_str()).map(str::to_owned);
             let name = function
@@ -223,7 +220,10 @@ pub fn parse_anthropic_line(line: &str) -> Vec<StreamEvent> {
                 let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                     let id = block.get("id").and_then(|i| i.as_str()).map(str::to_owned);
-                    let name = block.get("name").and_then(|n| n.as_str()).map(str::to_owned);
+                    let name = block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_owned);
                     out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
                         index,
                         id,
@@ -268,11 +268,13 @@ pub fn parse_anthropic_line(line: &str) -> Vec<StreamEvent> {
 
 /// Ollama NDJSON 行解析。返回 0..N 个事件：
 /// - `message.content` 非空 → `Delta`
-/// - `message.tool_calls[]` 非空（best-effort，非标准流式）→ 每项一个完整 `ToolCallDelta`
+/// - `message.thinking` 非空 → `Reasoning`（深度思考/推理模型）
+/// - `message.tool_calls[]` 非空（best-effort，非标准流式）→ 每项一个完整 `ToolCallDelta`（支持 arguments 为 JSON Object/String）
+/// - `prompt_eval_count` + `eval_count` → `Usage`
 /// - `done==true` → `Done`
 ///
 /// Ollama 工具调用流式支持非标准（多数模型一次性返回完整 tool_calls），
-/// 此处 best-effort 解析；顺序：content/tool_calls 先于 Done，避免丢数据。
+/// 此处 best-effort 解析；顺序：content/thinking/tool_calls/usage 先于 Done，避免丢数据。
 pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
     let line = line.trim();
     if line.is_empty() {
@@ -282,6 +284,9 @@ pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    if let Some(err_msg) = extract_sse_error(&v) {
+        return vec![StreamEvent::Error(err_msg)];
+    }
     let mut out = Vec::new();
     if let Some(msg) = v.get("message") {
         if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
@@ -289,20 +294,33 @@ pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
                 out.push(StreamEvent::Delta(content.to_string()));
             }
         }
+        if let Some(thinking) = msg.get("thinking").and_then(|t| t.as_str()) {
+            if !thinking.is_empty() {
+                out.push(StreamEvent::Reasoning(thinking.to_string()));
+            }
+        }
         if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
             for (i, tc) in tool_calls.iter().enumerate() {
                 let index = i as u32;
-                let id = tc.get("id").and_then(|i| i.as_str()).map(str::to_owned);
+                let id = tc
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| Some(format!("call_{i}")));
                 let function = tc.get("function");
                 let name = function
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .map(str::to_owned);
-                let arguments_fragment = function
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("")
-                    .to_owned();
+                let arguments_fragment = match function.and_then(|f| f.get("arguments")) {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(v) if v.is_object() || v.is_array() => {
+                        serde_json::to_string(v).unwrap_or_default()
+                    }
+                    Some(v) if !v.is_null() => v.to_string(),
+                    _ => String::new(),
+                };
                 out.push(StreamEvent::ToolCallDelta(ToolCallDelta {
                     index,
                     id,
@@ -311,6 +329,17 @@ pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
                 }));
             }
         }
+    }
+    if let (Some(prompt_tokens), Some(completion_tokens)) = (
+        v.get("prompt_eval_count").and_then(|c| c.as_u64()),
+        v.get("eval_count").and_then(|c| c.as_u64()),
+    ) {
+        out.push(StreamEvent::Usage(Usage {
+            prompt_tokens,
+            completion_tokens,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: prompt_tokens,
+        }));
     }
     if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
         out.push(StreamEvent::Done);
@@ -358,10 +387,7 @@ pub fn parse_responses_line(line: &str) -> Vec<StreamEvent> {
         "response.output_item.added" => {
             if let Some(item) = v.get("item") {
                 if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                    let index = v
-                        .get("output_index")
-                        .and_then(|i| i.as_u64())
-                        .unwrap_or(0) as u32;
+                    let index = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                     let id = item
                         .get("id")
                         .and_then(|i| i.as_str())
@@ -378,10 +404,7 @@ pub fn parse_responses_line(line: &str) -> Vec<StreamEvent> {
             }
         }
         "response.function_call_arguments.delta" => {
-            let index = v
-                .get("output_index")
-                .and_then(|i| i.as_u64())
-                .unwrap_or(0) as u32;
+            let index = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
             let delta = v
                 .get("delta")
                 .and_then(|d| d.as_str())
@@ -625,6 +648,62 @@ mod tests {
     }
 
     #[test]
+    fn ollama_parses_tool_calls_with_object_arguments_and_synthesizes_id() {
+        // Ollama 原生返回 arguments 是 JSON Object，且通常无 id
+        let d = r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"list_dir","arguments":{"path":"."}}}]},"done":false}"#;
+        let r = parse_ollama_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::ToolCallDelta(d) => {
+                assert_eq!(d.index, 0);
+                assert_eq!(d.id.as_deref(), Some("call_0"));
+                assert_eq!(d.name.as_deref(), Some("list_dir"));
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&d.arguments_fragment).unwrap();
+                assert_eq!(parsed["path"], ".");
+            }
+            other => panic!("应为 ToolCallDelta，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ollama_parses_thinking() {
+        let d = r#"{"message":{"role":"assistant","content":"","thinking":"Let me think"},"done":false}"#;
+        let r = parse_ollama_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::Reasoning(t) => assert_eq!(t, "Let me think"),
+            other => panic!("应为 Reasoning，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ollama_parses_usage_and_done() {
+        let d = r#"{"done":true,"prompt_eval_count":128,"eval_count":64}"#;
+        let r = parse_ollama_line(d);
+        assert_eq!(r.len(), 2);
+        match &r[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.prompt_tokens, 128);
+                assert_eq!(u.completion_tokens, 64);
+            }
+            other => panic!("应为 Usage，实际 {other:?}"),
+        }
+        assert!(matches!(r[1], StreamEvent::Done));
+    }
+
+    #[test]
+    fn ollama_parses_stream_error() {
+        let d = r#"{"error":"model 'gemma2:9b' not found"}"#;
+        let r = parse_ollama_line(d);
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            StreamEvent::Error(msg) => assert!(msg.contains("model 'gemma2:9b' not found")),
+            other => panic!("应为 Error，实际 {other:?}"),
+        }
+    }
+
+    #[test]
     fn openai_parses_content_and_usage_in_same_chunk() {
         // 部分兼容端点（vLLM / 硅基流动等）把 usage 附在最后一个 content chunk 上：
         // 两者都要保留——提前返回会丢弃 content，导致回复末尾被截断。
@@ -695,7 +774,8 @@ mod tests {
     #[test]
     fn anthropic_parses_error_event() {
         // Anthropic error 事件
-        let d = r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let d =
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
         let r = parse_anthropic_line(d);
         assert_eq!(r.len(), 1);
         match &r[0] {
@@ -715,7 +795,8 @@ mod tests {
         assert!(matches!(&r[0], StreamEvent::Delta(t) if t == "Hello"));
 
         // completed → Usage + Done
-        let d = r#"data: {"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let d =
+            r#"data: {"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5}}"#;
         let r = parse_responses_line(d);
         assert_eq!(r.len(), 2);
         assert!(matches!(&r[0], StreamEvent::Usage(_)));
@@ -763,7 +844,8 @@ mod tests {
 
     #[test]
     fn responses_parses_failed_error() {
-        let d = r#"data: {"type":"response.failed","error":{"code":"server_error","message":"boom"}}"#;
+        let d =
+            r#"data: {"type":"response.failed","error":{"code":"server_error","message":"boom"}}"#;
         let r = parse_responses_line(d);
         assert_eq!(r.len(), 1);
         assert!(matches!(&r[0], StreamEvent::Error(m) if m == "boom"));

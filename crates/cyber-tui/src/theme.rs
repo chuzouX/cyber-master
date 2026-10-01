@@ -82,8 +82,8 @@ const NORD: Theme = Theme {
 /// 灵感来自 ratatui.rs "Built with Ratatui" 项目群的暗底霓虹 TUI 美学
 ///（scope-tui 示波器、rebels-in-the-sky 太空海盗、binsider 二进制分析等）。
 const CYBERPUNK: Theme = Theme {
-    bg: rgb(13, 2, 33),       // #0D0221 深紫黑底
-    fg: rgb(244, 244, 248),   // #F4F4F8 冷白
+    bg: rgb(13, 2, 33),        // #0D0221 深紫黑底
+    fg: rgb(244, 244, 248),    // #F4F4F8 冷白
     accent: rgb(255, 42, 109), // #FF2A6D 霓虹粉（标题栏底，深色字保证对比）
     muted: rgb(109, 109, 153), // #6D6D99 暗紫灰
     border: rgb(61, 31, 92),   // #3D1F5C 暗紫边框

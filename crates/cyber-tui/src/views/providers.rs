@@ -20,7 +20,10 @@ use ratatui::{
 use std::cell::Cell;
 use tui_textarea::TextArea;
 
-use cyber_core::{ModelConfig, PriceConfig, ProviderConfig, ProviderConfig as _Cfg, ProvidersConfig, PROVIDER_KINDS};
+use cyber_core::{
+    ModelConfig, PriceConfig, ProviderConfig, ProviderConfig as _Cfg, ProvidersConfig,
+    PROVIDER_KINDS,
+};
 
 use crate::theme::Theme;
 
@@ -44,25 +47,82 @@ const CURRENCIES: &[(&str, &str)] = &[("usd", "美元"), ("cny", "人民币")];
 /// 0-4 provider 基本字段，5-13 为当前 model 的个性化参数（含价格及单位），
 /// 14-15 高级选项，16=拉取模型，17=保存，18=取消。
 const FIELDS: &[FieldDef] = &[
-    FieldDef { label: "名称 name", kind: FieldKind::Text },
-    FieldDef { label: "类型 kind", kind: FieldKind::Enum },
-    FieldDef { label: "base_url", kind: FieldKind::Text },
-    FieldDef { label: "api_key", kind: FieldKind::Text },
-    FieldDef { label: "model", kind: FieldKind::Text },
-    FieldDef { label: "别名 alias（显示名，留空用 model id）", kind: FieldKind::Text },
-    FieldDef { label: "上下文长度 context_length", kind: FieldKind::Text },
-    FieldDef { label: "max_tokens（最大输出 token）", kind: FieldKind::Text },
-    FieldDef { label: "temperature（温度）", kind: FieldKind::Text },
-    FieldDef { label: "输入价格 /M (input_per_m)", kind: FieldKind::Text },
-    FieldDef { label: "输出价格 /M (output_per_m)", kind: FieldKind::Text },
-    FieldDef { label: "缓存命中价格 /M (cache_hit_per_m)", kind: FieldKind::Text },
-    FieldDef { label: "价格单位 currency", kind: FieldKind::Enum },
-    FieldDef { label: "备注 notes", kind: FieldKind::Text },
-    FieldDef { label: "自定义对话端点 chat_endpoint（留空默认 {base_url}/chat/completions）", kind: FieldKind::Text },
-    FieldDef { label: "自定义模型列表端点 models_endpoint（留空默认 {base_url}/models）", kind: FieldKind::Text },
-    FieldDef { label: "拉取模型", kind: FieldKind::Button },
-    FieldDef { label: "保存", kind: FieldKind::Button },
-    FieldDef { label: "取消", kind: FieldKind::Button },
+    FieldDef {
+        label: "名称 name",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "类型 kind",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "base_url",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "api_key",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "model",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "别名 alias（显示名，留空用 model id）",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "上下文长度 context_length",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "max_tokens（最大输出 token）",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "temperature（温度）",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "输入价格 /M (input_per_m)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "输出价格 /M (output_per_m)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "缓存命中价格 /M (cache_hit_per_m)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "价格单位 currency",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "备注 notes",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "自定义对话端点 chat_endpoint（留空默认 {base_url}/chat/completions）",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "自定义模型列表端点 models_endpoint（留空默认 {base_url}/models）",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "拉取模型",
+        kind: FieldKind::Button,
+    },
+    FieldDef {
+        label: "保存",
+        kind: FieldKind::Button,
+    },
+    FieldDef {
+        label: "取消",
+        kind: FieldKind::Button,
+    },
 ];
 const IDX_KIND: usize = 1;
 const IDX_MODEL: usize = 4;
@@ -225,7 +285,9 @@ impl ProviderFormState {
             .and_then(|m| m.temperature)
             .map(|v| v.to_string())
             .unwrap_or_else(|| self.provider_temperature.to_string());
-        let price = mc.and_then(|m| m.price.as_ref()).or(self.provider_price.as_ref());
+        let price = mc
+            .and_then(|m| m.price.as_ref())
+            .or(self.provider_price.as_ref());
         self.price_input = price
             .and_then(|p| p.input_per_m)
             .map(|v| v.to_string())
@@ -319,13 +381,21 @@ impl ProviderFormState {
     /// chat_endpoint 转为 Option：空串 → None，否则 Some。
     fn chat_endpoint_opt(&self) -> Option<String> {
         let s = self.chat_endpoint.trim();
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     }
 
     /// models_endpoint 转为 Option：空串 → None，否则 Some。
     fn models_endpoint_opt(&self) -> Option<String> {
         let s = self.models_endpoint.trim();
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     }
 
     /// 当前表单值的快照（用于 fetch，即使未校验通过也能拉取）。
@@ -419,7 +489,11 @@ impl ProviderFormState {
 
     /// 构建保存后的 models map：克隆工作副本，将当前表单参数写入 `models[self.model]`。
     /// model 为空时返回原始工作副本（不插入新条目）。
-    fn build_models_map(&self, max_tokens: u32, temperature: f32) -> std::collections::HashMap<String, ModelConfig> {
+    fn build_models_map(
+        &self,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> std::collections::HashMap<String, ModelConfig> {
         let mut models = self.models.clone();
         let model_id = self.model.trim();
         if !model_id.is_empty() {
@@ -487,7 +561,10 @@ impl ProviderFormState {
     }
 
     fn is_text_field(idx: usize) -> bool {
-        matches!(idx, 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 13 | 14 | 15)
+        matches!(
+            idx,
+            0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 13 | 14 | 15
+        )
     }
 
     fn start_editing(&mut self, idx: usize) {
@@ -537,25 +614,23 @@ impl ProviderFormState {
                 }
                 FormAction::None
             }
-            KeyCode::Enter => {
-                match self.focused {
-                    IDX_FETCH => {
-                        if self.fetching {
-                            FormAction::None
-                        } else {
-                            FormAction::Fetch
-                        }
-                    }
-                    IDX_SAVE => FormAction::Save,
-                    IDX_CANCEL => FormAction::Cancel,
-                    IDX_KIND | IDX_CURRENCY => FormAction::None,
-                    idx if Self::is_text_field(idx) => {
-                        self.start_editing(idx);
+            KeyCode::Enter => match self.focused {
+                IDX_FETCH => {
+                    if self.fetching {
                         FormAction::None
+                    } else {
+                        FormAction::Fetch
                     }
-                    _ => FormAction::None,
                 }
-            }
+                IDX_SAVE => FormAction::Save,
+                IDX_CANCEL => FormAction::Cancel,
+                IDX_KIND | IDX_CURRENCY => FormAction::None,
+                idx if Self::is_text_field(idx) => {
+                    self.start_editing(idx);
+                    FormAction::None
+                }
+                _ => FormAction::None,
+            },
             KeyCode::Esc => FormAction::Cancel,
             _ => FormAction::None,
         }
@@ -701,11 +776,18 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provide
         .border_style(Style::default().fg(theme.accent))
         .title(
             Line::from(if state.is_edit() {
-                format!(" 编辑 Provider: {} ", state.original_name.as_deref().unwrap_or(""))
+                format!(
+                    " 编辑 Provider: {} ",
+                    state.original_name.as_deref().unwrap_or("")
+                )
             } else {
                 " 添加 Provider ".to_string()
             })
-            .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            .style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
@@ -713,7 +795,7 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provide
     frame.render_widget(block, modal);
 
     let chunks = Layout::vertical([
-        Constraint::Min(0),   // 字段列表
+        Constraint::Min(0),    // 字段列表
         Constraint::Length(3), // 编辑器 / picker / hint
         Constraint::Length(1), // 状态行
         Constraint::Length(1), // 按钮行
@@ -783,7 +865,11 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
         } else {
             state.get_field(i)
         };
-        let editing_marker = if selected && state.editing { " [编辑中]" } else { "" };
+        let editing_marker = if selected && state.editing {
+            " [编辑中]"
+        } else {
+            ""
+        };
         let row_style = if selected {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -796,7 +882,9 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                 Span::raw(" : "),
                 Span::styled(
                     format!("{value}{editing_marker}"),
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
             .style(row_style),
@@ -816,8 +904,7 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
     if state.picker_open && !state.fetched_models.is_empty() {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(
-            Line::from(" 选择模型 (Enter 选中 / Esc 关闭)")
-                .style(Style::default().fg(theme.muted)),
+            Line::from(" 选择模型 (Enter 选中 / Esc 关闭)").style(Style::default().fg(theme.muted)),
         );
         for (i, m) in state.fetched_models.iter().enumerate() {
             let selected = i == state.picker_selected;
@@ -832,14 +919,19 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
         // 粘性滚动：选中项溢出视口时自动调整（首行是标题，故 +1 偏移）
         let visible_h = area.height.saturating_sub(1) as usize; // 标题占 1 行
         let items = state.fetched_models.len();
-        let prev = state.picker_scroll.get().min(items.saturating_sub(visible_h));
+        let prev = state
+            .picker_scroll
+            .get()
+            .min(items.saturating_sub(visible_h));
         let sel = state.picker_selected;
         let scroll = if items <= visible_h {
             0
         } else if sel < prev {
             sel
         } else if sel >= prev + visible_h {
-            (sel + 1).saturating_sub(visible_h).min(items.saturating_sub(visible_h))
+            (sel + 1)
+                .saturating_sub(visible_h)
+                .min(items.saturating_sub(visible_h))
         } else {
             prev
         };
@@ -882,7 +974,11 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
 }
 
 fn render_buttons(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderFormState) {
-    let buttons = [(IDX_FETCH, "拉取模型"), (IDX_SAVE, "保存"), (IDX_CANCEL, "取消")];
+    let buttons = [
+        (IDX_FETCH, "拉取模型"),
+        (IDX_SAVE, "保存"),
+        (IDX_CANCEL, "取消"),
+    ];
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::raw(" "));
     for (idx, label) in buttons {
@@ -890,7 +986,10 @@ fn render_buttons(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provider
         let marker = if active { "▸[" } else { " [" };
         let close = "] ";
         let style = if active {
-            Style::default().bg(theme.sel_bg).fg(theme.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(theme.sel_bg)
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.fg)
         };
@@ -1012,7 +1111,9 @@ mod tests {
         };
         let s = ProviderFormState::from_provider("openai", &cfg);
         // 同名编辑应通过
-        let (name, _) = s.into_provider(&ProvidersConfig::default_template()).unwrap();
+        let (name, _) = s
+            .into_provider(&ProvidersConfig::default_template())
+            .unwrap();
         assert_eq!(name, "openai");
     }
 
@@ -1030,7 +1131,10 @@ mod tests {
     fn enter_text_field_starts_editing_enter_commits() {
         let mut s = ProviderFormState::empty();
         s.focused = 0; // name
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::None);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::None
+        );
         assert!(s.editing);
         // 输入字符
         s.handle_key(key(KeyCode::Char('z')), &ProvidersConfig::default());
@@ -1057,22 +1161,34 @@ mod tests {
     fn save_button_returns_save_action() {
         let mut s = ProviderFormState::empty();
         s.focused = IDX_SAVE;
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::Save);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::Save
+        );
     }
 
     #[test]
     fn cancel_button_and_esc_return_cancel() {
         let mut s = ProviderFormState::empty();
         s.focused = IDX_CANCEL;
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::Cancel);
-        assert_eq!(s.handle_key(key(KeyCode::Esc), &ProvidersConfig::default()), FormAction::Cancel);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::Cancel
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Esc), &ProvidersConfig::default()),
+            FormAction::Cancel
+        );
     }
 
     #[test]
     fn fetch_button_returns_fetch_action() {
         let mut s = ProviderFormState::empty();
         s.focused = IDX_FETCH;
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::Fetch);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::Fetch
+        );
     }
 
     #[test]
@@ -1080,7 +1196,10 @@ mod tests {
         let mut s = ProviderFormState::empty();
         s.focused = IDX_FETCH;
         s.fetching = true;
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::None);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::None
+        );
     }
 
     #[test]
@@ -1437,8 +1556,8 @@ mod tests {
 
     #[test]
     fn alias_and_notes_are_text_editable() {
-        assert!(ProviderFormState::is_text_field(5));  // alias
-        assert!(ProviderFormState::is_text_field(6));  // context_length
+        assert!(ProviderFormState::is_text_field(5)); // alias
+        assert!(ProviderFormState::is_text_field(6)); // context_length
         assert!(!ProviderFormState::is_text_field(12)); // currency (Enum)
         assert!(ProviderFormState::is_text_field(13)); // notes
     }
@@ -1493,7 +1612,8 @@ mod tests {
             model: "gpt-4o".into(),
             ..Default::default()
         };
-        cfg.models.insert("gpt-4o-mini".into(), ModelConfig::default());
+        cfg.models
+            .insert("gpt-4o-mini".into(), ModelConfig::default());
         let s = ProviderFormState::from_provider("openai", &cfg);
         assert!(s.known_models.contains(&"gpt-4o".to_string()));
         assert!(s.known_models.contains(&"gpt-4o-mini".to_string()));
@@ -1666,7 +1786,10 @@ mod tests {
     fn currency_enter_is_noop() {
         let mut s = ProviderFormState::empty();
         s.focused = IDX_CURRENCY;
-        assert_eq!(s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()), FormAction::None);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::None
+        );
         assert!(!s.editing, "currency 字段 Enter 不应进入编辑模式");
     }
 }

@@ -32,8 +32,11 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
         .title(
-            Line::from(" 模型选择 / Model Picker ")
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(" 模型选择 / Model Picker ").style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(1, 1, 1, 1));
@@ -42,30 +45,38 @@ pub fn render(
 
     // 双栏 + 底部 hint
     let chunks = Layout::vertical([
-        Constraint::Min(0),   // 双栏
+        Constraint::Min(0),    // 双栏
         Constraint::Length(2), // hint / 状态
     ])
     .split(inner);
     let body = chunks[0];
     let hint_area = chunks[1];
 
-    let panes = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(60),
-    ])
-    .split(body);
+    let panes =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(body);
     let provider_pane = panes[0];
     let model_pane = panes[1];
 
-    render_providers(frame, provider_pane, theme, state, providers, default_provider);
+    render_providers(
+        frame,
+        provider_pane,
+        theme,
+        state,
+        providers,
+        default_provider,
+    );
 
     // 取当前选中 provider 的 models map，传给 model 栏以显示 alias
     let names = providers.sorted_names();
-    let model_configs: Option<&HashMap<String, ModelConfig>> = if state.provider_selected < names.len() {
-        providers.providers.get(&names[state.provider_selected]).map(|p| &p.models)
-    } else {
-        None
-    };
+    let model_configs: Option<&HashMap<String, ModelConfig>> =
+        if state.provider_selected < names.len() {
+            providers
+                .providers
+                .get(&names[state.provider_selected])
+                .map(|p| &p.models)
+        } else {
+            None
+        };
     render_models(frame, model_pane, theme, state, model_configs);
     render_hint(frame, hint_area, theme, state);
 }
@@ -87,8 +98,11 @@ fn render_providers(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_fg))
         .title(
-            Line::from(" Providers ")
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(" Providers ").style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg));
     let inner = block.inner(area);
@@ -145,7 +159,10 @@ fn render_providers(
     // 粘性滚动：选中项溢出视口时自动调整
     let visible_h = inner.height as usize;
     let total_lines = lines.len();
-    let prev = state.provider_scroll.get().min(total_lines.saturating_sub(visible_h));
+    let prev = state
+        .provider_scroll
+        .get()
+        .min(total_lines.saturating_sub(visible_h));
     let sel_start = state.provider_selected * PROVIDER_ITEM_LINES;
     let sel_end = (sel_start + PROVIDER_ITEM_LINES).min(total_lines);
     let scroll = if total_lines <= visible_h {
@@ -153,7 +170,9 @@ fn render_providers(
     } else if sel_start < prev {
         sel_start
     } else if sel_end > prev + visible_h {
-        sel_end.saturating_sub(visible_h).min(total_lines.saturating_sub(visible_h))
+        sel_end
+            .saturating_sub(visible_h)
+            .min(total_lines.saturating_sub(visible_h))
     } else {
         prev
     };
@@ -185,8 +204,11 @@ fn render_models(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_fg))
         .title(
-            Line::from(title)
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(title).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg));
     let inner = block.inner(area);
@@ -194,15 +216,9 @@ fn render_models(
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(err) = &state.fetch_error {
-        lines.push(
-            Line::from(format!(" ⚠ {err}"))
-                .style(Style::default().fg(theme.accent)),
-        );
+        lines.push(Line::from(format!(" ⚠ {err}")).style(Style::default().fg(theme.accent)));
     } else if state.fetching {
-        lines.push(
-            Line::from(" ⏳ 正在拉取模型列表…")
-                .style(Style::default().fg(theme.muted)),
-        );
+        lines.push(Line::from(" ⏳ 正在拉取模型列表…").style(Style::default().fg(theme.muted)));
     } else if state.models.is_empty() {
         lines.push(
             Line::from("（无模型，按 Tab 切到 Providers 栏选择 provider 后自动拉取）")
@@ -214,7 +230,10 @@ fn render_models(
             let selected = i == state.model_selected;
             let marker = if selected { "▸ " } else { "  " };
             let style = if selected {
-                Style::default().bg(theme.sel_bg).fg(theme.sel_fg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(theme.sel_bg)
+                    .fg(theme.sel_fg)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.fg)
             };
@@ -239,14 +258,19 @@ fn render_models(
     // 粘性滚动：选中项溢出视口时自动调整（每项 1 行）
     let visible_h = inner.height as usize;
     let total_lines = lines.len();
-    let prev = state.model_scroll.get().min(total_lines.saturating_sub(visible_h));
+    let prev = state
+        .model_scroll
+        .get()
+        .min(total_lines.saturating_sub(visible_h));
     let sel = state.model_selected;
     let scroll = if total_lines <= visible_h {
         0
     } else if sel < prev {
         sel
     } else if sel >= prev + visible_h {
-        (sel + 1).saturating_sub(visible_h).min(total_lines.saturating_sub(visible_h))
+        (sel + 1)
+            .saturating_sub(visible_h)
+            .min(total_lines.saturating_sub(visible_h))
     } else {
         prev
     };
@@ -304,39 +328,72 @@ mod tests {
 
     #[test]
     fn render_model_picker_does_not_panic() {
-        let mut state = ModelPickerState::default();
-        state.models = vec!["gpt-4o".into(), "gpt-4o-mini".into()];
+        let state = ModelPickerState {
+            models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+            ..Default::default()
+        };
         let providers = make_providers();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &Theme::resolve("cyberpunk"), &state, &providers, "openai"))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &Theme::resolve("cyberpunk"),
+                    &state,
+                    &providers,
+                    "openai",
+                )
+            })
             .unwrap();
     }
 
     #[test]
     fn render_model_picker_fetching() {
-        let mut state = ModelPickerState::default();
-        state.provider_selected = 1;
-        state.fetching = true;
-        state.fetch_id = 1;
-        state.focus_models = true;
+        let state = ModelPickerState {
+            provider_selected: 1,
+            fetching: true,
+            fetch_id: 1,
+            focus_models: true,
+            ..Default::default()
+        };
         let providers = make_providers();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &Theme::resolve("cyberpunk"), &state, &providers, "ollama"))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &Theme::resolve("cyberpunk"),
+                    &state,
+                    &providers,
+                    "ollama",
+                )
+            })
             .unwrap();
     }
 
     #[test]
     fn render_model_picker_error() {
-        let mut state = ModelPickerState::default();
-        state.fetch_id = 1;
-        state.fetch_error = Some("timeout".into());
-        state.focus_models = true;
+        let state = ModelPickerState {
+            fetch_id: 1,
+            fetch_error: Some("timeout".into()),
+            focus_models: true,
+            ..Default::default()
+        };
         let providers = make_providers();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &Theme::resolve("cyberpunk"), &state, &providers, "openai"))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &Theme::resolve("cyberpunk"),
+                    &state,
+                    &providers,
+                    "openai",
+                )
+            })
             .unwrap();
     }
 
@@ -346,7 +403,16 @@ mod tests {
         let providers = ProvidersConfig::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &Theme::resolve("cyberpunk"), &state, &providers, ""))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &Theme::resolve("cyberpunk"),
+                    &state,
+                    &providers,
+                    "",
+                )
+            })
             .unwrap();
     }
 }

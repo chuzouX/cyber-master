@@ -57,8 +57,11 @@ pub fn render(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(title)
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(title).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg));
     let inner = block.inner(area);
@@ -75,7 +78,15 @@ pub fn render(
 
     render_history(frame, chunks[0], theme, state, project);
     render_input(frame, chunks[1], state);
-    render_usage_bar(frame, chunks[2], theme, provider, usage, price, context_usage);
+    render_usage_bar(
+        frame,
+        chunks[2],
+        theme,
+        provider,
+        usage,
+        price,
+        context_usage,
+    );
     render_hint(frame, chunks[3], theme, state);
     // 斜杠补全菜单：浮于输入框上方（覆盖历史区底部），最后绘制以叠加在最上层
     if state.slash_menu.open && !state.slash_menu.filtered.is_empty() {
@@ -108,18 +119,23 @@ fn render_history(
     if state.entries.is_empty() && !state.streaming {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(
-            Line::from("Chat Mode（对话交互式）")
-                .style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Line::from("Chat Mode（对话交互式）").style(
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
         );
         match project {
             Some(p) => {
-                lines.push(Line::from(format!(
-                    "项目：{} · scope：{} · 护栏 {} 条",
-                    p.frontmatter.project.as_deref().unwrap_or("<未指定>"),
-                    p.frontmatter.scope.as_deref().unwrap_or("<未指定>"),
-                    p.rules().len(),
-                ))
-                .style(Style::default().fg(theme.muted)));
+                lines.push(
+                    Line::from(format!(
+                        "项目：{} · scope：{} · 护栏 {} 条",
+                        p.frontmatter.project.as_deref().unwrap_or("<未指定>"),
+                        p.frontmatter.scope.as_deref().unwrap_or("<未指定>"),
+                        p.rules().len(),
+                    ))
+                    .style(Style::default().fg(theme.muted)),
+                );
             }
             None => {
                 lines.push(
@@ -180,14 +196,10 @@ fn render_usage_bar(
     context_usage: &ContextUsage,
 ) {
     // 前段：provider · model（始终显示，让用户随时知道当前用的什么模型）
-    let mut spans: Vec<Span> = vec![
-        Span::styled(
-            format!(" {provider} "),
-            Style::default()
-                .fg(theme.fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let mut spans: Vec<Span> = vec![Span::styled(
+        format!(" {provider} "),
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+    )];
 
     // 上下文剩余百分比（模型配置了 context_length 时显示）
     if let Some(pct) = context_usage.remaining_percent() {
@@ -217,7 +229,11 @@ fn render_usage_bar(
         ));
         spans.push(Span::raw("│"));
         spans.push(Span::styled(
-            format!(" ↑{} ↓{} ", fmt_tokens(total_in), fmt_tokens(usage.completion)),
+            format!(
+                " ↑{} ↓{} ",
+                fmt_tokens(total_in),
+                fmt_tokens(usage.completion)
+            ),
             Style::default().fg(theme.muted),
         ));
 
@@ -231,10 +247,7 @@ fn render_usage_bar(
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// 格式化 token 计数：< 1000 原样，≥ 1000 用 k 单位（1.2k）。
@@ -288,7 +301,11 @@ fn render_slash_menu(
                     ]))
                 })
                 .collect();
-            (menu.filtered.len(), " 命令(↑↓选择 Enter 补全 Esc 关闭) ", items)
+            (
+                menu.filtered.len(),
+                " 命令(↑↓选择 Enter 补全 Esc 关闭) ",
+                items,
+            )
         }
         SlashMenuMode::Param => {
             let items: Vec<ListItem<'static>> = menu
@@ -301,7 +318,11 @@ fn render_slash_menu(
                     )]))
                 })
                 .collect();
-            (menu.params.len(), " 参数(↑↓选择 Enter 补全 Esc 关闭) ", items)
+            (
+                menu.params.len(),
+                " 参数(↑↓选择 Enter 补全 Esc 关闭) ",
+                items,
+            )
         }
     };
 
@@ -322,8 +343,11 @@ fn render_slash_menu(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
         .title(
-            Line::from(title)
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(title).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg));
     let list = List::new(items)
@@ -353,8 +377,11 @@ pub fn render_placeholder(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(format!(" {title} "))
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(format!(" {title} ")).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
@@ -363,12 +390,13 @@ pub fn render_placeholder(
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(
-        Line::from(title.to_string())
-            .style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Line::from(title.to_string()).style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
     );
-    lines.push(
-        Line::from(format!("状态：{stage}")).style(Style::default().fg(theme.muted)),
-    );
+    lines.push(Line::from(format!("状态：{stage}")).style(Style::default().fg(theme.muted)));
     lines.push(Line::from(""));
     if let Some(p) = project {
         lines.push(
@@ -379,9 +407,7 @@ pub fn render_placeholder(
             .style(Style::default().fg(theme.fg)),
         );
     } else {
-        lines.push(
-            Line::from("项目上下文：无").style(Style::default().fg(theme.muted)),
-        );
+        lines.push(Line::from("项目上下文：无").style(Style::default().fg(theme.muted)));
     }
     lines.push(Line::from(""));
     lines.push(
@@ -409,7 +435,19 @@ mod tests {
         let state = ChatState::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -418,10 +456,24 @@ mod tests {
         let theme = Theme::resolve("cyberpunk");
         let mut state = ChatState::new();
         state.entries.push(ChatEntry::User("你好".into()));
-        state.entries.push(ChatEntry::Assistant("收到：你好".into()));
+        state
+            .entries
+            .push(ChatEntry::Assistant("收到：你好".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "openai", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "openai",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -433,7 +485,19 @@ mod tests {
         state.streaming_buffer = "收到：hi".into();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "ollama", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "ollama",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -445,7 +509,19 @@ mod tests {
         state.streaming_buffer.clear();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -458,7 +534,19 @@ mod tests {
             .push(ChatEntry::Assistant("第一行\n第二行\n第三行".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -467,7 +555,9 @@ mod tests {
         let theme = Theme::resolve("cyberpunk");
         let mut state = ChatState::new();
         state.entries.push(ChatEntry::User("列出当前目录".into()));
-        state.entries.push(ChatEntry::Assistant("好的，我来查看。".into()));
+        state
+            .entries
+            .push(ChatEntry::Assistant("好的，我来查看。".into()));
         state.entries.push(ChatEntry::ToolCall {
             id: "c1".into(),
             name: "list_dir".into(),
@@ -484,7 +574,19 @@ mod tests {
             .push(ChatEntry::Assistant("当前目录有 3 个文件。".into()));
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -505,7 +607,19 @@ mod tests {
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -527,7 +641,19 @@ mod tests {
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -550,7 +676,19 @@ mod tests {
         state.toggle_last_tool_result_expansion();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -571,7 +709,19 @@ mod tests {
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -584,7 +734,19 @@ mod tests {
         assert!(state.slash_menu.open);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -605,7 +767,19 @@ mod tests {
         assert!(!state.is_following_bottom());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -617,7 +791,19 @@ mod tests {
         state.update_slash_menu();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -638,7 +824,19 @@ mod tests {
         let state = ChatState::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &usage, Some(&price), &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &usage,
+                    Some(&price),
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -653,7 +851,19 @@ mod tests {
         let state = ChatState::new();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &usage, None, &ContextUsage::default()))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &usage,
+                    None,
+                    &ContextUsage::default(),
+                )
+            })
             .unwrap();
     }
 
@@ -668,15 +878,23 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ctx))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ctx,
+                )
+            })
             .unwrap();
         // 剩余 ≈ 80% → 应渲染 "ctx 80%"
         let buffer = terminal.backend().buffer();
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(content.contains("ctx"), "应显示 ctx 段: {content}");
         assert!(content.contains("80%"), "应显示 80% 剩余: {content}");
     }
@@ -692,14 +910,22 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, f.area(), &theme, &state, None, "mock", &empty_usage(), None, &ctx))
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ctx,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let content: String = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(!content.contains("ctx"), "不应显示 ctx 段: {content}");
     }
 }

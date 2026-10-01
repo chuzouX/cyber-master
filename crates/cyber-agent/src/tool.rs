@@ -27,6 +27,26 @@ pub struct ToolSchema {
 
 pub type ToolCatalog = Arc<RwLock<Vec<ToolSchema>>>;
 
+/// 确保工具名符合标准 LLM 命名约束（`^[a-zA-Z0-9_-]{1,64}$`）。
+/// 包含点号、空格或特殊字符会被替换为 `_`，超出 64 字符会被截断。
+pub fn sanitize_tool_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// 工具执行结果。`content` 回灌给 LLM（作为 tool 结果消息）。
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
@@ -95,8 +115,34 @@ impl ToolRegistry {
         }
     }
 
+    /// 仅注册为可执行工具，但不将 schema 导出到 catalog（不出现在发给 LLM 的 tools 列表中）。
+    /// 适合海量工具（如海量 Skills）场景，避免超出模型 tools 数量限制。
+    pub fn register_hidden(&mut self, tool: Box<dyn Tool>) {
+        let schema = tool.schema();
+        let mut catalog = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+        catalog.retain(|item| item.name != schema.name);
+        if let Some(index) = self
+            .tools
+            .iter()
+            .position(|item| item.schema().name == schema.name)
+        {
+            self.tools[index] = tool;
+        } else {
+            self.tools.push(tool);
+        }
+    }
+
+    /// 导出当前在 catalog 中的工具 Schema（发给 LLM 的 tools 列表）。
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.catalog.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 导出全部已注册工具的 Schema（包含 register_hidden 的工具，供系统提示词等索引提取）。
+    pub fn all_schemas(&self) -> Vec<ToolSchema> {
+        self.tools.iter().map(|t| t.schema()).collect()
     }
 
     pub fn catalog(&self) -> ToolCatalog {
@@ -106,7 +152,12 @@ impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
-            .find(|t| t.schema().name == name)
+            .find(|t| {
+                let schema_name = &t.schema().name;
+                schema_name == name
+                    || (schema_name.starts_with("skill_")
+                        && schema_name.replace('.', "_") == name.replace('.', "_"))
+            })
             .map(|t| t.as_ref())
     }
 
@@ -123,9 +174,7 @@ impl ToolRegistry {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
         match self.get(name) {
             Some(tool) => tool.run(input, ctx),
-            None => Box::pin(async move {
-                Err(AgentError::Provider(format!("未知工具: {name}")))
-            }),
+            None => Box::pin(async move { Err(AgentError::Provider(format!("未知工具: {name}"))) }),
         }
     }
 
@@ -232,5 +281,33 @@ mod tests {
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"shell"));
+    }
+
+    #[test]
+    fn sanitize_tool_name_replaces_illegal_characters() {
+        assert_eq!(sanitize_tool_name("valid_name-123"), "valid_name-123");
+        assert_eq!(
+            sanitize_tool_name("skill_ctf-crypto-1.0.0"),
+            "skill_ctf-crypto-1_0_0"
+        );
+        assert_eq!(sanitize_tool_name("tool with space!"), "tool_with_space_");
+        let long_name = "a".repeat(100);
+        assert_eq!(sanitize_tool_name(&long_name).len(), 64);
+    }
+
+    #[tokio::test]
+    async fn register_hidden_executes_but_omits_from_schemas() {
+        let mut reg = ToolRegistry::new();
+        reg.register_hidden(Box::new(EchoTool));
+        // schemas() 为空（不发给 LLM）
+        assert_eq!(reg.schemas().len(), 0);
+        // all_schemas() 包含该工具（供提示词索引提取）
+        assert_eq!(reg.all_schemas().len(), 1);
+        // 可被正常查找和执行
+        let out = reg
+            .execute("echo", serde_json::json!({"test": 123}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.content.contains("123"));
     }
 }

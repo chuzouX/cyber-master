@@ -19,7 +19,9 @@ impl Tool for FindFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "find_file".into(),
-            description: "在指定目录中按文件名或内容关键词查找文件（跨平台、无编码问题，替代 grep/find）".into(),
+            description:
+                "在指定目录中按文件名或内容关键词查找文件（跨平台、无编码问题，替代 grep/find）"
+                    .into(),
             tags: vec![],
             parameters: json!({
                 "type": "object",
@@ -56,19 +58,19 @@ impl Tool for FindFileTool {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
         Box::pin(async move {
             let path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            let pattern = input
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let content_kw = input.get("content").and_then(|v| v.as_str());
             let recursive = input
                 .get("recursive")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let max_depth = input.get("max_depth").and_then(|v| v.as_u64()).map(|d| d as usize);
+            let max_depth = input
+                .get("max_depth")
+                .and_then(|v| v.as_u64())
+                .map(|d| d as usize);
 
-            let resolved = resolve_under_cwd(Path::new(path_str), &ctx.cwd)
-                .map_err(AgentError::Provider)?;
+            let resolved =
+                resolve_under_cwd(Path::new(path_str), &ctx.cwd).map_err(AgentError::Provider)?;
 
             let pattern_lower = pattern.to_lowercase();
             let content_lower = content_kw.map(|s| s.to_lowercase());
@@ -252,7 +254,10 @@ mod tests {
         let dir = setup_test_dir();
         let c = ctx(&dir);
         let out = FindFileTool
-            .run(json!({"path": ".", "pattern": "", "content": "默认口令"}), &c)
+            .run(
+                json!({"path": ".", "pattern": "", "content": "默认口令"}),
+                &c,
+            )
             .await
             .unwrap();
         assert!(out.content.contains("nacos_default.md"));
@@ -265,7 +270,10 @@ mod tests {
         let dir = setup_test_dir();
         let c = ctx(&dir);
         let out = FindFileTool
-            .run(json!({"path": ".", "pattern": "nacos", "content": "RCE"}), &c)
+            .run(
+                json!({"path": ".", "pattern": "nacos", "content": "RCE"}),
+                &c,
+            )
             .await
             .unwrap();
         assert!(out.content.contains("nacos_rce.md"));
@@ -278,12 +286,18 @@ mod tests {
         let dir = setup_test_dir();
         let c = ctx(&dir);
         let out = FindFileTool
-            .run(json!({"path": ".", "pattern": "nacos", "recursive": false}), &c)
+            .run(
+                json!({"path": ".", "pattern": "nacos", "recursive": false}),
+                &c,
+            )
             .await
             .unwrap();
         assert!(out.content.contains("nacos_default.md"));
         assert!(out.content.contains("nacos_sqli.md"));
-        assert!(!out.content.contains("nacos_rce.md"), "非递归不应包含子目录文件");
+        assert!(
+            !out.content.contains("nacos_rce.md"),
+            "非递归不应包含子目录文件"
+        );
         assert!(!out.content.contains("nacos_deep.md"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -298,8 +312,14 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("nacos_default.md"));
-        assert!(out.content.contains("nacos_rce.md"), "depth=1 应包含 sub/ 下的文件");
-        assert!(!out.content.contains("nacos_deep.md"), "depth=1 不应包含 sub/deep/ 下的文件");
+        assert!(
+            out.content.contains("nacos_rce.md"),
+            "depth=1 应包含 sub/ 下的文件"
+        );
+        assert!(
+            !out.content.contains("nacos_deep.md"),
+            "depth=1 不应包含 sub/deep/ 下的文件"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

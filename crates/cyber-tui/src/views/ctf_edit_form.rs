@@ -51,17 +51,50 @@ struct FieldDef {
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
 /// 0=name 1=category 2=status 3=description 4=target 5=flag 6=tags 7=key_points 8=is_global 9=保存 10=取消
 const FIELDS: &[FieldDef] = &[
-    FieldDef { label: "名称 name", kind: FieldKind::Text },
-    FieldDef { label: "分类 category", kind: FieldKind::Enum },
-    FieldDef { label: "状态 status", kind: FieldKind::Enum },
-    FieldDef { label: "描述 description", kind: FieldKind::Text },
-    FieldDef { label: "靶机 target", kind: FieldKind::Text },
-    FieldDef { label: "Flag", kind: FieldKind::Text },
-    FieldDef { label: "标签 tags (空格分隔)", kind: FieldKind::Text },
-    FieldDef { label: "关键知识点 key_points", kind: FieldKind::Text },
-    FieldDef { label: "范围 scope", kind: FieldKind::Enum },
-    FieldDef { label: "保存", kind: FieldKind::Button },
-    FieldDef { label: "取消", kind: FieldKind::Button },
+    FieldDef {
+        label: "名称 name",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "分类 category",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "状态 status",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "描述 description",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "靶机 target",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "Flag",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "标签 tags (空格分隔)",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "关键知识点 key_points",
+        kind: FieldKind::Text,
+    },
+    FieldDef {
+        label: "范围 scope",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "保存",
+        kind: FieldKind::Button,
+    },
+    FieldDef {
+        label: "取消",
+        kind: FieldKind::Button,
+    },
 ];
 const IDX_CATEGORY: usize = 1;
 const IDX_STATUS: usize = 2;
@@ -102,10 +135,7 @@ impl CtfEditFormState {
             .iter()
             .position(|&cat| cat == c.category)
             .unwrap_or(0);
-        let status_idx = STATUSES
-            .iter()
-            .position(|&s| s == c.status)
-            .unwrap_or(0);
+        let status_idx = STATUSES.iter().position(|&s| s == c.status).unwrap_or(0);
         let global_idx = GLOBAL_OPTIONS
             .iter()
             .position(|&g| g == c.is_global)
@@ -159,11 +189,7 @@ impl CtfEditFormState {
         } else {
             Some(self.flag.clone())
         };
-        c.tags = self
-            .tags
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        c.tags = self.tags.split_whitespace().map(String::from).collect();
         c.key_points = if self.key_points.is_empty() {
             None
         } else {
@@ -180,10 +206,7 @@ impl CtfEditFormState {
     }
 
     fn is_text_field(idx: usize) -> bool {
-        matches!(
-            idx,
-            0 | 3 | 4 | 5 | 6 | 7
-        )
+        matches!(idx, 0 | 3 | 4 | 5 | 6 | 7)
     }
 
     fn get_field(&self, idx: usize) -> String {
@@ -251,8 +274,7 @@ impl CtfEditFormState {
                             (self.category_idx + CATEGORIES.len() - 1) % CATEGORIES.len();
                     }
                     IDX_STATUS => {
-                        self.status_idx =
-                            (self.status_idx + STATUSES.len() - 1) % STATUSES.len();
+                        self.status_idx = (self.status_idx + STATUSES.len() - 1) % STATUSES.len();
                     }
                     IDX_GLOBAL => {
                         self.global_idx =
@@ -277,17 +299,15 @@ impl CtfEditFormState {
                 }
                 CtfEditFormAction::None
             }
-            KeyCode::Enter => {
-                match self.focused {
-                    IDX_SAVE => CtfEditFormAction::Save,
-                    IDX_CANCEL => CtfEditFormAction::Cancel,
-                    idx if Self::is_text_field(idx) => {
-                        self.start_editing(idx);
-                        CtfEditFormAction::None
-                    }
-                    _ => CtfEditFormAction::None,
+            KeyCode::Enter => match self.focused {
+                IDX_SAVE => CtfEditFormAction::Save,
+                IDX_CANCEL => CtfEditFormAction::Cancel,
+                idx if Self::is_text_field(idx) => {
+                    self.start_editing(idx);
+                    CtfEditFormAction::None
                 }
-            }
+                _ => CtfEditFormAction::None,
+            },
             KeyCode::Esc => CtfEditFormAction::Cancel,
             _ => CtfEditFormAction::None,
         }
@@ -337,8 +357,11 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &CtfEdit
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
         .title(
-            Line::from(format!(" 编辑题目: {} ", state.name))
-                .style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Line::from(format!(" 编辑题目: {} ", state.name)).style(
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .padding(Padding::new(2, 2, 1, 1));
@@ -377,7 +400,11 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &CtfEditFo
             }
             _ => state.get_field(i),
         };
-        let editing_marker = if selected && state.editing { " [编辑中]" } else { "" };
+        let editing_marker = if selected && state.editing {
+            " [编辑中]"
+        } else {
+            ""
+        };
         let row_style = if selected {
             Style::default().bg(theme.sel_bg)
         } else {
@@ -402,7 +429,9 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &CtfEditFo
                 Span::raw(" : "),
                 Span::styled(
                     display_value,
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
             .style(row_style),
@@ -440,7 +469,9 @@ fn render_buttons(frame: &mut Frame, area: Rect, theme: &Theme, state: &CtfEditF
     let line = Line::from(vec![
         Span::styled(
             save_marker,
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("    "),
         Span::styled(cancel_marker, Style::default().fg(theme.fg)),
