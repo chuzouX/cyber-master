@@ -310,7 +310,9 @@ fn save_memory_rule(
         }
         (None, Some(rule)) => items
             .push(toml::Value::try_from(rule).map_err(|_| eyre!("Cannot serialize memory rule"))?),
-        (None, None) => bail!("Missing memory rule operation"),
+        (None, None) => {
+            bail!("Missing memory rule operation");
+        }
     }
     let updated: Vec<MemoryRule> = rules
         .clone()
@@ -432,9 +434,11 @@ fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             config.agent.subagents.max_steps = number;
             format!("Subagent max_steps set to {number}")
         }
-        _ => bail!(
-            "Usage: /subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]"
-        ),
+        _ => {
+            bail!(
+                "Usage: /subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]"
+            );
+        }
     };
     save_config(runner, config, "agent", "subagents")?;
     Ok(refresh(&message, false))
@@ -489,7 +493,9 @@ fn env(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             }
             format!("Environment variable '{rest}' removed")
         }
-        _ => bail!("Usage: /env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]"),
+        _ => {
+            bail!("Usage: /env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]");
+        }
     };
     save_config(runner, config, "env", "vars")?;
     Ok(refresh(&message, false))
@@ -516,7 +522,9 @@ fn web(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             false,
             "Web search disabled; web_fetch tool is hidden from model",
         ),
-        _ => bail!("Usage: /web [status|on|off|enable|disable]"),
+        _ => {
+            bail!("Usage: /web [status|on|off|enable|disable]");
+        }
     };
     let mut config = runner.ctx.config.clone();
     config.tools.web_search = enabled;
@@ -673,7 +681,9 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                             .join("\n"),
                     )
                 }
-                _ => bail!("Usage: /mcp list|status|connect"),
+                _ => {
+                    bail!("Usage: /mcp list|status|connect");
+                }
             }
         }
         SlashCommand::Compact(args) => CliAction::Task(CliTask::Compact {
@@ -716,8 +726,12 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         SlashCommand::Sessions(args) => sessions(runner, &args)?,
         SlashCommand::Memory(args) => memory(runner, &args)?,
         SlashCommand::Todo(args) => todo_cmd(runner, &args)?,
-        SlashCommand::Mode(_) => bail!("/mode is not available in CLI"),
-        SlashCommand::Unknown(_) => bail!("Unknown command; use /help"),
+        SlashCommand::Mode(_) => {
+            bail!("/mode is not available in CLI");
+        }
+        SlashCommand::Unknown(_) => {
+            bail!("Unknown command; use /help");
+        }
     })
 }
 
@@ -815,7 +829,9 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             save_selection_renamed(runner, config, providers, None, false)?;
             Ok(refresh("Provider removed", false))
         }
-        _ => bail!("Usage: /provider list|add|edit <name>|use <name>|remove <name>"),
+        _ => {
+            bail!("Usage: /provider list|add|edit <name>|use <name>|remove <name>");
+        }
     }
 }
 fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
@@ -1048,7 +1064,9 @@ fn memory(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     ],
                 }))
             }
-            _ => bail!("Usage: /memory rule [add|list|edit <index>|delete <index>]"),
+            _ => {
+                bail!("Usage: /memory rule [add|list|edit <index>|delete <index>]");
+            }
         };
     }
     let global = runner.ctx.paths.memory_file.clone();
@@ -1075,7 +1093,9 @@ fn memory(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
         let path = match scope.to_ascii_lowercase().as_str() {
             "global" => global,
             "project" => project,
-            _ => bail!("Scope must be global or project"),
+            _ => {
+                bail!("Scope must be global or project");
+            }
         };
         let (index, content) = split(rest);
         (
@@ -1125,7 +1145,9 @@ fn memory(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 lines.remove(position);
             }
         }
-        _ => bail!("Unknown memory command"),
+        _ => {
+            bail!("Unknown memory command");
+        }
     }
     persist(&path, format!("{}\n", lines.join("\n")).as_bytes())?;
     Ok(refresh("Memory saved", false))
@@ -1201,7 +1223,9 @@ fn ctf(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 challenge: Box::new(challenge),
             }))
         }
-        _ => bail!("Usage: /ctf enable|disable|add <name> <category>|list|writeup <name>"),
+        _ => {
+            bail!("Usage: /ctf enable|disable|add <name> <category>|list|writeup <name>");
+        }
     }
 }
 
@@ -1291,7 +1315,9 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
             let enabled = match field("enabled")?.to_ascii_lowercase().as_str() {
                 "true" => true,
                 "false" => false,
-                _ => bail!("Enabled must be true or false"),
+                _ => {
+                    bail!("Enabled must be true or false");
+                }
             };
             let scope = field("scope")?.to_ascii_lowercase();
             if !["global", "project", "both"].contains(&scope.as_str()) {

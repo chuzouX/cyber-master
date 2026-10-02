@@ -274,7 +274,7 @@ impl SessionRunner {
         while let Some(path) = ancestor {
             match std::fs::symlink_metadata(path) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    color_eyre::eyre::bail!("Writeup path contains a symbolic link")
+                    color_eyre::eyre::bail!("Writeup path contains a symbolic link");
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

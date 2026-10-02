@@ -185,7 +185,9 @@ pub fn run_setup(cwd: &Path) -> Result<()> {
         }
         "k" => {}
         "n" if provider.kind == "ollama" => provider.api_key.clear(),
-        _ => bail!("Invalid credential mode."),
+        _ => {
+            bail!("Invalid credential mode.");
+        }
     }
     if provider.kind != "ollama" && provider.api_key.trim().is_empty() {
         bail!("This provider requires a credential or environment variable reference.");
