@@ -197,12 +197,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx(cwd: &Path) -> ToolCtx {
-        ToolCtx {
-            cwd: cwd.to_path_buf(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        }
+        ToolCtx::new(cwd.to_path_buf(), vec![], None, Vec::new())
     }
 
     fn setup_test_dir() -> PathBuf {

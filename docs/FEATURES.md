@@ -17,135 +17,80 @@
 
 ### 1.1 概述
 
-Subagent 允许主 agent 把独立子任务委派给一个**完全独立的子 agent** 执行。子 agent 拥有：
+主 agent 通过 `delegate_tasks` 一次提交多个互不依赖的任务。每项任务在空历史中启动独立
+agent loop，并动态指定 specialist system prompt、任务、上下文、provider/model 与工具白名单。
+批次受并发、数量、逐任务超时和步数限制；返回结果始终与输入顺序一致。
 
-- 独立的 agent loop（与主 agent 同构，但独立运转）
-- 独立的精简系统提示词
-- 按 `subagent_type` 过滤后的工具集
-- 独立的对话上下文（完成后仅回传最终摘要，**不污染**主 agent 的对话历史）
+子 agent 复用主 agent 的项目规则、CTF 提示、记忆、统一工具注册表和权限代理，但不会继承父
+对话历史，也不能再次调用 `delegate_tasks`。`tools = []` 表示纯文本任务，不继承父工具。
 
-### 1.2 架构与文件分布
+### 1.2 工具协议
 
-```
-crates/cyber-agent/src/tools/subagent.rs   # SubagentTool：把 run_subagent 包装成 Tool
-crates/cyber-agent/src/agent.rs            # run_subagent()：子 agent loop 核心
-                                            #   - SUBAGENT_SYSTEM_PROMPT 精简提示词
-                                            #   - subagent_stream_with_retry 空响应重试
-                                            #   - filtered_tools 工具集过滤
-crates/cyber-core/src/config.rs            # SubagentConfig / SubagentType 配置定义
-crates/cyber-agent/src/types.rs            # SubagentMessage（内部消息，供 TUI 展示）
-crates/cyber-tui/src/views/subagents.rs    # TUI：Subagent 管理面板（Ctrl+F）
-crates/cyber-tui/src/chat.rs               # TUI：chat 内 Subagent 条目（折叠/展开）
-```
-
-### 1.3 工具 Schema
-
-主 agent 通过调用 `subagent` 工具启动子 agent：
-
-| 参数 | 类型 | 必填 | 默认 | 说明 |
-|---|---|---|---|---|
-| `description` | string | 是 | - | 子任务简短描述（3-5 词），用于 TUI 列表展示 |
-| `task` | string | 是 | - | 子任务详细指令（完整写入子 agent 首条 user 消息） |
-| `subagent_type` | string | 否 | `general` | `general`=全部工具；`search`=仅只读工具 |
-| `max_steps` | integer | 否 | 100 | 最大工具调用步数（上限受配置钳制） |
-
-### 1.4 核心执行流程（`run_subagent`）
-
-```text
-SubagentTool.run(input)
-  ├─ 从 ToolCtx 取 provider_config（复用父 agent 的 provider 配置）
-  ├─ 发送 AgentEvent::SubagentStart { id, description, subagent_type } → TUI
-  └─ run_subagent(provider_cfg, registry, subagent_cfg, type, task, max_steps, ctx)
-        ├─ provider_factory(provider_cfg)          # 独立 provider 实例
-        ├─ filtered_tools(registry, subagent_type) # 工具集过滤
-        ├─ messages = [user(task)]                 # 独立对话上下文
-        └─ loop (0..max_steps):
-             ├─ subagent_stream_with_retry()       # 空响应退避重试
-             ├─ 无 tool_calls → 截断续写 → break（产出最终文本）
-             ├─ push assistant(text + tool_calls)
-             ├─ 逐个执行工具：
-             │    ├─ parse_tool_call_args(call, registry, Some(&turn_text))
-             │    │     # 参数抢救：arguments 为空时从回复文本提取满足
-             │    │     # required 字段的 JSON（通道层缺陷兜底）
-             │    └─ registry.execute(name, input, ctx)
-             ├─ push tool 结果消息
-             ├─ 参数错误撞墙保护（param_error_threshold）
-             ├─ 连续重复调用检测（LoopDetector → loop_detect_threshold）
-             └─ 自动压缩（上下文超阈值时触发 compact）
-  ├─ Ok((output, messages)) → 发送 AgentEvent::SubagentDone { id, output, messages }
-  └─ Err(e) → 返回 is_error 的 ToolOutput
+```json
+{
+  "tasks": [
+    {
+      "name": "dependency-review",
+      "system_prompt": "You are a dependency security reviewer.",
+      "task": "Review the dependency policy.",
+      "context": "Optional task-specific context.",
+      "provider": "openai",
+      "model": "gpt-4o",
+      "tools": ["read_file", "find_file"]
+    }
+  ]
+}
 ```
 
-关键设计点：
+`name`、`system_prompt`、`task`、`tools` 必填；`context` 默认空字符串；`provider` 和
+`model` 可选。未提供 provider/model 时继承父 turn；provider 必须是 `providers.toml`
+中已配置的名称，model 仅覆盖所选 provider 的 model。重复 name 合法，系统按输入索引区分；
+重复工具名会去重。空批次和超过 `max_tasks` 的批次整次报错；单项字段为空、provider/tool
+未知或请求递归委派时，仅该项返回 validation error。
 
-1. **结果隔离**：子 agent 的完整对话历史（`messages: Vec<SubagentMessage>`）只随
-   `SubagentDone` 事件进 TUI 详情页；主 agent 收到的 tool result 仅是最终摘要文本。
-2. **provider 复用**：子 agent 用 `ToolCtx.provider_config` 克隆父配置，同一模型
-   同一网关，无需额外配置。
-3. **事件流打通**：`ToolCtx.event_tx + event_gen` 把子 agent 生命周期事件实时推给
-   TUI，携带 generation 计数防止 cancel 后的 stale 事件。
+结果格式：
 
-### 1.5 工具集过滤（`filtered_tools`）
+```json
+{
+  "results": [
+    {"name": "a", "status": "completed", "output": "..."},
+    {"name": "b", "status": "error", "error": "..."},
+    {"name": "c", "status": "timed_out", "error": "Timed out after 300 seconds"}
+  ]
+}
+```
 
-| SubagentType | 可用工具 |
-|---|---|
-| `general` | 注册表全部工具（含 MCP / Skill / 自定义工具） |
-| `search` | 白名单：`read_file`、`list_dir`、`find_file`、`web_fetch`（纯只读） |
+部分成功仍是正常工具结果；全部失败时工具结果标记为 error。子 agent 的内部 token、工具卡和
+上下文更新不会写入父对话；父界面只显示普通 `delegate_tasks` 工具卡、批任务进度行和结果。
 
-`search` 类型适合纯信息收集任务：无副作用、不消耗写操作风险额度。
+### 1.3 执行与安全边界
 
-### 1.6 子 agent 系统提示词
+1. `DelegateTasksTool` 使用有界并发执行任务，每项独立应用 timeout，不创建 detached task。
+2. 父 turn 取消会 drop 整批 future；已发生的外部工具副作用不能回滚。
+3. schema 只暴露白名单工具；执行前再次检查工具名，模型伪造调用也不能触达 registry。
+4. 委派工具和每个子工具均经过现有权限代理；session grant 仍按工具名和完整 JSON 参数匹配。
+5. 子 agent 与父 agent 共用唯一的 loop 实现，包括自动压缩、JSON 参数检查、循环检测和步数
+   耗尽后的无工具总结。
+6. 子任务只向父事件通道转发 usage。生命周期通过工具 progress 行显示，不新增专用历史类型或
+   管理面板。
 
-精简版（区别于主 agent 的完整提示词），核心约束：
+适合委派：可并行的代码审查、独立资料分析、互不依赖的检查。简单操作（例如读取一个已知文件）
+应直接调用普通工具。
 
-- **边做边想**：思考控制在 3-5 行内，立即调用工具或给结论
-- **先行动后解释**：不确定的问题用工具验证，不纯推理
-- **不过度规划**：先收集信息，再根据结果决定下一步
-- **必出结果**：任务失败也要说明原因，禁止空输出
-
-### 1.7 可靠性机制
-
-| 机制 | 参数 | 默认 | 说明 |
-|---|---|---|---|
-| 空响应重试 | `SUBAGENT_EMPTY_RETRIES` | 3 | 指数退避 2s/4s/8s；429 限流、网关抖动不再直接失败 |
-| 截断自动续写 | `MAX_TRUNCATION_CONTINUATIONS` | 3 | `finish_reason=length` 时自动续写，续写文本拼进最终输出 |
-| 参数错误撞墙 | `param_error_threshold` | 3 | 同一工具连续参数错误达阈值 → 注入带完整 schema + 示例的警告消息；0=禁用 |
-| 死循环检测 | `loop_detect_threshold` | 5 | 连续相同工具调用指纹（name+arguments）达阈值判定死循环；0=禁用 |
-| 参数抢救 | - | 常开 | tool call arguments 为空时，从本轮回复文本提取满足 required 字段的 JSON 直接使用 |
-
-### 1.8 配置（`SubagentConfig`）
+### 1.4 配置
 
 ```toml
-# .cyber/config.toml
-[agent.subagent]
-enabled = true                # 是否启用（默认 false；关闭后 subagent 工具不注册）
-max_steps = 100               # 每个 subagent 最大步数
-max_parallel = 4              # 并行 subagent 数上限
-loop_detect_threshold = 5     # 连续重复调用检测阈值（0=禁用）
-param_error_threshold = 3     # 同工具连续参数错误阈值（0=禁用）
+[agent.subagents]
+enabled = true
+max_tasks = 8
+max_parallel = 4
+timeout_secs = 300
+max_steps = 25
 ```
 
-### 1.9 TUI 展示
-
-**Subagent 管理面板**（Ctrl+F）：
-
-- 三种视图：列表视图 / 任务输入视图（n 新建）/ 详情视图（Enter 查看内部消息）
-- 列表展示当前 session 内运行中/已完成的 subagent（描述、类型、状态）
-- ↑↓ 选择，Enter 进详情，Esc 返回 Chat 模式
-
-**Chat 内嵌条目**（`ChatEntry::Subagent`）：
-
-- 默认折叠：仅显示 `[subagent] description` + 最终摘要
-- Enter 展开：渲染完整内部消息流（assistant 思考 / tool 调用 / tool 结果）
-- 条目随 chat 历史持久化（`SubagentMessage` 序列化到 session 历史）
-
-### 1.10 使用规范（给 LLM 的约定，已注入主 agent 系统提示词）
-
-- 可独立完成的子任务（搜索代码库、分析特定文件、研究主题）→ 用 `subagent` 委派
-- `description` 保持 3-5 词；详细指令写在 `task` 里
-- 纯信息收集用 `subagent_type="search"`
-- **不要**为简单操作（读一个已知路径的文件）开 subagent——直接调对应工具
-- 多个无依赖 subagent 可在同一轮并行发起
+`enabled = false` 时不注册工具，因此 provider schema 和 `search_tools` 均不可见。
+`max_tasks`、`max_parallel`、`timeout_secs`、`max_steps` 的 `0` 在运行时按 `1` 处理；
+`max_parallel` 还会钳制到有效 `max_tasks`。旧配置缺少本表时使用以上默认值。
 
 ---
 

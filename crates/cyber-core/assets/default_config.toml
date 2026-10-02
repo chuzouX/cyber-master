@@ -12,6 +12,13 @@ default_provider = "openai"  # 见 providers.toml
 auto_tool_call = true
 max_steps = 25               # agent loop 最大步数
 
+[agent.subagents]
+enabled = true
+max_tasks = 8
+max_parallel = 4
+timeout_secs = 300
+max_steps = 25
+
 [workflow]
 max_parallel_nodes = 8
 default_timeout_secs = 1800

@@ -89,6 +89,7 @@ pub struct AgentConfig {
     pub permission_mode: Option<String>,
     pub max_steps: u32,
     pub thinking_intensity: ThinkingIntensity,
+    pub subagents: SubagentConfig,
 }
 
 impl Default for AgentConfig {
@@ -99,6 +100,47 @@ impl Default for AgentConfig {
             permission_mode: None,
             max_steps: 500,
             thinking_intensity: ThinkingIntensity::default(),
+            subagents: SubagentConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubagentConfig {
+    pub enabled: bool,
+    pub max_tasks: u32,
+    pub max_parallel: u32,
+    pub timeout_secs: u64,
+    pub max_steps: u32,
+}
+
+impl SubagentConfig {
+    pub fn effective_max_tasks(&self) -> usize {
+        self.max_tasks.max(1) as usize
+    }
+
+    pub fn effective_max_parallel(&self) -> usize {
+        (self.max_parallel.max(1) as usize).min(self.effective_max_tasks())
+    }
+
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.max(1)
+    }
+
+    pub fn effective_max_steps(&self) -> u32 {
+        self.max_steps.max(1)
+    }
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tasks: 8,
+            max_parallel: 4,
+            timeout_secs: 300,
+            max_steps: 25,
         }
     }
 }
@@ -201,5 +243,35 @@ impl Default for StorageConfig {
             history_retention_days: 90,
             log_level: "info".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subagent_defaults_load_when_legacy_config_omits_table() {
+        let config: Config = toml::from_str("[agent]\nmax_steps = 12\n").unwrap();
+        let subagents = config.agent.subagents;
+        assert!(subagents.enabled);
+        assert_eq!(subagents.max_tasks, 8);
+        assert_eq!(subagents.max_parallel, 4);
+        assert_eq!(subagents.timeout_secs, 300);
+        assert_eq!(subagents.max_steps, 25);
+    }
+
+    #[test]
+    fn subagent_explicit_values_and_zero_limits_are_normalized() {
+        let config: Config = toml::from_str(
+            "[agent.subagents]\nenabled = false\nmax_tasks = 0\nmax_parallel = 0\ntimeout_secs = 0\nmax_steps = 0\n",
+        )
+        .unwrap();
+        let subagents = config.agent.subagents;
+        assert!(!subagents.enabled);
+        assert_eq!(subagents.effective_max_tasks(), 1);
+        assert_eq!(subagents.effective_max_parallel(), 1);
+        assert_eq!(subagents.effective_timeout_secs(), 1);
+        assert_eq!(subagents.effective_max_steps(), 1);
     }
 }

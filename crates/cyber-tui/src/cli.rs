@@ -14,7 +14,9 @@ use crossterm::{
         Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    },
 };
 use cyber_agent::{
     estimate_messages_tokens, AgentEvent, ApprovalChoice, PermissionBroker, PermissionDecision,
@@ -83,6 +85,7 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
+        SetTitle("Cyber Master"),
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
@@ -206,6 +209,7 @@ struct CliScreen {
     saved_draft: String,
     thinking_started: Option<std::time::Instant>,
     has_run: bool,
+    last_window_title: String,
 }
 
 struct FormState {
@@ -366,6 +370,7 @@ impl CliScreen {
             saved_draft: String::new(),
             thinking_started: None,
             has_run: false,
+            last_window_title: String::new(),
         };
         screen.sync(runner);
         screen
@@ -870,6 +875,16 @@ impl CliScreen {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        let win_title = crate::history::terminal_window_title(
+            self.busy,
+            self.thinking_started,
+            &self.session_title,
+            &self.model,
+        );
+        if win_title != self.last_window_title {
+            let _ = execute!(io::stdout(), SetTitle(&win_title));
+            self.last_window_title = win_title;
+        }
         let area = frame.area();
         if !self.tools_expanded && self.history_view.width != area.width {
             self.refresh_tools(area.width);

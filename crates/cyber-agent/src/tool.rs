@@ -55,13 +55,43 @@ pub struct ToolOutput {
 }
 
 /// 工具执行上下文：工作目录 + 安全护栏（rules / scope）+ 用户自定义环境变量。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolCtx {
     pub cwd: PathBuf,
     pub rules: Vec<String>,
     pub scope: Option<String>,
     /// 用户在 Settings → Env 配置的环境变量，注入 shell 子进程。
     pub env: Vec<(String, String)>,
+    pub(crate) subagent_runtime: Option<Arc<crate::agent::SubagentRuntime>>,
+}
+
+impl ToolCtx {
+    pub fn new(
+        cwd: PathBuf,
+        rules: Vec<String>,
+        scope: Option<String>,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            cwd,
+            rules,
+            scope,
+            env,
+            subagent_runtime: None,
+        }
+    }
+
+    pub(crate) fn with_subagent_runtime(
+        mut self,
+        runtime: Arc<crate::agent::SubagentRuntime>,
+    ) -> Self {
+        self.subagent_runtime = Some(runtime);
+        self
+    }
+
+    pub(crate) fn subagent_runtime(&self) -> Option<&Arc<crate::agent::SubagentRuntime>> {
+        self.subagent_runtime.as_ref()
+    }
 }
 
 /// 工具抽象。`Send + Sync` 以便 `Box<dyn Tool>` 跨 tokio task。
@@ -312,12 +342,7 @@ mod tests {
     }
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            cwd: std::env::temp_dir(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        }
+        ToolCtx::new(std::env::temp_dir(), vec![], None, Vec::new())
     }
 
     #[tokio::test]

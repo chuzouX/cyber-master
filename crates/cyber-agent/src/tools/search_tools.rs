@@ -96,12 +96,7 @@ mod tests {
     use crate::tool::ToolRegistry;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            cwd: std::env::temp_dir(),
-            rules: vec![],
-            scope: None,
-            env: vec![],
-        }
+        ToolCtx::new(std::env::temp_dir(), vec![], None, vec![])
     }
 
     #[tokio::test]

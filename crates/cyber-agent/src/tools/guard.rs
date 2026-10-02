@@ -185,12 +185,7 @@ mod tests {
     use super::*;
 
     fn ctx(cwd: &str) -> ToolCtx {
-        ToolCtx {
-            cwd: PathBuf::from(cwd),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        }
+        ToolCtx::new(PathBuf::from(cwd), vec![], None, Vec::new())
     }
 
     #[test]

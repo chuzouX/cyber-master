@@ -74,12 +74,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let ctx = ToolCtx {
-            cwd: dir.clone(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        };
+        let ctx = ToolCtx::new(dir.clone(), vec![], None, Vec::new());
         let out = ListDirTool.run(json!({"path": "."}), &ctx).await.unwrap();
         assert!(out.content.contains("a.txt"));
         assert!(out.content.contains("sub/"));
@@ -92,12 +87,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("marker.txt"), "x").unwrap();
-        let ctx = ToolCtx {
-            cwd: dir.clone(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        };
+        let ctx = ToolCtx::new(dir.clone(), vec![], None, Vec::new());
         let out = ListDirTool.run(json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("marker.txt"));
         let _ = std::fs::remove_dir_all(&dir);

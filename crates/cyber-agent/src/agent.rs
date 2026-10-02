@@ -34,6 +34,163 @@ use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Us
 /// 用户可在 providers.toml 精确配置以获得更准确的阈值。
 const DEFAULT_CONTEXT_LENGTH: u32 = 128_000;
 
+pub(crate) struct SubagentRuntime {
+    config: Config,
+    providers: ProvidersConfig,
+    project: Option<ProjectContext>,
+    mock: bool,
+    cwd: PathBuf,
+    registry: Arc<ToolRegistry>,
+    ctf_enabled: bool,
+    intensity: ThinkingIntensity,
+    memory: String,
+    tx: UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+}
+
+impl SubagentRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        config: Config,
+        providers: ProvidersConfig,
+        project: Option<ProjectContext>,
+        mock: bool,
+        cwd: PathBuf,
+        registry: Arc<ToolRegistry>,
+        ctf_enabled: bool,
+        intensity: ThinkingIntensity,
+        memory: String,
+        tx: UnboundedSender<(u64, AgentEvent)>,
+        gen: u64,
+    ) -> Self {
+        Self {
+            config,
+            providers,
+            project,
+            mock,
+            cwd,
+            registry,
+            ctf_enabled,
+            intensity,
+            memory,
+            tx,
+            gen,
+        }
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) fn providers(&self) -> &ProvidersConfig {
+        &self.providers
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_task(
+        &self,
+        specialist_prompt: String,
+        task: String,
+        context: String,
+        provider_name: Option<String>,
+        model: Option<String>,
+        tool_names: Vec<String>,
+    ) -> Result<String> {
+        let provider_name =
+            provider_name.unwrap_or_else(|| self.config.agent.default_provider.clone());
+        let mut provider_config = self
+            .providers
+            .providers
+            .get(&provider_name)
+            .cloned()
+            .ok_or_else(|| AgentError::Provider(format!("unknown provider '{provider_name}'")))?;
+        if let Some(model) = model {
+            provider_config.model = model;
+        }
+        let provider = provider_factory(&provider_config, self.mock)?;
+        let allowed: std::collections::HashSet<String> = tool_names.into_iter().collect();
+        if allowed.contains("delegate_tasks") {
+            return Err(AgentError::Provider(
+                "delegate_tasks cannot be delegated recursively".into(),
+            ));
+        }
+        let schemas: Vec<_> = self
+            .registry
+            .all_schemas()
+            .into_iter()
+            .filter(|schema| allowed.contains(&schema.name))
+            .collect();
+        if schemas.len() != allowed.len() {
+            return Err(AgentError::Provider(
+                "subagent tool allowlist contains an unknown tool".into(),
+            ));
+        }
+
+        let mut system = build_system_prompt(
+            self.project.as_ref(),
+            self.intensity.resolve(self.ctf_enabled),
+            &skill_summaries(&schemas),
+            &self.memory,
+        );
+        if self.ctf_enabled {
+            system.push_str(CTF_PROMPT);
+        }
+        system.push_str("\n\n# Specialist instructions\n");
+        system.push_str(&specialist_prompt);
+        system.push_str(
+            "\n\nComplete only this task. Return an evidence-based result. You must not delegate or create subagents.",
+        );
+        let user_message = if context.is_empty() {
+            task
+        } else {
+            format!("{task}\n\nContext:\n{context}")
+        };
+        let rules = self
+            .project
+            .as_ref()
+            .map(|project| project.rules().to_vec())
+            .unwrap_or_default();
+        let scope = self
+            .project
+            .as_ref()
+            .and_then(|project| project.frontmatter.scope.clone());
+        let env = self
+            .config
+            .env
+            .vars
+            .iter()
+            .map(|value| (value.key.clone(), value.value.clone()))
+            .collect();
+        let ctx = ToolCtx::new(self.cwd.clone(), rules, scope, env);
+        let sink = EventSink::child(&self.tx, self.gen);
+        let output = run_agent_loop(
+            provider.as_ref(),
+            system,
+            vec![Message::user(user_message)],
+            ctx,
+            schemas,
+            Some(&allowed),
+            Arc::clone(&self.registry),
+            self.config.agent.subagents.effective_max_steps(),
+            provider_config
+                .effective_context_length()
+                .or(Some(DEFAULT_CONTEXT_LENGTH)),
+            &sink,
+        )
+        .await?;
+        if output.final_text.trim().is_empty() {
+            return Err(AgentError::Provider(
+                "subagent returned an empty final response".into(),
+            ));
+        }
+        Ok(output.final_text)
+    }
+}
+
 /// 连续相同工具调用检测器：记录每轮工具调用指纹，连续 `threshold` 轮相同则判定死循环。
 ///
 /// 指纹 = 本轮所有 ToolCall 的 `name|arguments` 排序后拼接（排序消除顺序差异）。
@@ -197,44 +354,23 @@ async fn run_inner(
     memory: &str,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
-    let cfg: &ProviderConfig = providers.providers.get(name).ok_or_else(|| {
+    let cfg = providers.providers.get(name).ok_or_else(|| {
         AgentError::Provider(format!(
             "default_provider '{name}' 未在 providers.toml 配置"
         ))
     })?;
     debug!(provider = %name, kind = %cfg.kind, mock, gen, "启动 agent loop");
-
     let provider = provider_factory(cfg, mock)?;
-    let resolved = intensity.resolve(ctf_enabled);
-    // 从工具注册表中提取 skill 摘要，注入系统提示词的「可用 Skill」索引段落
-    let skill_summaries: Vec<SkillSummary> = registry
-        .all_schemas()
-        .iter()
-        .filter(|s| s.name.starts_with("skill_"))
-        .filter(|s| !s.description.contains("仅显式调用"))
-        .map(|s| {
-            let name = s.name.strip_prefix("skill_").unwrap_or(&s.name).to_string();
-            // description 格式："[Skill] {actual_desc}\n触发词: ..." — 取首行实际描述
-            let desc = s
-                .description
-                .strip_prefix("[Skill] ")
-                .unwrap_or(&s.description)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            SkillSummary {
-                name,
-                description: desc,
-            }
-        })
-        .collect();
-    let mut system = build_system_prompt(project, resolved, &skill_summaries, memory);
+    let mut system = build_system_prompt(
+        project,
+        intensity.resolve(ctf_enabled),
+        &skill_summaries(&registry.all_schemas()),
+        memory,
+    );
     if ctf_enabled {
         system.push_str(CTF_PROMPT);
     }
 
-    // 工具上下文 + 注册表
     let rules = project.map(|p| p.rules().to_vec()).unwrap_or_default();
     let scope = project.and_then(|p| p.frontmatter.scope.clone());
     let env = config
@@ -243,93 +379,163 @@ async fn run_inner(
         .iter()
         .map(|v| (v.key.clone(), v.value.clone()))
         .collect();
-    let ctx = ToolCtx {
-        cwd,
-        rules,
-        scope,
-        env,
-    };
-
-    // tools：auto_tool_call 开启且注册表非空时才暴露工具
+    let runtime = Arc::new(SubagentRuntime::new(
+        config.clone(),
+        providers.clone(),
+        project.cloned(),
+        mock,
+        cwd.clone(),
+        Arc::clone(&registry),
+        ctf_enabled,
+        intensity,
+        memory.to_string(),
+        tx.clone(),
+        gen,
+    ));
+    let ctx = ToolCtx::new(cwd, rules, scope, env).with_subagent_runtime(runtime);
     let tools = if config.agent.auto_tool_call && !registry.is_empty() {
         registry.schemas()
     } else {
         Vec::new()
     };
-
     let mut messages = history;
     messages.push(Message::user(user_input));
+    let sink = EventSink::parent(tx, gen);
+    run_agent_loop(
+        provider.as_ref(),
+        system,
+        messages,
+        ctx,
+        tools,
+        None,
+        registry,
+        config.agent.max_steps.max(1),
+        cfg.effective_context_length()
+            .or(Some(DEFAULT_CONTEXT_LENGTH)),
+        &sink,
+    )
+    .await?;
+    Ok(())
+}
 
-    // 有效上下文长度（用于自动压缩阈值 + TUI 剩余百分比显示）。
-    // 未配置 per-model context_length 时回退到 DEFAULT_CONTEXT_LENGTH，
-    // 确保自动压缩始终能触发，避免长对话被 provider 突然截断。
-    let effective_ctx_len = cfg
-        .effective_context_length()
-        .or(Some(DEFAULT_CONTEXT_LENGTH));
+struct AgentRunOutput {
+    final_text: String,
+}
 
-    // 首次发送上下文使用情况（TUI 据此显示初始剩余百分比）
-    emit_context_update(tx, gen, &messages, effective_ctx_len);
+#[derive(Clone, Copy)]
+enum EventMode {
+    Parent,
+    Child,
+}
 
-    let max_steps = config.agent.max_steps.max(1);
+struct EventSink<'a> {
+    tx: &'a UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    mode: EventMode,
+}
+
+impl<'a> EventSink<'a> {
+    fn parent(tx: &'a UnboundedSender<(u64, AgentEvent)>, gen: u64) -> Self {
+        Self {
+            tx,
+            gen,
+            mode: EventMode::Parent,
+        }
+    }
+
+    fn child(tx: &'a UnboundedSender<(u64, AgentEvent)>, gen: u64) -> Self {
+        Self {
+            tx,
+            gen,
+            mode: EventMode::Child,
+        }
+    }
+
+    fn send(&self, event: AgentEvent) -> bool {
+        if matches!(self.mode, EventMode::Child) && !matches!(event, AgentEvent::Usage(_)) {
+            return true;
+        }
+        self.tx.send((self.gen, event)).is_ok()
+    }
+}
+
+fn skill_summaries(schemas: &[crate::tool::ToolSchema]) -> Vec<SkillSummary> {
+    schemas
+        .iter()
+        .filter(|schema| schema.name.starts_with("skill_"))
+        .filter(|schema| !schema.description.contains("仅显式调用"))
+        .map(|schema| SkillSummary {
+            name: schema
+                .name
+                .strip_prefix("skill_")
+                .unwrap_or(&schema.name)
+                .to_string(),
+            description: schema
+                .description
+                .strip_prefix("[Skill] ")
+                .unwrap_or(&schema.description)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_loop(
+    provider: &dyn Provider,
+    system: String,
+    mut messages: Vec<Message>,
+    ctx: ToolCtx,
+    tools: Vec<crate::tool::ToolSchema>,
+    allowed_tools: Option<&std::collections::HashSet<String>>,
+    registry: Arc<ToolRegistry>,
+    max_steps: u32,
+    effective_ctx_len: Option<u32>,
+    sink: &EventSink<'_>,
+) -> Result<AgentRunOutput> {
+    emit_context_update(sink, &messages, effective_ctx_len);
     let mut detector = LoopDetector::new(3);
     let mut loop_detected = false;
     for step in 0..max_steps {
-        debug!(step, gen, "agent loop 迭代");
-
-        // 自动压缩检查：估算当前 messages token 数，超过阈值则先压缩再继续。
-        // 仅在 effective_ctx_len 已知时触发；压缩失败仅记日志不中断（回退到原消息）。
+        debug!(step, gen = sink.gen, "agent loop 迭代");
         if let Some(threshold) = auto_compact_threshold(effective_ctx_len) {
             let used = estimate_messages_tokens(&messages);
             if used >= threshold as usize {
-                debug!(step, used, threshold, gen, "触发自动上下文压缩");
-                match do_compact(
-                    provider.as_ref(),
-                    &system,
-                    &mut messages,
-                    None,
-                    tx,
-                    gen,
-                    true, // is_auto
-                )
-                .await
+                if let Err(error) =
+                    do_compact(provider, &system, &mut messages, None, sink, true).await
                 {
-                    Ok(()) => {}
-                    Err(e) => warn!(error = %e, gen, "自动压缩失败，回退到原消息继续"),
+                    warn!(error = %error, gen = sink.gen, "自动压缩失败，回退到原消息继续");
                 }
             }
         }
 
-        let req = StreamRequest::new(messages.clone())
-            .with_system(system.clone())
-            .with_tools(tools.clone());
-        let mut stream = provider.stream(req);
-
-        // 累积本轮流式：Delta→Token 事件 + 文本；ToolCallDelta→按 index 合并；Done→break
-        let (text, calls, usage) = accumulate_stream(&mut stream, tx, gen).await;
-
-        // 发送本轮 usage（TUI 据此显示缓存命中率 + 成本）
-        if let Some(ref u) = usage {
-            let _ = tx.send((gen, AgentEvent::Usage(u.clone())));
+        let mut stream = provider.stream(
+            StreamRequest::new(messages.clone())
+                .with_system(system.clone())
+                .with_tools(tools.clone()),
+        );
+        let accumulation = accumulate_stream(&mut stream, sink).await?;
+        if let Some(usage) = accumulation.usage.as_ref() {
+            sink.send(AgentEvent::Usage(usage.clone()));
         }
-
-        if calls.is_empty() {
-            // 无工具调用：push assistant 文本，发 Done，结束
-            if !text.is_empty() {
-                messages.push(Message::assistant(text));
+        if accumulation.calls.is_empty() {
+            let final_text = accumulation.text;
+            if !final_text.is_empty() {
+                messages.push(Message::assistant(final_text.clone()));
             }
-            emit_context_update(tx, gen, &messages, effective_ctx_len);
-            let _ = tx.send((gen, AgentEvent::Done));
-            return Ok(());
+            emit_context_update(sink, &messages, effective_ctx_len);
+            sink.send(AgentEvent::Done);
+            return Ok(AgentRunOutput { final_text });
         }
 
-        // 有工具调用：先保证写入历史的 arguments 一定是合法 JSON。
-        // provider 会在下一轮严格校验 assistant.tool_calls，不能把原始非法字符串带回去。
+        let calls = accumulation.calls;
         let history_calls = sanitized_tool_calls(&calls);
-        let mut assistant_msg = Message::assistant(text);
+        let mut assistant_msg = Message::assistant(accumulation.text);
         assistant_msg.tool_calls = history_calls.values().cloned().collect();
         messages.push(assistant_msg);
 
-        // 逐个执行工具调用，结果回灌
         for (index, call) in &calls {
             let raw_args = call.arguments.trim();
             let parsed_input = if raw_args.is_empty() {
@@ -339,7 +545,7 @@ async fn run_inner(
                     Ok(Value::Object(input)) => Some(Value::Object(input)),
                     Ok(other) => {
                         warn!(
-                            gen,
+                            gen = sink.gen,
                             tool = %call.name,
                             call_id = %call.id,
                             arguments = %truncate_for_log(raw_args),
@@ -350,7 +556,7 @@ async fn run_inner(
                     }
                     Err(error) => {
                         warn!(
-                            gen,
+                            gen = sink.gen,
                             tool = %call.name,
                             call_id = %call.id,
                             arguments = %truncate_for_log(raw_args),
@@ -361,162 +567,120 @@ async fn run_inner(
                     }
                 }
             };
+            sink.send(AgentEvent::ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: history_calls
+                    .get(index)
+                    .map(|item| item.arguments.clone())
+                    .unwrap_or_else(|| "{}".into()),
+            });
 
-            debug!(
-                gen,
-                tool = %call.name,
-                call_id = %call.id,
-                arguments = %truncate_for_log(raw_args),
-                valid_json_object = parsed_input.is_some(),
-                "执行工具前记录最终参数"
-            );
-            let _ = tx.send((
-                gen,
-                AgentEvent::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: history_calls
-                        .get(index)
-                        .map(|c| c.arguments.clone())
-                        .unwrap_or_else(|| "{}".into()),
-                },
-            ));
-            let out = match parsed_input {
-                Some(input) => {
-                    // 流式执行：progress 通道把 shell 逐行输出实时推给 TUI；agent 边等结果边转发。
-                    // 非流式工具（read_file 等）走 trait 默认实现，progress 通道不会收到任何 chunk。
-                    let (progress_tx, mut progress_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
-                    let mut exec = Box::pin(registry.execute_streaming(
-                        &call.name,
-                        input,
-                        &ctx,
-                        Some(progress_tx),
-                    ));
-                    loop {
-                        tokio::select! {
-                            biased;
-                            res = exec.as_mut() => {
-                                break match res {
-                                    Ok(o) => o,
-                                    Err(e) => ToolOutput {
-                                        content: e.to_string(),
-                                        is_error: true,
-                                    },
-                                };
-                            }
-                            chunk = progress_rx.recv() => {
-                                if let Some(chunk) = chunk {
-                                    let _ = tx.send((
-                                        gen,
-                                        AgentEvent::ToolProgress {
-                                            id: call.id.clone(),
-                                            name: call.name.clone(),
-                                            chunk,
-                                        },
-                                    ));
-                                }
+            let out = if allowed_tools.is_some_and(|allowed| {
+                call.name == "delegate_tasks" || !allowed.contains(&call.name)
+            }) {
+                ToolOutput {
+                    content: format!("Tool '{}' is not allowed for this subagent", call.name),
+                    is_error: true,
+                }
+            } else if let Some(input) = parsed_input {
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<String>();
+                let mut exec = Box::pin(registry.execute_streaming(
+                    &call.name,
+                    input,
+                    &ctx,
+                    Some(progress_tx),
+                ));
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = exec.as_mut() => {
+                            break match result {
+                                Ok(output) => output,
+                                Err(error) => ToolOutput {
+                                    content: error.to_string(),
+                                    is_error: true,
+                                },
+                            };
+                        }
+                        chunk = progress_rx.recv() => {
+                            if let Some(chunk) = chunk {
+                                sink.send(AgentEvent::ToolProgress {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    chunk,
+                                });
                             }
                         }
                     }
                 }
-                None => ToolOutput {
+            } else {
+                ToolOutput {
                     content:
                         "工具调用参数不是合法 JSON 对象，未执行工具；请重新发送完整 JSON 参数。"
                             .into(),
                     is_error: true,
-                },
+                }
             };
-            let _ = tx.send((
-                gen,
-                AgentEvent::ToolResult {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: out.content.clone(),
-                    is_error: out.is_error,
-                },
-            ));
+            sink.send(AgentEvent::ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                output: out.content.clone(),
+                is_error: out.is_error,
+            });
             messages.push(Message::tool(call.id.clone(), out.content));
         }
 
-        // 工具结果回灌后发送上下文使用情况（工具结果可能显著增加 token 数）
-        emit_context_update(tx, gen, &messages, effective_ctx_len);
-
-        // 死循环检测：连续 3 轮相同工具调用指纹 → 提前中止（比空跑 max_steps 省钱省时）
-        // 非连续重复（之前出现过相同指纹）→ 注入提醒，让模型意识到自己在重复
+        emit_context_update(sink, &messages, effective_ctx_len);
         let (loop_triggered, should_warn) = detector.observe(&calls);
         if should_warn {
-            warn!(step, gen, "检测到非连续重复工具调用，注入提醒");
             messages.push(Message::user(
                 "（系统提醒：你之前已经执行过相同的工具调用，请回顾上方对话历史中的结果，不要重复操作。如果之前的尝试没有成功，请换一个不同的策略。）".to_string(),
             ));
         }
         if loop_triggered {
-            warn!(
-                step,
-                gen,
-                repeat_count = detector.repeat_count,
-                "检测到连续重复工具调用，提前中止 agent loop"
-            );
             loop_detected = true;
             break;
         }
-        // 继续循环：带着工具结果再流式一次
     }
 
-    // 收尾总结（max_steps 耗尽 或 死循环检测触发）：
-    // 做一次无工具的收尾流式，让模型总结已收集的信息，而非直接报错中断。
-    // 收尾流式 `tools=[]` → 模型无法再调工具，只能输出文本；其 Delta 经
-    // `accumulate_stream` → `AgentEvent::Token` 流式回传 TUI。发 `Done` 而非 `Error`
-    // → TUI 走正常定稿（总结文本成为 assistant 条目进入 history，使「继续」有上下文）。
     let wrap = if loop_detected {
-        warn!(
-            max_steps,
-            gen, "agent loop 因连续重复工具调用提前中止，进入收尾总结"
-        );
         "（系统提示：检测到连续多次相同的工具调用，可能已陷入循环。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）".to_string()
     } else {
-        warn!(max_steps, gen, "agent loop 超过最大步数，进入收尾总结");
         format!(
             "（系统提示：已达到工具调用步数上限 {max_steps}。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）"
         )
     };
     messages.push(Message::user(wrap));
-    let req = StreamRequest::new(messages.clone())
-        .with_system(system.clone())
-        .with_tools(Vec::new()); // 不暴露工具 → 模型只能给文本
-    let mut stream = provider.stream(req);
-    let (text, _calls, usage) = accumulate_stream(&mut stream, tx, gen).await;
-    if let Some(ref u) = usage {
-        let _ = tx.send((gen, AgentEvent::Usage(u.clone())));
+    let mut stream = provider.stream(
+        StreamRequest::new(messages.clone())
+            .with_system(system)
+            .with_tools(Vec::new()),
+    );
+    let accumulation = accumulate_stream(&mut stream, sink).await?;
+    if let Some(usage) = accumulation.usage.as_ref() {
+        sink.send(AgentEvent::Usage(usage.clone()));
     }
-    if !text.is_empty() {
-        messages.push(Message::assistant(text));
+    let final_text = accumulation.text;
+    if !final_text.is_empty() {
+        messages.push(Message::assistant(final_text.clone()));
     }
-    emit_context_update(tx, gen, &messages, effective_ctx_len);
-    let _ = tx.send((gen, AgentEvent::Done));
-    Ok(())
+    emit_context_update(sink, &messages, effective_ctx_len);
+    sink.send(AgentEvent::Done);
+    Ok(AgentRunOutput { final_text })
 }
 
 /// 发送上下文使用情况更新事件（TUI 据此显示剩余百分比）。
 /// `effective_ctx_len` 为 None 时不发送（TUI 不显示百分比）。
-fn emit_context_update(
-    tx: &UnboundedSender<(u64, AgentEvent)>,
-    gen: u64,
-    messages: &[Message],
-    effective_ctx_len: Option<u32>,
-) {
+fn emit_context_update(sink: &EventSink<'_>, messages: &[Message], effective_ctx_len: Option<u32>) {
     if effective_ctx_len.is_none() {
-        return; // 未知上下文长度 → 不发送
+        return;
     }
-    let used = estimate_messages_tokens(messages);
-    let _ = tx.send((
-        gen,
-        AgentEvent::ContextUpdate {
-            used_tokens: used,
-            effective_context_length: effective_ctx_len,
-        },
-    ));
+    sink.send(AgentEvent::ContextUpdate {
+        used_tokens: estimate_messages_tokens(messages),
+        effective_context_length: effective_ctx_len,
+    });
 }
 
 /// 执行上下文压缩：发 Compacting 事件 → 调用 compact_messages 替换 messages → 发 Compacted 事件。
@@ -527,23 +691,19 @@ async fn do_compact(
     system: &str,
     messages: &mut Vec<Message>,
     custom_instructions: Option<&str>,
-    tx: &UnboundedSender<(u64, AgentEvent)>,
-    gen: u64,
+    sink: &EventSink<'_>,
     is_auto: bool,
 ) -> Result<()> {
     let before_tokens = estimate_messages_tokens(messages);
-    let _ = tx.send((gen, AgentEvent::Compacting { is_auto }));
+    sink.send(AgentEvent::Compacting { is_auto });
     let summary_msg = compact_messages(provider, system, messages, custom_instructions).await?;
     let after_tokens = estimate_messages_tokens(std::slice::from_ref(&summary_msg));
     *messages = vec![summary_msg.clone()];
-    let _ = tx.send((
-        gen,
-        AgentEvent::Compacted {
-            summary: summary_msg.content,
-            before_tokens,
-            after_tokens,
-        },
-    ));
+    sink.send(AgentEvent::Compacted {
+        summary: summary_msg.content,
+        before_tokens,
+        after_tokens,
+    });
     Ok(())
 }
 
@@ -695,59 +855,60 @@ async fn run_compact_inner(
     }
 
     let mut messages = history;
+    let sink = EventSink::parent(tx, gen);
     do_compact(
         provider.as_ref(),
         &system,
         &mut messages,
         custom_instructions.as_deref(),
-        tx,
-        gen,
-        false, // is_auto = false（手动触发）
+        &sink,
+        false,
     )
     .await
 }
 
-/// 驱动一个流到结束，累积 Delta 文本与 ToolCallDelta（按 index 合并为完整 ToolCall）。
-/// Delta→发 `(gen, AgentEvent::Token(t))` 并 append 到文本；Done→break；Error→发 Error 并 break。
-/// 返回 `(累积文本, 按 index 排序的工具调用, usage 用量)`。
+#[derive(Debug)]
+struct StreamAccumulation {
+    text: String,
+    calls: BTreeMap<u32, ToolCall>,
+    usage: Option<Usage>,
+}
+
+/// 驱动一个流到结束，累积文本、工具调用和 usage。
 async fn accumulate_stream(
     stream: &mut (impl futures::Stream<Item = StreamEvent> + Unpin),
-    tx: &UnboundedSender<(u64, AgentEvent)>,
-    gen: u64,
-) -> (String, BTreeMap<u32, ToolCall>, Option<Usage>) {
+    sink: &EventSink<'_>,
+) -> Result<StreamAccumulation> {
     let mut text = String::new();
     let mut calls: BTreeMap<u32, ToolCall> = BTreeMap::new();
     let mut usage: Option<Usage> = None;
 
-    while let Some(ev) = stream.next().await {
-        match ev {
-            StreamEvent::Delta(t) => {
-                text.push_str(&t);
-                if tx.send((gen, AgentEvent::Token(t))).is_err() {
+    while let Some(event) = stream.next().await {
+        match event {
+            StreamEvent::Delta(token) => {
+                text.push_str(&token);
+                if !sink.send(AgentEvent::Token(token)) {
                     debug!("TUI 通道已关闭，agent 累积终止");
-                    return (text, calls, usage);
+                    break;
                 }
             }
-            StreamEvent::Reasoning(t) => {
-                if tx.send((gen, AgentEvent::Reasoning(t))).is_err() {
+            StreamEvent::Reasoning(reasoning) => {
+                if !sink.send(AgentEvent::Reasoning(reasoning)) {
                     debug!("TUI 通道已关闭，agent 累积终止");
-                    return (text, calls, usage);
+                    break;
                 }
             }
-            StreamEvent::ToolCallDelta(d) => {
-                accumulate_tool_delta(&mut calls, d);
+            StreamEvent::ToolCallDelta(delta) => {
+                accumulate_tool_delta(&mut calls, delta);
             }
-            StreamEvent::Usage(u) => {
-                usage = Some(u);
+            StreamEvent::Usage(value) => {
+                usage = Some(value);
             }
             StreamEvent::Done => break,
-            StreamEvent::Error(m) => {
-                let _ = tx.send((gen, AgentEvent::Error(m)));
-                break;
-            }
+            StreamEvent::Error(message) => return Err(AgentError::Provider(message)),
         }
     }
-    (text, calls, usage)
+    Ok(StreamAccumulation { text, calls, usage })
 }
 
 /// 将工具调用参数规范化后写入 assistant 历史，避免非法 JSON 被 provider 拒绝。
@@ -932,9 +1093,10 @@ mod tests {
         ];
         let mut s = stream::iter(events);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
-        let (text, calls, _usage) = accumulate_stream(&mut s, &tx, 0).await;
-        assert_eq!(text, "Hello world");
-        assert!(calls.is_empty());
+        let sink = EventSink::parent(&tx, 0);
+        let accumulation = accumulate_stream(&mut s, &sink).await.unwrap();
+        assert_eq!(accumulation.text, "Hello world");
+        assert!(accumulation.calls.is_empty());
     }
 
     #[tokio::test]
@@ -957,11 +1119,23 @@ mod tests {
         ];
         let mut s = stream::iter(events);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
-        let (text, calls, _usage) = accumulate_stream(&mut s, &tx, 0).await;
-        assert!(text.is_empty());
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[&0].name, "list_dir");
-        assert_eq!(calls[&0].arguments, "{\"path\":\".\"}");
+        let sink = EventSink::parent(&tx, 0);
+        let accumulation = accumulate_stream(&mut s, &sink).await.unwrap();
+        assert!(accumulation.text.is_empty());
+        assert_eq!(accumulation.calls.len(), 1);
+        assert_eq!(accumulation.calls[&0].name, "list_dir");
+        assert_eq!(accumulation.calls[&0].arguments, "{\"path\":\".\"}");
+    }
+
+    #[tokio::test]
+    async fn provider_stream_error_does_not_emit_done() {
+        use futures::stream;
+        let mut stream = stream::iter(vec![StreamEvent::Error("boom".into())]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
+        let sink = EventSink::parent(&tx, 7);
+        let error = accumulate_stream(&mut stream, &sink).await.unwrap_err();
+        assert!(matches!(error, AgentError::Provider(message) if message == "boom"));
+        assert!(rx.try_recv().is_err());
     }
 
     // ── LoopDetector / fingerprint ──────────────────────────────────────────

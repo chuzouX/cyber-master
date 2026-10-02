@@ -70,12 +70,7 @@ mod tests {
         let dir = std::env::temp_dir().join("cyber_write_file_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let ctx = ToolCtx {
-            cwd: dir.clone(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        };
+        let ctx = ToolCtx::new(dir.clone(), vec![], None, Vec::new());
         let out = WriteFileTool
             .run(json!({"path": "out.txt", "content": "hello"}), &ctx)
             .await
@@ -90,12 +85,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_traversal() {
-        let ctx = ToolCtx {
-            cwd: std::env::temp_dir().join("cyber_write_guard"),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        };
+        let ctx = ToolCtx::new(
+            std::env::temp_dir().join("cyber_write_guard"),
+            vec![],
+            None,
+            Vec::new(),
+        );
         let out = WriteFileTool
             .run(json!({"path": "../../etc/evil", "content": "x"}), &ctx)
             .await;

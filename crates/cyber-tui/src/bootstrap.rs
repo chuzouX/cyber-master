@@ -11,7 +11,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cyber_agent::{CtfChallengeTool, CustomTool, SaveMemoryTool, SearchToolsTool, ToolRegistry};
+use cyber_agent::{
+    CtfChallengeTool, CustomTool, DelegateTasksTool, SaveMemoryTool, SearchToolsTool, ToolRegistry,
+};
 use cyber_core::{load_custom_tools, CtfChallenge, Paths};
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::{SkillRegistry, SkillTool, UseSkillTool};
@@ -31,6 +33,7 @@ pub async fn build_registries(
     paths: &Paths,
     cwd: &Path,
     mock: bool,
+    subagents_enabled: bool,
 ) -> (AppRegistries, Vec<String>) {
     let mut errors: Vec<String> = Vec::new();
 
@@ -106,6 +109,10 @@ pub async fn build_registries(
     } else {
         None
     };
+
+    if subagents_enabled {
+        tool_reg.register(Box::new(DelegateTasksTool));
+    }
 
     let catalog = tool_reg.catalog();
     tool_reg.register(Box::new(SearchToolsTool::new(catalog)));

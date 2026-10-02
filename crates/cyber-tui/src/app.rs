@@ -24,6 +24,7 @@ use crossterm::event::{
     KeyEvent, KeyEventKind, MouseEventKind,
 };
 use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use futures::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -450,6 +451,8 @@ pub struct App {
     pub pending_permission: Option<PermissionRequest>,
     pub permission_choice: Option<ApprovalChoice>,
     pub permission_mode: PermissionMode,
+    last_window_title: String,
+    streaming_started: Option<std::time::Instant>,
 }
 
 const WELCOME_OPTIONS: usize = 5;
@@ -545,6 +548,8 @@ impl App {
             pending_permission: None,
             permission_choice: None,
             permission_mode: initial_mode,
+            last_window_title: String::new(),
+            streaming_started: None,
         }
     }
 
@@ -613,9 +618,12 @@ impl App {
         if let Some(mcp) = self.registries.mcp.as_ref() {
             mcp.shutdown_all().await;
         }
-        // 无条件禁用鼠标捕获与 bracketed paste（幂等），避免退出后终端状态泄漏。
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
-        ratatui::restore();
+        let _ = execute!(
+            io::stdout(),
+            SetTitle("Cyber Master"),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         result?;
         info!(mode = ?self.mode, "TUI 退出");
         Ok(())
@@ -653,6 +661,29 @@ impl App {
         ctf_store::save_session_challenges(&self.paths.ctf_dir, &self.sessions.current, &session);
     }
 
+    fn cancel_active_turn(&mut self) {
+        let reason = cancel_reason(&self.chat);
+        if let Some(handle) = self.agent_handle.take() {
+            handle.abort();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(request) = self.pending_permission.take() {
+            let _ = request.reply.send(PermissionDecision::Deny);
+        }
+        self.permission_choice = None;
+        self.streaming_started = None;
+        self.chat.cancel_stream();
+        self.chat.entries.push(ChatEntry::System(reason));
+        self.save_history();
+        self.toast = Some("已取消生成".into());
+    }
+
+    fn reject_queued_permissions(permission_rx: &mut UnboundedReceiver<PermissionRequest>) {
+        while let Ok(request) = permission_rx.try_recv() {
+            let _ = request.reply.send(PermissionDecision::Deny);
+        }
+    }
+
     async fn main_loop(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -665,17 +696,35 @@ impl App {
         // tick：周期重绘兜底（流式期由 agent 事件驱动重绘，idle 期低频刷新）
         let mut tick = tokio::time::interval(Duration::from_millis(120));
         loop {
+            let session_title = self
+                .sessions
+                .current_meta()
+                .map(|m| m.title.as_str())
+                .unwrap_or("新会话");
+            let win_title = crate::history::terminal_window_title(
+                self.chat.streaming,
+                self.streaming_started,
+                session_title,
+                &self.config.agent.default_provider,
+            );
+            if win_title != self.last_window_title {
+                let _ = execute!(io::stdout(), SetTitle(&win_title));
+                self.last_window_title = win_title;
+            }
             // textarea 的 set_block/set_style 需 &mut，而 render 是 &self；
             // 故在 draw 前以 &mut self 应用样式（含 streaming 态边框/标题切换、
             // ProviderForm 的 textarea 样式）。
             self.style_chat_input();
             terminal.draw(|f| self.render(f))?;
+            let generation_before_event = self.generation;
             tokio::select! {
                 biased;
                 req = permission_rx.recv(), if self.pending_permission.is_none() => {
                     if let Some(req) = req {
-                        self.pending_permission = Some(req);
-                        self.permission_choice = None;
+                        if !req.reply.is_closed() {
+                            self.pending_permission = Some(req);
+                            self.permission_choice = None;
+                        }
                     }
                 }
                 maybe_ev = events.next() => {
@@ -699,6 +748,9 @@ impl App {
                         self.chat.paste(&text);
                     }
                 }
+            }
+            if self.generation != generation_before_event {
+                Self::reject_queued_permissions(permission_rx);
             }
             // 排空所有待处理的 agent 事件，合并为一次重绘（避免逐 token 触发 draw 卡顿）。
             while let Ok((gen, ae)) = agent_rx.try_recv() {
@@ -821,12 +873,7 @@ impl App {
                         self.permission_choice = None;
                     }
                 }
-                KeyCode::Esc => {
-                    if let Some(req) = self.pending_permission.take() {
-                        let _ = req.reply.send(PermissionDecision::Deny);
-                    }
-                    self.permission_choice = None;
-                }
+                KeyCode::Esc => self.cancel_active_turn(),
                 _ => {}
             }
             return;
@@ -891,17 +938,7 @@ impl App {
             }
             ChatAction::Back => {
                 if self.chat.streaming {
-                    // 流式期 Esc：取消（abort 任务 + bump gen 隔离 stale 事件）
-                    // 先取取消原因（读 buffer），cancel_stream 会 flush buffer 到条目
-                    let reason = cancel_reason(&self.chat);
-                    if let Some(h) = self.agent_handle.take() {
-                        h.abort();
-                    }
-                    self.generation = self.generation.wrapping_add(1);
-                    self.chat.cancel_stream();
-                    self.chat.entries.push(ChatEntry::System(reason));
-                    self.save_history();
-                    self.toast = Some("已取消生成".into());
+                    self.cancel_active_turn();
                 } else if self.project.is_none() {
                     // 非流式 + 无项目：返回 Welcome
                     self.mode = Mode::Welcome;
@@ -1026,6 +1063,7 @@ impl App {
             }
             AgentEvent::Done => {
                 // writeup 生成完成：保存文件 + 更新题目状态
+                self.streaming_started = None;
                 if let Some(name) = self.ctf_writeup_pending.take() {
                     let raw = std::mem::take(&mut self.ctf_writeup_buffer);
                     // 兜底：剥离模型可能误输出的工具调用标签，仅保留正文
@@ -1117,6 +1155,7 @@ impl App {
                 )));
             }
             AgentEvent::Error(m) => {
+                self.streaming_started = None;
                 // writeup 生成失败：清理状态
                 if self.ctf_writeup_pending.take().is_some() {
                     self.ctf_writeup_buffer.clear();
@@ -1523,6 +1562,7 @@ impl App {
         }
         self.generation = self.generation.wrapping_add(1);
         let gen = self.generation;
+        self.streaming_started = Some(std::time::Instant::now());
         let config = self.config.clone();
         let providers = self.providers.clone();
         let project = self.project.clone();
@@ -2384,6 +2424,7 @@ impl App {
                         h.abort();
                     }
                     self.generation = self.generation.wrapping_add(1);
+                    self.streaming_started = None;
                     self.chat.cancel_stream();
                     self.chat.entries.push(ChatEntry::System(reason));
                     self.save_history();
@@ -5323,5 +5364,46 @@ mod tests {
         app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.pending_permission.is_none());
         assert_eq!(rx.try_recv().unwrap(), PermissionDecision::AllowSession);
+    }
+
+    #[tokio::test]
+    async fn cancel_stream_clears_queued_subagent_permissions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio::sync::{mpsc, oneshot};
+
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        app.generation = 4;
+        app.agent_handle = Some(tokio::spawn(std::future::pending::<()>()));
+
+        let (current_reply, mut current_rx) = oneshot::channel();
+        app.pending_permission = Some(PermissionRequest {
+            tool: "read_file".into(),
+            arguments: serde_json::json!({"path": "one"}),
+            nonce: "current".into(),
+            reply: current_reply,
+        });
+        let (queued_reply, mut queued_rx) = oneshot::channel();
+        let (permission_tx, mut permission_rx) = mpsc::unbounded_channel();
+        permission_tx
+            .send(PermissionRequest {
+                tool: "read_file".into(),
+                arguments: serde_json::json!({"path": "two"}),
+                nonce: "queued".into(),
+                reply: queued_reply,
+            })
+            .unwrap();
+
+        app.handle_chat_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        App::reject_queued_permissions(&mut permission_rx);
+
+        assert!(app.agent_handle.is_none());
+        assert_eq!(app.generation, 5);
+        assert!(!app.chat.streaming);
+        assert!(app.pending_permission.is_none());
+        assert!(app.permission_choice.is_none());
+        assert_eq!(current_rx.try_recv().unwrap(), PermissionDecision::Deny);
+        assert_eq!(queued_rx.try_recv().unwrap(), PermissionDecision::Deny);
+        assert!(permission_rx.try_recv().is_err());
     }
 }

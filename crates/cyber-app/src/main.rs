@@ -342,7 +342,13 @@ async fn run_tui(cwd: &Path, mock_flag: bool, log_level: Option<&str>) -> color_
 
     // 构建统一工具表（builtins + Skills + MCP）。注意在 `paths` move 前 borrow ctx.paths + cwd。
     // mock 模式跳过 MCP 连接。boot_errors 经 toast 展示（降级为仅可用部分，不阻断启动）。
-    let (registries, boot_errors) = build_registries(&ctx.paths, &paths.cwd, mock).await;
+    let (registries, boot_errors) = build_registries(
+        &ctx.paths,
+        &paths.cwd,
+        mock,
+        ctx.config.agent.subagents.enabled,
+    )
+    .await;
     for e in &boot_errors {
         tracing::warn!(error = %e, "启动注册表构建警告");
     }

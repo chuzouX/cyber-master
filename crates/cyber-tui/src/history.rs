@@ -320,6 +320,41 @@ pub fn derive_session_title(
     }
 }
 
+/// 终端窗口/标签标题所用的加载旋转动效帧。
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// 生成符合当前会话与思考/执行状态的终端窗口/标签页标题。
+pub fn terminal_window_title(
+    busy: bool,
+    thinking_started: Option<std::time::Instant>,
+    session_title: &str,
+    model: &str,
+) -> String {
+    let base_name = if !session_title.is_empty()
+        && session_title != DEFAULT_SESSION_TITLE
+        && session_title != MIGRATED_SESSION_TITLE
+    {
+        session_title
+    } else if !model.is_empty() {
+        model
+    } else {
+        "AI Agent"
+    };
+
+    if busy {
+        let (spinner, secs) = if let Some(started) = thinking_started {
+            let elapsed_ms = started.elapsed().as_millis();
+            let frame = (elapsed_ms / 80) as usize % SPINNER_FRAMES.len();
+            (SPINNER_FRAMES[frame], started.elapsed().as_secs())
+        } else {
+            ("⠋", 0)
+        };
+        format!("{spinner} [{secs}s] Cyber Master - {base_name}")
+    } else {
+        format!("Cyber Master - {base_name}")
+    }
+}
+
 pub fn save_current(history_dir: &Path, cwd: &Path, idx: &mut SessionIndex, entries: &[ChatEntry]) {
     // 先派生/生成 title（在写 index 前更新 meta）
     if let Some(meta) = idx.get_mut(&idx.current.clone()) {
@@ -922,5 +957,26 @@ mod tests {
         assert_eq!(idx.current_meta().unwrap().title, "A");
         idx.get_mut("b").unwrap().title = "B-modified".into();
         assert_eq!(idx.get("b").unwrap().title, "B-modified");
+    }
+
+    #[test]
+    fn terminal_window_title_formats_idle_and_busy_spinner_animation() {
+        use std::time::Instant;
+
+        // 1. Idle state with custom title
+        let idle_title = terminal_window_title(false, None, "源码审计与漏洞分析", "gpt-4o");
+        assert_eq!(idle_title, "Cyber Master - 源码审计与漏洞分析");
+
+        // 2. Idle state with default title -> falls back to model
+        let default_title = terminal_window_title(false, None, "新会话", "deepseek-v4");
+        assert_eq!(default_title, "Cyber Master - deepseek-v4");
+
+        // 3. Busy state with thinking timer -> animated spinner frame + seconds
+        let now = Instant::now();
+        let busy_title = terminal_window_title(true, Some(now), "源码审计与漏洞分析", "gpt-4o");
+        assert!(busy_title.contains("[0s] Cyber Master - 源码审计与漏洞分析"));
+        assert!(SPINNER_FRAMES
+            .iter()
+            .any(|frame| busy_title.starts_with(frame)));
     }
 }

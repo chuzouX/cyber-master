@@ -158,12 +158,7 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(SearchToolsTool::new(registry.catalog())));
-        let ctx = ToolCtx {
-            cwd: std::env::temp_dir(),
-            rules: vec![],
-            scope: None,
-            env: vec![],
-        };
+        let ctx = ToolCtx::new(std::env::temp_dir(), vec![], None, vec![]);
         let before = registry
             .execute("search_tools", serde_json::json!({"tag": "mcp"}), &ctx)
             .await

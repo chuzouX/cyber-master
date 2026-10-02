@@ -178,7 +178,8 @@ impl SessionRunner {
         // The bootstrap's mock switch only suppresses MCP startup. Provider mock
         // selection is kept separate below, so real providers remain available.
         eprintln!("[security] CLI/headless MCP auto-start disabled; no MCP servers are connected.");
-        let (registries, errors) = build_registries(&ctx.paths, cwd, true).await;
+        let (registries, errors) =
+            build_registries(&ctx.paths, cwd, true, ctx.config.agent.subagents.enabled).await;
         for error in errors {
             eprintln!("[bootstrap] {}", terminal_text(&error));
         }
@@ -1634,7 +1635,7 @@ pub(crate) mod tests {
         let cwd = tempfile::tempdir().unwrap().keep();
         let paths = cyber_core::Paths::at(cwd.clone()).unwrap();
         let index = load_index(&paths.history_dir, &cwd);
-        let (registries, _) = build_registries(&paths, &cwd, true).await;
+        let (registries, _) = build_registries(&paths, &cwd, true, true).await;
         SessionRunner {
             ctx: AppContext {
                 config: cyber_core::Config::default(),
@@ -2248,12 +2249,7 @@ pub(crate) mod tests {
         assert_eq!(outcome.tool_calls[0].name, "list_dir");
         assert!(!outcome.tool_calls[0].is_error);
         let registry = ToolRegistry::with_permissions(runner.registry.clone(), permissions.clone());
-        let ctx = cyber_agent::ToolCtx {
-            cwd: runner.cwd.clone(),
-            rules: vec![],
-            scope: None,
-            env: vec![],
-        };
+        let ctx = cyber_agent::ToolCtx::new(runner.cwd.clone(), vec![], None, vec![]);
         let output = registry
             .execute(
                 "write_file",
@@ -2298,12 +2294,7 @@ pub(crate) mod tests {
         let runner = test_runner().await;
         let permissions = runner.explicit_permissions(&["write_file".into()]).unwrap();
         let registry = ToolRegistry::with_permissions(runner.registry.clone(), permissions.clone());
-        let ctx = cyber_agent::ToolCtx {
-            cwd: runner.cwd.clone(),
-            rules: vec![],
-            scope: None,
-            env: vec![],
-        };
+        let ctx = cyber_agent::ToolCtx::new(runner.cwd.clone(), vec![], None, vec![]);
         let output = registry
             .execute(
                 "write_file",
@@ -2370,12 +2361,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn two_tool_registered_challenges_survive_id_deduplicating_reload() {
         let mut runner = test_runner().await;
-        let ctx = cyber_agent::ToolCtx {
-            cwd: runner.cwd.clone(),
-            rules: vec![],
-            scope: None,
-            env: vec![],
-        };
+        let ctx = cyber_agent::ToolCtx::new(runner.cwd.clone(), vec![], None, vec![]);
         for name in ["first", "second"] {
             let output = runner
                 .registries
@@ -2508,12 +2494,7 @@ pub(crate) mod tests {
         assert!(!system.contains("disabled-guidance-marker"));
         assert!(!system.contains("invalid-guidance-marker"));
         // Guidance remains advisory; the approved tool retains its existing guards.
-        let ctx = cyber_agent::ToolCtx {
-            cwd: runner.cwd.clone(),
-            rules: vec![],
-            scope: None,
-            env: vec![],
-        };
+        let ctx = cyber_agent::ToolCtx::new(runner.cwd.clone(), vec![], None, vec![]);
         let registry = ToolRegistry::with_permissions(
             runner.registry.clone(),
             Arc::new(PermissionBroker::explicit_tools(["save_memory"])),

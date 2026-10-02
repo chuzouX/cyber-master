@@ -281,12 +281,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            cwd: PathBuf::from("."),
-            rules: Vec::new(),
-            scope: None,
-            env: Vec::new(),
-        }
+        ToolCtx::new(PathBuf::from("."), Vec::new(), None, Vec::new())
     }
 
     fn make_tool() -> (CtfChallengeTool, Arc<Mutex<Vec<CtfChallenge>>>) {

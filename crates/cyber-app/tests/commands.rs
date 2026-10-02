@@ -70,6 +70,43 @@ fn mock_run_works_without_credentials_and_returns_json() {
 }
 
 #[test]
+fn mock_run_delegates_parallel_subagents() {
+    let home = tempfile::tempdir().unwrap();
+    let output = command(home.path())
+        .args([
+            "run",
+            "delegate: compare two independent checks",
+            "--mock",
+            "--new",
+            "--format",
+            "json",
+            "--allow-tool",
+            "delegate_tasks",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = json(&output);
+    assert_eq!(result["success"], true);
+    assert!(!result["answer"].as_str().unwrap().is_empty());
+    let calls = result["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["name"], "delegate_tasks");
+    let delegated: serde_json::Value =
+        serde_json::from_str(calls[0]["output"].as_str().unwrap()).unwrap();
+    let results = delegated["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["name"], "check-one");
+    assert_eq!(results[0]["status"], "completed");
+    assert_eq!(results[1]["name"], "check-two");
+    assert_eq!(results[1]["status"], "completed");
+}
+
+#[test]
 fn json_failure_has_nonzero_exit_status() {
     let home = tempfile::tempdir().unwrap();
     let output = command(home.path())

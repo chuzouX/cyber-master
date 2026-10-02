@@ -89,12 +89,7 @@ mod tests {
     use super::*;
 
     fn ctx_with(dir: &std::path::Path) -> ToolCtx {
-        ToolCtx {
-            cwd: dir.to_path_buf(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        }
+        ToolCtx::new(dir.to_path_buf(), vec![], None, Vec::new())
     }
 
     #[tokio::test]

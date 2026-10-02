@@ -5,6 +5,7 @@
 
 mod ctf_challenge;
 mod custom_tool;
+mod delegate_tasks;
 mod download_file;
 mod find_file;
 mod guard;
@@ -46,5 +47,6 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
 
 pub use ctf_challenge::CtfChallengeTool;
 pub use custom_tool::CustomTool;
+pub use delegate_tasks::DelegateTasksTool;
 pub use save_memory::SaveMemoryTool;
 pub use search_tools::SearchToolsTool;

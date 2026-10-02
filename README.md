@@ -147,6 +147,13 @@ default_provider = "openai"  # 见 providers.toml
 auto_tool_call = true
 max_steps = 25               # agent loop 最大步数
 
+[agent.subagents]
+enabled = true               # false 时不注册 delegate_tasks
+max_tasks = 8                # 单次批量任务上限
+max_parallel = 4             # 子任务并发上限
+timeout_secs = 300           # 每项任务超时
+max_steps = 25               # 每个子 agent 的 loop 步数上限
+
 [workflow]
 max_parallel_nodes = 8
 default_timeout_secs = 1800

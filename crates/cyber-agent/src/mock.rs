@@ -37,26 +37,64 @@ impl Provider for MockProvider {
         &self,
         req: StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
-        let has_tool_result = req.messages.iter().any(|m| m.role == Role::Tool);
-
-        // tool-loop 模式：tools 非空
+        let has_tool_result = req
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Tool);
         if !req.tools.is_empty() {
-            if !has_tool_result {
-                // 第一步：文本 + 工具调用 + Done（无延迟，测试用）
+            if has_tool_result {
                 return Box::pin(stream::iter(vec![
-                    StreamEvent::Delta("让我查看当前目录。".into()),
+                    StreamEvent::Delta("（mock）工具结果已回灌，任务完成。".into()),
+                    StreamEvent::Done,
+                ]));
+            }
+            let exposes_delegate = req
+                .tools
+                .iter()
+                .any(|schema| schema.name == "delegate_tasks");
+            let user_requests_delegate = req
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .is_some_and(|message| message.content.starts_with("delegate:"));
+            if exposes_delegate && user_requests_delegate {
+                let arguments = serde_json::json!({
+                    "tasks": [
+                        {
+                            "name": "check-one",
+                            "system_prompt": "You are the first independent checker.",
+                            "task": "Perform the first independent check.",
+                            "tools": []
+                        },
+                        {
+                            "name": "check-two",
+                            "system_prompt": "You are the second independent checker.",
+                            "task": "Perform the second independent check.",
+                            "tools": []
+                        }
+                    ]
+                })
+                .to_string();
+                return Box::pin(stream::iter(vec![
+                    StreamEvent::Delta("（mock）正在并行委派两个检查。".into()),
                     StreamEvent::ToolCallDelta(ToolCallDelta {
                         index: 0,
-                        id: Some("mock_call_1".into()),
-                        name: Some("list_dir".into()),
-                        arguments_fragment: "{\"path\":\".\"}".into(),
+                        id: Some("mock_delegate_call_1".into()),
+                        name: Some("delegate_tasks".into()),
+                        arguments_fragment: arguments,
                     }),
                     StreamEvent::Done,
                 ]));
             }
-            // 第二步：工具结果已回灌，发最终文本 + Done
             return Box::pin(stream::iter(vec![
-                StreamEvent::Delta("（mock）已获取目录信息，任务完成。".into()),
+                StreamEvent::Delta("让我查看当前目录。".into()),
+                StreamEvent::ToolCallDelta(ToolCallDelta {
+                    index: 0,
+                    id: Some("mock_call_1".into()),
+                    name: Some("list_dir".into()),
+                    arguments_fragment: "{\"path\":\".\"}".into(),
+                }),
                 StreamEvent::Done,
             ]));
         }
@@ -99,6 +137,15 @@ mod tests {
         StreamRequest::new(messages).with_tools(vec![ToolSchema {
             name: "list_dir".into(),
             description: "list directory".into(),
+            tags: vec![],
+            parameters: serde_json::json!({"type": "object"}),
+        }])
+    }
+
+    fn req_with_delegate(messages: Vec<Message>) -> StreamRequest {
+        StreamRequest::new(messages).with_tools(vec![ToolSchema {
+            name: "delegate_tasks".into(),
+            description: "delegate".into(),
             tags: vec![],
             parameters: serde_json::json!({"type": "object"}),
         }])
@@ -180,5 +227,37 @@ mod tests {
         assert!(!text.is_empty(), "第二步应发最终文本");
         assert!(!got_tool_call, "第二步不应再发 tool call");
         assert!(got_done, "应以 Done 结束");
+    }
+
+    #[tokio::test]
+    async fn mock_delegate_tasks_second_round_does_not_delegate_again() {
+        let provider = MockProvider::new();
+        let mut first = provider.stream(req_with_delegate(vec![Message::user(
+            "delegate: compare checks",
+        )]));
+        assert!(
+            first
+                .any(|event| async move {
+                    matches!(
+                        event,
+                        StreamEvent::ToolCallDelta(ToolCallDelta {
+                            name: Some(name),
+                            ..
+                        }) if name == "delegate_tasks"
+                    )
+                })
+                .await
+        );
+
+        let mut second = provider.stream(req_with_delegate(vec![
+            Message::user("delegate: compare checks"),
+            Message::assistant("delegating"),
+            Message::tool("mock_delegate_call_1", "{\"results\":[]}"),
+        ]));
+        assert!(
+            !second
+                .any(|event| async move { matches!(event, StreamEvent::ToolCallDelta(_)) })
+                .await
+        );
     }
 }

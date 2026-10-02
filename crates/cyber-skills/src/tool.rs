@@ -197,12 +197,7 @@ mod tests {
     }
 
     fn ctx() -> ToolCtx {
-        ToolCtx {
-            cwd: std::env::temp_dir(),
-            rules: vec![],
-            scope: None,
-            env: Vec::new(),
-        }
+        ToolCtx::new(std::env::temp_dir(), vec![], None, Vec::new())
     }
 
     #[test]
