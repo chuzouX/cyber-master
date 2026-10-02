@@ -175,11 +175,9 @@ impl SessionRunner {
         } else {
             serde_json::from_slice(&bytes)?
         };
-        // The bootstrap's mock switch only suppresses MCP startup. Provider mock
-        // selection is kept separate below, so real providers remain available.
-        eprintln!("[security] CLI/headless MCP auto-start disabled; no MCP servers are connected.");
+        // 非 mock 时正常自动连接已配置的 MCP servers。
         let (registries, errors) =
-            build_registries(&ctx.paths, cwd, true, ctx.config.agent.subagents.enabled).await;
+            build_registries(&ctx.paths, cwd, mock, ctx.config.agent.subagents.enabled).await;
         for error in errors {
             eprintln!("[bootstrap] {}", terminal_text(&error));
         }
@@ -194,6 +192,7 @@ impl SessionRunner {
             mock: mock || std::env::var("CYBER_MOCK_PROVIDER").is_ok_and(|v| v == "1"),
         };
         runner.load_challenges(&runner.index.current.clone())?;
+        runner.load_todos(&runner.index.current.clone())?;
         Ok(runner)
     }
 
@@ -233,6 +232,27 @@ impl SessionRunner {
         *shared
             .lock()
             .map_err(|_| color_eyre::eyre::eyre!("CTF state lock poisoned"))? = list;
+        Ok(())
+    }
+
+    pub(crate) fn todos(&self) -> Vec<cyber_core::TodoItem> {
+        self.registries
+            .todos
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn replace_todos(&mut self, list: Vec<cyber_core::TodoItem>) {
+        if let Ok(mut g) = self.registries.todos.lock() {
+            *g = list;
+        }
+    }
+
+    fn load_todos(&mut self, id: &str) -> color_eyre::Result<()> {
+        validate_session_id(id)?;
+        let items = crate::history::load_todos(&self.ctx.paths.history_dir, &self.cwd, id);
+        self.replace_todos(items);
         Ok(())
     }
 
@@ -378,6 +398,13 @@ impl SessionRunner {
             &dir.join(format!("{}.json", self.index.current)),
             &serde_json::to_vec_pretty(&self.entries)?,
         )?;
+        let todos = self.todos();
+        let _ = crate::history::save_todos(
+            &self.ctx.paths.history_dir,
+            &self.cwd,
+            &self.index.current,
+            &todos,
+        );
         persist(
             &dir.join("index.json"),
             &serde_json::to_vec_pretty(&self.index)?,
@@ -412,6 +439,7 @@ impl SessionRunner {
         self.save()?;
         let meta = create_session_meta();
         self.load_challenges(&meta.id)?;
+        self.load_todos(&meta.id)?;
         self.index.current = meta.id.clone();
         self.index.sessions.push(meta);
         self.entries.clear();
@@ -487,6 +515,7 @@ impl SessionRunner {
         let entries = self.read_entries(id)?;
         self.save()?;
         self.load_challenges(id)?;
+        self.load_todos(id)?;
         self.entries = entries;
         self.index.current = id.to_owned();
         self.save()?;

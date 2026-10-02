@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -117,6 +117,10 @@ pub trait Tool: Send + Sync {
         let _ = progress;
         self.run(input, ctx)
     }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// 统一工具表：持有 `Box<dyn Tool>`，按名查找、批量导出 schema、统一执行。
@@ -163,6 +167,10 @@ impl Tool for PermissionTool {
                 .execute_streaming(name, input, ctx, progress)
                 .await
         })
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.get(&self.schema.name).and_then(|t| t.as_any())
     }
 }
 
@@ -241,6 +249,13 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    pub fn todo_state(&self) -> Option<Arc<Mutex<Vec<cyber_core::TodoItem>>>> {
+        self.get("todo")
+            .and_then(|t| t.as_any())
+            .and_then(|a| a.downcast_ref::<crate::tools::TodoTool>())
+            .map(|t| t.todos())
     }
 
     /// All execution entry points on this view require explicit approval.
@@ -503,13 +518,13 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 8);
+        assert_eq!(registry.all_schemas().len(), 9);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 8);
-        assert_eq!(registry.schemas().len(), 8);
+        assert_eq!(registry.all_schemas().len(), 9);
+        assert_eq!(registry.schemas().len(), 9);
     }
 
     #[test]

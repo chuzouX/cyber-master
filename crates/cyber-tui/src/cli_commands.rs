@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{bail, eyre, Result};
 use cyber_agent::{AgentEvent, PermissionBroker};
-use cyber_core::{Config, CtfCategory, CtfChallenge, MemoryRule, ProviderConfig, ProvidersConfig};
+use cyber_core::{
+    Config, CtfCategory, CtfChallenge, EnvVar, MemoryRule, ProviderConfig, ProvidersConfig,
+};
 use cyber_mcp::McpServersConfig;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
@@ -239,16 +241,22 @@ fn config_field_bytes(path: &Path, config: &Config, section: &str, field: &str) 
     )]));
     configuration_bytes(path, &patch)
 }
+pub(crate) fn persist_config_field(
+    path: &Path,
+    config: &Config,
+    section: &str,
+    field: &str,
+) -> Result<()> {
+    persist(path, &config_field_bytes(path, config, section, field)?)
+}
+
 fn save_config(
     runner: &mut SessionRunner,
     config: Config,
     section: &str,
     field: &str,
 ) -> Result<()> {
-    persist(
-        &runner.ctx.paths.config_file,
-        &config_field_bytes(&runner.ctx.paths.config_file, &config, section, field)?,
-    )?;
+    persist_config_field(&runner.ctx.paths.config_file, &config, section, field)?;
     runner.ctx.config = config;
     Ok(())
 }
@@ -361,6 +369,161 @@ fn save_selection_renamed(
     Ok(())
 }
 
+fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let (command, value) = split(args);
+    if command.is_empty() || command.eq_ignore_ascii_case("status") {
+        let config = &runner.ctx.config.agent.subagents;
+        return Ok(output(
+            "Subagents",
+            format!(
+                "enabled={}\nmax_tasks={}\nmax_parallel={}\ntimeout_secs={}\nmax_steps={}",
+                config.enabled,
+                config.effective_max_tasks(),
+                config.effective_max_parallel(),
+                config.effective_timeout_secs(),
+                config.effective_max_steps()
+            ),
+        ));
+    }
+
+    let mut config = runner.ctx.config.clone();
+    let message = match command.to_ascii_lowercase().as_str() {
+        "enable" if value.is_empty() => {
+            config.agent.subagents.enabled = true;
+            "Subagents enabled; restart to update the tool catalog".to_string()
+        }
+        "disable" if value.is_empty() => {
+            config.agent.subagents.enabled = false;
+            "Subagents disabled; restart to update the tool catalog".to_string()
+        }
+        "max_tasks" => {
+            let number = value
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| eyre!("max_tasks must be a positive integer"))?;
+            config.agent.subagents.max_tasks = number;
+            format!("Subagent max_tasks set to {number}")
+        }
+        "max_parallel" => {
+            let number = value
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| eyre!("max_parallel must be a positive integer"))?;
+            config.agent.subagents.max_parallel = number;
+            format!("Subagent max_parallel set to {number}")
+        }
+        "timeout" => {
+            let number = value
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| eyre!("timeout must be a positive integer"))?;
+            config.agent.subagents.timeout_secs = number;
+            format!("Subagent timeout set to {number}s")
+        }
+        "max_steps" => {
+            let number = value
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| eyre!("max_steps must be a positive integer"))?;
+            config.agent.subagents.max_steps = number;
+            format!("Subagent max_steps set to {number}")
+        }
+        _ => bail!(
+            "Usage: /subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]"
+        ),
+    };
+    save_config(runner, config, "agent", "subagents")?;
+    Ok(refresh(&message, false))
+}
+
+fn env(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let (command, rest) = split(args);
+    if command.is_empty() || command.eq_ignore_ascii_case("list") {
+        let mut vars = runner.ctx.config.env.vars.clone();
+        vars.sort_by(|left, right| left.key.cmp(&right.key));
+        let text = if vars.is_empty() {
+            "No environment variables configured".to_string()
+        } else {
+            vars.into_iter()
+                .map(|var| {
+                    if var.sensitive {
+                        format!("{}=<sensitive>", var.key)
+                    } else {
+                        format!("{}={}", var.key, var.value)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        return Ok(output("Environment", text));
+    }
+
+    let mut config = runner.ctx.config.clone();
+    let message = match command.to_ascii_lowercase().as_str() {
+        "set" | "set-sensitive" => {
+            let (key, value) = split(rest);
+            if key.is_empty() || value.is_empty() {
+                bail!("Usage: /env set KEY VALUE or /env set-sensitive KEY VALUE");
+            }
+            let updated = EnvVar {
+                key: key.to_string(),
+                value: value.to_string(),
+                sensitive: command.eq_ignore_ascii_case("set-sensitive"),
+            };
+            if let Some(existing) = config.env.vars.iter_mut().find(|var| var.key == key) {
+                *existing = updated;
+            } else {
+                config.env.vars.push(updated);
+            }
+            format!("Environment variable '{key}' saved")
+        }
+        "remove" if !rest.is_empty() => {
+            let before = config.env.vars.len();
+            config.env.vars.retain(|var| var.key != rest);
+            if config.env.vars.len() == before {
+                bail!("Unknown environment variable");
+            }
+            format!("Environment variable '{rest}' removed")
+        }
+        _ => bail!("Usage: /env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]"),
+    };
+    save_config(runner, config, "env", "vars")?;
+    Ok(refresh(&message, false))
+}
+fn web(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let sub = args.trim().to_ascii_lowercase();
+    if sub.is_empty() || sub == "status" {
+        let status_str = if runner.ctx.config.tools.web_search {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        return Ok(output(
+            "Web Search",
+            format!("web_search is currently {status_str}"),
+        ));
+    }
+    let (enabled, message) = match sub.as_str() {
+        "on" | "enable" | "1" | "true" => (
+            true,
+            "Web search enabled; web_fetch tool is exposed to model",
+        ),
+        "off" | "disable" | "0" | "false" => (
+            false,
+            "Web search disabled; web_fetch tool is hidden from model",
+        ),
+        _ => bail!("Usage: /web [status|on|off|enable|disable]"),
+    };
+    let mut config = runner.ctx.config.clone();
+    config.tools.web_search = enabled;
+    save_config(runner, config, "tools", "web_search")?;
+    Ok(refresh(message, false))
+}
+
 pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
     let (name, args) = split(line);
     if name.eq_ignore_ascii_case("/mode") || name.eq_ignore_ascii_case("/approval") {
@@ -437,6 +600,9 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
             }
         }
         SlashCommand::Provider(args) => provider(runner, &args)?,
+        SlashCommand::Subagents(args) => subagents(runner, &args)?,
+        SlashCommand::Env(args) => env(runner, &args)?,
+        SlashCommand::Web(args) => web(runner, &args)?,
         SlashCommand::Tools => output(
             "Tools",
             runner
@@ -549,6 +715,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         }
         SlashCommand::Sessions(args) => sessions(runner, &args)?,
         SlashCommand::Memory(args) => memory(runner, &args)?,
+        SlashCommand::Todo(args) => todo_cmd(runner, &args)?,
         SlashCommand::Mode(_) => bail!("/mode is not available in CLI"),
         SlashCommand::Unknown(_) => bail!("Unknown command; use /help"),
     })
@@ -649,6 +816,75 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             Ok(refresh("Provider removed", false))
         }
         _ => bail!("Usage: /provider list|add|edit <name>|use <name>|remove <name>"),
+    }
+}
+fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let (sub, rest) = split(args);
+    let mut todos = runner
+        .registries
+        .todos
+        .lock()
+        .map_err(|_| color_eyre::eyre::eyre!("Failed to acquire todo lock"))?;
+    match sub.to_ascii_lowercase().as_str() {
+        "" | "list" => {
+            if todos.is_empty() {
+                Ok(output("Todo", "当前没有任务，可用 /todo add <title> 添加"))
+            } else {
+                let mut lines = String::from("📋 任务清单：");
+                for t in todos.iter() {
+                    let status_mark = match t.status {
+                        cyber_core::TodoStatus::Pending => "[ ]",
+                        cyber_core::TodoStatus::InProgress => "[>]",
+                        cyber_core::TodoStatus::Completed => "[x]",
+                        cyber_core::TodoStatus::Failed => "[!]",
+                    };
+                    lines.push_str(&format!("\n  {} #{} {}", status_mark, t.id, t.title));
+                }
+                Ok(output("Todo", lines))
+            }
+        }
+        "add" => {
+            if rest.is_empty() {
+                bail!("用法：/todo add <任务标题>");
+            }
+            let next_num = todos
+                .iter()
+                .filter_map(|t| t.id.parse::<usize>().ok())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let id_str = next_num.to_string();
+            todos.push(cyber_core::TodoItem::new(
+                id_str.clone(),
+                rest,
+                cyber_core::TodoStatus::Pending,
+            ));
+            drop(todos);
+            runner.save()?;
+            Ok(output("Todo", format!("已添加任务 #{id_str}：{rest}")))
+        }
+        "done" => {
+            if rest.is_empty() {
+                bail!("用法：/todo done <任务编号>");
+            }
+            if let Some(item) = todos.iter_mut().find(|t| t.id == rest) {
+                item.status = cyber_core::TodoStatus::Completed;
+                drop(todos);
+                runner.save()?;
+                Ok(output("Todo", format!("任务 #{rest} 已标记为完成")))
+            } else {
+                bail!("未找到编号为 #{rest} 的任务");
+            }
+        }
+        "clear" => {
+            todos.clear();
+            drop(todos);
+            runner.save()?;
+            Ok(output("Todo", "任务清单已清空"))
+        }
+        other => {
+            bail!("未知子命令：{other}（用法：/todo [list|add <title>|done <id>|clear]）");
+        }
     }
 }
 
@@ -1157,6 +1393,13 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
         {
             values.extend(runner.index.sessions.iter().map(|s| s.id.clone()));
         }
+        if cmd == "/env"
+            && ["set", "set-sensitive", "remove"]
+                .iter()
+                .any(|value| head.eq_ignore_ascii_case(value))
+        {
+            values.extend(runner.ctx.config.env.vars.iter().map(|var| var.key.clone()));
+        }
         if cmd == "/skill" && head.is_empty() {
             values.extend(runner.registries.skills.iter().map(|s| s.name().to_owned()));
         }
@@ -1214,9 +1457,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_dispatches_all_sixteen_commands_and_effort_case_insensitively() {
+    async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 17);
+        assert_eq!(commands().len(), 21);
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
             if let Err(error) = execute(&mut runner, &command.name.to_uppercase()) {
@@ -2205,6 +2448,81 @@ rules = [
                 CliAction::Task(CliTask::McpConnect { .. })
             ));
         }
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn subagents_and_env_commands_persist_mask_and_complete() {
+        let mut runner = test_runner().await;
+
+        execute(&mut runner, "/subagents max_parallel 3").unwrap();
+        execute(&mut runner, "/subagents timeout 45").unwrap();
+        execute(&mut runner, "/subagents disable").unwrap();
+        assert_eq!(runner.ctx.config.agent.subagents.max_parallel, 3);
+        assert_eq!(runner.ctx.config.agent.subagents.timeout_secs, 45);
+        assert!(!runner.ctx.config.agent.subagents.enabled);
+        assert!(execute(&mut runner, "/subagents max_tasks 0").is_err());
+
+        execute(&mut runner, "/env set PUBLIC visible value").unwrap();
+        execute(&mut runner, "/env set-sensitive TOKEN private value").unwrap();
+        let listed = execute(&mut runner, "/env list").unwrap();
+        let CliAction::Output { text, .. } = listed else {
+            panic!("expected env output");
+        };
+        assert!(text.contains("PUBLIC=visible value"));
+        assert!(text.contains("TOKEN=<sensitive>"));
+        assert!(!text.contains("private value"));
+
+        let completions = suggestions(Some(&runner), "/env remove TO");
+        assert!(completions
+            .iter()
+            .any(|item| item.value == "/env remove TOKEN "));
+
+        let persisted: Config =
+            toml::from_str(&std::fs::read_to_string(&runner.ctx.paths.config_file).unwrap())
+                .unwrap();
+        assert_eq!(persisted.agent.subagents.max_parallel, 3);
+        assert_eq!(persisted.agent.subagents.timeout_secs, 45);
+        assert!(!persisted.agent.subagents.enabled);
+        assert!(persisted
+            .env
+            .vars
+            .iter()
+            .any(|var| var.key == "TOKEN" && var.sensitive && var.value == "private value"));
+
+        execute(&mut runner, "/env remove TOKEN").unwrap();
+        assert!(!runner
+            .ctx
+            .config
+            .env
+            .vars
+            .iter()
+            .any(|var| var.key == "TOKEN"));
+
+        // /web 命令验证：关闭与开启，以及持久化
+        assert!(runner.ctx.config.tools.web_search);
+        execute(&mut runner, "/web off").unwrap();
+        assert!(!runner.ctx.config.tools.web_search);
+        let persisted_disabled: Config =
+            toml::from_str(&std::fs::read_to_string(&runner.ctx.paths.config_file).unwrap())
+                .unwrap();
+        assert!(!persisted_disabled.tools.web_search);
+
+        execute(&mut runner, "/web on").unwrap();
+        assert!(runner.ctx.config.tools.web_search);
+        let persisted_enabled: Config =
+            toml::from_str(&std::fs::read_to_string(&runner.ctx.paths.config_file).unwrap())
+                .unwrap();
+        assert!(persisted_enabled.tools.web_search);
+
+        let web_status = execute(&mut runner, "/web status").unwrap();
+        let CliAction::Output {
+            text: status_text, ..
+        } = web_status
+        else {
+            panic!("expected web status output");
+        };
+        assert!(status_text.contains("enabled"));
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 }

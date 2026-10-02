@@ -48,9 +48,14 @@ pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全�
 - 同一个文件不要重复读取：你已经读过的内容在上方对话历史中，直接引用即可。\n\
 - 如果发现自己陷入循环（反复调用相似的工具），立即停下，总结当前进度，向用户说明情况或换一个完全不同的思路。\n\n\
 # 任务执行\n\
+- 结构化任务管理：遇到 3 步以上的多步骤复杂任务、重构任务或渗透测试时，优先调用 `todo` 工具（action=\"add\"）初始化任务清单；开始执行子步骤时将状态更新为 `in_progress`，完成后立即更新为 `completed`；遇到卡点更新为 `failed` 并说明原因，保持任务进度透明。\n\
 - 先读后改：不要对没读过的文件提出修改建议。修改代码前先读取文件，理解现有代码再动手。\n\
 - 不要过度工程：只做被要求的事，不添加多余功能、配置、注释、错误处理或抽象。修 bug 不需要顺便重构周边代码。\n\
 - 不要创建不必要的文件：优先编辑现有文件而非新建文件。\n\
+- 工作区整洁与分类归档（必须遵守）：\n\
+  * 严禁将自己编写的临时脚本、测试工具、数据字典或生成的文件随意堆放在项目工作区根目录下。\n\
+  * 所有因任务需要而创建的脚本或产物，必须按类型或功能组织存储到专门的子目录中（例如 `scripts/`、`exploits/`、`payloads/`、`output/` 或以题目/功能命名的专属文件夹内）。\n\
+  * 在写入文件前，先规划好归档目录并使用对应路径，保持整个工作区结构清晰、干净整洁。\n\
 - 完成任务后验证：运行测试或检查输出，确认结果正确再报告完成。如实报告结果，不要谎称「测试通过」。\n\n\
 # 工具使用\n\
 - 优先使用专用工具而非 shell：读文件用 read_file 而非 cat；编辑文件用 write_file 而非 sed；搜索文件用 find_file 而非 find/grep。\n\
@@ -137,7 +142,8 @@ CTF 解题按以下优先级推进，**严禁跳级**：\n\
 - **目录扫描**用 `shell` 运行 `dirsearch`（已安装），不要自写 Python 脚本扫目录。命令示例：`dirsearch -u <url> -x 404 --exclude-sizes=0B`\n\
 - **端口扫描**用 `shell` 运行 `nmap`，不要自写脚本。\n\
 - **HTTP 请求**优先用 `web_fetch` 或 `shell` 运行 `curl`，不要自写脚本发请求。\n\
-- 仅当已有工具无法满足特定需求时才写脚本（如需要特定协议交互、链式利用、自定义 payload 生成）。";
+- 仅当已有工具无法满足特定需求时才写脚本（如需要特定协议交互、链式利用、自定义 payload 生成）。\n\
+- **脚本与文件归档**：严禁将解题脚本、爆破字典、临时输出直接堆放在根目录！必须归类存放到统一目录（如 `scripts/`、`exploits/`、`tools/` 或对应题目专属目录下，如 `scripts/<题目名>/`），保持工作区干净整洁。";
 
 /// 组装系统提示词：thinking_section + base + 环境 + 用户记忆 + skill 索引 + 项目上下文 + rules。
 ///
@@ -223,6 +229,14 @@ mod tests {
         let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
         assert!(s.contains("Cyber Master"));
         assert!(!s.contains("项目上下文"));
+    }
+
+    #[test]
+    fn base_prompt_contains_workspace_tidiness_rule() {
+        let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
+        assert!(s.contains("工作区整洁与分类归档"));
+        assert!(s.contains("严禁将自己编写的临时脚本"));
+        assert!(CTF_PROMPT.contains("脚本与文件归档"));
     }
 
     #[test]
@@ -313,5 +327,11 @@ mod tests {
     fn memory_omitted_when_empty() {
         let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
         assert!(!s.contains("# 用户记忆"), "空记忆不应生成记忆段落");
+    }
+
+    #[test]
+    fn base_prompt_contains_todo_guidance() {
+        assert!(BASE_PROMPT_STATIC.contains("todo"));
+        assert!(BASE_PROMPT_STATIC.contains("结构化任务管理"));
     }
 }

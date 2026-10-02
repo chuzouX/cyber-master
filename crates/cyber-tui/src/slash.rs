@@ -52,6 +52,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "管理服务商：list | add | edit <name> | use <name> | remove <name>",
     },
     CommandSpec {
+        name: "/subagents",
+        usage: "/subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]",
+        desc: "查看或配置批量子 agent（启用状态变更需重启）",
+    },
+    CommandSpec {
+        name: "/env",
+        usage: "/env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]",
+        desc: "管理注入工具子进程的环境变量",
+    },
+    CommandSpec {
+        name: "/web",
+        usage: "/web [status|on|off|enable|disable]",
+        desc: "开启或禁用联网搜索与抓取功能（web_fetch）",
+    },
+    CommandSpec {
         name: "/tools",
         usage: "/tools",
         desc: "列出可用工具",
@@ -107,6 +122,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "用户记忆：list 查看 / add 追加全局 / project 追加项目级",
     },
     CommandSpec {
+        name: "/todo",
+        usage: "/todo [list|add <title>|done <id>|clear]",
+        desc: "结构化任务清单：list 查看 / add 添加 / done 完成 / clear 清空",
+    },
+    CommandSpec {
         name: "/quit",
         usage: "/quit",
         desc: "退出 Cyber Master",
@@ -134,9 +154,21 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/mode" => vec!["chat", "workflow", "dashboard"],
         "/provider" => vec!["list", "add", "edit", "use", "remove"],
         "/sessions" => vec!["list", "read", "new"],
+        "/subagents" => vec![
+            "status",
+            "enable",
+            "disable",
+            "max_tasks",
+            "max_parallel",
+            "timeout",
+            "max_steps",
+        ],
+        "/env" => vec!["list", "set", "set-sensitive", "remove"],
+        "/web" => vec!["status", "on", "off", "enable", "disable"],
         "/memory" => vec!["list", "add", "project", "edit", "delete", "rule"],
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
+        "/todo" => vec!["list", "add", "done", "clear"],
         _ => Vec::new(),
     }
 }
@@ -155,6 +187,12 @@ pub enum SlashCommand {
     /// `/provider <subcommand>` — 管理服务商（list / add / edit / use / remove）。
     /// 空串 = list；子命令参数保留原样由 App 层解析。
     Provider(String),
+    /// `/subagents [...]` — 查看或配置批量子 agent。
+    Subagents(String),
+    /// `/env [...]` — 管理工具子进程环境变量。
+    Env(String),
+    /// `/web [status|on|off|enable|disable]` — 开启/禁用联网搜索功能。
+    Web(String),
     /// `/tools` — 列出可用工具。
     Tools,
     /// `/skill <name|list>` — 查看 Skill 详细说明（list 列出全部）。
@@ -183,6 +221,8 @@ pub enum SlashCommand {
     /// `/memory [list|add <text>|project <text>|edit <scope> <index> <text>|delete <scope> <index>|rule]` — 用户记忆管理。
     /// 空串 / list → 查看记忆；add <text> → 追加全局；project <text> → 追加项目级。
     Memory(String),
+    /// `/todo [list|add <title>|done <id>|clear]` — 结构化任务清单管理。
+    Todo(String),
     /// `/quit` — 退出。
     Quit,
     /// 未知命令（含原始命令名）。
@@ -203,6 +243,9 @@ pub fn parse(line: &str) -> SlashCommand {
         "/mode" => SlashCommand::Mode(args.to_string()),
         "/model" => SlashCommand::Model(args.to_string()),
         "/provider" => SlashCommand::Provider(args.to_string()),
+        "/subagents" => SlashCommand::Subagents(args.to_string()),
+        "/env" => SlashCommand::Env(args.to_string()),
+        "/web" => SlashCommand::Web(args.to_string()),
         "/tools" => SlashCommand::Tools,
         "/skill" => SlashCommand::Skill(args.to_string()),
         "/mcp" => SlashCommand::Mcp(args.to_string()),
@@ -214,6 +257,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/new" => SlashCommand::New,
         "/sessions" => SlashCommand::Sessions(args.to_string()),
         "/memory" => SlashCommand::Memory(args.to_string()),
+        "/todo" => SlashCommand::Todo(args.to_string()),
         "/quit" => SlashCommand::Quit,
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
     }
@@ -227,6 +271,9 @@ pub const HELP_TEXT: &str = "\
   /mode <name>       切换模式（chat / workflow / dashboard）
   /model [provider]  打开面板选择 provider + model（带 provider 参数则直接切换）
   /provider <sub>    管理服务商：list | add | edit <name> | use <name> | remove <name>
+  /subagents [sub]   子 agent：status | enable | disable | max_tasks N | max_parallel N | timeout N | max_steps N
+  /env [sub]         环境变量：list | set KEY VALUE | set-sensitive KEY VALUE | remove KEY
+  /web [status|on|off] 联网搜索：查看状态或开启/禁用 web_fetch 功能
   /tools             列出可用工具
   /skill <name|list> 查看 Skill 详细说明（list 列出全部）
   /mcp <list|status> 查看 MCP server 连接状态
@@ -237,6 +284,7 @@ pub const HELP_TEXT: &str = "\
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
   /memory <sub>      记忆管理：list | add | project | edit | delete | rule
+  /todo <sub>        任务管理：list | add <title> | done <id> | clear
   /quit              退出 Cyber Master";
 
 #[cfg(test)]
@@ -314,6 +362,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_todo() {
+        assert_eq!(parse("/todo"), SlashCommand::Todo(String::new()));
+        assert_eq!(parse("/todo list"), SlashCommand::Todo("list".into()));
+        assert_eq!(
+            parse("/todo add Scan ports"),
+            SlashCommand::Todo("add Scan ports".into())
+        );
+        assert_eq!(parse("/todo done 1"), SlashCommand::Todo("done 1".into()));
+        assert_eq!(parse("/todo clear"), SlashCommand::Todo("clear".into()));
+    }
+
+    #[test]
     fn parse_compact_no_arg() {
         assert_eq!(parse("/compact"), SlashCommand::Compact(String::new()));
         assert_eq!(parse("/compact   "), SlashCommand::Compact(String::new()));
@@ -368,6 +428,8 @@ mod tests {
             "/tools",
             "/skill",
             "/mcp",
+            "/subagents",
+            "/env",
             "/cancel",
             "/compact",
             "/max_steps",
@@ -432,6 +494,20 @@ mod tests {
             parse("/Provider List"),
             SlashCommand::Provider("List".into())
         );
+    }
+
+    #[test]
+    fn parse_subagents_and_env_commands() {
+        assert_eq!(
+            parse("/subagents max_parallel 3"),
+            SlashCommand::Subagents("max_parallel 3".into())
+        );
+        assert_eq!(
+            parse("/ENV set-sensitive TOKEN secret value"),
+            SlashCommand::Env("set-sensitive TOKEN secret value".into())
+        );
+        assert_eq!(parse("/web on"), SlashCommand::Web("on".into()));
+        assert_eq!(parse("/WEB OFF"), SlashCommand::Web("OFF".into()));
     }
 
     #[test]
@@ -542,6 +618,22 @@ mod tests {
         assert_eq!(param_suggestions("/sessions"), vec!["list", "read", "new"]);
         assert_eq!(param_suggestions("/mcp"), vec!["list", "status"]);
         assert_eq!(param_suggestions("/skill"), vec!["list"]);
+        assert_eq!(
+            param_suggestions("/subagents"),
+            vec![
+                "status",
+                "enable",
+                "disable",
+                "max_tasks",
+                "max_parallel",
+                "timeout",
+                "max_steps"
+            ]
+        );
+        assert_eq!(
+            param_suggestions("/env"),
+            vec!["list", "set", "set-sensitive", "remove"]
+        );
     }
 
     #[test]

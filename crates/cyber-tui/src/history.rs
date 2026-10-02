@@ -105,6 +105,47 @@ fn session_file(history_dir: &Path, cwd: &Path, id: &str) -> PathBuf {
     session_dir(history_dir, cwd).join(format!("{id}.json"))
 }
 
+/// 单个 session 的 todo 文件路径：`session_dir/{id}.todo.json`。
+pub fn todo_file(history_dir: &Path, cwd: &Path, id: &str) -> PathBuf {
+    session_dir(history_dir, cwd).join(format!("{id}.todo.json"))
+}
+
+/// 保存某 session 的 todo 列表到磁盘（atomic_write）。
+pub fn save_todos(
+    history_dir: &Path,
+    cwd: &Path,
+    id: &str,
+    todos: &[cyber_core::TodoItem],
+) -> std::io::Result<()> {
+    let path = todo_file(history_dir, cwd, id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(todos)?;
+    cyber_core::atomic_write(&path, &bytes).map_err(std::io::Error::other)
+}
+
+/// 读取某 session 的 todo 列表。文件不存在或损坏返回空 Vec。
+pub fn load_todos(history_dir: &Path, cwd: &Path, id: &str) -> Vec<cyber_core::TodoItem> {
+    let path = todo_file(history_dir, cwd, id);
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read(&path) {
+        Ok(data) => match serde_json::from_slice::<Vec<cyber_core::TodoItem>>(&data) {
+            Ok(todos) => todos,
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "解析 todo 文件失败，回退为空");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "读取 todo 文件失败");
+            Vec::new()
+        }
+    }
+}
+
 /// 生成新 session id：当前时间纳秒 base36 编码（短、单调）。
 pub fn generate_session_id() -> String {
     let nanos = std::time::SystemTime::now()
@@ -433,6 +474,10 @@ pub fn delete_session(history_dir: &Path, cwd: &Path, id: &str) -> usize {
         if let Err(e) = std::fs::remove_file(&file) {
             warn!(error = %e, path = %file.display(), "删除 session 文件失败");
         }
+    }
+    let tfile = todo_file(history_dir, cwd, id);
+    if tfile.exists() {
+        let _ = std::fs::remove_file(&tfile);
     }
     // 从 index 移除
     idx.sessions.retain(|s| s.id != id);
@@ -978,5 +1023,34 @@ mod tests {
         assert!(SPINNER_FRAMES
             .iter()
             .any(|frame| busy_title.starts_with(frame)));
+    }
+
+    #[test]
+    fn todo_save_and_load_roundtrip() {
+        use cyber_core::{TodoItem, TodoStatus};
+        let dir = temp_dir("todo_roundtrip");
+        let cwd = Path::new("/tmp/todo-proj");
+        let session_id = "test-session-123";
+
+        let loaded_empty = load_todos(&dir, cwd, session_id);
+        assert!(loaded_empty.is_empty());
+
+        let items = vec![
+            TodoItem::new("1", "Task 1", TodoStatus::Pending),
+            TodoItem::new("2", "Task 2", TodoStatus::Completed).with_notes("Done cleanly"),
+        ];
+        save_todos(&dir, cwd, session_id, &items).unwrap();
+
+        let loaded = load_todos(&dir, cwd, session_id);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].title, "Task 1");
+        assert_eq!(loaded[0].status, TodoStatus::Pending);
+        assert_eq!(loaded[1].title, "Task 2");
+        assert_eq!(loaded[1].status, TodoStatus::Completed);
+        assert_eq!(loaded[1].notes.as_deref(), Some("Done cleanly"));
+
+        let _ = delete_session(&dir, cwd, session_id);
+        assert!(!todo_file(&dir, cwd, session_id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

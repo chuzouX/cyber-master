@@ -2,14 +2,14 @@
 
 本页区分默认 `cyber` coding CLI 与 `cyber tui` 原 Chat 面板。CLI 依据 [cli_commands.rs](../crates/cyber-tui/src/cli_commands.rs) 的目录、补全和执行 handler，以及 [cli.rs](../crates/cyber-tui/src/cli.rs) / [headless.rs](../crates/cyber-tui/src/headless.rs) 的 UI 和任务处理核对；原 TUI 依据 [slash.rs](../crates/cyber-tui/src/slash.rs) / [app.rs](../crates/cyber-tui/src/app.rs)。目录、补全或帮助列出某参数，不等于所有参数组合均已实现。
 
-CLI 支持原 TUI 17 个主命令中除 `/mode` 外的 16 项，加上 `/effort` 共 17 项：`/help`、`/clear`、`/model`、`/provider`、`/tools`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/quit`、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
+CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort` 共 20 项：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/quit`、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
 
 ## CLI 输入与交互
 
-- `/` 打开完整主命令目录，按前缀过滤；支持子命令及已配置 provider/model、session ID、Skill 名称的二级建议，不是 shell 自动补全。
+- `/` 打开完整主命令目录，按前缀过滤；支持子命令及已配置 provider/model、session ID、Skill 名称、env key 的二级建议，不是 shell 自动补全。
 - `Up/Down` 选择候选，`Tab` 接受补全；`Enter` 在有未接受候选时先补全，再按 Enter 执行。接受补全后仍可继续输入参数。`Esc` 关闭候选并保留原输入，不清空命令。
 - 主命令及实现支持的子命令大小写不敏感；provider/题目等名称按实际数据匹配。按空白切分参数，不解析 shell 引号，不支持一行执行多个命令。
-- 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。支持鼠标滚轮滑动浏览历史对话；在输入区按方向键上/下键可翻看/切换历史已发送的对话内容，scrolled 状态下上/下键逐行滚动视图。按 F2 或使用 `/mode [auto|manual|unlimited]` 切换三种审批模式（手动审批/自动审批/无限制）。
+表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。支持鼠标滚轮滑动浏览历史对话；在输入区按方向键上/下键可翻看/切换历史已发送的对话内容，scrolled 状态下上/下键逐行滚动视图。按 F2 或使用 `/mode [auto|manual|unlimited]` 切换三种审批模式（手动审批/自动审批/无限制）。自动审批（Auto）模式下常见只读与环境查看命令（如 `cat`、`grep`、`rg`、`git`、`cargo`、`pwd` 等）直接放行，高风险操作弹出确认。经会话授权（Session）的工具在后续使用相同命令主干或常见安全命令且无破坏性重定向时自动放行，无需因参数微调而重复确认。
 - 生成中命令受 UI 状态限制，须先取消再进行配置/会话操作；不能据静态目录推断任何任务状态下均可执行。
 
 ## CLI 已实现行为
@@ -22,10 +22,13 @@ CLI 支持原 TUI 17 个主命令中除 `/mode` 外的 16 项，加上 `/effort`
 | `/quit` / 空输入 Ctrl+D | 保存会话并退出。 |
 | `/model [provider [model]]` | 无参数打开已配置 provider/model picker；带参数选择并持久化，不自动联网发现模型。 |
 | `/provider [list\|add\|edit name\|use name\|remove name]` | list 隐藏 endpoint/凭据；add/edit 打开表单，use 持久化选择，remove 直接删除并处理默认项回退，无二次删除确认。 |
+| `/subagents [status\|enable\|disable\|max_tasks N\|max_parallel N\|timeout N\|max_steps N]` | 查询或持久化 `[agent.subagents]`；数量、并发、超时和步数在后续 turn 生效，enable/disable 需重启以重建工具目录。所有数值必须为正整数。 |
+| `/env [list\|set KEY VALUE\|set-sensitive KEY VALUE\|remove KEY]` | 查询或持久化 `[env].vars`。value 可含空格；敏感值列表显示为 `<sensitive>`，补全只提供 key，不提供 value。 |
+| `/web [status\|on\|off\|enable\|disable]` | 查询或持久化 `[tools].web_search`；开启或禁用联网搜索与抓取（web_fetch），实时生效并持久化到配置。 |
 | `/tools` | 查询实际注册工具 schema，不执行工具，不把工具数据算成令牌 Usage。直接打开模式（coding CLI）下，工具调用、调用请求、Edit、Read、Downloading、Shell 等工具统一以轻量小卡片形式呈现，支持 Ctrl+O 展开/折叠。 |
 | `/skill [list\|name]` | 查询目录或显示正文；通知不入模型历史，模型须调用 `skill_<name>` 获取正文。 |
 | `/mcp [list\|status]` | 展示配置 server、transport 与 connected/not connected；查询不会连接。 |
-| `/mcp connect` | 默认 no autostart，显式任务须在 `Permission Required` 框批准才连接配置 server；deny 不启动。已有连接时拒绝重复 connect，配置变更需重启；没有按 server 名连接/断连/重连子命令。 |
+| `/mcp connect` | 重新连接配置的 MCP servers（若未在启动时连接或需重试）；显式任务须在 `Permission Required` 框批准才发起连接，deny 不启动。 |
 | `/compact [instructions]` | 真实模型摘要任务，成功后替换模型历史并持久化；空历史拒绝，失败/取消不提交排队摘要，不等于清屏。 |
 | `/think [low\|middle\|high\|max\|auto]` | 查看/保存现有思考档位，沿用系统提示词，不新增 API `reasoning_effort`，不保证返回 reasoning。 |
 | `/effort [low\|medium\|high\|xhigh\|auto]` | `/think` 别名；medium→Middle、xhigh→Max，仍接受 middle/max。 |
@@ -49,7 +52,7 @@ CLI 支持原 TUI 17 个主命令中除 `/mode` 外的 16 项，加上 `/effort`
 
 Provider 表单包含 name/kind/endpoint/apikey/model/maxtokens/temperature/context_length；API key 和可能包含凭据的 endpoint 均掩码显示，取消不保存。保存使用私有文件权限和同目录原子发布，不生成公开凭据备份；不宣称 CLI 表单支持原 TUI 的联网「拉取模型」按钮。
 
-`/think`、`/effort`、`/max_steps` 只更新全局配置的目标字段，保留无关字段，避免把项目 merged 配置写入全局。内存立即生效；若项目覆盖同一字段，重新加载仍按项目优先。Memory rule 在项目 config 已有 memory.rules 时修改项目规则，否则修改全局规则，不整份回写 merged 配置。enabled=false、无效 scope 或空 prompt 不注入；合法 scope 为 global/project/both，按标签进入后续系统提示词约束，不是 hard guard 或工具访问控制。
+`/think`、`/effort`、`/max_steps`、`/subagents`、`/env`、`/web` 只更新全局配置的目标字段，保留无关字段，避免把项目 merged 配置写入全局。内存立即生效；若项目覆盖同一字段，重新加载仍按项目优先。`/env set-sensitive` 的值不写入 TUI 命令历史明文，但配置文件仍包含真实值，必须保护 `~/.cyber/config.toml`。Memory rule 在项目 config 已有 memory.rules 时修改项目规则，否则修改全局规则，不整份回写 merged 配置。enabled=false、无效 scope 或空 prompt 不注入；合法 scope 为 global/project/both，按标签进入后续系统提示词约束，不是 hard guard 或工具访问控制。
 
 CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>/<category>/<name>/writeup.md`，按项目、会话、题目隔离。题目状态由实际 CTF 工具维护；目录验收和已解条件回归不等于真实 Provider API 的 Solved→writeup 全链路联调。
 
@@ -64,7 +67,7 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 - 下表方括号表示可选参数，尖括号表示占位参数，使用时不输入括号。实现按空白切分，不提供 shell 引号解析。
 - 生成中部分操作会被 handler 拒绝；取消用 `/cancel`。键盘输入/面板自身还有状态限制，不能把 handler 未设检查理解为任意状态均可操作。
 
-## 原 TUI 17 个主命令
+## 原 TUI 20 个主命令
 
 | 命令 | 实际行为与限制 |
 | --- | --- |
@@ -73,6 +76,9 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 | `/mode <chat\|workflow\|dashboard>` | 切换视图；生成中拒绝。workflow/dashboard 目前仅占位页，不代表 DAG 执行或监控已可用。 |
 | `/model [provider]` | 无参数打开 provider/model 选择面板；带参数只切换已存在的 provider，沿用其配置模型。生成中拒绝，不支持 CLI 的 `/model provider model` 语法。 |
 | `/provider [子命令]` | 列出、表单新增/编辑、设默认、删除 provider，详见下文；生成中拒绝。 |
+| `/subagents [status\|enable\|disable\|max_tasks N\|max_parallel N\|timeout N\|max_steps N]` | 查询或保存批量子 agent 配置；enable/disable 提示重启后更新工具目录。 |
+| `/env [list\|set KEY VALUE\|set-sensitive KEY VALUE\|remove KEY]` | 管理工具子进程环境变量。敏感值列表脱敏，`set-sensitive` 命令历史将 value 替换为 `<redacted>`。 |
+| `/web [status\|on\|off\|enable\|disable]` | 开启或禁用联网搜索与网页抓取（web_fetch）工具，实时生效并持久化到全局配置 `[tools].web_search`。 |
 | `/tools` | 展示当前注册工具的名称与说明，包含实际装配的内置、Skill、自定义及 MCP 工具；不执行工具。 |
 | `/skill [list\|name]` | 无参数或 `list` 列出名称、全局/项目来源与简介；名称参数显示对应正文。仅添加 UI System 展示条目，不注入模型历史；模型获取正文需调用 `skill_<name>`。 |
 | `/mcp [list\|status]` | 展示已连接 server 名称，未启用/无连接则提示；没有 reconnect 或配置管理。当前 handler 忽略参数，其他参数也只显示同一列表，不表示实现了新操作。 |
@@ -103,7 +109,7 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 | 语法 | 行为 |
 | --- | --- |
 | `/ctf` / `/ctf status` | 显示 CTF 开关状态，不是修改某题目的解题状态。`status` 已有 handler，虽未列入命令目录/参数建议。 |
-| `/ctf enable` | 开启 CTF，后续 agent 提示词使用 CTF 方法论；Ctrl+T 可切换题目面板。 |
+| `/ctf enable` | 开启 CTF，后续 agent 提示词使用 CTF 方法论；全屏 TUI 与 coding CLI 均支持 `Ctrl+T` 快捷键打开/关闭居中题目面板。 |
 | `/ctf disable` | 关闭 CTF 并隐藏题目面板。 |
 | `/ctf add <name> [category]` | 添加题目，名称取第一个空白分隔字段；分类为 misc/web/reverse/pwn/crypto，省略或无法识别时回退 misc。不使用 `/ctf add category name`。 |
 | `/ctf list` | 列出题目的编号、分类、名称、当前解题状态。 |

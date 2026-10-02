@@ -37,6 +37,6 @@ pub use provider::{provider_factory, Provider, StreamRequest};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{
     builtin_tool_names, CtfChallengeTool, CustomTool, DelegateTasksTool, SaveMemoryTool,
-    SearchToolsTool,
+    SearchToolsTool, TodoTool,
 };
 pub use types::{AgentEvent, Message, Role, StreamEvent, ToolCall, ToolCallDelta, Usage};

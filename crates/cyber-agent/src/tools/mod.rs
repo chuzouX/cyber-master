@@ -14,6 +14,7 @@ mod read_file;
 mod save_memory;
 mod search_tools;
 mod shell;
+mod todo;
 mod web_fetch;
 mod write_file;
 
@@ -28,6 +29,7 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(shell::ShellTool::default()));
     reg.register(Box::new(web_fetch::WebFetchTool));
     reg.register(Box::new(download_file::DownloadFileTool));
+    reg.register(Box::new(todo::TodoTool::default()));
 }
 
 /// 内置工具名（供 TUI `/tools` 命令展示，避免重复构造 registry）。
@@ -40,6 +42,7 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
         "shell",
         "web_fetch",
         "download_file",
+        "todo",
         "ctf_challenge",
         "save_memory",
     ]
@@ -50,3 +53,4 @@ pub use custom_tool::CustomTool;
 pub use delegate_tasks::DelegateTasksTool;
 pub use save_memory::SaveMemoryTool;
 pub use search_tools::SearchToolsTool;
+pub use todo::TodoTool;

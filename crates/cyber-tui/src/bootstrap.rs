@@ -117,6 +117,10 @@ pub async fn build_registries(
     let catalog = tool_reg.catalog();
     tool_reg.register(Box::new(SearchToolsTool::new(catalog)));
 
+    let todos = tool_reg
+        .todo_state()
+        .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
+
     (
         AppRegistries {
             tools: Arc::new(tool_reg),
@@ -124,6 +128,7 @@ pub async fn build_registries(
             custom_tools: Arc::new(custom_tools),
             mcp,
             ctf_challenges: Some(ctf_challenges),
+            todos,
         },
         errors,
     )

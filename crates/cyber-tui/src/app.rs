@@ -44,7 +44,7 @@ use cyber_agent::{
 };
 use cyber_core::{
     current_time_str, save_config, save_providers, Config, CtfCategory, CtfChallenge, CtfStatus,
-    LoadedCustomTool, MemoryScope, MemoryStore, ProjectContext, ProvidersConfig,
+    EnvVar, LoadedCustomTool, MemoryScope, MemoryStore, ProjectContext, ProvidersConfig,
 };
 use cyber_mcp::{McpRegistry, McpServersConfig};
 use cyber_skills::SkillRegistry;
@@ -145,6 +145,8 @@ pub struct AppRegistries {
     pub mcp: Option<Arc<McpRegistry>>,
     /// CTF 题目共享状态（工具与 App 共享）。
     pub ctf_challenges: Option<Arc<Mutex<Vec<CtfChallenge>>>>,
+    /// Todo 任务清单共享状态（工具与 App / CLI 共享）。
+    pub todos: Arc<Mutex<Vec<cyber_core::TodoItem>>>,
 }
 
 impl std::fmt::Debug for AppRegistries {
@@ -161,6 +163,7 @@ impl std::fmt::Debug for AppRegistries {
                     .as_ref()
                     .map(|c| c.lock().map(|g| g.len()).unwrap_or(0)),
             )
+            .field("todos", &self.todos.lock().map(|g| g.len()).unwrap_or(0))
             .finish()
     }
 }
@@ -168,12 +171,17 @@ impl std::fmt::Debug for AppRegistries {
 impl AppRegistries {
     /// 测试用：仅内置工具 + 空 skills + 无 MCP。
     pub fn with_builtins() -> Self {
+        let tools = Arc::new(ToolRegistry::with_builtins());
+        let todos = tools
+            .todo_state()
+            .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
         Self {
-            tools: Arc::new(ToolRegistry::with_builtins()),
+            tools,
             skills: Arc::new(SkillRegistry::new()),
             custom_tools: Arc::new(Vec::new()),
             mcp: None,
             ctf_challenges: None,
+            todos,
         }
     }
 }
@@ -585,6 +593,15 @@ impl App {
         if let Ok(mut list) = self.ctf_challenges.lock() {
             *list = merge_challenges(global_challenges, session_challenges);
         }
+        // 加载当前 session 的 Todo 任务清单
+        let session_todos = crate::history::load_todos(
+            &self.paths.history_dir,
+            &self.paths.cwd,
+            &self.sessions.current,
+        );
+        if let Ok(mut list) = self.registries.todos.lock() {
+            *list = session_todos;
+        }
         let mut terminal: DefaultTerminal = ratatui::init();
         // 启用 bracketed paste：终端在粘贴内容前后发送 \e[200~ / \e[201~ 标记，
         // crossterm 解析为 Event::Paste(String) → 整块插入 textarea，而非逐行
@@ -659,6 +676,14 @@ impl App {
             .collect();
         ctf_store::save_challenges(&self.paths.ctf_dir, &global);
         ctf_store::save_session_challenges(&self.paths.ctf_dir, &self.sessions.current, &session);
+        if let Ok(guard) = self.registries.todos.lock() {
+            let _ = crate::history::save_todos(
+                &self.paths.history_dir,
+                &self.paths.cwd,
+                &self.sessions.current,
+                &guard,
+            );
+        }
     }
 
     fn cancel_active_turn(&mut self) {
@@ -1744,6 +1769,12 @@ impl App {
         if let Ok(mut list) = self.ctf_challenges.lock() {
             *list = merge_challenges(global_challenges, session_challenges);
         }
+        // 加载目标 session 的 Todo 任务清单
+        let session_todos =
+            crate::history::load_todos(&self.paths.history_dir, &self.paths.cwd, id);
+        if let Ok(mut list) = self.registries.todos.lock() {
+            *list = session_todos;
+        }
         // 重置面板选中状态
         self.ctf_selected = 0;
         self.ctf_detail_view = false;
@@ -1769,6 +1800,10 @@ impl App {
         self.usage = UsageStats::default();
         // 新 session 无题目
         if let Ok(mut list) = self.ctf_challenges.lock() {
+            list.clear();
+        }
+        // 新 session 无 todo
+        if let Ok(mut list) = self.registries.todos.lock() {
             list.clear();
         }
         self.ctf_selected = 0;
@@ -2308,10 +2343,14 @@ impl App {
     /// `/help` `/tools` `/quit` 任意时刻可用。
     fn handle_slash_command(&mut self, raw: &str) {
         let cmd = parse_slash(raw);
-        // 记录命令本身（/clear 会随后清空，无妨）
-        self.chat
-            .entries
-            .push(ChatEntry::User(raw.trim().to_string()));
+        let recorded = match &cmd {
+            SlashCommand::Env(args) if args.to_ascii_lowercase().starts_with("set-sensitive ") => {
+                let key = args.split_whitespace().nth(1).unwrap_or("<key>");
+                format!("/env set-sensitive {key} <redacted>")
+            }
+            _ => raw.trim().to_string(),
+        };
+        self.chat.entries.push(ChatEntry::User(recorded));
         match cmd {
             SlashCommand::Help => {
                 self.chat
@@ -2403,6 +2442,15 @@ impl App {
             }
             SlashCommand::Provider(args) => {
                 self.handle_provider_slash(&args);
+            }
+            SlashCommand::Subagents(args) => {
+                self.handle_subagents_slash(&args);
+            }
+            SlashCommand::Env(args) => {
+                self.handle_env_slash(&args);
+            }
+            SlashCommand::Web(args) => {
+                self.handle_web_slash(&args);
             }
             SlashCommand::Tools => {
                 let mut lines = String::from("可用工具：");
@@ -2533,9 +2581,118 @@ impl App {
             SlashCommand::Ctf(args) => {
                 self.handle_ctf_slash(&args);
             }
+            SlashCommand::Todo(args) => {
+                self.handle_todo_slash(&args);
+            }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
                     "未知命令：{name}（输入 /help 查看可用命令）"
+                )));
+            }
+        }
+    }
+    /// 处理 `/todo [list|add <title>|done <id>|clear]`：结构化任务清单。
+    fn handle_todo_slash(&mut self, args: &str) {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").trim().to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+        let mut todos = match self.registries.todos.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("无法获取 todo 状态锁".into()));
+                return;
+            }
+        };
+        match sub.as_str() {
+            "" | "list" => {
+                if todos.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(
+                        "当前没有任务，可用 /todo add <title> 添加".into(),
+                    ));
+                } else {
+                    let mut lines = String::from("📋 任务清单：");
+                    for t in todos.iter() {
+                        let status_mark = match t.status {
+                            cyber_core::TodoStatus::Pending => "[ ]",
+                            cyber_core::TodoStatus::InProgress => "[>]",
+                            cyber_core::TodoStatus::Completed => "[x]",
+                            cyber_core::TodoStatus::Failed => "[!]",
+                        };
+                        lines.push_str(&format!("\n  {} #{} {}", status_mark, t.id, t.title));
+                    }
+                    self.chat.entries.push(ChatEntry::System(lines));
+                }
+            }
+            "add" => {
+                if rest.is_empty() {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("用法：/todo add <任务标题>".into()));
+                } else {
+                    let next_num = todos
+                        .iter()
+                        .filter_map(|t| t.id.parse::<usize>().ok())
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    let id_str = next_num.to_string();
+                    todos.push(cyber_core::TodoItem::new(
+                        id_str.clone(),
+                        rest,
+                        cyber_core::TodoStatus::Pending,
+                    ));
+                    let _ = crate::history::save_todos(
+                        &self.paths.history_dir,
+                        &self.paths.cwd,
+                        &self.sessions.current,
+                        &todos,
+                    );
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("已添加任务 #{id_str}：{rest}")));
+                }
+            }
+            "done" => {
+                if !rest.is_empty() {
+                    if let Some(item) = todos.iter_mut().find(|t| t.id == rest) {
+                        item.status = cyber_core::TodoStatus::Completed;
+                        let _ = crate::history::save_todos(
+                            &self.paths.history_dir,
+                            &self.paths.cwd,
+                            &self.sessions.current,
+                            &todos,
+                        );
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System(format!("任务 #{rest} 已标记为完成")));
+                    } else {
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System(format!("未找到编号为 #{rest} 的任务")));
+                    }
+                } else {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("用法：/todo done <任务编号>".into()));
+                }
+            }
+            "clear" => {
+                todos.clear();
+                let _ = crate::history::save_todos(
+                    &self.paths.history_dir,
+                    &self.paths.cwd,
+                    &self.sessions.current,
+                    &todos,
+                );
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("任务清单已清空".into()));
+            }
+            other => {
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "未知子命令：{other}（用法：/todo [list|add <title>|done <id>|clear]）"
                 )));
             }
         }
@@ -2765,7 +2922,216 @@ impl App {
         }
     }
 
-    /// 处理 `/provider <subcommand>`：list / add / edit <name> / use <name> / remove <name>。
+    fn save_command_config(
+        &mut self,
+        previous: Config,
+        success: String,
+        section: &str,
+        field: &str,
+    ) {
+        match crate::cli_commands::persist_config_field(
+            &self.paths.config_file,
+            &self.config,
+            section,
+            field,
+        ) {
+            Ok(()) => self.chat.entries.push(ChatEntry::System(success)),
+            Err(error) => {
+                self.config = previous;
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "配置保存失败，未应用更改：{error}"
+                )));
+            }
+        }
+    }
+
+    fn handle_subagents_slash(&mut self, args: &str) {
+        let (command, value) = args
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(command, value)| (command, value.trim()))
+            .unwrap_or((args.trim(), ""));
+        if command.is_empty() || command.eq_ignore_ascii_case("status") {
+            let config = &self.config.agent.subagents;
+            self.chat.entries.push(ChatEntry::System(format!(
+                "Subagents：enabled={}，max_tasks={}，max_parallel={}，timeout={}s，max_steps={}",
+                config.enabled,
+                config.effective_max_tasks(),
+                config.effective_max_parallel(),
+                config.effective_timeout_secs(),
+                config.effective_max_steps()
+            )));
+            return;
+        }
+
+        let previous = self.config.clone();
+        let result = match command.to_ascii_lowercase().as_str() {
+            "enable" if value.is_empty() => {
+                self.config.agent.subagents.enabled = true;
+                Ok("Subagents 已启用；重启后更新工具目录".to_string())
+            }
+            "disable" if value.is_empty() => {
+                self.config.agent.subagents.enabled = false;
+                Ok("Subagents 已禁用；重启后从工具目录移除".to_string())
+            }
+            "max_tasks" => value
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+                .map(|number| {
+                    self.config.agent.subagents.max_tasks = number;
+                    format!("Subagent max_tasks 已设为 {number}")
+                })
+                .ok_or("max_tasks 必须是正整数"),
+            "max_parallel" => value
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+                .map(|number| {
+                    self.config.agent.subagents.max_parallel = number;
+                    format!("Subagent max_parallel 已设为 {number}")
+                })
+                .ok_or("max_parallel 必须是正整数"),
+            "timeout" => value
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .map(|number| {
+                    self.config.agent.subagents.timeout_secs = number;
+                    format!("Subagent timeout 已设为 {number}s")
+                })
+                .ok_or("timeout 必须是正整数秒"),
+            "max_steps" => value
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+                .map(|number| {
+                    self.config.agent.subagents.max_steps = number;
+                    format!("Subagent max_steps 已设为 {number}")
+                })
+                .ok_or("max_steps 必须是正整数"),
+            _ => Err(
+                "用法：/subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]",
+            ),
+        };
+        match result {
+            Ok(message) => self.save_command_config(previous, message, "agent", "subagents"),
+            Err(message) => {
+                self.config = previous;
+                self.chat
+                    .entries
+                    .push(ChatEntry::System(message.to_string()));
+            }
+        }
+    }
+
+    fn handle_env_slash(&mut self, args: &str) {
+        let (command, rest) = args
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(command, rest)| (command, rest.trim()))
+            .unwrap_or((args.trim(), ""));
+        if command.is_empty() || command.eq_ignore_ascii_case("list") {
+            let mut vars = self.config.env.vars.clone();
+            vars.sort_by(|left, right| left.key.cmp(&right.key));
+            let text = if vars.is_empty() {
+                "未配置环境变量".to_string()
+            } else {
+                vars.into_iter()
+                    .map(|var| {
+                        if var.sensitive {
+                            format!("{}=<sensitive>", var.key)
+                        } else {
+                            format!("{}={}", var.key, var.value)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            self.chat.entries.push(ChatEntry::System(text));
+            return;
+        }
+
+        let previous = self.config.clone();
+        let result = match command.to_ascii_lowercase().as_str() {
+            "set" | "set-sensitive" => {
+                let (key, value) = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(key, value)| (key.trim(), value.trim()))
+                    .unwrap_or((rest, ""));
+                if key.is_empty() || value.is_empty() {
+                    Err("用法：/env set KEY VALUE 或 /env set-sensitive KEY VALUE")
+                } else {
+                    let sensitive = command.eq_ignore_ascii_case("set-sensitive");
+                    let updated = EnvVar {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                        sensitive,
+                    };
+                    if let Some(existing) =
+                        self.config.env.vars.iter_mut().find(|var| var.key == key)
+                    {
+                        *existing = updated;
+                    } else {
+                        self.config.env.vars.push(updated);
+                    }
+                    Ok(format!("环境变量 '{key}' 已保存"))
+                }
+            }
+            "remove" if !rest.is_empty() => {
+                let before = self.config.env.vars.len();
+                self.config.env.vars.retain(|var| var.key != rest);
+                if self.config.env.vars.len() == before {
+                    Err("未找到该环境变量")
+                } else {
+                    Ok(format!("环境变量 '{rest}' 已删除"))
+                }
+            }
+            _ => Err("用法：/env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]"),
+        };
+        match result {
+            Ok(message) => self.save_command_config(previous, message, "env", "vars"),
+            Err(message) => {
+                self.config = previous;
+                self.chat
+                    .entries
+                    .push(ChatEntry::System(message.to_string()));
+            }
+        }
+    }
+    fn handle_web_slash(&mut self, args: &str) {
+        let sub = args.trim().to_ascii_lowercase();
+        if sub.is_empty() || sub == "status" {
+            let status_str = if self.config.tools.web_search {
+                "已开启 (enabled)"
+            } else {
+                "已禁用 (disabled)"
+            };
+            self.chat.entries.push(ChatEntry::System(format!(
+                "联网搜索功能当前状态：{status_str}（用法：/web on | /web off）"
+            )));
+            return;
+        }
+        let previous = self.config.clone();
+        let (enabled, msg) = match sub.as_str() {
+            "on" | "enable" | "1" | "true" => {
+                (true, "联网搜索功能已开启（模型可使用 web_fetch 抓取网页）")
+            }
+            "off" | "disable" | "0" | "false" => {
+                (false, "联网搜索功能已禁用（模型不再暴露 web_fetch 工具）")
+            }
+            _ => {
+                self.chat.entries.push(ChatEntry::System(
+                    "用法：/web [status|on|off|enable|disable]".into(),
+                ));
+                return;
+            }
+        };
+        self.config.tools.web_search = enabled;
+        self.save_command_config(previous, msg.to_string(), "tools", "web_search");
+    }
+
+    /// 处理 `/provider <subcommand>`：list / add / edit <name> / use / remove。
     /// 流式期阻止（与 /model 一致）。add/edit 进入 ProviderForm（prev_mode=Chat，立即持久化）。
     fn handle_provider_slash(&mut self, args: &str) {
         if self.chat.streaming {
@@ -5405,5 +5771,60 @@ mod tests {
         assert_eq!(current_rx.try_recv().unwrap(), PermissionDecision::Deny);
         assert_eq!(queued_rx.try_recv().unwrap(), PermissionDecision::Deny);
         assert!(permission_rx.try_recv().is_err());
+    }
+    #[test]
+    fn subagents_and_env_slash_commands_persist_without_leaking_sensitive_values() {
+        let config_path = temp_config_path();
+        let mut app = make_app(Mode::Chat, config_path.clone());
+
+        app.handle_slash_command("/subagents max_tasks 6");
+        app.handle_slash_command("/env set PUBLIC visible value");
+        app.handle_slash_command("/env set-sensitive TOKEN private value");
+        app.handle_slash_command("/env list");
+
+        assert_eq!(app.config.agent.subagents.max_tasks, 6);
+        assert!(app
+            .config
+            .env
+            .vars
+            .iter()
+            .any(|var| var.key == "PUBLIC" && var.value == "visible value" && !var.sensitive));
+        assert!(app
+            .config
+            .env
+            .vars
+            .iter()
+            .any(|var| var.key == "TOKEN" && var.value == "private value" && var.sensitive));
+        assert!(app.chat.entries.iter().all(|entry| {
+            !matches!(entry, ChatEntry::User(text) | ChatEntry::System(text) if text.contains("private value"))
+        }));
+        assert!(app
+            .chat
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, ChatEntry::User(text) if text == "/env set-sensitive TOKEN <redacted>")));
+
+        let persisted: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(persisted.agent.subagents.max_tasks, 6);
+        assert!(persisted
+            .env
+            .vars
+            .iter()
+            .any(|var| var.key == "TOKEN" && var.sensitive));
+
+        // /web 命令验证：TUI 侧开启与关闭，以及持久化
+        assert!(app.config.tools.web_search);
+        app.handle_slash_command("/web off");
+        assert!(!app.config.tools.web_search);
+        let persisted_off: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(!persisted_off.tools.web_search);
+
+        app.handle_slash_command("/web on");
+        assert!(app.config.tools.web_search);
+        let persisted_on: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(persisted_on.tools.web_search);
     }
 }

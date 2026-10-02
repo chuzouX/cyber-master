@@ -13,6 +13,7 @@ pub mod memory;
 pub mod paths;
 pub mod project;
 pub mod providers;
+pub mod todo;
 
 pub use config::{Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity};
 pub use ctf::{current_time_str, CtfCategory, CtfChallenge, CtfStatus};
@@ -25,3 +26,4 @@ pub use project::{ProjectContext, ProjectFrontmatter};
 pub use providers::{
     resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS,
 };
+pub use todo::{TodoItem, TodoStatus};
