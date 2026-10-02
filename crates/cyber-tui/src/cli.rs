@@ -120,9 +120,10 @@ impl Drop for TerminalSession {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Panel {
     Shortcuts,
+    Ctf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,7 +143,9 @@ enum ToolCardKind {
     Fetch,
     List,
     Find,
+    Delegate,
     Generic,
+    Todo,
 }
 
 #[derive(Debug)]
@@ -191,6 +194,12 @@ struct CliScreen {
     approval_view: WrappedViewport,
     approval_visible: bool,
     panel: Option<Panel>,
+    ctf_enabled: bool,
+    ctf_challenges: Vec<cyber_core::CtfChallenge>,
+    ctf_selected: usize,
+    ctf_detail_view: bool,
+    ctf_detail_scroll: usize,
+    ctf_list_scroll: std::cell::Cell<usize>,
     completions: Vec<CompletionItem>,
     completion_selected: usize,
     completion_closed: bool,
@@ -209,6 +218,7 @@ struct CliScreen {
     saved_draft: String,
     thinking_started: Option<std::time::Instant>,
     has_run: bool,
+    todos: Arc<std::sync::Mutex<Vec<cyber_core::TodoItem>>>,
     last_window_title: String,
 }
 
@@ -341,6 +351,12 @@ impl CliScreen {
             approval_view: WrappedViewport::default(),
             approval_visible: false,
             panel: None,
+            ctf_enabled: runner.ctf_enabled,
+            ctf_challenges: runner.challenges().unwrap_or_default(),
+            ctf_selected: 0,
+            ctf_detail_view: false,
+            ctf_detail_scroll: 0,
+            ctf_list_scroll: std::cell::Cell::new(0),
             completions: Vec::new(),
             completion_selected: 0,
             completion_closed: false,
@@ -369,6 +385,7 @@ impl CliScreen {
             history_index: None,
             saved_draft: String::new(),
             thinking_started: None,
+            todos: Arc::clone(&runner.registries.todos),
             has_run: false,
             last_window_title: String::new(),
         };
@@ -405,6 +422,11 @@ impl CliScreen {
             .get(&self.session)
             .map(|meta| meta.title.clone())
             .unwrap_or_else(|| "新会话".into());
+        self.ctf_enabled = runner.ctf_enabled;
+        self.ctf_challenges = runner.challenges().unwrap_or_default();
+        if self.ctf_selected >= self.ctf_challenges.len() {
+            self.ctf_selected = self.ctf_challenges.len().saturating_sub(1);
+        }
         let mut recent = runner
             .index
             .sessions
@@ -417,6 +439,7 @@ impl CliScreen {
             .take(4)
             .map(|session| format!("{}  {}", clean(&session.id), clean(&session.title)))
             .collect();
+        self.todos = Arc::clone(&runner.registries.todos);
         self.prompt_history = runner
             .entries
             .iter()
@@ -553,7 +576,11 @@ impl CliScreen {
             self.tools.len() - 1
         });
         self.tools[index].name = name.to_owned();
-        self.tools[index].progress.push_str(&clean(chunk));
+        let cleaned = clean(chunk);
+        if !self.tools[index].progress.is_empty() && !self.tools[index].progress.ends_with('\n') {
+            self.tools[index].progress.push('\n');
+        }
+        self.tools[index].progress.push_str(&cleaned);
         self.replace_tool_card(index, self.tool_width());
     }
 
@@ -728,10 +755,39 @@ impl CliScreen {
         }
     }
 
+    fn todo_summary(&self) -> String {
+        let todos = self.todos.lock().map(|g| g.clone()).unwrap_or_default();
+        if todos.is_empty() {
+            return String::new();
+        }
+        let total = todos.len();
+        let completed = todos
+            .iter()
+            .filter(|t| t.status == cyber_core::TodoStatus::Completed)
+            .count();
+        let active_desc = todos
+            .iter()
+            .find(|t| t.status == cyber_core::TodoStatus::InProgress)
+            .or_else(|| {
+                todos
+                    .iter()
+                    .find(|t| t.status == cyber_core::TodoStatus::Pending)
+            })
+            .map(|t| format!(" (▶ {})", t.title))
+            .unwrap_or_default();
+        format!("Todo: [{completed}/{total}]{active_desc}")
+    }
+
     fn footer(&self) -> String {
+        let todo_sum = self.todo_summary();
         if !self.has_run {
             if self.approval.is_some() {
                 return "  permission required · 1/2/3 select · Enter confirm · Esc deny".into();
+            } else if !todo_sum.is_empty() {
+                if !self.status.is_empty() {
+                    return format!("  {todo_sum} │ {}", clean(&self.status));
+                }
+                return format!("  {todo_sum}");
             } else if !self.status.is_empty() {
                 return format!("  {}", clean(&self.status));
             } else {
@@ -772,6 +828,9 @@ impl CliScreen {
             clean(&self.provider),
             clean(&self.model)
         );
+        if !todo_sum.is_empty() {
+            footer.push_str(&format!(" │ {todo_sum}"));
+        }
         if self.approval.is_some() {
             footer.push_str(" · permission required · 1/2/3 select · Enter confirm · Esc deny");
             footer.push_str(&format!(" · {} · Ctrl+C to cancel", clean(&self.status)));
@@ -1109,7 +1168,7 @@ impl CliScreen {
             frame.render_widget(Paragraph::new(lines), menu);
         }
         let input_area = sections[2];
-        let border = if self.approval.is_some() || self.form.is_some() {
+        let border = if self.approval.is_some() || self.form.is_some() || self.busy {
             ACCENT
         } else {
             effort_color(self.effort)
@@ -1147,7 +1206,15 @@ impl CliScreen {
                     .get(form.selected)
                     .is_some_and(|field| field.secret)
             });
-        draw_composer(frame, input_area, active_input, &title, border, secret);
+        draw_composer(
+            frame,
+            input_area,
+            active_input,
+            &title,
+            border,
+            secret,
+            self.busy,
+        );
         let mut footer = self.footer();
         if self.approval.is_some() {
             footer = "  permission required · 1/2/3 select · Enter confirm · Esc deny".into();
@@ -1234,10 +1301,50 @@ impl CliScreen {
                 self.approval_visible = true;
             }
         } else if let Some(panel) = self.panel {
-            let (title, text) = match panel {
-                Panel::Shortcuts => (" Shortcuts ", format!("Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.", cli_commands::commands().iter().map(|spec| format!("{:<30} {}", spec.usage, spec.desc)).collect::<Vec<_>>().join("\n"))),
-            };
-            popup(frame, sections[1], title, &text);
+            match panel {
+                Panel::Shortcuts => {
+                    let title = " Shortcuts ";
+                    let text = format!(
+                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
+                        cli_commands::commands()
+                            .iter()
+                            .map(|spec| format!("{:<30} {}", spec.usage, spec.desc))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    popup(frame, sections[1], title, &text);
+                }
+                Panel::Ctf => {
+                    let width = sections[1]
+                        .width
+                        .saturating_sub(6)
+                        .clamp(48, 86)
+                        .min(sections[1].width);
+                    let height = sections[1]
+                        .height
+                        .saturating_sub(2)
+                        .max(10)
+                        .min(sections[1].height);
+                    let popup_area = Rect::new(
+                        sections[1].x + (sections[1].width.saturating_sub(width)) / 2,
+                        sections[1].y + (sections[1].height.saturating_sub(height)) / 2,
+                        width,
+                        height,
+                    );
+                    frame.render_widget(Clear, popup_area);
+                    crate::views::ctf_panel::render(
+                        frame,
+                        popup_area,
+                        &CLI_THEME,
+                        &self.ctf_challenges,
+                        self.ctf_selected,
+                        self.ctf_detail_view,
+                        self.ctf_detail_scroll,
+                        true,
+                        &self.ctf_list_scroll,
+                    );
+                }
+            }
         } else if let Some(form) = &self.form {
             let lines = form
                 .form
@@ -1474,6 +1581,10 @@ fn tool_card_kind(name: &str) -> ToolCardKind {
         || name.eq_ignore_ascii_case("grep")
     {
         ToolCardKind::Find
+    } else if name.eq_ignore_ascii_case("delegate_tasks") || name.eq_ignore_ascii_case("delegate") {
+        ToolCardKind::Delegate
+    } else if name.eq_ignore_ascii_case("todo") {
+        ToolCardKind::Todo
     } else {
         ToolCardKind::Generic
     }
@@ -1499,6 +1610,8 @@ fn tool_card_title(card: &ToolCard, kind: ToolCardKind) -> String {
         ToolCardKind::Fetch => "Fetch".into(),
         ToolCardKind::List => "List".into(),
         ToolCardKind::Find => "Find".into(),
+        ToolCardKind::Delegate => "Delegate tasks".into(),
+        ToolCardKind::Todo => "Todo".into(),
         ToolCardKind::Generic => {
             let mut words = card.name.split('_');
             let first = words.next().unwrap_or("Tool");
@@ -1522,20 +1635,49 @@ fn tool_card_detail(kind: ToolCardKind, arguments: Option<&serde_json::Value>) -
         return String::new();
     };
     let value = match kind {
-        ToolCardKind::Read => argument_string(arguments, &["path", "file_path"]),
+        ToolCardKind::Read => argument_string(arguments, &["path", "file_path"]).map(str::to_owned),
         ToolCardKind::Edit | ToolCardKind::Write => {
-            argument_string(arguments, &["path", "file_path"])
+            argument_string(arguments, &["path", "file_path"]).map(str::to_owned)
         }
-        ToolCardKind::Download => argument_string(arguments, &["output", "path", "url"]),
-        ToolCardKind::Shell => argument_string(arguments, &["command"]),
-        ToolCardKind::Fetch => argument_string(arguments, &["url", "path"]),
-        ToolCardKind::List => argument_string(arguments, &["path"]),
-        ToolCardKind::Find => argument_string(arguments, &["name", "pattern", "content", "path"]),
+        ToolCardKind::Download => {
+            argument_string(arguments, &["output", "path", "url"]).map(str::to_owned)
+        }
+        ToolCardKind::Shell => argument_string(arguments, &["command"]).map(str::to_owned),
+        ToolCardKind::Fetch => argument_string(arguments, &["url", "path"]).map(str::to_owned),
+        ToolCardKind::List => argument_string(arguments, &["path"]).map(str::to_owned),
+        ToolCardKind::Find => {
+            argument_string(arguments, &["name", "pattern", "content", "path"]).map(str::to_owned)
+        }
+        ToolCardKind::Delegate => {
+            argument_string(arguments, &["intent", "task"]).map(str::to_owned)
+        }
+        ToolCardKind::Todo => {
+            let action = argument_string(arguments, &["action"]).unwrap_or("manage");
+            Some(
+                if let Some(title) = argument_string(arguments, &["title"]) {
+                    format!("{action} {title}")
+                } else if let Some(id) = argument_string(arguments, &["id"]) {
+                    let status = argument_string(arguments, &["status"]).unwrap_or("");
+                    if status.is_empty() {
+                        format!("{action} #{id}")
+                    } else {
+                        format!("{action} #{id} ({status})")
+                    }
+                } else if let Some(items) =
+                    arguments.get("items").and_then(serde_json::Value::as_array)
+                {
+                    format!("{action} {} tasks", items.len())
+                } else {
+                    action.to_string()
+                },
+            )
+        }
         ToolCardKind::Generic => {
             argument_string(arguments, &["intent", "path", "url", "command", "query"])
+                .map(str::to_owned)
         }
     };
-    clean(value.unwrap_or_default())
+    clean(&value.unwrap_or_default())
 }
 
 fn pretty_tool_arguments(arguments: &str) -> String {
@@ -1573,7 +1715,10 @@ fn tool_card_body(card: &ToolCard, kind: ToolCardKind, expanded: bool) -> Vec<St
         && arguments.trim() != "{}"
         && matches!(
             kind,
-            ToolCardKind::Edit | ToolCardKind::Write | ToolCardKind::Generic
+            ToolCardKind::Edit
+                | ToolCardKind::Write
+                | ToolCardKind::Generic
+                | ToolCardKind::Delegate
         )
     {
         lines.push("Arguments".into());
@@ -1599,14 +1744,299 @@ fn tool_body_style(card: &ToolCard, kind: ToolCardKind, line: &str, bg: Color) -
         FG
     } else if line == "Arguments" || line == "Result" {
         CODE
+    } else if kind == ToolCardKind::Todo && line.contains("[x]") {
+        SUCCESS
+    } else if kind == ToolCardKind::Todo && line.contains("[>]") {
+        ACCENT
+    } else if kind == ToolCardKind::Todo && line.contains("[!]") {
+        ERROR
     } else {
         MUTED
     };
     Style::default().fg(foreground).bg(bg)
 }
 
+fn extract_task_progress_msg<'a>(
+    line: &'a str,
+    task_num: usize,
+    total: usize,
+    name: &str,
+) -> Option<&'a str> {
+    let tag = format!("[{task_num}/{total}]");
+    let tag_num = format!("[{task_num}/");
+    let trimmed = line.trim();
+    if trimmed.starts_with(&tag) || trimmed.starts_with(&tag_num) {
+        let after_tag = if let Some(rest) = trimmed.strip_prefix(&tag) {
+            rest.trim()
+        } else if let Some(idx) = trimmed.find(']') {
+            trimmed[idx + 1..].trim()
+        } else {
+            trimmed
+        };
+        let after_name = if let Some(rest) = after_tag.strip_prefix(name) {
+            rest.trim()
+        } else {
+            after_tag
+        };
+        let msg = after_name.strip_prefix(':').unwrap_or(after_name).trim();
+        return Some(if msg.is_empty() { "started" } else { msg });
+    }
+    if let Some(rest) = trimmed.strip_prefix(name) {
+        let msg = rest.strip_prefix(':').unwrap_or(rest).trim();
+        return Some(if msg.is_empty() { "started" } else { msg });
+    }
+    if trimmed.contains(name) {
+        return Some(trimmed);
+    }
+    None
+}
+
+fn render_delegate_tasks_cards(
+    card: &ToolCard,
+    expanded: bool,
+    width: u16,
+) -> Option<Vec<Line<'static>>> {
+    let parsed_args: serde_json::Value = serde_json::from_str(&card.arguments).ok()?;
+    let tasks = parsed_args.get("tasks").and_then(|v| v.as_array())?;
+    if tasks.is_empty() {
+        return None;
+    }
+    let total = tasks.len();
+
+    let parsed_output: Option<serde_json::Value> = serde_json::from_str(&card.output).ok();
+    let results = parsed_output
+        .as_ref()
+        .and_then(|v| v.get("results"))
+        .and_then(|v| v.as_array());
+
+    let progress_lines: Vec<&str> = card
+        .progress
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut all_lines = Vec::new();
+
+    for (i, task_val) in tasks.iter().enumerate() {
+        let task_num = i + 1;
+        let task_name = task_val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("subagent");
+        let task_prompt = task_val.get("task").and_then(|v| v.as_str()).unwrap_or("");
+        let system_prompt = task_val
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tools = task_val.get("tools").and_then(|v| v.as_array());
+
+        let task_result = results.and_then(|arr| {
+            arr.iter()
+                .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(task_name))
+                .or_else(|| arr.get(i))
+        });
+
+        let mut task_progress_msgs = Vec::new();
+        for line in &progress_lines {
+            if let Some(msg) = extract_task_progress_msg(line, task_num, total, task_name) {
+                task_progress_msgs.push(msg);
+            }
+        }
+
+        let task_state = if let Some(r) = task_result {
+            let status_str = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status_str == "completed" {
+                ToolCardState::Success
+            } else {
+                ToolCardState::Error
+            }
+        } else if card.state == ToolCardState::Pending {
+            if let Some(last_msg) = task_progress_msgs.last() {
+                if last_msg.contains("completed") {
+                    ToolCardState::Success
+                } else if last_msg.contains("error")
+                    || last_msg.contains("timed_out")
+                    || last_msg.contains("failed")
+                {
+                    ToolCardState::Error
+                } else {
+                    ToolCardState::Pending
+                }
+            } else {
+                ToolCardState::Pending
+            }
+        } else if card.state == ToolCardState::Error {
+            ToolCardState::Error
+        } else {
+            ToolCardState::Success
+        };
+
+        let (icon, color, bg, default_status) = match task_state {
+            ToolCardState::Pending => ("◇", ACCENT, PENDING_BG, "running"),
+            ToolCardState::Success => ("✓", SUCCESS, SUCCESS_BG, "done"),
+            ToolCardState::Error => ("✗", ERROR, ERROR_BG, "failed"),
+        };
+
+        let title = format!("Subagent [{task_num}/{total}]");
+        let detail = task_name;
+        let title_cells = Line::raw(&title).width();
+        let detail_budget = usize::from(width)
+            .saturating_sub(title_cells)
+            .saturating_sub(10);
+        let detail = clip_cells(&single_line(detail), detail_budget);
+
+        all_lines.push(Line::default());
+        all_lines.push(
+            Line::from(vec![
+                Span::styled("╭─ ", Style::default().fg(color).bg(bg)),
+                Span::styled(
+                    format!("{icon} {title}"),
+                    Style::default()
+                        .fg(color)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {detail}")
+                    },
+                    Style::default().fg(FG).bg(bg),
+                ),
+            ])
+            .style(Style::default().bg(bg)),
+        );
+
+        let mut body = Vec::new();
+        if !task_prompt.trim().is_empty() {
+            if expanded {
+                body.push(format!("Task: {}", task_prompt.trim()));
+            } else {
+                body.push(format!("Task: {}", single_line(task_prompt.trim())));
+            }
+        }
+        if expanded {
+            if !system_prompt.trim().is_empty() {
+                body.push(format!("System: {}", single_line(system_prompt.trim())));
+            }
+            if let Some(tool_arr) = tools {
+                let t_names: Vec<&str> = tool_arr.iter().filter_map(|v| v.as_str()).collect();
+                if !t_names.is_empty() {
+                    body.push(format!("Tools: {}", t_names.join(", ")));
+                }
+            }
+        }
+
+        if let Some(r) = task_result {
+            let status_str = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status_str == "completed" {
+                if let Some(output) = r.get("output").and_then(|v| v.as_str()) {
+                    let trimmed = output.trim();
+                    if !trimmed.is_empty() {
+                        if expanded {
+                            body.push("Result:".into());
+                            body.extend(trimmed.lines().map(str::to_owned));
+                        } else {
+                            let first_line = trimmed
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or(trimmed);
+                            body.push(format!("Result: {first_line}"));
+                        }
+                    } else {
+                        body.push("Result: completed".into());
+                    }
+                } else {
+                    body.push("Result: completed".into());
+                }
+            } else {
+                let err_msg = r
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| r.get("output").and_then(|v| v.as_str()))
+                    .unwrap_or(status_str);
+                body.push(format!("Error: {err_msg}"));
+            }
+        } else if card.state == ToolCardState::Pending {
+            if task_progress_msgs.is_empty() {
+                body.push("Progress: queued".into());
+            } else if expanded {
+                for p in task_progress_msgs.iter().rev().take(4).rev() {
+                    body.push(format!("Progress: {p}"));
+                }
+            } else {
+                let latest = task_progress_msgs.last().unwrap();
+                body.push(format!("Progress: {latest}"));
+            }
+        } else if let Some(last_msg) = task_progress_msgs.last() {
+            body.push(format!("Result: {last_msg}"));
+        }
+
+        let collapsed_limit = 3;
+        let shown = body.len().min(if expanded {
+            body.len()
+        } else {
+            collapsed_limit
+        });
+        let mut clipped_body = false;
+        for line in body.iter().take(shown) {
+            let content = if expanded {
+                line.clone()
+            } else {
+                let clipped = clip_cells(line, usize::from(width.saturating_sub(4).max(1)) * 3);
+                clipped_body |= clipped != *line;
+                clipped
+            };
+            let fg_color = if task_state == ToolCardState::Error
+                && (line.starts_with("Error:") || line.starts_with("failed"))
+            {
+                ERROR
+            } else if line.starts_with("Task:")
+                || line.starts_with("Result:")
+                || line.starts_with("Progress:")
+            {
+                CODE
+            } else {
+                FG
+            };
+            all_lines.push(
+                Line::from(vec![
+                    Span::styled("│  ", Style::default().fg(color).bg(bg)),
+                    Span::styled(content, Style::default().fg(fg_color).bg(bg)),
+                ])
+                .style(Style::default().bg(bg)),
+            );
+        }
+
+        let hidden = body.len().saturating_sub(shown);
+        let footer = if hidden > 0 {
+            format!("Ctrl+O details · {hidden} more lines")
+        } else if clipped_body {
+            "Ctrl+O details".into()
+        } else {
+            default_status.into()
+        };
+        all_lines.push(
+            Line::from(vec![
+                Span::styled("╰─ ", Style::default().fg(color).bg(bg)),
+                Span::styled(footer, Style::default().fg(DIM).bg(bg)),
+            ])
+            .style(Style::default().bg(bg)),
+        );
+    }
+
+    Some(all_lines)
+}
+
 fn render_tool_card(card: &ToolCard, expanded: bool, width: u16) -> Vec<Line<'static>> {
     let kind = tool_card_kind(&card.name);
+    if kind == ToolCardKind::Delegate {
+        if let Some(lines) = render_delegate_tasks_cards(card, expanded, width) {
+            return lines;
+        }
+    }
     let parsed_arguments = serde_json::from_str::<serde_json::Value>(&card.arguments).ok();
     let title = tool_card_title(card, kind);
     let detail = tool_card_detail(kind, parsed_arguments.as_ref());
@@ -1646,6 +2076,7 @@ fn render_tool_card(card: &ToolCard, expanded: bool, width: u16) -> Vec<Line<'st
     let collapsed_limit = match kind {
         ToolCardKind::Edit => 5,
         ToolCardKind::Download => 2,
+        ToolCardKind::Todo => 4,
         _ => 3,
     };
     let shown = body.len().min(if expanded {
@@ -1710,6 +2141,7 @@ fn draw_composer(
     title: &str,
     border: Color,
     secret: bool,
+    thinking: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1731,13 +2163,24 @@ fn draw_composer(
             .width
             .saturating_sub(chrome)
             .saturating_sub(Line::raw(&label).width() as u16);
+        let header_line = if thinking {
+            Line::from(vec![
+                Span::styled(if chrome == 6 { "╭──" } else { "╭" }, style),
+                Span::styled(
+                    label,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{}──╮", "─".repeat(fill as usize)), style),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(if chrome == 6 { "╭──" } else { "╭" }, style),
+                Span::styled(label, style),
+                Span::styled(format!("{}──╮", "─".repeat(fill as usize)), style),
+            ])
+        };
         frame.render_widget(
-            Paragraph::new(if chrome == 6 {
-                format!("╭──{label}{}──╮", "─".repeat(fill as usize))
-            } else {
-                format!("╭{label}{}╮", "─".repeat(fill as usize))
-            })
-            .style(style),
+            Paragraph::new(header_line),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
@@ -2044,14 +2487,28 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                         Some(Ok(Event::Mouse(mouse))) => {
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => {
-                                    if screen.approval.is_some() {
+                                    if screen.panel == Some(Panel::Ctf) {
+                                        if screen.ctf_detail_view {
+                                            screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(3);
+                                        } else if screen.ctf_selected > 0 {
+                                            screen.ctf_selected = screen.ctf_selected.saturating_sub(1);
+                                        }
+                                    } else if screen.approval.is_some() {
                                         screen.approval_scroll = screen.approval_scroll.saturating_sub(3);
                                     } else {
                                         screen.scroll = screen.scroll.saturating_add(3).min(screen.max_scroll);
                                     }
                                 }
                                 MouseEventKind::ScrollDown => {
-                                    if screen.approval.is_some() {
+                                    if screen.panel == Some(Panel::Ctf) {
+                                        if screen.ctf_detail_view {
+                                            screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(3);
+                                        } else if !screen.ctf_challenges.is_empty()
+                                            && screen.ctf_selected + 1 < screen.ctf_challenges.len()
+                                        {
+                                            screen.ctf_selected += 1;
+                                        }
+                                    } else if screen.approval.is_some() {
                                         screen.approval_scroll = screen
                                             .approval_scroll
                                             .saturating_add(3)
@@ -2130,7 +2587,72 @@ fn handle_key(
         }
     }
     if screen.panel.is_some() && key.code == KeyCode::Esc {
-        screen.panel = None;
+        if screen.panel == Some(Panel::Ctf) && screen.ctf_detail_view {
+            screen.ctf_detail_view = false;
+            screen.ctf_detail_scroll = 0;
+        } else {
+            screen.panel = None;
+            screen.ctf_detail_view = false;
+            screen.ctf_detail_scroll = 0;
+        }
+        return Ok(false);
+    }
+    if control && key.code == KeyCode::Char('t') {
+        if screen.panel == Some(Panel::Ctf) {
+            screen.panel = None;
+            screen.ctf_detail_view = false;
+            screen.ctf_detail_scroll = 0;
+        } else if screen.ctf_enabled {
+            if let Some(r) = runner.as_ref() {
+                screen.ctf_challenges = r.challenges().unwrap_or_default();
+            }
+            screen.ctf_selected = 0;
+            screen.ctf_detail_view = false;
+            screen.ctf_detail_scroll = 0;
+            screen.ctf_list_scroll.set(0);
+            screen.panel = Some(Panel::Ctf);
+        } else {
+            screen.message("CTF", "CTF 模式未开启（可输入 /ctf enable 开启）", MUTED);
+        }
+        return Ok(false);
+    }
+    if screen.panel == Some(Panel::Ctf) {
+        let len = screen.ctf_challenges.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('8') => {
+                if screen.ctf_detail_view {
+                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(1);
+                } else if screen.ctf_selected > 0 {
+                    screen.ctf_selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('2') => {
+                if screen.ctf_detail_view {
+                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(1);
+                } else if len > 0 && screen.ctf_selected + 1 < len {
+                    screen.ctf_selected += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                if screen.ctf_detail_view {
+                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(10);
+                } else {
+                    screen.ctf_selected = screen.ctf_selected.saturating_sub(5);
+                }
+            }
+            KeyCode::PageDown => {
+                if screen.ctf_detail_view {
+                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(10);
+                } else if len > 0 {
+                    screen.ctf_selected = (screen.ctf_selected + 5).min(len.saturating_sub(1));
+                }
+            }
+            KeyCode::Enter if !screen.ctf_detail_view && len > 0 && screen.ctf_selected < len => {
+                screen.ctf_detail_view = true;
+                screen.ctf_detail_scroll = 0;
+            }
+            _ => {}
+        }
         return Ok(false);
     }
     if (control && key.code == KeyCode::Char('c')) || key.code == KeyCode::Esc {
@@ -2665,14 +3187,12 @@ mod tests {
                     " model · high ",
                     effort_color(ThinkingIntensity::High),
                     false,
+                    false,
                 )
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "╭");
-        assert_eq!(buffer[(39, 0)].symbol(), "╮");
-        assert_eq!(buffer[(0, 1)].symbol(), "│");
-        assert_eq!(buffer[(0, 2)].symbol(), "╰");
         assert_eq!(buffer[(38, 2)].symbol(), "─");
         assert_eq!(buffer[(39, 2)].symbol(), "╯");
         assert_eq!(buffer[(3, 1)].symbol(), "A");
@@ -2690,6 +3210,7 @@ mod tests {
                     &input,
                     " model · low ",
                     effort_color(ThinkingIntensity::Low),
+                    false,
                     false,
                 )
             })
@@ -2884,6 +3405,86 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected} in:\n{text}");
         }
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+    #[tokio::test]
+    async fn omp_cards_render_separate_subagent_cards_with_task_and_realtime_progress() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let delegate_args = serde_json::json!({
+            "tasks": [
+                {
+                    "name": "solve-shishangwunanshi",
+                    "system_prompt": "You are a binary expert.",
+                    "task": "分析二进制文件 shishangwunanshi，找到其中的 flag",
+                    "tools": ["shell"]
+                },
+                {
+                    "name": "solve-windows-pwd",
+                    "system_prompt": "You are a windows expert.",
+                    "task": "提取 Windows 密码哈希并解密",
+                    "tools": ["shell"]
+                }
+            ]
+        })
+        .to_string();
+
+        screen.tool_call("del-1", "delegate_tasks", &delegate_args);
+
+        // Before progress: both cards exist and show running
+        let text_initial = render(&mut screen, 100, 30);
+        assert!(text_initial.contains("╭─ ◇ Subagent [1/2]  solve-shishangwunanshi"));
+        assert!(text_initial.contains("Task:"));
+        assert!(text_initial.contains("shishangwunanshi"));
+        assert!(text_initial.contains("Progress: queued"));
+        assert!(text_initial.contains("╭─ ◇ Subagent [2/2]  solve-windows-pwd"));
+        assert!(text_initial.contains("Windows"));
+        // Progress arrives
+        screen.tool_progress(
+            "del-1",
+            "delegate_tasks",
+            "[1/2] solve-shishangwunanshi started\n[1/2] solve-shishangwunanshi: running tool: shell\n[2/2] solve-windows-pwd started\n",
+        );
+        let text_progress = render(&mut screen, 100, 30);
+        assert!(text_progress.contains("Progress: running tool: shell"));
+        assert!(text_progress.contains("Progress: started"));
+
+        // Tool result arrives
+        let delegate_result = serde_json::json!({
+            "results": [
+                {
+                    "name": "solve-shishangwunanshi",
+                    "status": "completed",
+                    "output": "Found flag: cyber{shishang_wunan_shi}"
+                },
+                {
+                    "name": "solve-windows-pwd",
+                    "status": "error",
+                    "error": "wordlist not found"
+                }
+            ]
+        })
+        .to_string();
+
+        screen.tool_result("del-1", "delegate_tasks", &delegate_result, false);
+
+        let text_done = render(&mut screen, 100, 30);
+        assert!(text_done.contains("╭─ ✓ Subagent [1/2]  solve-shishangwunanshi"));
+        assert!(text_done.contains("Result: Found flag: cyber{shishang_wunan_shi}"));
+        assert!(text_done.contains("╭─ ✗ Subagent [2/2]  solve-windows-pwd"));
+        assert!(text_done.contains("Error: wordlist not found"));
+
+        // Test expanded view with toggle_tools (Ctrl+O)
+        screen.toggle_tools();
+        let text_expanded = render(&mut screen, 100, 30);
+        assert!(text_expanded.contains("System: You are a binary expert."));
+        assert!(text_expanded.contains("Tools: shell"));
+
+        // Toggle back to collapsed
+        screen.toggle_tools();
+        let text_collapsed = render(&mut screen, 100, 30);
+        assert!(!text_collapsed.contains("System: You are a binary expert."));
+
         let _ = std::fs::remove_dir_all(owner.cwd);
     }
 
@@ -3414,6 +4015,73 @@ mod tests {
         screen.toggle_tools();
         screen.sync(&owner);
         assert!(history(&screen).contains("actual second line"));
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn todo_cli_commands_and_footer_progress_and_persistence() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let orig_id = owner.index.current.clone();
+
+        // 1. Initial state has no todo
+        assert!(screen.todo_summary().is_empty());
+
+        // 2. Add two tasks via /todo add
+        let act1 = cli_commands::execute(&mut owner, "/todo add 第一阶段信息收集").unwrap();
+        let CliAction::Output { text, .. } = act1 else {
+            panic!("expected output");
+        };
+        assert!(text.contains("#1"));
+
+        let act2 = cli_commands::execute(&mut owner, "/todo add 第二阶段漏洞挖掘").unwrap();
+        let CliAction::Output { text, .. } = act2 else {
+            panic!("expected output");
+        };
+        assert!(text.contains("#2"));
+
+        // 3. /todo list
+        let list_act = cli_commands::execute(&mut owner, "/todo list").unwrap();
+        let CliAction::Output { text, .. } = list_act else {
+            panic!("expected output");
+        };
+        assert!(text.contains("#1 第一阶段信息收集"));
+        assert!(text.contains("#2 第二阶段漏洞挖掘"));
+
+        // 4. Verify footer summary
+        assert_eq!(screen.todo_summary(), "Todo: [0/2] (▶ 第一阶段信息收集)");
+        assert!(screen.footer().contains("Todo: [0/2] (▶ 第一阶段信息收集)"));
+
+        // 5. Complete task 1
+        let done_act = cli_commands::execute(&mut owner, "/todo done 1").unwrap();
+        let CliAction::Output { text, .. } = done_act else {
+            panic!("expected output");
+        };
+        assert!(text.contains("已标记为完成"));
+
+        assert_eq!(screen.todo_summary(), "Todo: [1/2] (▶ 第二阶段漏洞挖掘)");
+
+        // 6. Test session isolation: new session resets todos
+        owner.create_session().unwrap();
+        screen.sync(&owner);
+        assert!(owner.todos().is_empty());
+        assert!(screen.todo_summary().is_empty());
+
+        // 7. Switching back restores the todos
+        owner.select_session(&orig_id).unwrap();
+        screen.sync(&owner);
+        assert_eq!(owner.todos().len(), 2);
+        assert_eq!(screen.todo_summary(), "Todo: [1/2] (▶ 第二阶段漏洞挖掘)");
+
+        // 8. /todo clear
+        let clear_act = cli_commands::execute(&mut owner, "/todo clear").unwrap();
+        let CliAction::Output { text, .. } = clear_act else {
+            panic!("expected output");
+        };
+        assert!(text.contains("已清空"));
+        assert!(owner.todos().is_empty());
+        assert!(screen.todo_summary().is_empty());
+
         let _ = std::fs::remove_dir_all(owner.cwd);
     }
 
@@ -4081,22 +4749,32 @@ mod tests {
         // 1. Fresh session before run: no footer metrics, title unchanged
         assert!(!screen.has_run);
         assert!(screen.footer().is_empty());
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| screen.draw(f)).unwrap();
+        let idle_fg = term.backend().buffer()[(0, 21)].fg;
+        assert_eq!(idle_fg, effort_color(ThinkingIntensity::Low));
         let text = render(&mut screen, 120, 24);
         assert!(text.contains("deepseek-v4-1-flash-260910 · low"));
         assert!(!text.contains("Cy >"));
         assert!(!text.contains("ctx"));
         assert!(!text.contains("cache"));
 
-        // 2. Active run (thinking / processing): title shows Cy > 0s > model · effort
+        // 2. Active run (thinking / processing): title shows Cy > 0s > model · effort and changes to thinking color
         screen.busy = true;
         screen.thinking_started = Some(std::time::Instant::now());
+        term.draw(|f| screen.draw(f)).unwrap();
+        let busy_fg = term.backend().buffer()[(0, 21)].fg;
+        assert_eq!(busy_fg, ACCENT);
+        assert_ne!(
+            idle_fg, busy_fg,
+            "normal mode and thinking mode must be two different colors"
+        );
         let busy_text = render(&mut screen, 120, 24);
         assert!(busy_text.contains("Cy > 0s > deepseek-v4-1-flash-260910 · low"));
         assert!(
             !busy_text.contains("(0s)"),
             "should not have parentheses around duration"
         );
-
         // 3. After run completes: footer displays metrics line
         screen.busy = false;
         screen.has_run = true;
@@ -4252,6 +4930,118 @@ mod tests {
         assert!(screen.panel.is_none());
         page_key(&mut screen, KeyCode::Left);
         assert!(screen.panel.is_none());
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn ctf_panel_toggles_with_ctrl_t_and_navigates_in_cli() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+        let mut runner = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        // 1. Press Ctrl+T when CTF disabled -> shows hint message, panel stays None
+        assert!(!screen.ctf_enabled);
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.panel.is_none());
+        assert!(history(&screen).contains("CTF 模式未开启"));
+        // 2. Enable CTF and add challenge via command
+        screen.input.insert_str("/ctf enable");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_enabled);
+
+        screen.input.insert_str("/ctf add webftp_auth_bypass web");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+
+        // 3. Press Ctrl+T -> opens CTF panel
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert!(!screen.ctf_detail_view);
+        let rendered_panel = render(&mut screen, 100, 30);
+        assert!(rendered_panel.contains("webftp_auth_bypass"));
+        assert!(rendered_panel.contains("进 行 中") || rendered_panel.contains("进行中"));
+
+        // 4. Press Enter -> opens challenge detail
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_detail_view);
+        let rendered_detail = render(&mut screen, 100, 30);
+        assert!(rendered_detail.contains("webftp_auth_bypass"));
+        assert!(rendered_detail.contains("Esc"));
+
+        // 5. Press Esc -> exits detail back to list
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert!(!screen.ctf_detail_view);
+
+        // 6. Press Ctrl+T -> closes panel
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.panel.is_none());
+
         let _ = std::fs::remove_dir_all(cwd);
     }
 }

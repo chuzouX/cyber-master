@@ -99,6 +99,7 @@ impl SubagentRuntime {
         provider_name: Option<String>,
         model: Option<String>,
         tool_names: Vec<String>,
+        task_progress: Option<UnboundedSender<String>>,
     ) -> Result<String> {
         let provider_name =
             provider_name.unwrap_or_else(|| self.config.agent.default_provider.clone());
@@ -123,6 +124,7 @@ impl SubagentRuntime {
             .all_schemas()
             .into_iter()
             .filter(|schema| allowed.contains(&schema.name))
+            .filter(|schema| self.config.tools.web_search || schema.name != "web_fetch")
             .collect();
         if schemas.len() != allowed.len() {
             return Err(AgentError::Provider(
@@ -166,7 +168,7 @@ impl SubagentRuntime {
             .map(|value| (value.key.clone(), value.value.clone()))
             .collect();
         let ctx = ToolCtx::new(self.cwd.clone(), rules, scope, env);
-        let sink = EventSink::child(&self.tx, self.gen);
+        let sink = EventSink::child_with_progress(&self.tx, self.gen, task_progress.as_ref());
         let output = run_agent_loop(
             provider.as_ref(),
             system,
@@ -393,11 +395,14 @@ async fn run_inner(
         gen,
     ));
     let ctx = ToolCtx::new(cwd, rules, scope, env).with_subagent_runtime(runtime);
-    let tools = if config.agent.auto_tool_call && !registry.is_empty() {
+    let mut tools = if config.agent.auto_tool_call && !registry.is_empty() {
         registry.schemas()
     } else {
         Vec::new()
     };
+    if !config.tools.web_search {
+        tools.retain(|s| s.name != "web_fetch");
+    }
     let mut messages = history;
     messages.push(Message::user(user_input));
     let sink = EventSink::parent(tx, gen);
@@ -432,6 +437,7 @@ struct EventSink<'a> {
     tx: &'a UnboundedSender<(u64, AgentEvent)>,
     gen: u64,
     mode: EventMode,
+    task_progress: Option<&'a UnboundedSender<String>>,
 }
 
 impl<'a> EventSink<'a> {
@@ -440,20 +446,53 @@ impl<'a> EventSink<'a> {
             tx,
             gen,
             mode: EventMode::Parent,
+            task_progress: None,
         }
     }
 
+    #[cfg(test)]
     fn child(tx: &'a UnboundedSender<(u64, AgentEvent)>, gen: u64) -> Self {
         Self {
             tx,
             gen,
             mode: EventMode::Child,
+            task_progress: None,
+        }
+    }
+
+    fn child_with_progress(
+        tx: &'a UnboundedSender<(u64, AgentEvent)>,
+        gen: u64,
+        task_progress: Option<&'a UnboundedSender<String>>,
+    ) -> Self {
+        Self {
+            tx,
+            gen,
+            mode: EventMode::Child,
+            task_progress,
         }
     }
 
     fn send(&self, event: AgentEvent) -> bool {
-        if matches!(self.mode, EventMode::Child) && !matches!(event, AgentEvent::Usage(_)) {
-            return true;
+        if matches!(self.mode, EventMode::Child) {
+            if let Some(tp) = self.task_progress {
+                match &event {
+                    AgentEvent::ToolCall { name, .. } => {
+                        let _ = tp.send(format!("running tool: {name}\n"));
+                    }
+                    AgentEvent::ToolResult { name, is_error, .. } => {
+                        if *is_error {
+                            let _ = tp.send(format!("tool {name} failed\n"));
+                        } else {
+                            let _ = tp.send(format!("tool {name} completed\n"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !matches!(event, AgentEvent::Usage(_)) {
+                return true;
+            }
         }
         self.tx.send((self.gen, event)).is_ok()
     }
@@ -1136,6 +1175,96 @@ mod tests {
         let error = accumulate_stream(&mut stream, &sink).await.unwrap_err();
         assert!(matches!(error, AgentError::Provider(message) if message == "boom"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn delegate_tasks_disallowed_tool_is_never_executed() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use futures::{stream, Stream};
+
+        struct ScriptProvider {
+            calls: AtomicUsize,
+        }
+
+        impl Provider for ScriptProvider {
+            fn stream(
+                &self,
+                _req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::ToolCallDelta(ToolCallDelta {
+                            index: 0,
+                            id: Some("blocked-call".into()),
+                            name: Some("blocked".into()),
+                            arguments_fragment: "{}".into(),
+                        }),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("done".into()),
+                        StreamEvent::Done,
+                    ]))
+                }
+            }
+        }
+
+        struct CountingTool(Arc<AtomicUsize>);
+
+        impl crate::Tool for CountingTool {
+            fn schema(&self) -> crate::ToolSchema {
+                crate::ToolSchema {
+                    name: "blocked".into(),
+                    description: "must not execute".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: Vec::new(),
+                }
+            }
+
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(ToolOutput {
+                        content: "executed".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool(Arc::clone(&executions))));
+        let registry = Arc::new(registry);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::child(&tx, 1);
+        let allowed = std::collections::HashSet::new();
+        let output = run_agent_loop(
+            &ScriptProvider {
+                calls: AtomicUsize::new(0),
+            },
+            String::new(),
+            vec![Message::user("test")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            registry.schemas(),
+            Some(&allowed),
+            registry,
+            2,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.final_text, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
     }
 
     // ── LoopDetector / fingerprint ──────────────────────────────────────────

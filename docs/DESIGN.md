@@ -12,7 +12,7 @@
 
 `cyber` 默认进入全屏简洁 coding CLI，替代行式多轮输入；`cyber tui` 显式进入原有全屏功能面板，`cyber run` 保留非交互单次任务，`cyber setup` 提供配置向导。缺少有效配置的首次交互启动先运行向导；脚本不弹向导。此约定替代下文早期的默认 TUI / 唯一界面描述。
 
-CLI 与 headless 在 `cyber-tui` 内共用独立于 `App` 的 `SessionRunner`、JSON 历史和注册表装配，尚未迁移到独立 runtime/storage crate。CLI 启用执行前 nonce 审批；headless 仅接受调用者显式的 `--allow-tool` 授权。两者默认不自动启动 MCP，CLI `/mcp connect` 经显式 nonce 批准才连接，UI deny 不启动 server。原 TUI 的权限和 MCP 行为保持原样，不应视为已有新审批保护。
+CLI 与 headless 在 `cyber-tui` 内共用独立于 `App` 的 `SessionRunner`、JSON 历史和注册表装配，尚未迁移到独立 runtime/storage crate。CLI 启用执行前 nonce 审批；headless 仅接受调用者显式的 `--allow-tool` 授权。两者启动时默认连接已配置的 MCP servers，并支持在 CLI 中通过 `/mcp connect` 重新连接。原 TUI 的权限和 MCP 行为保持原样，不应视为已有新审批保护。
 
 ### 默认 coding CLI 交互约定
 
@@ -421,7 +421,7 @@ Tab 切换：`Overview / Nodes / Logs / Stats / Assets`。
 
 ### 6.2 能力
 
-- 原 `cyber tui` 启动时按 `mcp/servers.toml` 并行连接配置 server（`McpRegistry::connect_all`，每 server 独立超时，失败 warn + skip 不阻断启动）；CLI/headless 默认 no autostart，CLI 仅在 `/mcp connect` nonce 批准后连接，deny 不启动。
+- `cyber tui` 与 CLI/headless 启动时均按 `mcp/servers.toml` 并行连接配置 server（`McpRegistry::connect_all`，每 server 独立超时，失败 warn + skip 不阻断启动）；CLI 亦支持通过 `/mcp connect` 重连。
 - 握手：`initialize`（协议版本 + client/server info）→ `tools/list` 缓存工具 schema 到 `McpConnection`（避免每次拉取）
 - v0.1 支持 `tools/list` `tools/call`；`resources/*` `prompts/*` 留待后续阶段
 - **统一工具表**：MCP 工具与内置工具、Skill 同等暴露给 agent 与工作流节点（详见 §6.4）

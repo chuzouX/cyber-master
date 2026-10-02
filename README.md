@@ -296,7 +296,7 @@ cyber run "继续上次任务" --session abc      # 续接指定会话
 cyber run --help                            # 查看 provider/model 等任务选项
 ```
 
-CLI 由 `cli_commands.rs` 处理 TUI 目录中除 `/mode` 外的 16 个主命令，并增加 `/effort`，共 17 项，完整行为与子命令边界见 [命令参考](docs/TUI_COMMANDS.md)。`/effort low|medium|high|xhigh|auto` 保留 `middle` / `max` 别名，`medium` 对应内部 `Middle`，`xhigh` 对应 `Max`；`/think` 与 `/effort` 只改变系统提示词档位，不新增 provider API 的 `reasoning_effort` 参数。`/think`、`/max_steps` 保存到全局配置的目标字段，不把合并后的项目覆盖整份写入全局；项目覆盖在重新加载时仍优先。`--cwd` 会验证并规范化目录；项目配置仍只在指定目录查找，不向父目录继承。
+CLI 由 `cli_commands.rs` 处理 TUI 目录中除 `/mode` 外的 19 个主命令，并增加 `/effort`，共 20 项，完整行为与子命令边界见 [命令参考](docs/TUI_COMMANDS.md)。`/effort low|medium|high|xhigh|auto` 保留 `middle` / `max` 别名，`medium` 对应内部 `Middle`，`xhigh` 对应 `Max`；`/think` 与 `/effort` 只改变系统提示词档位，不新增 provider API 的 `reasoning_effort` 参数。`/think`、`/max_steps`、`/subagents`、`/env` 和 `/web` 保存到全局配置的目标字段，不把合并后的项目覆盖整份写入全局；项目覆盖在重新加载时仍优先。`--cwd` 会验证并规范化目录；项目配置仍只在指定目录查找，不向父目录继承。
 
 ### CLI 界面与快捷键
 
@@ -324,7 +324,7 @@ provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output
 
 执行前审批仍须输入当前请求的 nonce（`once <请求码>` 或 `session <请求码>`）后显式提交；paste 不得自动提交或确认授权，预输入内容也不得误批准。这是工具权限流程，不是可切换的 mode；底栏精简不改变下述权限策略或 headless 行为。
 
-**权限与当前限制：** CLI 在工具执行前询问；输入提示中的 `once <请求码>` 或 `session <请求码>` 才能授权，避免粘贴或预输入内容误批准。会话授权只匹配同一工具及完全相同的参数。`cyber run` 不询问、默认拒绝所有工具；可重复传入 `--allow-tool <名称>` 显式授权指定工具，例如 `cyber run "列出文件" --allow-tool list_dir`。该授权允许目标工具的任意参数，不支持通配符，不绕过内置护栏；谨慎授权 `shell` 等工具。权限拒绝和任务错误均以非零退出码结束，JSON 包含失败结果。CLI/headless 默认不自动启动 MCP；CLI `/mcp connect` 经当前 nonce 显式批准才连接，UI deny 不启动子进程。原 TUI 保留原工具执行和 MCP 行为，尚未接入新的逐次审批；这不是系统级沙箱，批准操作后仍可能产生不可撤销的副作用。
+**权限与当前限制：** CLI 在工具执行前询问；输入提示中的 `once <请求码>` 或 `session <请求码>` 才能授权，避免粘贴或预输入内容误批准。自动审批（Auto）模式已放行只读与安全探测命令（如 `cat`、`grep`、`cargo`、`git` 等）；会话授权（Session）对同一工具及已被授权的主干命令集合（如 `cargo` 等）或只读命令后续放行，避免仅因调整参数而反复弹窗。破坏性操作（如写入重定向、文件修改、未授权命令）仍要求确认。`cyber run` 不询问、默认拒绝所有工具；可重复传入 `--allow-tool <名称>` 显式授权指定工具，例如 `cyber run "列出文件" --allow-tool list_dir`。该授权允许目标工具的任意参数，不支持通配符，不绕过内置护栏；谨慎授权 `shell` 等工具。权限拒绝和任务错误均以非零退出码结束，JSON 包含失败结果。CLI 启动时默认按配置连接已配置的 MCP servers（若配置或网络异常则跳过并提示）。这不是系统级沙箱，批准操作后仍可能产生不可撤销的副作用。
 
 `cyber` / `cyber tui` 要求交互终端；脚本使用 `cyber run`。非交互命令不弹出向导，配置缺失时提示 `cyber setup`。当前全局选项：
 
@@ -349,9 +349,12 @@ Options:
 | `/clear` | 清空对话历史 |
 | `/model [provider]` | 选择 provider + model |
 | `/provider <list\|add\|edit\|use\|remove>` | 管理服务商 |
+| `/subagents [status\|enable\|disable\|max_tasks N\|max_parallel N\|timeout N\|max_steps N]` | 查看或持久化批量子 agent 配置；启用状态变更需重启更新工具目录 |
+| `/env [list\|set KEY VALUE\|set-sensitive KEY VALUE\|remove KEY]` | 管理工具子进程环境变量；敏感值在列表、补全和 TUI 历史中不明文显示 |
+| `/web [status\|on\|off\|enable\|disable]` | 开启或禁用联网搜索与网页抓取（web_fetch）；实时生效并持久化 |
 | `/tools` | 列出可用工具 |
 | `/skill <name\|list>` | 查看 Skill 详细说明 |
-| `/mcp <list\|status\|connect>` | CLI 查询配置/连接状态，connect 须 nonce 授权；原 TUI 仅查询 |
+| `/mcp <list\|status\|connect>` | 查询 MCP 配置与连接状态，或重连配置的 MCP servers |
 | `/think [low\|middle\|high\|max\|auto]` | 切换思考强度 |
 | `/max_steps <N>` | 工具调用步数上限 |
 | `/compact [instructions]` | 手动压缩上下文 |
