@@ -170,6 +170,8 @@ pub enum ChatEntry {
         elapsed_ms: u64,
         finished_at: u64,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 }
 
@@ -1067,11 +1069,22 @@ pub fn render_entries(
                 elapsed_ms,
                 finished_at,
                 status,
+                summary,
             } => {
                 lines.push(Line::from(Span::styled(
                     turn_summary_text(*elapsed_ms, *finished_at, status),
                     Style::default().fg(theme.muted),
                 )));
+                if let Some(summary_text) = summary {
+                    if !summary_text.trim().is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!("※summary：{summary_text}"),
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                }
             }
             ChatEntry::ToolCall {
                 id: _,
@@ -1611,6 +1624,7 @@ mod tests {
                 elapsed_ms: 1234,
                 finished_at,
                 status: "done".into(),
+                summary: Some("任务完成".into()),
             },
         ];
         let json = serde_json::to_string(&entries).unwrap();

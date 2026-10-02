@@ -85,6 +85,8 @@ impl Default for UiConfig {
 pub struct AgentConfig {
     pub default_provider: String,
     pub auto_tool_call: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     pub max_steps: u32,
     pub thinking_intensity: ThinkingIntensity,
 }
@@ -94,6 +96,7 @@ impl Default for AgentConfig {
         Self {
             default_provider: "openai".into(),
             auto_tool_call: true,
+            permission_mode: None,
             max_steps: 500,
             thinking_intensity: ThinkingIntensity::default(),
         }

@@ -26,6 +26,7 @@ pub(crate) enum CliAction {
     Task(CliTask),
     Cancel,
     Quit,
+    Mode(cyber_agent::PermissionMode),
 }
 
 pub struct CommandForm {
@@ -362,6 +363,18 @@ fn save_selection_renamed(
 
 pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
     let (name, args) = split(line);
+    if name.eq_ignore_ascii_case("/mode") || name.eq_ignore_ascii_case("/approval") {
+        if args.is_empty() {
+            return Ok(output(
+                "Mode",
+                "审批模式选项：\n/mode auto       自动审批（低风险自动放行，高风险弹出确认）\n/mode manual     手动审批（每次调用工具都弹出确认）\n/mode unlimited  无限制（不弹出确认，直接执行）\n快捷键：按 F2 可快速循环切换审批模式。",
+            ));
+        }
+        let mode = cyber_agent::PermissionMode::parse(args).ok_or_else(|| {
+            eyre!("未知审批模式：{args}。可用值：auto(自动)、manual(手动)、unlimited(无限制)")
+        })?;
+        return Ok(CliAction::Mode(mode));
+    }
     let parsed = if name.eq_ignore_ascii_case("/effort") {
         let args = match args.to_ascii_lowercase().as_str() {
             "medium" => "middle",

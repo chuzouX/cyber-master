@@ -9,7 +9,7 @@ CLI 支持原 TUI 17 个主命令中除 `/mode` 外的 16 项，加上 `/effort`
 - `/` 打开完整主命令目录，按前缀过滤；支持子命令及已配置 provider/model、session ID、Skill 名称的二级建议，不是 shell 自动补全。
 - `Up/Down` 选择候选，`Tab` 接受补全；`Enter` 在有未接受候选时先补全，再按 Enter 执行。接受补全后仍可继续输入参数。`Esc` 关闭候选并保留原输入，不清空命令。
 - 主命令及实现支持的子命令大小写不敏感；provider/题目等名称按实际数据匹配。按空白切分参数，不解析 shell 引号，不支持一行执行多个命令。
-- 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。
+- 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。支持鼠标滚轮滑动浏览历史对话；在输入区按方向键上/下键可翻看/切换历史已发送的对话内容，scrolled 状态下上/下键逐行滚动视图。按 F2 或使用 `/mode [auto|manual|unlimited]` 切换三种审批模式（手动审批/自动审批/无限制）。
 - 生成中命令受 UI 状态限制，须先取消再进行配置/会话操作；不能据静态目录推断任何任务状态下均可执行。
 
 ## CLI 已实现行为

@@ -503,6 +503,115 @@ impl SessionRunner {
         Ok(())
     }
 
+    pub(crate) fn generate_turn_summary(
+        &self,
+        status: &str,
+        answer: &str,
+        tool_calls: &[ToolCallRecord],
+        error: Option<&str>,
+    ) -> String {
+        let challenges = self.challenges().unwrap_or_default();
+        let has_challenges = self.ctf_enabled || !challenges.is_empty();
+
+        if has_challenges {
+            // 1. 如果有题目解出来，总结题目的解题流程
+            if let Some(solved) = challenges
+                .iter()
+                .find(|c| c.status == cyber_core::CtfStatus::Solved)
+            {
+                let flag_str = solved.flag.as_deref().unwrap_or("已获取");
+                let mut steps = Vec::new();
+                for call in tool_calls {
+                    if !steps.contains(&call.name.as_str()) {
+                        steps.push(call.name.as_str());
+                    }
+                }
+                let flow = if !steps.is_empty() {
+                    format!(
+                        "调用工具 [{}] 探测与利用目标漏洞，成功取得 Flag 并验证解决",
+                        steps.join(" -> ")
+                    )
+                } else if !answer.trim().is_empty() {
+                    let first_line = answer
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("完成验证");
+                    first_line.chars().take(60).collect()
+                } else {
+                    "经综合分析与利用成功获取 Flag 并标记解决".to_string()
+                };
+                return format!(
+                    "题目【{}】已解出 (Flag: {flag_str})，解题流程：{flow}",
+                    solved.name
+                );
+            }
+
+            // 2. 有题目但没解出来 -> 说明卡点
+            if let Some(in_progress) = challenges
+                .iter()
+                .find(|c| c.status == cyber_core::CtfStatus::InProgress)
+            {
+                let blocker = if let Some(err) = error {
+                    err.to_string()
+                } else if let Some(kp) = &in_progress.key_points {
+                    kp.clone()
+                } else if status == "cancelled" {
+                    "解题过程被用户取消".to_string()
+                } else if let Some(last_tool_err) =
+                    tool_calls.iter().rev().find(|c| c.name == "shell")
+                {
+                    format!(
+                        "执行命令 [{}] 遇到阻碍，尚未发现有效利用链",
+                        last_tool_err.name
+                    )
+                } else {
+                    let last_line = answer
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("靶机环境分析中，正在尝试绕过限制或探测攻击面");
+                    last_line.chars().take(60).collect()
+                };
+                return format!("题目【{}】尚未解出，卡点：{blocker}", in_progress.name);
+            }
+        }
+
+        // 3. 如果不是题目则直接总结对话和任务完成情况
+        if status == "cancelled" {
+            return "任务已取消，已保存当前对话与执行历史。".into();
+        }
+        if let Some(err) = error {
+            return format!("任务执行未完成：{err}");
+        }
+        if !tool_calls.is_empty() {
+            let mut tools: Vec<&str> = Vec::new();
+            for call in tool_calls {
+                if !tools.contains(&call.name.as_str()) {
+                    tools.push(call.name.as_str());
+                }
+            }
+            let brief = if !answer.trim().is_empty() {
+                let line = answer
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("任务已完成");
+                line.chars().take(50).collect::<String>()
+            } else {
+                "工具执行完毕并返回输出结果".to_string()
+            };
+            return format!("任务完成：调用 [{}]，{brief}", tools.join(", "));
+        }
+        if !answer.trim().is_empty() {
+            let first = answer
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("对话已完成");
+            let brief: String = first.chars().take(60).collect();
+            return format!("对话完成：{brief}");
+        }
+        "任务已完成。".into()
+    }
+
     pub(crate) async fn run_cli_task(
         &mut self,
         task: crate::cli_commands::CliTask,
@@ -693,20 +802,27 @@ impl SessionRunner {
                 // Partial summaries must never replace the resumable model history.
             }
         }
+        let status = if cancelled {
+            "cancelled"
+        } else if turn.error.is_some() {
+            "error"
+        } else {
+            "done"
+        };
+        let summary = self.generate_turn_summary(
+            status,
+            &turn.answer,
+            &turn.tool_calls,
+            turn.error.as_deref(),
+        );
         self.entries.push(ChatEntry::TurnSummary {
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             finished_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            status: if cancelled {
-                "cancelled"
-            } else if turn.error.is_some() {
-                "error"
-            } else {
-                "done"
-            }
-            .into(),
+            status: status.into(),
+            summary: Some(summary),
         });
         self.save_turn_outcome(&mut turn.error);
         HeadlessOutcome {
@@ -923,20 +1039,27 @@ impl SessionRunner {
         }
         self.entries.extend(turn.entries);
         if observer.is_some() {
+            let status = if cancelled {
+                "cancelled"
+            } else if turn.error.is_some() {
+                "error"
+            } else {
+                "done"
+            };
+            let summary = self.generate_turn_summary(
+                status,
+                &turn.answer,
+                &turn.tool_calls,
+                turn.error.as_deref(),
+            );
             self.entries.push(ChatEntry::TurnSummary {
                 elapsed_ms: started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 finished_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                status: if cancelled {
-                    "cancelled"
-                } else if turn.error.is_some() {
-                    "error"
-                } else {
-                    "done"
-                }
-                .into(),
+                status: status.into(),
+                summary: Some(summary),
             });
         }
         self.save_turn_outcome(&mut turn.error);
@@ -1707,7 +1830,7 @@ pub(crate) mod tests {
         assert!(outcome.tool_calls[0].output.contains("completion unknown"));
         let saved = assert_saved_history(&runner);
         assert!(
-            matches!(saved.last(), Some(ChatEntry::TurnSummary { elapsed_ms, finished_at, status })
+            matches!(saved.last(), Some(ChatEntry::TurnSummary { elapsed_ms, finished_at, status, .. })
             if *elapsed_ms >= 40 && *finished_at > 0 && status == "cancelled")
         );
         assert!(matches!(&saved[1], ChatEntry::Assistant(t) if t == &outcome.answer));
@@ -2617,6 +2740,7 @@ pub(crate) mod tests {
                     elapsed_ms: 1,
                     finished_at: 1,
                     status: status.into(),
+                    summary: Some("任务完成".into()),
                 },
             ];
             let dir = crate::history::session_dir(&runner.ctx.paths.history_dir, &runner.cwd);

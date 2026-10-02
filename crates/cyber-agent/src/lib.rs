@@ -29,7 +29,9 @@ pub use compact::{
 };
 pub use error::{AgentError, Result};
 pub use models::{extract_model_ids, fetch_models};
-pub use permission::{PermissionBroker, PermissionDecision, PermissionRequest};
+pub use permission::{
+    is_high_risk_tool, PermissionBroker, PermissionDecision, PermissionMode, PermissionRequest,
+};
 pub use provider::{provider_factory, Provider, StreamRequest};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{

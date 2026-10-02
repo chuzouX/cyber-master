@@ -17,6 +17,76 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// 审批模式：控制工具执行前的授权拦截策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum PermissionMode {
+    /// 自动审批：低风险只读工具自动放行，高风险操作（命令执行/写文件/下载等）弹出确认
+    #[default]
+    Auto,
+    /// 手动审批：每次调用任何工具都会提示 Permission Required
+    Manual,
+    /// 无限制：不弹出任何确认提示，始终自动放行（底层安全护栏仍生效）
+    Unlimited,
+}
+
+impl PermissionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动审批",
+            Self::Manual => "手动审批",
+            Self::Unlimited => "无限制",
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Unlimited => "unlimited",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" | "自动" | "自动审批" | "a" | "2" => Some(Self::Auto),
+            "manual" | "手动" | "手动审批" | "m" | "1" => Some(Self::Manual),
+            "unlimited" | "无限制" | "u" | "3" => Some(Self::Unlimited),
+            _ => None,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Manual => Self::Auto,
+            Self::Auto => Self::Unlimited,
+            Self::Unlimited => Self::Manual,
+        }
+    }
+}
+
+/// 判定某工具是否属于高风险操作（用于自动审批模式下进行拦截）。
+pub fn is_high_risk_tool(tool: &str, arguments: &Value) -> bool {
+    let lower = tool.to_lowercase();
+    match lower.as_str() {
+        // 高风险执行与写操作
+        "shell" | "bash" | "exec" => true,
+        "write_file" | "write" | "edit" | "apply_patch" => true,
+        "download_file" | "download" => true,
+        "mcp_connect" => true,
+        name if name.starts_with("custom_") => true,
+        "ctf_challenge" => {
+            // 查询题目为低风险，修改/解题状态为高风险
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            action != "list"
+        }
+        // 低风险安全工具（read_file, list_dir, find_file, search_tools, web_fetch, use_skill, save_memory 等）
+        _ => false,
+    }
+}
+
 pub struct PermissionRequest {
     pub tool: String,
     pub arguments: Value,
@@ -59,6 +129,7 @@ pub struct PermissionBroker {
     grants: Mutex<Vec<(String, Value)>>,
     explicit_tools: HashSet<String>,
     denials: AtomicU64,
+    mode: Mutex<PermissionMode>,
 }
 
 impl PermissionBroker {
@@ -68,6 +139,7 @@ impl PermissionBroker {
             grants: Mutex::new(Vec::new()),
             explicit_tools: HashSet::new(),
             denials: AtomicU64::new(0),
+            mode: Mutex::new(PermissionMode::Manual),
         }
     }
 
@@ -93,6 +165,7 @@ impl PermissionBroker {
                 grants: Mutex::new(Vec::new()),
                 explicit_tools: HashSet::new(),
                 denials: AtomicU64::new(0),
+                mode: Mutex::new(PermissionMode::Manual),
             },
             rx,
         )
@@ -103,6 +176,14 @@ impl PermissionBroker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_mode(&self, mode: PermissionMode) {
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     }
 
     /// Monotonic structured signal, distinct from ordinary tool errors.
@@ -121,6 +202,16 @@ impl PermissionBroker {
     async fn decide(&self, tool: &str, arguments: &Value) -> bool {
         if self.explicit_tools.contains(tool) {
             return true;
+        }
+        let current_mode = self.mode();
+        match current_mode {
+            PermissionMode::Unlimited => return true,
+            PermissionMode::Auto => {
+                if !is_high_risk_tool(tool, arguments) {
+                    return true;
+                }
+            }
+            PermissionMode::Manual => {}
         }
         if self
             .grants
@@ -287,5 +378,50 @@ mod tests {
         let broker = PermissionBroker::explicit_tools(["*", "all", "shell*"]);
         assert!(!broker.authorize("shell", &json!({})).await);
         assert!(!broker.authorize("write_file", &json!({})).await);
+    }
+
+    #[tokio::test]
+    async fn permission_modes_control_tool_execution_filtering() {
+        let (broker, mut requests) = PermissionBroker::interactive();
+        broker.set_mode(PermissionMode::Auto);
+        assert!(
+            broker
+                .authorize("read_file", &json!({"path": "a.txt"}))
+                .await
+        );
+        assert!(broker.authorize("list_dir", &json!({"path": "."})).await);
+        assert!(broker.authorize("search_tools", &json!({})).await);
+
+        let shell_broker = Arc::new(broker);
+        let b2 = shell_broker.clone();
+        let handle =
+            tokio::spawn(
+                async move { b2.authorize("shell", &json!({"command": "echo hi"})).await },
+            );
+        let req = requests.recv().await.unwrap();
+        assert_eq!(req.tool, "shell");
+        req.reply.send(PermissionDecision::AllowOnce).unwrap();
+        assert!(handle.await.unwrap());
+
+        shell_broker.set_mode(PermissionMode::Unlimited);
+        assert!(
+            shell_broker
+                .authorize("shell", &json!({"command": "echo free"}))
+                .await
+        );
+        assert!(
+            shell_broker
+                .authorize("write_file", &json!({"path": "f.txt"}))
+                .await
+        );
+
+        shell_broker.set_mode(PermissionMode::Manual);
+        let b3 = shell_broker.clone();
+        let handle =
+            tokio::spawn(async move { b3.authorize("read_file", &json!({"path": "m.txt"})).await });
+        let req = requests.recv().await.unwrap();
+        assert_eq!(req.tool, "read_file");
+        req.reply.send(PermissionDecision::Deny).unwrap();
+        assert!(!handle.await.unwrap());
     }
 }

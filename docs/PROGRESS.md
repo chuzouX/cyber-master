@@ -28,12 +28,12 @@
 - [x] 行式 CLI 替换为全屏简洁 coding 界面；视觉参考 [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)，不拷源码、不仿造未实现 agents/LSP。真实 palette 为暖金/灰白/cyan/紫色，彩色 ASCII `Cy` + 版本/model/effort/cwd，两行圆角输入与金色无框候选，实际状态栏 `provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output`，未知为 `--`；移除旧审批模式提示与 agent 面板入口。
 - [x] 空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，任务中 Ctrl+C cancel，空输入 Ctrl+D quit；当前空闲且空输入的 Ctrl+C 也可退出，不宣称它在所有状态都只取消。
 - [x] `/effort low|medium|high|xhigh|auto` 切换现有 agent 思考档位；medium→Middle、xhigh→Max，保留 middle/max aliases 与 `/think`，只沿用系统提示词注入，不新增 provider API `reasoning_effort`。
-- [x] 执行前审批保留当前 nonce 与精确参数授权，不是可切换 mode；bracketed paste 只插入文本，Windows 键事件粘贴使用 burst 缓冲；长参数审批固定显示控件并独立滚动，小窗口不足时禁止确认。
+- [x] 执行前审批支持三大模式：手动审批（每次调用工具弹出确认）、自动审批（低风险只读工具直接放行，高风险命令/写操作弹出确认）、无限制（完全不弹出确认，直接持续执行）。支持 F2 / Ctrl+P 快捷键及 `/mode [auto|manual|unlimited]` 即时切换。审批弹框采用按钮小卡片，支持 1/2/3 直达、方向键/Tab 选择和 Enter 确认。
 - [x] headless 文本/JSON、会话续接、默认拒绝工具和显式 `--allow-tool` 授权回归通过；布局覆盖小尺寸与超过 65535 行历史。
 - [x] 底栏 ctx 使用当前上下文估算与有效容量计算剩余百分比；cache 使用上报命中/(命中+未命中) token；input/output 为本进程当前会话实际 Usage 累计。新建/切换会话重置，切换 provider/model 不重置累计，重开不恢复；Usage 未上报或 cache 分母为零时显示 `--`。
 - [x] CLI 正文与真实 `reasoning_content` 复用 Markdown 支持子集，不宣称表格或完整 CommonMark；实际 Reasoning 显示斜体 Markdown `Thinking`，不伪造思考。参考 OMP 将工具调用、执行请求与结果统一渲染为轻量圆角小卡片（支持 Read、Edit、Write、Downloading、Shell、Fetch、List、Find 等卡片头及状态边框），折叠预览关键参数/输出并提示 `Ctrl+O details · N more lines`，Ctrl+O 展开完整内容；工具数据不伪造令牌 stats。
 - [x] 修复空 Assistant 与 interleaved Reasoning/正文导致重复 `Cyber` 标题；空 Token 不创建空回复标题，旧 history 兼容读取。
-- [x] 每轮持久化 `TurnSummary`，重开显示 `Worked for 3s · done HH:mm` 或 `error` / `cancelled`；旧历史没有摘要时不补造，展示记录不注入模型上下文。
+- [x] 每轮持久化 `TurnSummary`，在 `Worked for 3s · done HH:mm` 下新增 `※summary：xxx` 总结行：解出题目展示解题流程与 Flag，未解出总结当前卡点，非题目任务总结对话与工具执行结果。旧历史没有摘要时不补造，展示记录不注入模型上下文。
 - [x] Windows ConPTY 真实终端共 119 个断言通过（47 SSE + 72 commands），覆盖交错 Reasoning/空 Token/Markdown/Usage、120x30 与 80x12、Unicode 光标、secrets masked/cancel、17 项命令目录、compact/cancel/session 持久化与 memory rule 等。
 - [x] `cli_commands.rs` 支持 TUI 目录除 mode 外的 16 个主命令，加 effort 共 17 项；完整 slash/二级建议、Tab/Up/Down、Enter 先补全再 execute、Esc 关闭候选保留输入已实现。
 - [x] Provider add/edit 表单、掩码 API key 与 endpoint、取消不写盘、私有文件持久化、use/remove 与默认项回退；model picker 使用已配置模型，不宣称 CLI 联网拉取模型。

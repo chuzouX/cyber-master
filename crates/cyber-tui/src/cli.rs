@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use cyber_agent::{
-    estimate_messages_tokens, AgentEvent, PermissionBroker, PermissionDecision, PermissionRequest,
+    estimate_messages_tokens, AgentEvent, PermissionBroker, PermissionDecision, PermissionMode,
+    PermissionRequest,
 };
 use cyber_core::ThinkingIntensity;
 use futures::StreamExt;
@@ -82,6 +83,7 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
@@ -104,7 +106,7 @@ impl TerminalSession {
         execute!(io::stdout(), EnterAlternateScreen)?;
         // Legacy Windows consoles may not support bracketed paste. Key bursts
         // are also buffered below instead of treating pasted newlines as sends.
-        let _ = execute!(io::stdout(), EnableBracketedPaste);
+        let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
         Ok(guard)
     }
 }
@@ -222,6 +224,10 @@ struct CliScreen {
     tools_expanded: bool,
     assistant_label_shown: bool,
     recent_sessions: Vec<String>,
+    permission_mode: PermissionMode,
+    prompt_history: Vec<String>,
+    history_index: Option<usize>,
+    saved_draft: String,
 }
 
 struct FormState {
@@ -360,6 +366,21 @@ impl CliScreen {
             tools_expanded: false,
             assistant_label_shown: false,
             recent_sessions: Vec::new(),
+            permission_mode: runner
+                .ctx
+                .config
+                .agent
+                .permission_mode
+                .as_deref()
+                .and_then(PermissionMode::parse)
+                .unwrap_or(if runner.ctx.config.agent.auto_tool_call {
+                    PermissionMode::Auto
+                } else {
+                    PermissionMode::Manual
+                }),
+            prompt_history: Vec::new(),
+            history_index: None,
+            saved_draft: String::new(),
         };
         screen.sync(runner);
         screen
@@ -401,6 +422,22 @@ impl CliScreen {
             .take(4)
             .map(|session| format!("{}  {}", clean(&session.id), clean(&session.title)))
             .collect();
+        self.prompt_history = runner
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::User(text) => {
+                    let cleaned = clean(text);
+                    if !cleaned.trim().is_empty() {
+                        Some(cleaned)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        self.history_index = None;
         self.messages.clear();
         self.assistant_label_shown = false;
         self.tools.clear();
@@ -434,8 +471,9 @@ impl CliScreen {
                     elapsed_ms,
                     finished_at,
                     status,
+                    summary,
                 } => {
-                    self.turn_summary(*elapsed_ms, *finished_at, status);
+                    self.turn_summary(*elapsed_ms, *finished_at, status, summary.as_deref());
                 }
                 ChatEntry::System(text) => self.message("Notice", text, MUTED),
             }
@@ -666,7 +704,13 @@ impl CliScreen {
         }
     }
 
-    fn turn_summary(&mut self, elapsed_ms: u64, finished_at: u64, status: &str) {
+    fn turn_summary(
+        &mut self,
+        elapsed_ms: u64,
+        finished_at: u64,
+        status: &str,
+        summary: Option<&str>,
+    ) {
         self.stream.clear();
         self.response_start = None;
         self.assistant_label_shown = false;
@@ -675,6 +719,14 @@ impl CliScreen {
             crate::chat::turn_summary_text(elapsed_ms, finished_at, &clean(status)),
             Style::default().fg(DIM),
         ));
+        if let Some(summary_text) = summary {
+            if !summary_text.trim().is_empty() {
+                self.messages.push(Line::styled(
+                    format!("※summary：{summary_text}"),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
     }
 
     fn footer(&self) -> String {
@@ -706,8 +758,9 @@ impl CliScreen {
         } else {
             ("--".into(), "--".into())
         };
+        let mode_label = self.permission_mode.label();
         let mut footer = format!(
-            "  {} · {} │ ctx {context} │ cache {cache} │ ↑{input} ↓{output}",
+            "  {} · {} │ ctx {context} │ cache {cache} │ ↑{input} ↓{output} │ 模式: {mode_label} (F2)",
             clean(&self.provider),
             clean(&self.model)
         );
@@ -1135,7 +1188,7 @@ impl CliScreen {
             }
         } else if let Some(panel) = self.panel {
             let (title, text) = match panel {
-                Panel::Shortcuts => (" Shortcuts ", format!("Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nCtrl+O          Toggle tool details\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.", cli_commands::commands().iter().map(|spec| format!("{:<30} {}", spec.usage, spec.desc)).collect::<Vec<_>>().join("\n"))),
+                Panel::Shortcuts => (" Shortcuts ", format!("Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.", cli_commands::commands().iter().map(|spec| format!("{:<30} {}", spec.usage, spec.desc)).collect::<Vec<_>>().join("\n"))),
             };
             popup(frame, sections[1], title, &text);
         } else if let Some(form) = &self.form {
@@ -1931,6 +1984,28 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                             screen.completion_accepted = false;
                             screen.update_completions(runner.as_ref());
                         }
+                        Some(Ok(Event::Mouse(mouse))) => {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    if screen.approval.is_some() {
+                                        screen.approval_scroll = screen.approval_scroll.saturating_sub(3);
+                                    } else {
+                                        screen.scroll = screen.scroll.saturating_add(3).min(screen.max_scroll);
+                                    }
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    if screen.approval.is_some() {
+                                        screen.approval_scroll = screen
+                                            .approval_scroll
+                                            .saturating_add(3)
+                                            .min(screen.approval_max_scroll);
+                                    } else {
+                                        screen.scroll = screen.scroll.saturating_sub(3);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         Some(Ok(_)) => {}
                         Some(Err(error)) => return Err(error.into()),
                         None => break,
@@ -2026,6 +2101,71 @@ fn handle_key(
             screen.panel = None;
         }
         return Ok(false);
+    }
+    if key.code == KeyCode::F(2) || (control && key.code == KeyCode::Char('p')) {
+        let next_mode = screen.permission_mode.next();
+        screen.permission_mode = next_mode;
+        permissions.set_mode(next_mode);
+        screen.message(
+            "Mode",
+            &format!("已切换审批模式为：{}", next_mode.label()),
+            ACCENT,
+        );
+        return Ok(false);
+    }
+    if screen.scroll > 0
+        && screen.approval.is_none()
+        && screen.form.is_none()
+        && screen.picker.is_none()
+    {
+        if key.code == KeyCode::Up {
+            screen.scroll = screen.scroll.saturating_add(1).min(screen.max_scroll);
+            return Ok(false);
+        }
+        if key.code == KeyCode::Down {
+            screen.scroll = screen.scroll.saturating_sub(1);
+            return Ok(false);
+        }
+    } else if screen.approval.is_none()
+        && screen.form.is_none()
+        && screen.picker.is_none()
+        && screen.panel.is_none()
+        && (screen.completion_closed || screen.completions.is_empty())
+        && key.modifiers.is_empty()
+    {
+        if key.code == KeyCode::Up && screen.input.lines().len() <= 1 {
+            if !screen.prompt_history.is_empty() {
+                if screen.history_index.is_none() {
+                    screen.saved_draft = screen.input.lines().join("\n");
+                    screen.history_index = Some(screen.prompt_history.len() - 1);
+                } else if let Some(idx) = screen.history_index {
+                    if idx > 0 {
+                        screen.history_index = Some(idx - 1);
+                    }
+                }
+                if let Some(idx) = screen.history_index {
+                    let text = screen.prompt_history[idx].clone();
+                    screen.input = composer();
+                    screen.input.insert_str(&text);
+                }
+                return Ok(false);
+            }
+        } else if key.code == KeyCode::Down && screen.input.lines().len() <= 1 {
+            if let Some(idx) = screen.history_index {
+                if idx + 1 < screen.prompt_history.len() {
+                    screen.history_index = Some(idx + 1);
+                    let text = screen.prompt_history[idx + 1].clone();
+                    screen.input = composer();
+                    screen.input.insert_str(&text);
+                } else {
+                    screen.history_index = None;
+                    let draft = std::mem::take(&mut screen.saved_draft);
+                    screen.input = composer();
+                    screen.input.insert_str(&draft);
+                }
+                return Ok(false);
+            }
+        }
     }
     if key.code == KeyCode::PageUp {
         if screen.approval.is_some() {
@@ -2318,6 +2458,9 @@ fn handle_key(
         return Ok(false);
     };
     screen.message("You", text, ACCENT);
+    screen.prompt_history.push(text.to_owned());
+    screen.history_index = None;
+    screen.saved_draft.clear();
     screen.scroll = 0;
     screen.busy = true;
     screen.status = "Working".into();
@@ -2400,6 +2543,15 @@ fn apply_action(
             }
         }
         CliAction::Quit => return Ok(true),
+        CliAction::Mode(mode) => {
+            screen.permission_mode = mode;
+            permissions.set_mode(mode);
+            screen.message(
+                "Mode",
+                &format!("已切换审批模式为：{}", mode.label()),
+                ACCENT,
+            );
+        }
     }
     Ok(false)
 }
@@ -3172,7 +3324,7 @@ mod tests {
         screen.tool_result("read-1", "read_file", "actual contents", false);
         screen.tool_call("shell-1", "shell", r#"{"command":"false"}"#);
         screen.tool_result("shell-1", "shell", "permission denied", true);
-        screen.turn_summary(2000, 1_700_000_000, "done");
+        screen.turn_summary(2000, 1_700_000_000, "done", Some("任务完成"));
         let snapshot = render(&mut screen, 110, 35);
         for marker in [
             "Cyber Master V",
@@ -3393,6 +3545,7 @@ mod tests {
                 elapsed_ms: 3_999,
                 finished_at,
                 status: status.into(),
+                summary: None,
             }];
             screen.sync(&runner);
             assert_eq!(
@@ -3402,7 +3555,7 @@ mod tests {
             assert_eq!(screen.messages.last().unwrap().style.fg, Some(DIM));
             assert_eq!(screen.messages, CliScreen::new(&runner).messages);
         }
-        screen.turn_summary(0, u64::MAX, "error");
+        screen.turn_summary(0, u64::MAX, "error", None);
         assert!(history(&screen).ends_with("error --:--"));
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
@@ -3662,6 +3815,155 @@ mod tests {
         page_key(&mut screen, KeyCode::PageUp);
         assert_eq!(screen.scroll, 0);
         let _ = std::fs::remove_dir_all(&runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn prompt_history_cycles_with_up_and_down_and_restores_draft() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.prompt_history = vec!["first query".into(), "second query".into()];
+        screen.input.insert_str("my draft");
+
+        let (broker, _rx) = PermissionBroker::interactive();
+        let broker = Arc::new(broker);
+        let (events, _rx_ev) = mpsc::unbounded_channel();
+        let mut runner_opt = Some(runner);
+
+        // Press Up: loads latest ("second query")
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut runner_opt,
+            &broker,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.input.lines().join("\n"), "second query");
+
+        // Press Up again: loads earlier ("first query")
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut runner_opt,
+            &broker,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.input.lines().join("\n"), "first query");
+
+        // Press Down: moves back to "second query"
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut runner_opt,
+            &broker,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.input.lines().join("\n"), "second query");
+
+        // Press Down: restores "my draft"
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut runner_opt,
+            &broker,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.input.lines().join("\n"), "my draft");
+        assert!(screen.history_index.is_none());
+        let _ = std::fs::remove_dir_all(runner_opt.unwrap().cwd);
+    }
+
+    #[tokio::test]
+    async fn f2_and_mode_command_cycle_permission_modes() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let (broker, _rx) = PermissionBroker::interactive();
+        let broker = Arc::new(broker);
+        let (events, _rx_ev) = mpsc::unbounded_channel();
+        let mut runner_opt = Some(runner);
+
+        assert_eq!(screen.permission_mode, PermissionMode::Auto);
+        assert!(screen.footer().contains("模式: 自动审批 (F2)"));
+
+        // Press F2 -> Unlimited
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &mut runner_opt,
+            &broker,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.permission_mode, PermissionMode::Unlimited);
+        assert_eq!(broker.mode(), PermissionMode::Unlimited);
+        assert!(screen.footer().contains("模式: 无限制 (F2)"));
+
+        // Press F2 again -> Manual
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &mut runner_opt,
+            &broker,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.permission_mode, PermissionMode::Manual);
+        assert_eq!(broker.mode(), PermissionMode::Manual);
+        assert!(screen.footer().contains("模式: 手动审批 (F2)"));
+        let _ = std::fs::remove_dir_all(runner_opt.unwrap().cwd);
+    }
+
+    #[tokio::test]
+    async fn turn_summary_renders_ctf_and_general_summaries() {
+        let mut runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // 1. General task summary
+        screen.turn_summary(
+            5000,
+            1_700_000_000,
+            "done",
+            Some("任务完成：调用 [list_dir]，已列出当前工作目录条目"),
+        );
+        render(&mut screen, 100, 20);
+        assert!(history(&screen).contains("※summary：任务完成：调用 [list_dir]"));
+        // 2. CTF Solved summary
+        let mut ch = cyber_core::CtfChallenge::new("web-sqli".into(), cyber_core::CtfCategory::Web);
+        ch.status = cyber_core::CtfStatus::Solved;
+        ch.flag = Some("NSSCTF{flag_sqli_success}".into());
+        runner.replace_challenges(vec![ch]).unwrap();
+
+        let summary =
+            runner.generate_turn_summary("done", "利用 SQL 盲注成功提取 Flag 并提交", &[], None);
+        assert!(summary.contains("题目【web-sqli】已解出 (Flag: NSSCTF{flag_sqli_success})"));
+
+        // 3. CTF InProgress blocker summary
+        let mut ch_prog =
+            cyber_core::CtfChallenge::new("pwn-stack".into(), cyber_core::CtfCategory::Pwn);
+        ch_prog.status = cyber_core::CtfStatus::InProgress;
+        ch_prog.key_points = Some("开启了 Canary 与 PIE 保护，需先泄露基址".into());
+        runner.replace_challenges(vec![ch_prog]).unwrap();
+
+        let blocker_summary = runner.generate_turn_summary("done", "探测保护机制中", &[], None);
+        assert!(
+            blocker_summary.contains("题目【pwn-stack】尚未解出，卡点：开启了 Canary 与 PIE 保护")
+        );
+        let _ = std::fs::remove_dir_all(runner.cwd);
     }
 
     #[test]
