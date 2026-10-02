@@ -172,3 +172,29 @@ fn missing_configuration_in_script_returns_json_without_prompting() {
     assert!(result["error"].as_str().unwrap().contains("cyber setup"));
     assert!(!home.path().join(".cyber/setup.toml").exists());
 }
+#[test]
+fn help_and_version_output_are_formatted_and_informative() {
+    let home = tempfile::tempdir().unwrap();
+    let help_out = command(home.path()).arg("--help").output().unwrap();
+    assert!(help_out.status.success());
+    let help_str = String::from_utf8_lossy(&help_out.stdout);
+    assert!(help_str.contains("运行模式"));
+    assert!(help_str.contains("常用示例"));
+    assert!(help_str.contains("tui"));
+    assert!(help_str.contains("setup"));
+    assert!(help_str.contains("run"));
+
+    let run_help_out = command(home.path())
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    assert!(run_help_out.status.success());
+    let run_help_str = String::from_utf8_lossy(&run_help_out.stdout);
+    assert!(run_help_str.contains("PROMPT"));
+    assert!(run_help_str.contains("示例:"));
+
+    let ver_out = command(home.path()).arg("--version").output().unwrap();
+    assert!(ver_out.status.success());
+    let ver_str = String::from_utf8_lossy(&ver_out.stdout);
+    assert!(ver_str.contains("cyber"));
+}

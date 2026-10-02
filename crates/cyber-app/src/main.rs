@@ -31,20 +31,49 @@ use tokio::sync::mpsc;
 #[command(
     name = "cyber",
     version,
-    about = "网络安全智能体终端（对话 + 工作流 DAG）"
+    about = "网络安全智能体终端：代码交互、任务编排与 CTF 协作",
+    long_about = "Cyber Master 是基于 Rust 构建的高性能网络安全智能体终端。\n\n\
+                 运行模式：\n  \
+                 cyber                   默认交互模式：全屏简洁 coding CLI，支持流式对话、\n                          \
+                 工具调用（Shell/文件/搜索等）、Todo 任务拆解与子 Agent 并行委派\n  \
+                 cyber tui               全屏多面板模式：包含 CTF 题目协作、系统设置与多视图切换\n  \
+                 cyber run \"<prompt>\"    Headless 非交互模式：单次执行任务（支持流式文本或结构化 JSON）\n  \
+                 cyber setup             交互式向导：配置模型服务商、API 凭据与默认模型",
+    after_help = "常用示例:\n  \
+                  cyber                         # 启动默认交互式 Coding CLI\n  \
+                  cyber --mock                  # 以离线模拟模式启动（免配置 API 密钥快速体验）\n  \
+                  cyber tui                     # 启动全屏 TUI 面板（CTF 题目/设置/多视图）\n  \
+                  cyber setup                   # 运行或重新配置模型服务商向导\n  \
+                  cyber run \"总结当前目录结构\" # 单次执行任务并流式输出结果到终端\n  \
+                  cyber run \"检查代码\" --format json --allow-tool list_dir,read_file\n  \
+                  cyber run \"继续分析\" --session <id>  # 续接指定历史会话\n\n\
+                  文档与命令参考:\n  \
+                  https://github.com/chuzouX/cyber-master\n  \
+                  docs/TUI_COMMANDS.md",
+    subcommand_help_heading = "子命令",
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 struct Cli {
     /// 工作目录（默认当前目录，决定 `.cyber.md` / `.cyber/` 检测位置）
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// 日志级别（覆盖 RUST_LOG，如 debug/info/warn）
-    #[arg(long, global = true)]
+    /// 日志级别（trace | debug | info | warn | error，覆盖 RUST_LOG）
+    #[arg(long, global = true, value_name = "LEVEL")]
     log_level: Option<String>,
 
-    /// 离线 Mock 模式：强制使用 MockProvider，无需联网/API key（用于冒烟测试）
+    /// 离线 Mock 模式：强制使用 MockProvider，无需联网/API Key（用于冒烟测试与离线体验）
     #[arg(long, global = true)]
     mock: bool,
+
+    /// 打印帮助信息
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Help, global = true)]
+    help: Option<bool>,
+
+    /// 打印版本信息
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+    version: Option<bool>,
 
     /// 子命令
     #[command(subcommand)]
@@ -54,16 +83,22 @@ struct Cli {
 /// 子命令。
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// 启动全屏 TUI 面板。
+    /// 启动全屏 TUI 多面板模式（包含 CTF 题目协作、系统设置、模型管理等）
     Tui,
-    /// 配置模型服务商、凭据和默认模型。
+    /// 运行交互式配置向导（设置模型服务商、API 凭据和默认模型）
     Setup,
-    /// headless 非交互执行一次 agent 任务（可被外部 agent/脚本接管）。
-    ///
-    /// 示例：
-    ///   cyber run "列出当前目录" --allow-tool list_dir
-    ///   cyber run "解释这个概念" --format json
-    ///   cyber run "继续上次任务" --session abc    # 续接会话
+    /// 单次非交互执行 agent 任务（headless 自动化模式，支持流式文本或 JSON 输出）
+    #[command(
+        about = "单次非交互执行 agent 任务（headless 模式，可被外部脚本接管）",
+        long_about = "在命令行中单次执行 agent 任务，支持纯文本流式输出或结构化 JSON 输出。\n\n\
+                     适用于自动化脚本、CI/CD 流程或作为外部工具集成。",
+        after_help = "示例:\n  \
+                      cyber run \"解释这个概念\"\n  \
+                      cyber run \"列出当前目录\" --allow-tool list_dir\n  \
+                      cyber run \"分析代码隐患\" --format json --allow-tool read_file,list_dir\n  \
+                      cyber run \"继续分析\" --session <session-id>\n  \
+                      cyber run \"离线测试\" --mock --allow-tool list_dir"
+    )]
     Run(RunArgs),
 }
 
@@ -71,14 +106,20 @@ enum Command {
 #[derive(clap::Args, Debug)]
 struct RunArgs {
     /// 任务描述（用户 prompt）
+    #[arg(value_name = "PROMPT")]
     prompt: String,
 
     /// 输出格式：text（流式 Markdown）| json（结构化，含工具调用与 token 用量）
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        value_name = "FORMAT"
+    )]
     format: OutputFormat,
 
     /// 续接指定 session id（默认续接当前 session）
-    #[arg(long)]
+    #[arg(long, value_name = "ID")]
     session: Option<String>,
 
     /// 新建会话（忽略历史）
@@ -86,26 +127,25 @@ struct RunArgs {
     new: bool,
 
     /// 最大工具调用步数（覆盖 config）
-    #[arg(long)]
+    #[arg(long, value_name = "STEPS")]
     max_steps: Option<u32>,
 
-    /// 思考强度（覆盖 config：low/middle/high/max/auto）
-    #[arg(long)]
+    /// 思考强度（覆盖 config：low / middle / high / max / auto）
+    #[arg(long, value_name = "LEVEL")]
     think: Option<String>,
 
     /// 指定 provider（providers.toml 中的名称，覆盖 default_provider）
-    #[arg(long)]
+    #[arg(long, value_name = "NAME")]
     provider: Option<String>,
 
     /// 指定模型 id（覆盖所选 provider 的默认 model）
-    #[arg(long)]
+    #[arg(long, value_name = "MODEL")]
     model: Option<String>,
 
-    /// 显式允许指定工具（可重复）；允许其任意参数，但不绕过内置护栏。
-    #[arg(long = "allow-tool")]
+    /// 显式允许指定工具（可重复使用）；允许其任意参数，但不绕过内置护栏。
+    #[arg(long = "allow-tool", value_name = "TOOL")]
     allow_tools: Vec<String>,
 }
-
 /// 输出格式。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 enum OutputFormat {
