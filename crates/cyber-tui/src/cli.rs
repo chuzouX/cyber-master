@@ -2134,6 +2134,55 @@ fn handle_key(
         );
         return Ok(false);
     }
+    if !screen.completion_closed
+        && !screen.completions.is_empty()
+        && screen.approval.is_none()
+        && screen.form.is_none()
+        && screen.picker.is_none()
+    {
+        let is_up = key.code == KeyCode::Up
+            || (!control
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && key.code == KeyCode::Char('8')
+                && !screen.input.lines()[0].contains(' '));
+        let is_down = key.code == KeyCode::Down
+            || (!control
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && key.code == KeyCode::Char('2')
+                && !screen.input.lines()[0].contains(' '));
+
+        if is_up {
+            screen.completion_accepted = false;
+            screen.completion_selected = (screen.completion_selected + screen.completions.len()
+                - 1)
+                % screen.completions.len();
+            return Ok(false);
+        }
+        if is_down {
+            screen.completion_accepted = false;
+            screen.completion_selected =
+                (screen.completion_selected + 1) % screen.completions.len();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Tab {
+            screen.complete();
+            screen.completion_accepted = true;
+            screen.update_completions(runner.as_ref());
+            return Ok(false);
+        }
+        if key.code == KeyCode::BackTab {
+            screen.completion_accepted = false;
+            screen.completion_selected = (screen.completion_selected + screen.completions.len()
+                - 1)
+                % screen.completions.len();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Enter && !screen.completion_accepted && screen.complete() {
+            screen.completion_accepted = true;
+            screen.update_completions(runner.as_ref());
+            return Ok(false);
+        }
+    }
     if screen.scroll > 0
         && screen.approval.is_none()
         && screen.form.is_none()
@@ -2383,35 +2432,6 @@ fn handle_key(
             }
         }
         return Ok(false);
-    }
-    if !screen.completion_closed && !screen.completions.is_empty() && key.modifiers.is_empty() {
-        match key.code {
-            KeyCode::Up => {
-                screen.completion_accepted = false;
-                screen.completion_selected =
-                    (screen.completion_selected + screen.completions.len() - 1)
-                        % screen.completions.len();
-                return Ok(false);
-            }
-            KeyCode::Down => {
-                screen.completion_accepted = false;
-                screen.completion_selected =
-                    (screen.completion_selected + 1) % screen.completions.len();
-                return Ok(false);
-            }
-            KeyCode::Tab => {
-                screen.complete();
-                screen.completion_accepted = true;
-                screen.update_completions(runner.as_ref());
-                return Ok(false);
-            }
-            KeyCode::Enter if !screen.completion_accepted && screen.complete() => {
-                screen.completion_accepted = true;
-                screen.update_completions(runner.as_ref());
-                return Ok(false);
-            }
-            _ => {}
-        }
     }
     if screen.input.is_empty() && key.code == KeyCode::Char('?') {
         screen.panel = Some(Panel::Shortcuts);
@@ -3072,6 +3092,29 @@ mod tests {
         assert_eq!(screen.completion_selected, 1);
         input_key(&mut screen, &mut runner, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(screen.completion_selected, 0);
+        // Numpad 2 (Down) and 8 (Up) select in command palette
+        input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.completion_selected, 1);
+        input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('8'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.completion_selected, 0);
+        // When scrolled up, menu navigation is prioritized
+        screen.scroll = 5;
+        input_key(&mut screen, &mut runner, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(screen.completion_selected, 1);
+        assert_eq!(screen.scroll, 5);
+        input_key(&mut screen, &mut runner, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(screen.completion_selected, 0);
+        screen.scroll = 0;
         let selected = screen.completions[0].value.clone();
         input_key(&mut screen, &mut runner, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(screen.input.lines().join("\n"), selected);
