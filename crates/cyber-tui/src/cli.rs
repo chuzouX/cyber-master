@@ -769,7 +769,6 @@ impl CliScreen {
         match event {
             AgentEvent::Token(token) => {
                 self.has_run = true;
-                self.thinking_started = None;
                 self.response_text(false, &token);
                 self.status = "Responding".into();
             }
@@ -787,13 +786,11 @@ impl CliScreen {
                 arguments,
             } => {
                 self.has_run = true;
-                self.thinking_started = None;
                 self.tool_call(&id, &name, &arguments);
                 self.status = format!("Tool · {name}");
             }
             AgentEvent::ToolProgress { id, name, chunk } => {
                 self.has_run = true;
-                self.thinking_started = None;
                 self.tool_progress(&id, &name, &chunk);
                 self.status = format!("Running · {name}");
             }
@@ -804,7 +801,6 @@ impl CliScreen {
                 is_error,
             } => {
                 self.has_run = true;
-                self.thinking_started = None;
                 self.tool_result(&id, &name, &output, is_error);
             }
             AgentEvent::ContextUpdate {
@@ -832,17 +828,19 @@ impl CliScreen {
             }
             AgentEvent::Compacting { .. } => {
                 self.has_run = true;
-                self.thinking_started = None;
                 self.status = "Compacting context".into();
+            }
+            AgentEvent::Done => {
+                self.busy = false;
+                self.thinking_started = None;
             }
             AgentEvent::Error(error) => {
                 self.has_run = true;
+                self.busy = false;
                 self.thinking_started = None;
                 self.message("Error", &error, ERROR);
             }
-            _ => {
-                self.thinking_started = None;
-            }
+            _ => {}
         }
     }
 
@@ -1107,9 +1105,11 @@ impl CliScreen {
                 single_line(&self.model),
                 effort_label(self.effort)
             );
-            if let Some(started) = self.thinking_started {
-                let secs = started.elapsed().as_secs();
-                format!(" Cy > ({secs}s) > {model_effort} ")
+            if self.busy {
+                let secs = self
+                    .thinking_started
+                    .map_or(0, |started| started.elapsed().as_secs());
+                format!(" Cy > {secs}s > {model_effort} ")
             } else {
                 format!(" {model_effort} ")
             }
@@ -2484,8 +2484,8 @@ fn handle_key(
     screen.saved_draft.clear();
     screen.scroll = 0;
     screen.has_run = true;
-    screen.thinking_started = None;
     screen.busy = true;
+    screen.thinking_started = Some(std::time::Instant::now());
     screen.status = "Working".into();
     let text = text.to_owned();
     let permissions = permissions.clone();
@@ -2550,6 +2550,8 @@ fn apply_action(
                 let (tx, rx) = oneshot::channel();
                 *cancel = Some(tx);
                 screen.busy = true;
+                screen.has_run = true;
+                screen.thinking_started = Some(std::time::Instant::now());
                 screen.status = "Working".into();
                 *active = Some(tokio::spawn(async move {
                     let outcome =
@@ -3987,6 +3989,45 @@ mod tests {
         assert!(
             blocker_summary.contains("题目【pwn-stack】尚未解出，卡点：开启了 Canary 与 PIE 保护")
         );
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn thinking_title_and_lazy_footer_match_activity_states() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.model = "deepseek-v4-1-flash-260910".into();
+        screen.effort = ThinkingIntensity::Low;
+
+        // 1. Fresh session before run: no footer metrics, title unchanged
+        assert!(!screen.has_run);
+        assert!(screen.footer().is_empty());
+        let text = render(&mut screen, 120, 24);
+        assert!(text.contains("deepseek-v4-1-flash-260910 · low"));
+        assert!(!text.contains("Cy >"));
+        assert!(!text.contains("ctx"));
+        assert!(!text.contains("cache"));
+
+        // 2. Active run (thinking / processing): title shows Cy > 0s > model · effort
+        screen.busy = true;
+        screen.thinking_started = Some(std::time::Instant::now());
+        let busy_text = render(&mut screen, 120, 24);
+        assert!(busy_text.contains("Cy > 0s > deepseek-v4-1-flash-260910 · low"));
+        assert!(
+            !busy_text.contains("(0s)"),
+            "should not have parentheses around duration"
+        );
+
+        // 3. After run completes: footer displays metrics line
+        screen.busy = false;
+        screen.has_run = true;
+        screen.thinking_started = None;
+        let done_text = render(&mut screen, 120, 24);
+        assert!(done_text.contains("deepseek-v4-1-flash-260910 · low"));
+        assert!(!done_text.contains("Cy >"));
+        assert!(screen
+            .footer()
+            .contains("deepseek-v4-1-flash-260910 │ ctx -- │ cache -- │ ↑-- ↓--"));
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 
