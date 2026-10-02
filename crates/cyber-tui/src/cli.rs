@@ -17,8 +17,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use cyber_agent::{
-    estimate_messages_tokens, AgentEvent, PermissionBroker, PermissionDecision, PermissionMode,
-    PermissionRequest,
+    estimate_messages_tokens, AgentEvent, ApprovalChoice, PermissionBroker, PermissionDecision,
+    PermissionMode, PermissionRequest,
 };
 use cyber_core::ThinkingIntensity;
 use futures::StreamExt;
@@ -122,31 +122,6 @@ enum Panel {
     Shortcuts,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ApprovalChoice {
-    Once,
-    Session,
-    Deny,
-}
-
-impl ApprovalChoice {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Once => "Allow once",
-            Self::Session => "Allow for this session",
-            Self::Deny => "Deny execution",
-        }
-    }
-
-    fn decision(self) -> PermissionDecision {
-        match self {
-            Self::Once => PermissionDecision::AllowOnce,
-            Self::Session => PermissionDecision::AllowSession,
-            Self::Deny => PermissionDecision::Deny,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolCardState {
     Pending,
@@ -228,6 +203,8 @@ struct CliScreen {
     prompt_history: Vec<String>,
     history_index: Option<usize>,
     saved_draft: String,
+    thinking_started: Option<std::time::Instant>,
+    has_run: bool,
 }
 
 struct FormState {
@@ -381,6 +358,8 @@ impl CliScreen {
             prompt_history: Vec::new(),
             history_index: None,
             saved_draft: String::new(),
+            thinking_started: None,
+            has_run: false,
         };
         screen.sync(runner);
         screen
@@ -437,6 +416,8 @@ impl CliScreen {
                 _ => None,
             })
             .collect();
+        self.thinking_started = None;
+        self.has_run = !runner.entries.is_empty() || self.usage_reported;
         self.history_index = None;
         self.messages.clear();
         self.assistant_label_shown = false;
@@ -495,6 +476,7 @@ impl CliScreen {
         self.response_start = None;
         self.messages.push(Line::default());
         if label == "You" {
+            self.has_run = true;
             self.assistant_label_shown = false;
             let style = Style::default().fg(FG).bg(USER_BG);
             self.messages.push(Line::styled("", style));
@@ -712,6 +694,7 @@ impl CliScreen {
         summary: Option<&str>,
     ) {
         self.stream.clear();
+        self.has_run = true;
         self.response_start = None;
         self.assistant_label_shown = false;
         self.messages.push(Line::default());
@@ -730,6 +713,15 @@ impl CliScreen {
     }
 
     fn footer(&self) -> String {
+        if !self.has_run {
+            if self.approval.is_some() {
+                return "  permission required · 1/2/3 select · Enter confirm · Esc deny".into();
+            } else if !self.status.is_empty() {
+                return format!("  {}", clean(&self.status));
+            } else {
+                return String::new();
+            }
+        }
         let context = self
             .context_length
             .filter(|length| *length > 0)
@@ -776,10 +768,16 @@ impl CliScreen {
     fn event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Token(token) => {
+                self.has_run = true;
+                self.thinking_started = None;
                 self.response_text(false, &token);
                 self.status = "Responding".into();
             }
             AgentEvent::Reasoning(token) => {
+                self.has_run = true;
+                if self.thinking_started.is_none() {
+                    self.thinking_started = Some(std::time::Instant::now());
+                }
                 self.response_text(true, &token);
                 self.status = "Thinking".into();
             }
@@ -788,10 +786,14 @@ impl CliScreen {
                 name,
                 arguments,
             } => {
+                self.has_run = true;
+                self.thinking_started = None;
                 self.tool_call(&id, &name, &arguments);
                 self.status = format!("Tool · {name}");
             }
             AgentEvent::ToolProgress { id, name, chunk } => {
+                self.has_run = true;
+                self.thinking_started = None;
                 self.tool_progress(&id, &name, &chunk);
                 self.status = format!("Running · {name}");
             }
@@ -801,6 +803,8 @@ impl CliScreen {
                 output,
                 is_error,
             } => {
+                self.has_run = true;
+                self.thinking_started = None;
                 self.tool_result(&id, &name, &output, is_error);
             }
             AgentEvent::ContextUpdate {
@@ -811,6 +815,7 @@ impl CliScreen {
                 self.context_length = effective_context_length;
             }
             AgentEvent::Usage(usage) => {
+                self.has_run = true;
                 self.usage_reported = true;
                 self.prompt_tokens = self
                     .prompt_tokens
@@ -825,9 +830,19 @@ impl CliScreen {
                     .cache_miss_tokens
                     .saturating_add(u128::from(usage.cache_miss_tokens));
             }
-            AgentEvent::Compacting { .. } => self.status = "Compacting context".into(),
-            AgentEvent::Error(error) => self.message("Error", &error, ERROR),
-            _ => {}
+            AgentEvent::Compacting { .. } => {
+                self.has_run = true;
+                self.thinking_started = None;
+                self.status = "Compacting context".into();
+            }
+            AgentEvent::Error(error) => {
+                self.has_run = true;
+                self.thinking_started = None;
+                self.message("Error", &error, ERROR);
+            }
+            _ => {
+                self.thinking_started = None;
+            }
         }
     }
 
@@ -1087,11 +1102,17 @@ impl CliScreen {
                     .unwrap_or_default()
             )
         } else {
-            format!(
-                " {} · {} ",
+            let model_effort = format!(
+                "{} · {}",
                 single_line(&self.model),
                 effort_label(self.effort)
-            )
+            );
+            if let Some(started) = self.thinking_started {
+                let secs = started.elapsed().as_secs();
+                format!(" Cy > ({secs}s) > {model_effort} ")
+            } else {
+                format!(" {model_effort} ")
+            }
         };
         let secret = self.approval.is_none()
             && self.form.as_ref().is_some_and(|form| {
@@ -2462,6 +2483,8 @@ fn handle_key(
     screen.history_index = None;
     screen.saved_draft.clear();
     screen.scroll = 0;
+    screen.has_run = true;
+    screen.thinking_started = None;
     screen.busy = true;
     screen.status = "Working".into();
     let text = text.to_owned();
@@ -3564,6 +3587,7 @@ mod tests {
     async fn usage_is_reported_independently_of_cache_and_survives_same_session_sync() {
         let runner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&runner);
+        screen.has_run = true;
         assert!(screen.footer().contains("ctx -- │ cache -- │ ↑-- ↓--"));
         screen.event(AgentEvent::Usage(cyber_agent::Usage {
             prompt_tokens: 51_100,
@@ -3586,9 +3610,7 @@ mod tests {
         let footer = screen.footer();
         screen.sync(&runner);
         assert_eq!(screen.footer(), footer);
-        assert!(CliScreen::new(&runner)
-            .footer()
-            .contains("cache -- │ ↑-- ↓--"));
+        assert!(CliScreen::new(&runner).footer().is_empty());
         for capacity in [None, Some(0), Some(100)] {
             screen.event(AgentEvent::ContextUpdate {
                 used_tokens: usize::MAX,
@@ -3894,6 +3916,8 @@ mod tests {
         let mut runner_opt = Some(runner);
 
         assert_eq!(screen.permission_mode, PermissionMode::Auto);
+        assert!(screen.footer().is_empty());
+        screen.has_run = true;
         assert!(screen.footer().contains("模式: 自动审批 (F2)"));
 
         // Press F2 -> Unlimited
@@ -3996,6 +4020,7 @@ mod tests {
         let mut screen = CliScreen::new(&runner);
         screen.model = "deepseek-v4-flash-0731".into();
         screen.effort = ThinkingIntensity::Max;
+        screen.has_run = true;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| screen.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer().clone();

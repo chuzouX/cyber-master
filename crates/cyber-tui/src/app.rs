@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     DefaultTerminal, Frame,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -37,8 +37,9 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use cyber_agent::{
-    context_remaining_percent, fetch_models, run_compact_stream, run_stream, run_writeup_stream,
-    AgentEvent, Message, ToolRegistry, Usage,
+    context_remaining_percent, fetch_models, run_compact_stream, run_stream_with_permissions,
+    run_writeup_stream, AgentEvent, ApprovalChoice, Message, PermissionBroker, PermissionDecision,
+    PermissionMode, PermissionRequest, ToolRegistry, Usage,
 };
 use cyber_core::{
     current_time_str, save_config, save_providers, Config, CtfCategory, CtfChallenge, CtfStatus,
@@ -444,6 +445,11 @@ pub struct App {
     /// true：滚轮翻页（终端原生选区被禁用）；
     /// false：可拖拽选区复制（滚轮事件会被终端翻译为 ↑/↓，不再路由到 scroll_history）。
     mouse_capture: bool,
+    pub permissions: Arc<PermissionBroker>,
+    pub permission_rx: Option<UnboundedReceiver<PermissionRequest>>,
+    pub pending_permission: Option<PermissionRequest>,
+    pub permission_choice: Option<ApprovalChoice>,
+    pub permission_mode: PermissionMode,
 }
 
 const WELCOME_OPTIONS: usize = 5;
@@ -471,6 +477,19 @@ impl App {
             .ctf_challenges
             .clone()
             .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
+        let initial_mode = config
+            .agent
+            .permission_mode
+            .as_deref()
+            .and_then(PermissionMode::parse)
+            .unwrap_or(if config.agent.auto_tool_call {
+                PermissionMode::Auto
+            } else {
+                PermissionMode::Manual
+            });
+        let (broker, permission_rx) = PermissionBroker::interactive();
+        broker.set_mode(initial_mode);
+        let permissions = Arc::new(broker);
         Self {
             config_at_entry: config.clone(),
             providers_at_entry: providers.clone(),
@@ -521,6 +540,11 @@ impl App {
             log_viewer: LogViewerState::default(),
             model_picker: ModelPickerState::default(),
             mouse_capture: true,
+            permissions,
+            permission_rx: Some(permission_rx),
+            pending_permission: None,
+            permission_choice: None,
+            permission_mode: initial_mode,
         }
     }
 
@@ -567,8 +591,17 @@ impl App {
             execute!(io::stdout(), EnableMouseCapture)?;
         }
         // 即使 main_loop 出错也先恢复终端，避免终端卡在 alternate screen。
+        let mut permission_rx = self
+            .permission_rx
+            .take()
+            .unwrap_or_else(|| PermissionBroker::interactive().1);
         let result = self
-            .main_loop(&mut terminal, &mut agent_rx, &mut fetch_rx)
+            .main_loop(
+                &mut terminal,
+                &mut agent_rx,
+                &mut fetch_rx,
+                &mut permission_rx,
+            )
             .await;
         // 退出前持久化当前对话（catch-all，覆盖所有退出路径）。
         self.save_history();
@@ -618,6 +651,7 @@ impl App {
         terminal: &mut DefaultTerminal,
         agent_rx: &mut UnboundedReceiver<(u64, AgentEvent)>,
         fetch_rx: &mut UnboundedReceiver<FetchResult>,
+        permission_rx: &mut UnboundedReceiver<PermissionRequest>,
     ) -> io::Result<()> {
         // crossterm EventStream 必须fuse；Windows console handle 可用。
         let mut events = crossterm::event::EventStream::new().fuse();
@@ -631,6 +665,12 @@ impl App {
             terminal.draw(|f| self.render(f))?;
             tokio::select! {
                 biased;
+                req = permission_rx.recv(), if self.pending_permission.is_none() => {
+                    if let Some(req) = req {
+                        self.pending_permission = Some(req);
+                        self.permission_choice = None;
+                    }
+                }
                 maybe_ev = events.next() => {
                     if let Some(Ok(ev)) = maybe_ev {
                         self.handle_event(ev);
@@ -746,6 +786,56 @@ impl App {
 
     /// Chat 模式按键分发（文本输入态）。
     fn handle_chat_key(&mut self, k: KeyEvent) {
+        if self.pending_permission.is_some() {
+            use crossterm::event::KeyCode;
+            match k.code {
+                KeyCode::Char('1') => self.permission_choice = Some(ApprovalChoice::Once),
+                KeyCode::Char('2') => self.permission_choice = Some(ApprovalChoice::Session),
+                KeyCode::Char('3') => self.permission_choice = Some(ApprovalChoice::Deny),
+                KeyCode::Left | KeyCode::BackTab => {
+                    self.permission_choice = match self.permission_choice {
+                        Some(ApprovalChoice::Deny) => Some(ApprovalChoice::Session),
+                        Some(ApprovalChoice::Session) => Some(ApprovalChoice::Once),
+                        _ => Some(ApprovalChoice::Deny),
+                    };
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    self.permission_choice = match self.permission_choice {
+                        Some(ApprovalChoice::Once) => Some(ApprovalChoice::Session),
+                        Some(ApprovalChoice::Session) => Some(ApprovalChoice::Deny),
+                        _ => Some(ApprovalChoice::Once),
+                    };
+                }
+                KeyCode::Enter => {
+                    if let Some(choice) = self.permission_choice {
+                        if let Some(req) = self.pending_permission.take() {
+                            let _ = req.reply.send(choice.decision());
+                        }
+                        self.permission_choice = None;
+                    }
+                }
+                KeyCode::Esc => {
+                    if let Some(req) = self.pending_permission.take() {
+                        let _ = req.reply.send(PermissionDecision::Deny);
+                    }
+                    self.permission_choice = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if k.code == crossterm::event::KeyCode::F(2)
+            || (k
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+                && k.code == crossterm::event::KeyCode::Char('p'))
+        {
+            let next = self.permission_mode.next();
+            self.permission_mode = next;
+            self.permissions.set_mode(next);
+            self.toast = Some(format!("已切换审批模式为：{}", next.label()));
+            return;
+        }
         if self.toast.is_some() {
             self.toast = None;
         }
@@ -1442,8 +1532,9 @@ impl App {
             self.paths.cwd.join(".cyber").join("memory.md"),
         )
         .load_all();
+        let permissions = self.permissions.clone();
         let handle = tokio::spawn(async move {
-            run_stream(
+            run_stream_with_permissions(
                 config,
                 providers,
                 project,
@@ -1457,6 +1548,7 @@ impl App {
                 ctf_enabled,
                 intensity,
                 memory,
+                permissions,
             )
             .await;
         });
@@ -2194,6 +2286,15 @@ impl App {
                 }
             }
             SlashCommand::Mode(name) => {
+                if let Some(mode) = PermissionMode::parse(&name) {
+                    self.permission_mode = mode;
+                    self.permissions.set_mode(mode);
+                    self.chat.entries.push(ChatEntry::System(format!(
+                        "已切换审批模式为：{}",
+                        mode.label()
+                    )));
+                    return;
+                }
                 if self.chat.streaming {
                     self.chat
                         .entries
@@ -2219,10 +2320,10 @@ impl App {
                                 .push(ChatEntry::System("已切换到 Dashboard 模式".into()));
                         }
                         "" => self.chat.entries.push(ChatEntry::System(
-                            "用法：/mode <chat|workflow|dashboard>".into(),
+                            "用法：/mode <chat|workflow|dashboard> 或 /mode <auto|manual|unlimited>".into(),
                         )),
                         other => self.chat.entries.push(ChatEntry::System(format!(
-                            "未知模式：{other}（可选：chat / workflow / dashboard）"
+                            "未知模式：{other}（视图：chat/workflow/dashboard；审批：auto/manual/unlimited）"
                         ))),
                     }
                 }
@@ -3456,6 +3557,9 @@ impl App {
         self.render_title_bar(frame, chunks[0]);
         self.render_main(frame, chunks[1]);
         self.render_status_bar(frame, chunks[2]);
+        if let Some(req) = &self.pending_permission {
+            self.render_permission_dialog(frame, chunks[1], req);
+        }
     }
 
     fn render_title_bar(&self, frame: &mut Frame, area: Rect) {
@@ -3699,22 +3803,34 @@ impl App {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let hint = match self.mode {
+        let mode_hint = format!(" · 审批: {} (F2)", self.permission_mode.label());
+        let dynamic_chat_hint;
+        let hint: &str = match self.mode {
             Mode::Welcome => " ↑/↓ 导航   Enter 确认   s 设置   q 退出",
             Mode::Settings => " ↑↓ 行  Tab 段  Enter 编辑/保存  ←→ 调整  Esc 返回  q 退出",
+            Mode::Chat if self.pending_permission.is_some() => {
+                " ⚠️ 审批确认: 1/2/3 选择 · Enter 确认 · Esc 拒绝"
+            }
             Mode::Chat if self.chat.streaming => " ● 流式生成中… Esc 取消 · Ctrl+C 退出",
-            Mode::Chat if self.mouse_capture => " ○ 就绪 · Enter 发送 · F9 切选择模式",
-            Mode::Chat => " ○ 选择模式 · 可拖拽复制 · F9 切回滚轮",
+            Mode::Chat if self.mouse_capture => {
+                dynamic_chat_hint = format!(" ○ 就绪 · Enter 发送{mode_hint} · F9 切选择模式");
+                &dynamic_chat_hint
+            }
+            Mode::Chat => {
+                dynamic_chat_hint = format!(" ○ 选择模式 · 可拖拽复制{mode_hint} · F9 切回滚轮");
+                &dynamic_chat_hint
+            }
             Mode::ProviderForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 kind  Esc 取消",
             Mode::McpForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切 transport  Esc 取消",
             Mode::CtfEditForm => " ↑↓ 选字段  Enter 编辑/确认  ←→ 切枚举  Esc 取消",
             Mode::Sessions => " ↑↓ 选会话  Enter 切换  n 新建  d 删除  Esc 返回  q 退出",
             Mode::ModelPicker => " ↑↓ 导航  Tab 切换栏  Enter 选择/确认  Esc 返回  q 退出",
-            Mode::LogViewer => " ↑↓ 翻滚  ←→ 横滚  PageUp/PageDown 翻页  Home/End 左右端  Ctrl+R 刷新  Esc/Ctrl+L 关闭",
+            Mode::LogViewer => {
+                " ↑↓ 翻滚  ←→ 横滚  PageUp/PageDown 翻页  Home/End 左右端  Ctrl+R 刷新  Esc/Ctrl+L 关闭"
+            }
             Mode::About => " Esc 返回   q 退出",
             _ => " Tab 切换模式   s 设置   Esc 返回 Welcome   q 退出",
         };
-
         // 右下角 Ctrl+L 热键提示（所有模式常驻）
         let right_hint = " Ctrl+L 日志 ";
         let right_len = right_hint.len() as u16;
@@ -3731,6 +3847,148 @@ impl App {
                 .style(Style::default().bg(self.theme.muted).fg(self.theme.bg)),
             chunks[1],
         );
+    }
+    fn render_permission_dialog(&self, frame: &mut Frame, area: Rect, request: &PermissionRequest) {
+        let popup_width = area.width.saturating_sub(6).clamp(36, 76);
+        let button =
+            |num: &'static str, label: &'static str, choice: ApprovalChoice, base_color: Color| {
+                let selected = self.permission_choice == Some(choice);
+                let (bg_color, fg_color, num_fg) = if selected {
+                    (base_color, Color::Rgb(18, 18, 22), Color::Rgb(18, 18, 22))
+                } else {
+                    (
+                        Color::Rgb(36, 36, 44),
+                        Color::Rgb(210, 210, 220),
+                        base_color,
+                    )
+                };
+                vec![
+                    Span::styled(
+                        format!(" [{num} "),
+                        Style::default()
+                            .fg(num_fg)
+                            .bg(bg_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{label}] "),
+                        Style::default()
+                            .fg(fg_color)
+                            .bg(bg_color)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]
+            };
+        let mut button_spans = Vec::new();
+        button_spans.extend(button(
+            "1",
+            "Allow once",
+            ApprovalChoice::Once,
+            Color::Rgb(137, 210, 129),
+        ));
+        button_spans.push(Span::raw(" "));
+        button_spans.extend(button(
+            "2",
+            "Session",
+            ApprovalChoice::Session,
+            self.theme.accent,
+        ));
+        button_spans.push(Span::raw(" "));
+        button_spans.extend(button(
+            "3",
+            "Deny",
+            ApprovalChoice::Deny,
+            Color::Rgb(252, 58, 75),
+        ));
+
+        let action_hint = match self.permission_choice {
+            Some(ApprovalChoice::Once) => {
+                " > Allow this single tool call once. Press Enter to confirm."
+            }
+            Some(ApprovalChoice::Session) => {
+                " > Allow identical arguments for the entire session. Press Enter."
+            }
+            Some(ApprovalChoice::Deny) => " > Deny this tool call. Press Enter or Esc to confirm.",
+            None => " Select with [1 / 2 / 3] or Left/Right/Tab, then press Enter.",
+        };
+
+        let args_pretty = serde_json::to_string_pretty(&request.arguments)
+            .unwrap_or_else(|_| request.arguments.to_string());
+        let arg_lines: Vec<&str> = args_pretty.lines().collect();
+        let display_arg_count = arg_lines.len().clamp(1, 8);
+        let popup_height = (7 + display_arg_count as u16 + 2).min(area.height.saturating_sub(2));
+
+        let popup_area = Rect::new(
+            area.x + (area.width.saturating_sub(popup_width)) / 2,
+            area.y + (area.height.saturating_sub(popup_height)) / 2,
+            popup_width,
+            popup_height,
+        );
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Permission Required ")
+            .title_style(
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .border_style(Style::default().fg(self.theme.accent))
+            .style(Style::default().bg(self.theme.bg));
+
+        let inner = block.inner(popup_area);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(block, popup_area);
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    " TOOL ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    &request.tool,
+                    Style::default()
+                        .fg(self.theme.fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::default(),
+            Line::from(button_spans),
+            Line::styled(
+                action_hint,
+                Style::default().fg(if self.permission_choice.is_some() {
+                    self.theme.fg
+                } else {
+                    self.theme.muted
+                }),
+            ),
+            Line::default(),
+            Line::from(vec![Span::styled(
+                " ARGUMENTS ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(self.theme.title)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+        ];
+        for line in arg_lines.iter().take(display_arg_count) {
+            lines.push(Line::styled(
+                format!("  {line}"),
+                Style::default().fg(self.theme.muted),
+            ));
+        }
+
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 
@@ -5007,5 +5265,56 @@ mod tests {
         app.handle_slash_command("/model");
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
+    }
+
+    #[test]
+    fn mode_command_and_f2_switch_permission_modes_in_tui() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+
+        // Switch via slash command
+        app.handle_slash_command("/mode manual");
+        assert_eq!(app.permission_mode, PermissionMode::Manual);
+        assert_eq!(app.permissions.mode(), PermissionMode::Manual);
+
+        app.handle_slash_command("/mode unlimited");
+        assert_eq!(app.permission_mode, PermissionMode::Unlimited);
+        assert_eq!(app.permissions.mode(), PermissionMode::Unlimited);
+
+        // Toggle via F2
+        app.handle_chat_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.permission_mode, PermissionMode::Manual);
+        assert_eq!(app.permissions.mode(), PermissionMode::Manual);
+        assert!(app.toast.as_deref().unwrap().contains("手动审批"));
+    }
+
+    #[tokio::test]
+    async fn pending_permission_in_tui_renders_and_responds_via_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{backend::TestBackend, Terminal};
+        use tokio::sync::oneshot;
+
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        let (reply, mut rx) = oneshot::channel();
+        app.pending_permission = Some(PermissionRequest {
+            tool: "shell".into(),
+            arguments: serde_json::json!({"command": "ls -la"}),
+            nonce: "test-nonce".into(),
+            reply,
+        });
+
+        // Render modal dialog
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // Press '2' -> select Session
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.permission_choice, Some(ApprovalChoice::Session));
+
+        // Press Enter -> send AllowSession
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_permission.is_none());
+        assert_eq!(rx.try_recv().unwrap(), PermissionDecision::AllowSession);
     }
 }

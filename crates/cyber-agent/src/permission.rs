@@ -17,6 +17,32 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// 用户对审批请求的操作选项。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ApprovalChoice {
+    Once,
+    Session,
+    Deny,
+}
+
+impl ApprovalChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Once => "Allow once",
+            Self::Session => "Allow for this session",
+            Self::Deny => "Deny execution",
+        }
+    }
+
+    pub fn decision(self) -> PermissionDecision {
+        match self {
+            Self::Once => PermissionDecision::AllowOnce,
+            Self::Session => PermissionDecision::AllowSession,
+            Self::Deny => PermissionDecision::Deny,
+        }
+    }
+}
+
 /// 审批模式：控制工具执行前的授权拦截策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum PermissionMode {
