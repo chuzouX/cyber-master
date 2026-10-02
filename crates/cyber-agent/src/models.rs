@@ -44,7 +44,7 @@ pub async fn fetch_models(cfg: &ProviderConfig) -> Result<Vec<String>> {
                         if text.is_empty() {
                             String::new()
                         } else {
-                            format!(": {}", &text.chars().take(200).collect::<String>())
+                            format!(": {}", text.chars().take(200).collect::<String>())
                         }
                     ));
                     continue;
