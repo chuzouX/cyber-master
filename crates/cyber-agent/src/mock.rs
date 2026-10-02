@@ -232,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn mock_delegate_tasks_second_round_does_not_delegate_again() {
         let provider = MockProvider::new();
-        let mut first = provider.stream(req_with_delegate(vec![Message::user(
+        let first = provider.stream(req_with_delegate(vec![Message::user(
             "delegate: compare checks",
         )]));
         assert!(
@@ -249,7 +249,7 @@ mod tests {
                 .await
         );
 
-        let mut second = provider.stream(req_with_delegate(vec![
+        let second = provider.stream(req_with_delegate(vec![
             Message::user("delegate: compare checks"),
             Message::assistant("delegating"),
             Message::tool("mock_delegate_call_1", "{\"results\":[]}"),

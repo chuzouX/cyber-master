@@ -223,11 +223,22 @@ impl Default for WorkflowConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     pub prefer_docker: bool,
     pub extra_path: Vec<String>,
+    pub web_search: bool,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            prefer_docker: false,
+            extra_path: Vec::new(),
+            web_search: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,5 +284,13 @@ mod tests {
         assert_eq!(subagents.effective_max_parallel(), 1);
         assert_eq!(subagents.effective_timeout_secs(), 1);
         assert_eq!(subagents.effective_max_steps(), 1);
+    }
+
+    #[test]
+    fn tools_config_defaults_web_search_to_true() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.tools.web_search);
+        let config_disabled: Config = toml::from_str("[tools]\nweb_search = false\n").unwrap();
+        assert!(!config_disabled.tools.web_search);
     }
 }

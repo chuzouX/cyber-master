@@ -27,6 +27,7 @@ checkpoint = true            # 启用断点续跑
 [tools]
 prefer_docker = false        # 工具缺失时是否用 docker 镜像兜底
 extra_path = []              # 额外工具路径
+web_search = true              # 是否启用联网搜索与网页抓取（web_fetch）
 
 [storage]
 history_retention_days = 90
