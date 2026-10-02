@@ -3,7 +3,7 @@
 > 本文件实时反映各阶段实施进度。每完成一项即更新对应勾选状态与说明。
 > 设计依据见 [DESIGN.md](./DESIGN.md)，路线图对应 [§13](./DESIGN.md#13-开发路线图)。
 
-**最近更新**：2026-10-02（CLI 命令/表单/任务已实现行为、OMP 视觉、ConPTY 验收与 MCP lifecycle）
+**最近更新**：2026-10-03（v0.4.0：子 Agent 委派与独立卡片渲染、Todo 任务管理系统、权限与联网配置放宽、CLI 帮助与快捷键优化）
 
 ## CLI 入口升级
 
@@ -20,6 +20,11 @@
 - [ ] 会话存储迁入 `cyber-storage`、独立 runtime crate 与跨前端并发会话写保护。
 - [x] Windows ConPTY 真实终端启动、审批、任务完成、正常退出与会话保存；120x30 和 80x12 resize 验收。
 - [ ] 跨平台安装验收、发布包含新入口的 Release。
+- [x] **v0.4.0 发布与实施**：
+  - **子 Agent 批量委派**：新增 `delegate_tasks` 工具并发分发独立任务；CLI 彻底优化多任务展示，为每个子任务分配独立卡片（`Subagent [i/N] <name>`），实时标注目标（`Task:`）、子任务内部工具进度（`Progress:`）及结果（`Result:`/`Error:`），支持 `Ctrl+O` 展开/折叠。
+  - **任务管理系统（Todo）**：内置 `todo` 工具与 `/todo` 斜杠命令族（`list`/`add`/`done`/`remove`/`clear`），活跃任务自动注入系统提示词，CLI 底栏实时展示 `[x/y] tasks` 统计。
+  - **权限与审批优化**：对只读与安全探测命令放宽会话授权与自动审批匹配，新增 `tools.web_search` 配置项控制网页检索与抓取。
+  - **交互体验与命令优化**：完善 `cyber help` / `--help` 说明与常用示例，支持 `Ctrl+T` 快捷键打开/切换 CTF 题目面板，修复现代 rustc 编译兼容性（`format!` 冗余借用与 `bail!` 尾随分号）。
 
 ### 全屏 coding CLI 需求与验收
 
