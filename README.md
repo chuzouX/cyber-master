@@ -31,16 +31,17 @@
 ## 特性
 
 - **多 Provider 流式对话**：OpenAI / Anthropic / Ollama / OpenAI 兼容端点，流式输出含思考链（reasoning_content）
-- **统一工具体系**：内置工具（shell / read_file / write_file / web_fetch / download_file 等）+ MCP（stdio/HTTP/SSE）+ Skill 渐进式披露
+- **统一工具体系**：内置工具（shell / read_file / write_file / web_fetch / download_file / todo / delegate_tasks 等）+ MCP（stdio/HTTP/SSE）+ Skill 渐进式披露
+- **子 Agent 批量委派**：主 agent 通过 `delegate_tasks` 并发分发独立子任务；每个子任务运行独立隔离循环，在 CLI/TUI 中渲染为**独立卡片**，实时标注任务目标、执行进度与完成结果
+- **任务管理系统（Todo）**：内置 `todo` 追踪工具与 `/todo` 斜杠命令族，支持长任务进度拆解、状态流转（pending/in_progress/completed/cancelled）与底栏统计，活跃任务自动注入系统提示词
 - **Skill 知识库**：100+ 安全测试方法论 Skill，系统提示词自动注入索引，agent 按线索匹配调用
 - **CTF 协作面板**：题目注册 / 状态管理 / flag 记录 / writeup 生成，测试优先级引导（信息收集 → Skill → 工具测试 → 脚本）
 - **CLI 命令与管理表单**：斜杠/二级补全、Provider 与 memory rule 表单、模型/会话 picker；工作流与 Dashboard 仍为原 TUI 占位页
 - **上下文管理**：自动压缩（compact）、历史持久化、跨会话读取、输入历史回溯
 - **思考强度切换**：low / middle / high / max / auto 五档，动态注入系统提示词
-- **权限与提示约束**：CLI 工具执行前 nonce 审批、MCP 显式连接授权；`.cyber.md` rules 与 memory rules 属于提示词约束，不是 hard guard，内置工具另有运行时护栏
+- **权限与提示约束**：CLI 工具执行前 nonce 审批、MCP 显式连接授权；自动审批（Auto）放行安全探测命令；`.cyber.md` rules 与 memory rules 属于提示词约束，不是 hard guard，内置工具另有运行时护栏
 - **多主题**：cyberpunk / catppuccin / tokyo-night / dracula / gruvbox / nord
 - **跨平台**：Windows（cmd /C）/ macOS / Linux（sh -c），系统提示词自动注入平台信息
-
 ---
 
 ## 架构概览
@@ -296,18 +297,17 @@ cyber run "继续上次任务" --session abc      # 续接指定会话
 cyber run --help                            # 查看 provider/model 等任务选项
 ```
 
-CLI 由 `cli_commands.rs` 处理 TUI 目录中除 `/mode` 外的 19 个主命令，并增加 `/effort`，共 20 项，完整行为与子命令边界见 [命令参考](docs/TUI_COMMANDS.md)。`/effort low|medium|high|xhigh|auto` 保留 `middle` / `max` 别名，`medium` 对应内部 `Middle`，`xhigh` 对应 `Max`；`/think` 与 `/effort` 只改变系统提示词档位，不新增 provider API 的 `reasoning_effort` 参数。`/think`、`/max_steps`、`/subagents`、`/env` 和 `/web` 保存到全局配置的目标字段，不把合并后的项目覆盖整份写入全局；项目覆盖在重新加载时仍优先。`--cwd` 会验证并规范化目录；项目配置仍只在指定目录查找，不向父目录继承。
+CLI 由 `cli_commands.rs` 处理 TUI 目录中除 `/mode` 外的 20 个主命令（包含 `/todo`），并增加 `/effort`，共 21 项，完整行为与子命令边界见 [命令参考](docs/TUI_COMMANDS.md)。`/effort low|medium|high|xhigh|auto` 保留 `middle` / `max` 别名，`medium` 对应内部 `Middle`，`xhigh` 对应 `Max`；`/think` 与 `/effort` 只改变系统提示词档位，不新增 provider API 的 `reasoning_effort` 参数。`/think`、`/max_steps`、`/subagents`、`/env` 和 `/web` 保存到全局配置的目标字段，不把合并后的项目覆盖整份写入全局；项目覆盖在重新加载时仍优先。`--cwd` 会验证并规范化目录；项目配置仍只在指定目录查找，不向父目录继承。
 
 ### CLI 界面与快捷键
 
 默认 CLI 为全屏简洁 coding 界面，视觉参考 [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)，不拷贝其源码，也不仿造未实现的 agents/LSP 界面。实际 palette 使用暖金、灰白、cyan 与紫色；header 显示彩色 ASCII `Cy`、`Cyber Master V<版本>`、model/effort 和 cwd。中间为可滚动对话区，底部为两行圆角输入区、金色无框补全候选及实际状态栏：
 
 ```text
-provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output
+provider · model │ [1/3] tasks │ ctx 剩余% │ cache 命中率 │ ↑input ↓output
 ```
 
-`ctx` 根据当前上下文 token 估算与有效上下文容量计算剩余百分比；容量未知时显示 `--`。`cache` 为已报告的命中 token /（命中 + 未命中 token）；分母为零时显示 `--`。`↑input ↓output` 累计 provider 实际上报的 Usage，未上报时显示 `--`，不以估算代替 Usage。累计仅属于本进程内当前会话，新建或切换会话时重置，重开进程不从历史恢复；切换 provider/model 不重置累计。底栏不显示审批模式或 agent 面板入口，空输入 `Left` 不打开面板。
-
+`[1/3] tasks` 显示当前会话中已完成/总任务数，有活跃任务时高亮提示；无任务时自动隐去。`ctx` 根据当前上下文 token 估算与有效上下文容量计算剩余百分比；容量未知时显示 `--`。`cache` 为已报告的命中 token /（命中 + 未命中 token）；分母为零时显示 `--`。`↑input ↓output` 累计 provider 实际上报的 Usage，未上报时显示 `--`，不以估算代替 Usage。累计仅属于本进程内当前会话，新建或切换会话时重置，重开进程不从历史恢复；切换 provider/model 不重置累计。底栏不显示审批模式或 agent 面板入口，空输入 `Left` 不打开面板。
 正文和真实 `reasoning_content` 复用现有 Markdown 子集渲染，支持标题、围栏代码、行内样式、链接、列表、引用、分隔线及数学文本标记；不支持表格，也不宣称完整 CommonMark。仅收到实际 reasoning 内容时显示斜体 `Thinking`，不生成或伪造思考文本。工具调用使用紧凑状态背景块，`Ctrl+O` 展开/折叠详情，工具数据不冒充令牌 Usage。交错 reasoning/正文与空 Token 不重复生成 `Cyber` 标题，旧历史中的空 Assistant 条目仍可兼容读取。每轮结束持久化耗时、结束时间和状态，重开后显示如 `Worked for 3s · done HH:mm`，失败或取消对应 `error` / `cancelled`；旧历史没有此记录时不补造。
 
 | 按键 | 说明 |
@@ -316,7 +316,8 @@ provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output
 | `/`、`Tab`、`Up/Down` | 主命令及二级补全，选择候选 |
 | `Enter` | 有未接受候选时先补全，再 Enter 执行；普通输入直接提交 |
 | `Esc` | 关闭候选时保留输入；表单取消不保存；任务中可取消 |
-| `Ctrl+O` | 展开/折叠工具详情 |
+| `Ctrl+O` | 展开/折叠工具与子任务卡片详情 |
+| `Ctrl+T` | 打开/切换 CTF 题目面板 |
 | `Alt+Enter` / `Shift+Enter` | 换行 |
 | `PgUp` / `PgDown` | 滚动对话历史 |
 | `Ctrl+C` | 任务中取消；当前空闲且空输入时也可退出 |
@@ -361,6 +362,7 @@ Options:
 | `/ctf [status\|enable\|disable\|add name category\|list\|writeup name]` | 查看开关、添加/列出题目，为已解出题目生成报告；CLI 分类必填，原 TUI 可省略 |
 | `/sessions <list\|read\|new\|delete ID>` | CLI picker、读取、新建、删除及 ID 切换；原 TUI 通过面板删除/切换 |
 | `/mode <chat\|workflow\|dashboard>` | 切换视图；workflow/dashboard 为占位页 |
+| `/todo [list\|add\|done\|remove\|clear]` | 管理当前会话的待办任务；活跃任务自动注入系统提示词 |
 | `/memory [list\|add\|project\|edit\|delete\|rule]` | 记忆 CRUD；CLI rule 表单及 list/edit/delete，原 TUI rule 尚无 handler |
 | `/effort [low\|medium\|high\|xhigh\|auto]` | CLI `/think` 别名，保留 middle/max |
 | `/new` | 新建会话 |
@@ -371,6 +373,15 @@ Options:
 
 CLI Provider 表单支持 add/edit/use/remove，API key 掩码显示，取消不写入，凭据文件私有持久化；`/model` 打开已配置模型 picker，不宣称自动联网拉取。`/clear` 清空并保存当前历史，`/cancel` 取消实际任务，`/compact [instructions]` 发起真实模型摘要任务，成功后持久化压缩结果。Memory rule 表单的 `enabled`、`scope`（global/project/both）和 `prompt` 控制后续系统提示词约束，不是 hard guard。
 
+### 子 Agent 委派与任务卡片
+
+当面对复杂、多方向或并行的安全分析场景时，主 Agent 可通过 `delegate_tasks` 工具一次性批量委派多个独立的子任务：
+
+- **独立卡片隔离**：批量委派的每个子任务分配一个单独的可视化卡片（`╭─ ... │ ... ╰─`），彻底解决以往多个任务输出挤占粘连在单张卡片的问题。
+- **任务目标标注**：卡片顶栏展示任务序号与标识（`Subagent [1/N] <name>`），卡片内容直接标注任务提示与目标（`Task: <description>`）。
+- **实时进度推进**：子 Agent 内部调用工具（如 `shell`、`read_file`）或推进步骤时，实时回传动态到对应卡片（`Progress: running tool: shell`），完成时显示独立结果（`Result:`/`Error:`）。
+- **独立状态图标**：运行中呈现青色 `◇ running`，成功完成呈绿色 `✓ done`，执行失败或超时呈红色 `✗ failed`。
+- **折叠与展开**：按下 `Ctrl+O` 可展开查看详细的 Specialist 系统提示词、工具白名单及完整多行输出。
 ### TUI 快捷键
 
 | 按键 | 说明 |
@@ -453,7 +464,9 @@ cyber_master/
 | TUI 框架 | ratatui 布局、6 主题、事件循环、Welcome/Settings/About 页 | ✅ 完成 |
 | Chat 对话 | 流式输出、思考链、粘贴检测、输入历史、滚动缓存 | ✅ 完成 |
 | Agent + Provider | OpenAI/Anthropic/Ollama/OpenAI-compatible、SSE 解析、HTTP 状态码检查 | ✅ 完成 |
-| 内置工具 | shell/read_file/write_file/find_file/list_dir/web_fetch/download_file/ctf_challenge | ✅ 完成 |
+| 内置工具 | shell/read_file/write_file/find_file/list_dir/web_fetch/download_file/ctf_challenge/todo/delegate_tasks | ✅ 完成 |
+| 子 Agent 委派 | 批量独立子任务并发执行、隔离循环、独立卡片与实时进度展示 | ✅ 完成 |
+| 任务跟踪 (Todo) | 多步骤任务分解、实时状态同步、底栏汇总、跨轮提示词引导 | ✅ 完成 |
 | Skill 系统 | frontmatter 解析、注册表、渐进式披露、系统提示词索引注入 | ✅ 完成 |
 | MCP 客户端 | stdio/HTTP/SSE 三种传输、工具注册、连接管理 | ✅ 完成 |
 | CTF 模式 | 题目注册/状态管理/flag 记录/面板/writeup、测试优先级引导 | ✅ 完成 |
