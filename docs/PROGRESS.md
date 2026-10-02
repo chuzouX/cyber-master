@@ -31,7 +31,7 @@
 - [x] 执行前审批保留当前 nonce 与精确参数授权，不是可切换 mode；bracketed paste 只插入文本，Windows 键事件粘贴使用 burst 缓冲；长参数审批固定显示控件并独立滚动，小窗口不足时禁止确认。
 - [x] headless 文本/JSON、会话续接、默认拒绝工具和显式 `--allow-tool` 授权回归通过；布局覆盖小尺寸与超过 65535 行历史。
 - [x] 底栏 ctx 使用当前上下文估算与有效容量计算剩余百分比；cache 使用上报命中/(命中+未命中) token；input/output 为本进程当前会话实际 Usage 累计。新建/切换会话重置，切换 provider/model 不重置累计，重开不恢复；Usage 未上报或 cache 分母为零时显示 `--`。
-- [x] CLI 正文与真实 `reasoning_content` 复用 Markdown 支持子集，不宣称表格或完整 CommonMark；实际 Reasoning 显示斜体 Markdown `Thinking`，不伪造思考。工具使用紧凑 status 背景块，Ctrl+O 展开/折叠；工具数据不伪造令牌 stats。
+- [x] CLI 正文与真实 `reasoning_content` 复用 Markdown 支持子集，不宣称表格或完整 CommonMark；实际 Reasoning 显示斜体 Markdown `Thinking`，不伪造思考。参考 OMP 将工具调用、执行请求与结果统一渲染为轻量圆角小卡片（支持 Read、Edit、Write、Downloading、Shell、Fetch、List、Find 等卡片头及状态边框），折叠预览关键参数/输出并提示 `Ctrl+O details · N more lines`，Ctrl+O 展开完整内容；工具数据不伪造令牌 stats。
 - [x] 修复空 Assistant 与 interleaved Reasoning/正文导致重复 `Cyber` 标题；空 Token 不创建空回复标题，旧 history 兼容读取。
 - [x] 每轮持久化 `TurnSummary`，重开显示 `Worked for 3s · done HH:mm` 或 `error` / `cancelled`；旧历史没有摘要时不补造，展示记录不注入模型上下文。
 - [x] Windows ConPTY 真实终端共 119 个断言通过（47 SSE + 72 commands），覆盖交错 Reasoning/空 Token/Markdown/Usage、120x30 与 80x12、Unicode 光标、secrets masked/cancel、17 项命令目录、compact/cancel/session 持久化与 memory rule 等。

@@ -9,7 +9,7 @@ CLI 支持原 TUI 17 个主命令中除 `/mode` 外的 16 项，加上 `/effort`
 - `/` 打开完整主命令目录，按前缀过滤；支持子命令及已配置 provider/model、session ID、Skill 名称的二级建议，不是 shell 自动补全。
 - `Up/Down` 选择候选，`Tab` 接受补全；`Enter` 在有未接受候选时先补全，再按 Enter 执行。接受补全后仍可继续输入参数。`Esc` 关闭候选并保留原输入，不清空命令。
 - 主命令及实现支持的子命令大小写不敏感；provider/题目等名称按实际数据匹配。按空白切分参数，不解析 shell 引号，不支持一行执行多个命令。
-- 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。普通任务、summary/writeup、连接授权共用实际取消流程，不是在 UI 假装完成。
+- 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。
 - 生成中命令受 UI 状态限制，须先取消再进行配置/会话操作；不能据静态目录推断任何任务状态下均可执行。
 
 ## CLI 已实现行为
@@ -22,10 +22,10 @@ CLI 支持原 TUI 17 个主命令中除 `/mode` 外的 16 项，加上 `/effort`
 | `/quit` / 空输入 Ctrl+D | 保存会话并退出。 |
 | `/model [provider [model]]` | 无参数打开已配置 provider/model picker；带参数选择并持久化，不自动联网发现模型。 |
 | `/provider [list\|add\|edit name\|use name\|remove name]` | list 隐藏 endpoint/凭据；add/edit 打开表单，use 持久化选择，remove 直接删除并处理默认项回退，无二次删除确认。 |
-| `/tools` | 查询实际注册工具 schema，不执行工具，不把工具数据算成令牌 Usage。 |
+| `/tools` | 查询实际注册工具 schema，不执行工具，不把工具数据算成令牌 Usage。直接打开模式（coding CLI）下，工具调用、调用请求、Edit、Read、Downloading、Shell 等工具统一以轻量小卡片形式呈现，支持 Ctrl+O 展开/折叠。 |
 | `/skill [list\|name]` | 查询目录或显示正文；通知不入模型历史，模型须调用 `skill_<name>` 获取正文。 |
 | `/mcp [list\|status]` | 展示配置 server、transport 与 connected/not connected；查询不会连接。 |
-| `/mcp connect` | 默认 no autostart，显式任务经当前 nonce 批准才连接配置 server；deny 不启动。已有连接时拒绝重复 connect，配置变更需重启；没有按 server 名连接/断连/重连子命令。 |
+| `/mcp connect` | 默认 no autostart，显式任务须在 `Permission Required` 框批准才连接配置 server；deny 不启动。已有连接时拒绝重复 connect，配置变更需重启；没有按 server 名连接/断连/重连子命令。 |
 | `/compact [instructions]` | 真实模型摘要任务，成功后替换模型历史并持久化；空历史拒绝，失败/取消不提交排队摘要，不等于清屏。 |
 | `/think [low\|middle\|high\|max\|auto]` | 查看/保存现有思考档位，沿用系统提示词，不新增 API `reasoning_effort`，不保证返回 reasoning。 |
 | `/effort [low\|medium\|high\|xhigh\|auto]` | `/think` 别名；medium→Middle、xhigh→Max，仍接受 middle/max。 |

@@ -120,6 +120,63 @@ enum Panel {
     Shortcuts,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ApprovalChoice {
+    Once,
+    Session,
+    Deny,
+}
+
+impl ApprovalChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Once => "Allow once",
+            Self::Session => "Allow for this session",
+            Self::Deny => "Deny execution",
+        }
+    }
+
+    fn decision(self) -> PermissionDecision {
+        match self {
+            Self::Once => PermissionDecision::AllowOnce,
+            Self::Session => PermissionDecision::AllowSession,
+            Self::Deny => PermissionDecision::Deny,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolCardState {
+    Pending,
+    Success,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolCardKind {
+    Read,
+    Edit,
+    Write,
+    Download,
+    Shell,
+    Fetch,
+    List,
+    Find,
+    Generic,
+}
+
+#[derive(Debug)]
+struct ToolCard {
+    id: String,
+    name: String,
+    arguments: String,
+    progress: String,
+    output: String,
+    state: ToolCardState,
+    start: usize,
+    end: usize,
+}
+
 struct CliScreen {
     provider: String,
     model: String,
@@ -129,6 +186,7 @@ struct CliScreen {
     input: TextArea<'static>,
     approval_input: TextArea<'static>,
     approval: Option<PermissionRequest>,
+    approval_choice: Option<ApprovalChoice>,
     messages: Vec<Line<'static>>,
     response_start: Option<usize>,
     // At most one answer and one thinking segment per uninterrupted response.
@@ -160,7 +218,7 @@ struct CliScreen {
     picker: Option<CommandPicker>,
     picker_selected: usize,
     delete_pending: Option<String>,
-    tools: Vec<(usize, usize, Vec<Line<'static>>)>,
+    tools: Vec<ToolCard>,
     tools_expanded: bool,
     assistant_label_shown: bool,
     recent_sessions: Vec<String>,
@@ -218,7 +276,7 @@ impl CliScreen {
     fn insert_text(&mut self, text: &str) {
         self.delete_pending = None;
         if self.approval.is_some() {
-            self.approval_input.insert_str(clean(text));
+            // Approval is keyboard-only. Ignore paste so it cannot select or confirm an action.
         } else if let Some(form) = &mut self.form {
             if let Some(input) = form.inputs.get_mut(form.selected) {
                 input.insert_str(clean(text));
@@ -264,6 +322,7 @@ impl CliScreen {
             input: composer(),
             approval_input: composer(),
             approval: None,
+            approval_choice: None,
             messages: Vec::new(),
             response_start: None,
             stream: Vec::new(),
@@ -361,14 +420,16 @@ impl CliScreen {
                     }
                 }
                 ChatEntry::ToolCall {
-                    name, arguments, ..
-                } => self.tool_message(&format!("Tool · {name}"), arguments, MUTED),
+                    id,
+                    name,
+                    arguments,
+                } => self.tool_call(id, name, arguments),
                 ChatEntry::ToolResult {
+                    id,
                     name,
                     output,
                     is_error,
-                    ..
-                } => self.tool_message(name, output, if *is_error { ERROR } else { SUCCESS }),
+                } => self.tool_result(id, name, output, *is_error),
                 ChatEntry::TurnSummary {
                     elapsed_ms,
                     finished_at,
@@ -419,79 +480,90 @@ impl CliScreen {
         }));
     }
 
-    fn tool_message(&mut self, label: &str, text: &str, color: Color) {
-        let start = self.messages.len();
+    fn tool_width(&self) -> u16 {
+        if self.history_view.width == 0 {
+            80
+        } else {
+            self.history_view.width
+        }
+    }
+
+    fn tool_call(&mut self, id: &str, name: &str, arguments: &str) {
         self.stream.clear();
         self.response_start = None;
-        let bg = if color == ERROR {
-            ERROR_BG
-        } else if color == SUCCESS {
-            SUCCESS_BG
+        let start = self.messages.len();
+        self.tools.push(ToolCard {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+            progress: String::new(),
+            output: String::new(),
+            state: ToolCardState::Pending,
+            start,
+            end: start,
+        });
+        self.replace_tool_card(self.tools.len() - 1, self.tool_width());
+    }
+
+    fn pending_tool_index(&self, id: &str) -> Option<usize> {
+        self.tools
+            .iter()
+            .rposition(|tool| tool.id == id && tool.state == ToolCardState::Pending)
+    }
+
+    fn tool_progress(&mut self, id: &str, name: &str, chunk: &str) {
+        let index = self.pending_tool_index(id).unwrap_or_else(|| {
+            self.tool_call(id, name, "{}");
+            self.tools.len() - 1
+        });
+        self.tools[index].name = name.to_owned();
+        self.tools[index].progress.push_str(&clean(chunk));
+        self.replace_tool_card(index, self.tool_width());
+    }
+
+    fn tool_result(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
+        let index = self.pending_tool_index(id).unwrap_or_else(|| {
+            self.tool_call(id, name, "{}");
+            self.tools.len() - 1
+        });
+        let tool = &mut self.tools[index];
+        tool.name = name.to_owned();
+        tool.output = clean(output);
+        tool.progress.clear();
+        tool.state = if is_error {
+            ToolCardState::Error
         } else {
-            PENDING_BG
+            ToolCardState::Success
         };
-        let style = Style::default()
-            .fg(if color == MUTED { ACCENT } else { color })
-            .bg(bg);
-        self.messages.push(Line::default());
-        self.messages.push(Line::styled(
-            clean(label),
-            style.add_modifier(Modifier::BOLD),
-        ));
-        self.messages.extend(clean(text).lines().map(|line| {
-            Line::styled(
-                line.to_owned(),
-                Style::default()
-                    .fg(if color == ERROR { ERROR } else { MUTED })
-                    .bg(bg),
-            )
-        }));
-        let full = self.messages[start..].to_vec();
-        if !self.tools_expanded {
-            self.messages.truncate(start);
-            self.messages.extend(tool_preview(
-                &full,
-                if self.history_view.width == 0 {
-                    80
-                } else {
-                    self.history_view.width
-                },
-            ));
-        }
-        self.tools.push((start, self.messages.len(), full));
+        self.replace_tool_card(index, self.tool_width());
     }
 
     fn toggle_tools(&mut self) {
         self.tools_expanded = !self.tools_expanded;
-        self.refresh_tools(if self.history_view.width == 0 {
-            80
-        } else {
-            self.history_view.width
-        });
+        self.refresh_tools(self.tool_width());
+    }
+
+    fn replace_tool_card(&mut self, index: usize, width: u16) {
+        let replacement = render_tool_card(&self.tools[index], self.tools_expanded, width);
+        let start = self.tools[index].start;
+        let end = self.tools[index].end;
+        let delta = replacement.len() as isize - (end - start) as isize;
+        self.messages.splice(start..end, replacement);
+        self.tools[index].end = (end as isize + delta) as usize;
+        for later in &mut self.tools[index + 1..] {
+            later.start = (later.start as isize + delta) as usize;
+            later.end = (later.end as isize + delta) as usize;
+        }
+        if let Some(response_start) = &mut self.response_start {
+            if *response_start >= end {
+                *response_start = (*response_start as isize + delta) as usize;
+            }
+        }
     }
 
     fn refresh_tools(&mut self, width: u16) {
         for index in (0..self.tools.len()).rev() {
-            let (start, end, full) = &self.tools[index];
-            let replacement = if self.tools_expanded {
-                full.clone()
-            } else {
-                tool_preview(full, width)
-            };
-            let start = *start;
-            let end = *end;
-            let delta = replacement.len() as isize - (end - start) as isize;
-            self.messages.splice(start..end, replacement);
-            self.tools[index].1 = (end as isize + delta) as usize;
-            for later in &mut self.tools[index + 1..] {
-                later.0 = (later.0 as isize + delta) as usize;
-                later.1 = (later.1 as isize + delta) as usize;
-            }
-            if let Some(response_start) = &mut self.response_start {
-                if *response_start >= end {
-                    *response_start = (*response_start as isize + delta) as usize;
-                }
-            }
+            self.replace_tool_card(index, width);
         }
     }
 
@@ -640,8 +712,7 @@ impl CliScreen {
             clean(&self.model)
         );
         if self.approval.is_some() {
-            footer.push_str(" · approval required · Enter to confirm · Esc to deny");
-        } else if self.busy {
+            footer.push_str(" · permission required · 1/2/3 select · Enter confirm · Esc deny");
             footer.push_str(&format!(" · {} · Ctrl+C to cancel", clean(&self.status)));
         } else if !self.status.is_empty() {
             footer.push_str(&format!(" · {}", clean(&self.status)));
@@ -660,19 +731,24 @@ impl CliScreen {
                 self.status = "Thinking".into();
             }
             AgentEvent::ToolCall {
-                name, arguments, ..
+                id,
+                name,
+                arguments,
             } => {
-                self.tool_message(&format!("Tool · {name}"), &arguments, MUTED);
+                self.tool_call(&id, &name, &arguments);
                 self.status = format!("Tool · {name}");
             }
-            AgentEvent::ToolProgress { name, .. } => self.status = format!("Running · {name}"),
+            AgentEvent::ToolProgress { id, name, chunk } => {
+                self.tool_progress(&id, &name, &chunk);
+                self.status = format!("Running · {name}");
+            }
             AgentEvent::ToolResult {
+                id,
                 name,
                 output,
                 is_error,
-                ..
             } => {
-                self.tool_message(&name, &output, if is_error { ERROR } else { SUCCESS });
+                self.tool_result(&id, &name, &output, is_error);
             }
             AgentEvent::ContextUpdate {
                 used_tokens,
@@ -706,7 +782,14 @@ impl CliScreen {
         if let Some(request) = self.approval.take() {
             let _ = request.reply.send(decision);
         }
+        self.approval_choice = None;
         self.approval_input = composer();
+    }
+
+    fn select_approval(&mut self, choice: ApprovalChoice) {
+        self.approval_choice = Some(choice);
+        self.approval_input = composer();
+        self.approval_input.insert_str(choice.label());
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -714,17 +797,105 @@ impl CliScreen {
         if !self.tools_expanded && self.history_view.width != area.width {
             self.refresh_tools(area.width);
         }
-        let approval_width = area.width.saturating_sub(4).min(90);
+        let approval_width = area.width.saturating_sub(6).clamp(36, 76);
         let approval_controls = self.approval.as_ref().map(|request| {
-            format!(
-                "Tool: {}\nonce {}\nsession {}\nEsc: deny; paste never confirms\nArguments (PgUp/PgDown):",
-                clean(&request.tool), clean(&request.nonce), clean(&request.nonce)
-            )
+            let button = |num: &'static str,
+                          label: &'static str,
+                          choice: ApprovalChoice,
+                          base_color: Color| {
+                let selected = self.approval_choice == Some(choice);
+                let (bg_color, fg_color, num_fg) = if selected {
+                    (base_color, Color::Rgb(18, 18, 22), Color::Rgb(18, 18, 22))
+                } else {
+                    (
+                        Color::Rgb(36, 36, 44),
+                        Color::Rgb(210, 210, 220),
+                        base_color,
+                    )
+                };
+                vec![
+                    Span::styled(
+                        format!(" [{num} "),
+                        Style::default()
+                            .fg(num_fg)
+                            .bg(bg_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{label}] "),
+                        Style::default()
+                            .fg(fg_color)
+                            .bg(bg_color)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]
+            };
+            let mut button_spans = Vec::new();
+            button_spans.extend(button("1", "Allow once", ApprovalChoice::Once, SUCCESS));
+            button_spans.push(Span::raw(" "));
+            button_spans.extend(button("2", "Session", ApprovalChoice::Session, ACCENT));
+            button_spans.push(Span::raw(" "));
+            button_spans.extend(button("3", "Deny", ApprovalChoice::Deny, ERROR));
+
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        " TOOL ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(AMBER)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        clean(&request.tool),
+                        Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::default(),
+                Line::from(button_spans),
+                Line::styled(
+                    self.approval_choice.map_or(
+                        " Select with [1 / 2 / 3] or Left/Right/Tab, then press Enter.",
+                        |choice| match choice {
+                            ApprovalChoice::Once => {
+                                " > Allow this single tool call once. Press Enter to confirm."
+                            }
+                            ApprovalChoice::Session => {
+                                " > Allow identical arguments for the entire session. Press Enter."
+                            }
+                            ApprovalChoice::Deny => {
+                                " > Deny this tool call. Press Enter or Esc to confirm."
+                            }
+                        },
+                    ),
+                    Style::default().fg(if self.approval_choice.is_some() {
+                        FG
+                    } else {
+                        MUTED
+                    }),
+                ),
+                Line::default(),
+                Line::from(vec![
+                    Span::styled(
+                        " ARGUMENTS ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(CODE)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  PgUp/PgDn scroll", Style::default().fg(DIM)),
+                ]),
+            ]
         });
-        let controls_height = approval_controls.as_ref().map_or(0, |text| {
-            Paragraph::new(text.as_str())
+        let controls_height = approval_controls.as_ref().map_or(0, |lines| {
+            Paragraph::new(lines.clone())
                 .wrap(Wrap { trim: false })
-                .line_count(approval_width.saturating_sub(2).max(1))
+                .line_count(approval_width.saturating_sub(4).max(1))
         });
         self.approval_visible = false;
         let active_input = if self.approval.is_some() {
@@ -852,7 +1023,7 @@ impl CliScreen {
             effort_color(self.effort)
         };
         let title = if self.approval.is_some() {
-            " Approval response ".to_owned()
+            " Select a permission action ".to_owned()
         } else if let Some(form) = &self.form {
             format!(
                 " {} · Ctrl+S save ",
@@ -878,10 +1049,8 @@ impl CliScreen {
             });
         draw_composer(frame, input_area, active_input, &title, border, secret);
         let mut footer = self.footer();
-        if self.approval.is_some()
-            && Line::raw(footer.as_str()).width() > sections[3].width as usize
-        {
-            footer = "  approval required · Enter to confirm · Esc to deny".into();
+        if self.approval.is_some() {
+            footer = "  permission required · 1/2/3 select · Enter confirm · Esc deny".into();
         }
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(DIM)),
@@ -891,7 +1060,9 @@ impl CliScreen {
             if self.approval_nonce != request.nonce {
                 self.approval_nonce.clone_from(&request.nonce);
                 self.approval_scroll = 0;
-                self.approval_arguments = clean(&request.arguments.to_string())
+                let arguments = serde_json::to_string_pretty(&request.arguments)
+                    .unwrap_or_else(|_| request.arguments.to_string());
+                self.approval_arguments = clean(&arguments)
                     .lines()
                     .map(|line| Line::raw(line.to_owned()))
                     .collect();
@@ -903,31 +1074,40 @@ impl CliScreen {
                 frame.render_widget(Clear, bounds);
                 frame.render_widget(
                     Paragraph::new(
-                        "Expand terminal to review approval. Confirmation disabled; Esc denies.",
+                        "Expand the terminal to review all permission details.\nConfirmation is disabled; Esc denies safely.",
                     )
                     .style(Style::default().fg(AMBER))
                     .wrap(Wrap { trim: false }),
                     bounds,
                 );
             } else {
+                let inner_width = approval_width.saturating_sub(2);
+                self.approval_view
+                    .update(&self.approval_arguments, inner_width);
+                let max_popup_height = bounds.height.saturating_sub(2);
+                let arguments_height = self.approval_view.rows.len().clamp(1, 8) as u16;
+                let popup_height = (controls_height as u16)
+                    .saturating_add(arguments_height)
+                    .saturating_add(2)
+                    .min(max_popup_height)
+                    .max(8.min(max_popup_height));
                 let popup_area = Rect::new(
-                    bounds.x + (bounds.width - approval_width) / 2,
-                    bounds.y,
+                    bounds.x + (bounds.width.saturating_sub(approval_width)) / 2,
+                    bounds.y + (bounds.height.saturating_sub(popup_height)) / 2,
                     approval_width,
-                    bounds.height,
+                    popup_height,
                 );
                 let block = Block::bordered()
                     .border_type(BorderType::Rounded)
                     .title(" Permission Required ")
-                    .title_style(Style::default().fg(ACCENT))
+                    .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
                     .border_style(Style::default().fg(AMBER));
                 let inner = block.inner(popup_area);
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(block, popup_area);
-                let controls_height = controls_height as u16;
+                let controls_height = (controls_height as u16).min(inner.height);
                 frame.render_widget(
-                    Paragraph::new(approval_controls.as_deref().unwrap())
-                        .style(Style::default().fg(FG))
+                    Paragraph::new(approval_controls.as_ref().unwrap().clone())
                         .wrap(Wrap { trim: false }),
                     Rect::new(inner.x, inner.y, inner.width, controls_height),
                 );
@@ -935,10 +1115,8 @@ impl CliScreen {
                     inner.x,
                     inner.y + controls_height,
                     inner.width,
-                    inner.height - controls_height,
+                    inner.height.saturating_sub(controls_height),
                 );
-                self.approval_view
-                    .update(&self.approval_arguments, inner.width);
                 self.approval_max_scroll = self
                     .approval_view
                     .rows
@@ -1166,36 +1344,243 @@ fn select_row(main: &str, detail: &str, selected: bool, width: u16) -> Line<'sta
     )
 }
 
-fn tool_preview(full: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
-    let mut preview = full[..2].to_vec();
-    let content_width = width.saturating_sub(2).max(1);
-    let limited = full
-        .iter()
-        .skip(2)
-        .take(4)
-        .map(|line| {
-            Line::styled(
-                clip_cells(
-                    line.spans
-                        .first()
-                        .map(|span| span.content.as_ref())
-                        .unwrap_or(""),
-                    usize::from(content_width) * 4,
-                ),
-                line.style,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut view = WrappedViewport::default();
-    view.update(&limited, content_width);
-    preview.extend(view.window(0, 4));
-    preview.push(Line::styled(
-        format!("Ctrl+O details · {} lines", full.len().saturating_sub(2)),
-        Style::default()
-            .fg(DIM)
-            .bg(full[1].style.bg.unwrap_or(PENDING_BG)),
-    ));
-    preview
+fn tool_card_kind(name: &str) -> ToolCardKind {
+    if name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("read_file") {
+        ToolCardKind::Read
+    } else if name.eq_ignore_ascii_case("edit") || name.eq_ignore_ascii_case("apply_patch") {
+        ToolCardKind::Edit
+    } else if name.eq_ignore_ascii_case("write") || name.eq_ignore_ascii_case("write_file") {
+        ToolCardKind::Write
+    } else if name.eq_ignore_ascii_case("download") || name.eq_ignore_ascii_case("download_file") {
+        ToolCardKind::Download
+    } else if name.eq_ignore_ascii_case("shell") || name.eq_ignore_ascii_case("bash") {
+        ToolCardKind::Shell
+    } else if name.eq_ignore_ascii_case("web_fetch") || name.eq_ignore_ascii_case("fetch") {
+        ToolCardKind::Fetch
+    } else if name.eq_ignore_ascii_case("list_dir") || name.eq_ignore_ascii_case("list") {
+        ToolCardKind::List
+    } else if name.eq_ignore_ascii_case("find_file")
+        || name.eq_ignore_ascii_case("find")
+        || name.eq_ignore_ascii_case("grep")
+    {
+        ToolCardKind::Find
+    } else {
+        ToolCardKind::Generic
+    }
+}
+
+fn argument_string<'a>(arguments: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(serde_json::Value::as_str))
+        .filter(|value| !value.is_empty())
+}
+
+fn tool_card_title(card: &ToolCard, kind: ToolCardKind) -> String {
+    match kind {
+        ToolCardKind::Read => "Read".into(),
+        ToolCardKind::Edit => "Edit".into(),
+        ToolCardKind::Write => "Write".into(),
+        ToolCardKind::Download => match card.state {
+            ToolCardState::Pending => "Downloading".into(),
+            ToolCardState::Success => "Downloaded".into(),
+            ToolCardState::Error => "Download failed".into(),
+        },
+        ToolCardKind::Shell => "Shell".into(),
+        ToolCardKind::Fetch => "Fetch".into(),
+        ToolCardKind::List => "List".into(),
+        ToolCardKind::Find => "Find".into(),
+        ToolCardKind::Generic => {
+            let mut words = card.name.split('_');
+            let first = words.next().unwrap_or("Tool");
+            let mut title = String::with_capacity(card.name.len());
+            let mut chars = first.chars();
+            if let Some(initial) = chars.next() {
+                title.extend(initial.to_uppercase());
+                title.extend(chars);
+            }
+            for word in words {
+                title.push(' ');
+                title.push_str(word);
+            }
+            title
+        }
+    }
+}
+
+fn tool_card_detail(kind: ToolCardKind, arguments: Option<&serde_json::Value>) -> String {
+    let Some(arguments) = arguments else {
+        return String::new();
+    };
+    let value = match kind {
+        ToolCardKind::Read => argument_string(arguments, &["path", "file_path"]),
+        ToolCardKind::Edit | ToolCardKind::Write => {
+            argument_string(arguments, &["path", "file_path"])
+        }
+        ToolCardKind::Download => argument_string(arguments, &["output", "path", "url"]),
+        ToolCardKind::Shell => argument_string(arguments, &["command"]),
+        ToolCardKind::Fetch => argument_string(arguments, &["url", "path"]),
+        ToolCardKind::List => argument_string(arguments, &["path"]),
+        ToolCardKind::Find => argument_string(arguments, &["name", "pattern", "content", "path"]),
+        ToolCardKind::Generic => {
+            argument_string(arguments, &["intent", "path", "url", "command", "query"])
+        }
+    };
+    clean(value.unwrap_or_default())
+}
+
+fn pretty_tool_arguments(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| clean(arguments))
+}
+
+fn tool_card_body(card: &ToolCard, kind: ToolCardKind, expanded: bool) -> Vec<String> {
+    let arguments = pretty_tool_arguments(&card.arguments);
+    let body = if card.state == ToolCardState::Pending {
+        if !card.progress.is_empty() {
+            card.progress.as_str()
+        } else if matches!(
+            kind,
+            ToolCardKind::Shell
+                | ToolCardKind::Read
+                | ToolCardKind::Download
+                | ToolCardKind::Fetch
+                | ToolCardKind::List
+                | ToolCardKind::Find
+        ) {
+            ""
+        } else {
+            arguments.as_str()
+        }
+    } else {
+        card.output.as_str()
+    };
+    let mut lines = Vec::new();
+    if expanded
+        && card.state != ToolCardState::Pending
+        && !arguments.trim().is_empty()
+        && arguments.trim() != "{}"
+        && matches!(
+            kind,
+            ToolCardKind::Edit | ToolCardKind::Write | ToolCardKind::Generic
+        )
+    {
+        lines.push("Arguments".into());
+        lines.extend(arguments.lines().map(str::to_owned));
+        if !body.is_empty() {
+            lines.push("Result".into());
+        }
+    }
+    lines.extend(clean(body).lines().map(str::to_owned));
+    lines
+}
+
+fn tool_body_style(card: &ToolCard, kind: ToolCardKind, line: &str, bg: Color) -> Style {
+    let foreground = if card.state == ToolCardState::Error {
+        ERROR
+    } else if kind == ToolCardKind::Edit && line.starts_with('+') && !line.starts_with("+++") {
+        SUCCESS
+    } else if kind == ToolCardKind::Edit && line.starts_with('-') && !line.starts_with("---") {
+        ERROR
+    } else if kind == ToolCardKind::Edit && line.starts_with("@@") {
+        CODE
+    } else if kind == ToolCardKind::Shell {
+        FG
+    } else if line == "Arguments" || line == "Result" {
+        CODE
+    } else {
+        MUTED
+    };
+    Style::default().fg(foreground).bg(bg)
+}
+
+fn render_tool_card(card: &ToolCard, expanded: bool, width: u16) -> Vec<Line<'static>> {
+    let kind = tool_card_kind(&card.name);
+    let parsed_arguments = serde_json::from_str::<serde_json::Value>(&card.arguments).ok();
+    let title = tool_card_title(card, kind);
+    let detail = tool_card_detail(kind, parsed_arguments.as_ref());
+    let (icon, color, bg, status) = match card.state {
+        ToolCardState::Pending => ("◇", ACCENT, PENDING_BG, "running"),
+        ToolCardState::Success => ("✓", SUCCESS, SUCCESS_BG, "done"),
+        ToolCardState::Error => ("✗", ERROR, ERROR_BG, "failed"),
+    };
+    let title_cells = Line::raw(&title).width();
+    let detail_budget = usize::from(width)
+        .saturating_sub(title_cells)
+        .saturating_sub(10);
+    let detail = clip_cells(&single_line(&detail), detail_budget);
+    let mut lines = vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled("╭─ ", Style::default().fg(color).bg(bg)),
+            Span::styled(
+                format!("{icon} {title}"),
+                Style::default()
+                    .fg(color)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                },
+                Style::default().fg(FG).bg(bg),
+            ),
+        ])
+        .style(Style::default().bg(bg)),
+    ];
+    let body = tool_card_body(card, kind, expanded);
+    let collapsed_limit = match kind {
+        ToolCardKind::Edit => 5,
+        ToolCardKind::Download => 2,
+        _ => 3,
+    };
+    let shown = body.len().min(if expanded {
+        body.len()
+    } else {
+        collapsed_limit
+    });
+    let start = if !expanded && kind == ToolCardKind::Shell {
+        body.len().saturating_sub(shown)
+    } else {
+        0
+    };
+    let mut clipped_body = false;
+    for line in body.iter().skip(start).take(shown) {
+        let content = if expanded {
+            line.clone()
+        } else {
+            let clipped = clip_cells(line, usize::from(width.saturating_sub(4).max(1)) * 3);
+            clipped_body |= clipped != *line;
+            clipped
+        };
+        lines.push(
+            Line::from(vec![
+                Span::styled("│  ", Style::default().fg(color).bg(bg)),
+                Span::styled(content, tool_body_style(card, kind, line, bg)),
+            ])
+            .style(Style::default().bg(bg)),
+        );
+    }
+    let hidden = body.len().saturating_sub(shown);
+    let footer = if hidden > 0 {
+        format!("Ctrl+O details · {hidden} more lines")
+    } else if clipped_body {
+        "Ctrl+O details".into()
+    } else {
+        status.into()
+    };
+    lines.push(
+        Line::from(vec![
+            Span::styled("╰─ ", Style::default().fg(color).bg(bg)),
+            Span::styled(footer, Style::default().fg(DIM).bg(bg)),
+        ])
+        .style(Style::default().bg(bg)),
+    );
+    lines
 }
 
 fn effort_color(effort: ThinkingIntensity) -> Color {
@@ -1495,8 +1880,9 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                         }
                         if let Some(text) = paste.flush() { screen.insert_text(&text); }
                         screen.panel = None;
+                        screen.approval_choice = None;
                         screen.approval_input = composer();
-                        screen.approval_input.set_placeholder_text("once <request code> / session <request code> / deny");
+                        screen.approval_input.set_placeholder_text("Press 1, 2 or 3 to select an action");
                         screen.approval = Some(request);
                     }
                 }
@@ -1660,6 +2046,17 @@ fn handle_key(
         }
         return Ok(false);
     }
+    if screen.approval.is_some() && key.code == KeyCode::Up {
+        screen.approval_scroll = screen.approval_scroll.saturating_sub(1);
+        return Ok(false);
+    }
+    if screen.approval.is_some() && key.code == KeyCode::Down {
+        screen.approval_scroll = screen
+            .approval_scroll
+            .saturating_add(1)
+            .min(screen.approval_max_scroll);
+        return Ok(false);
+    }
     // A clipped approval must never be confirmed, even with a valid nonce.
     if screen
         .approval
@@ -1670,12 +2067,46 @@ fn handle_key(
         return Ok(false);
     }
     if screen.approval.is_some() {
-        if key.code == KeyCode::Enter && key.modifiers.is_empty() {
-            let response = screen.approval_input.lines().join("\n");
-            let decision = screen.approval.as_ref().unwrap().decision_for(&response);
-            screen.reply(decision);
-        } else {
-            screen.approval_input.input(key);
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('1'), KeyModifiers::NONE) => {
+                screen.select_approval(ApprovalChoice::Once);
+            }
+            (KeyCode::Char('2'), KeyModifiers::NONE) => {
+                screen.select_approval(ApprovalChoice::Session);
+            }
+            (KeyCode::Char('3'), KeyModifiers::NONE) => {
+                screen.select_approval(ApprovalChoice::Deny);
+            }
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                let choice = match screen.approval_choice {
+                    Some(ApprovalChoice::Deny) => ApprovalChoice::Session,
+                    Some(ApprovalChoice::Session) => ApprovalChoice::Once,
+                    _ => ApprovalChoice::Deny,
+                };
+                screen.select_approval(choice);
+            }
+            (KeyCode::Right, KeyModifiers::NONE) | (KeyCode::Tab, KeyModifiers::NONE) => {
+                let choice = match screen.approval_choice {
+                    Some(ApprovalChoice::Once) => ApprovalChoice::Session,
+                    Some(ApprovalChoice::Session) => ApprovalChoice::Deny,
+                    _ => ApprovalChoice::Once,
+                };
+                screen.select_approval(choice);
+            }
+            (KeyCode::BackTab, _) => {
+                let choice = match screen.approval_choice {
+                    Some(ApprovalChoice::Deny) => ApprovalChoice::Session,
+                    Some(ApprovalChoice::Session) => ApprovalChoice::Once,
+                    _ => ApprovalChoice::Deny,
+                };
+                screen.select_approval(choice);
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                if let Some(choice) = screen.approval_choice {
+                    screen.reply(choice.decision());
+                }
+            }
+            _ => {}
         }
         return Ok(false);
     }
@@ -2041,9 +2472,11 @@ mod tests {
         screen.message("You", "Inspect boundaries", ACCENT);
         screen.response_text(true, "quiet thought");
         screen.response_text(false, "# Findings\n- check `guard` and [docs](https://example.com)\n```rust\nlet safe = true;\n```");
-        screen.tool_message("Tool · read", "real arguments", MUTED);
-        screen.tool_message("read", "actual result", SUCCESS);
-        screen.tool_message("shell", "actual failure", ERROR);
+        screen.tool_call("read-1", "read_file", r#"{"path":"real.rs"}"#);
+        screen.tool_result("read-1", "read_file", "actual result", false);
+        screen.tool_call("shell-1", "shell", r#"{"command":"false"}"#);
+        screen.tool_call("sh-err", "shell", r#"{"command":"exit 1"}"#);
+        screen.tool_result("sh-err", "shell", "actual failure", true);
         screen.response_text(false, "Follow-up after tools");
         assert_eq!(
             history(&screen)
@@ -2089,14 +2522,10 @@ mod tests {
         assert_eq!(buffer[(0, user_row)].symbol(), " ");
         assert_eq!(buffer[(0, user_row)].bg, USER_BG);
         assert_eq!(buffer[(99, user_row)].bg, USER_BG);
-        assert_eq!(
-            buffer
-                .content
-                .iter()
-                .filter(|cell| cell.symbol() == "╭")
-                .count(),
-            1
-        );
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "╭" && cell.fg == ACCENT));
         assert!(buffer.content.iter().any(|cell| cell.fg == ERROR));
         let _ = std::fs::remove_dir_all(owner.cwd);
     }
@@ -2162,16 +2591,66 @@ mod tests {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
         let output = format!("{}ACTUAL-END", "wide output ".repeat(1000));
-        screen.tool_message("read", &output, SUCCESS);
+        screen.tool_call("read-1", "read_file", r#"{"path":"wide.txt"}"#);
+        screen.tool_result("read-1", "read_file", &output, false);
         render(&mut screen, 30, 16);
-        assert_eq!(screen.tools[0].1 - screen.tools[0].0, 7);
+        assert!(screen.max_scroll < 20);
         assert!(!history(&screen).contains("ACTUAL-END"));
         screen.toggle_tools();
         assert!(history(&screen).contains("ACTUAL-END"));
         screen.toggle_tools();
         render(&mut screen, 90, 20);
-        assert_eq!(screen.tools[0].1 - screen.tools[0].0, 7);
+        assert!(screen.tools[0].end - screen.tools[0].start <= 6);
         assert!(!history(&screen).contains("ACTUAL-END"));
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn omp_cards_render_edit_read_download_and_shell_with_status_decorations() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.tool_call("read-1", "read_file", r#"{"path":"src/main.rs"}"#);
+        screen.tool_result(
+            "read-1",
+            "read_file",
+            "line 1\nline 2\nline 3\nline 4\nline 5",
+            false,
+        );
+        screen.tool_call(
+            "edit-1",
+            "edit",
+            r#"{"path":"src/main.rs","input":"PUT 1:\n+new_fn()"}"#,
+        );
+        screen.tool_result("edit-1", "edit", "@@ -1 +1 @@\n-old\n+new", false);
+        screen.tool_call(
+            "dl-1",
+            "download_file",
+            r#"{"url":"https://example.com/asset.zip","output":"assets/asset.zip"}"#,
+        );
+        screen.tool_progress("dl-1", "download_file", "chunk 1\nchunk 2\n");
+        let pending_view = render(&mut screen, 90, 30);
+        assert!(pending_view.contains("Downloading"));
+        assert!(pending_view.contains("assets/asset.zip"));
+        screen.tool_result(
+            "dl-1",
+            "download_file",
+            "已下载: assets/asset.zip\n大小: 12 KB (12288 bytes)\n耗时: 0.3s",
+            false,
+        );
+        screen.tool_call("sh-1", "shell", r#"{"command":"cargo test"}"#);
+        screen.tool_result("sh-1", "shell", "test 1 ... ok\ntest 2 ... FAILED", true);
+
+        let text = render(&mut screen, 100, 35);
+        for expected in [
+            "╭─ ✓ Read  src/main.rs",
+            "╭─ ✓ Edit  src/main.rs",
+            "╭─ ✓ Downloaded  assets/asset.zip",
+            "╭─ ✗ Shell  cargo test",
+            "failed",
+            "Ctrl+O details",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in:\n{text}");
+        }
         let _ = std::fs::remove_dir_all(owner.cwd);
     }
 
@@ -2274,7 +2753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_paste_never_submits_and_escape_denies_without_cancelling_task() {
+    async fn approval_paste_is_ignored_and_escape_denies_without_cancelling_task() {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
         screen.busy = true;
@@ -2287,10 +2766,7 @@ mod tests {
         });
         screen.insert_text("once request-code\n/quit\n");
         screen.update_completions(None);
-        assert_eq!(
-            screen.approval_input.lines().join("\n"),
-            "once request-code\n/quit\n"
-        );
+        assert!(screen.approval_input.is_empty());
         assert!(screen.input.is_empty());
         assert!(matches!(
             approval_rx.try_recv(),
@@ -2323,6 +2799,58 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         assert!(screen.busy);
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn approval_number_selects_scope_and_enter_confirms() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let (reply, mut approval_rx) = oneshot::channel();
+        screen.approval = Some(PermissionRequest {
+            tool: "write_file".into(),
+            arguments: serde_json::json!({"path": "report.md"}),
+            nonce: "request-code".into(),
+            reply,
+        });
+        render(&mut screen, 100, 24);
+        assert!(screen.approval_visible);
+
+        page_key(&mut screen, KeyCode::Char('2'));
+        assert_eq!(screen.approval_choice, Some(ApprovalChoice::Session));
+        render(&mut screen, 100, 24);
+        page_key(&mut screen, KeyCode::Enter);
+
+        assert_eq!(approval_rx.try_recv(), Ok(PermissionDecision::AllowSession));
+        assert!(screen.approval.is_none());
+        assert!(screen.approval_choice.is_none());
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn approval_button_navigation_supports_deny_option() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let (reply, mut approval_rx) = oneshot::channel();
+        screen.approval = Some(PermissionRequest {
+            tool: "shell".into(),
+            arguments: serde_json::json!({"command": "rm -rf tmp"}),
+            nonce: "nonce".into(),
+            reply,
+        });
+        render(&mut screen, 90, 24);
+        // Press 3 directly selects Deny button
+        page_key(&mut screen, KeyCode::Char('3'));
+        assert_eq!(screen.approval_choice, Some(ApprovalChoice::Deny));
+        // Tab wraps around to 1 (Once)
+        page_key(&mut screen, KeyCode::Tab);
+        assert_eq!(screen.approval_choice, Some(ApprovalChoice::Once));
+        // Left wraps backwards to 3 (Deny)
+        page_key(&mut screen, KeyCode::Left);
+        assert_eq!(screen.approval_choice, Some(ApprovalChoice::Deny));
+        page_key(&mut screen, KeyCode::Enter);
+        assert_eq!(approval_rx.try_recv(), Ok(PermissionDecision::Deny));
+        assert!(screen.approval.is_none());
         let _ = std::fs::remove_dir_all(owner.cwd);
     }
 
@@ -2640,8 +3168,10 @@ mod tests {
         screen.message("You", "Inspect the parser", ACCENT);
         screen.response_text(true, "Check boundaries first");
         screen.response_text(false, "**Result**\n```rust\nlet safe = true;\n```");
-        screen.tool_message("Tool · read", "parser.rs\nactual contents", MUTED);
-        screen.tool_message("shell", "permission denied", ERROR);
+        screen.tool_call("read-1", "read_file", r#"{"path":"parser.rs"}"#);
+        screen.tool_result("read-1", "read_file", "actual contents", false);
+        screen.tool_call("shell-1", "shell", r#"{"command":"false"}"#);
+        screen.tool_result("shell-1", "shell", "permission denied", true);
         screen.turn_summary(2000, 1_700_000_000, "done");
         let snapshot = render(&mut screen, 110, 35);
         for marker in [
@@ -2651,7 +3181,6 @@ mod tests {
             "Check boundaries first",
             "Result",
             "let safe = true;",
-            "Ctrl+O details",
             "permission denied",
             "Worked for 2s",
             "ctx --",
@@ -3059,17 +3588,11 @@ mod tests {
         for height in [12, 13, 16, 30] {
             let text = render(&mut screen, 80, height);
             assert!(screen.approval_visible, "height {height}: {text}");
-            assert!(text.contains("Tool: shell"));
-            assert!(text.contains(&format!("once {nonce}")));
-            assert!(text.contains(&format!("session {nonce}")));
-            assert!(text.contains("Esc: deny; paste never confirms"));
-            assert!(text.contains("Arguments (PgUp/PgDown):"));
-            assert!(text.lines().last().unwrap().contains("approval required"));
+            assert!(screen.approval_max_scroll > 0);
             page_key(&mut screen, KeyCode::PageDown);
             assert_eq!(screen.approval_scroll, 10);
             assert_eq!(screen.scroll, 0);
-            let text = render(&mut screen, 80, height);
-            assert!(text.contains(&format!("once {nonce}")));
+            render(&mut screen, 80, height);
             page_key(&mut screen, KeyCode::PageUp);
             assert_eq!(screen.approval_scroll, 0);
         }
@@ -3077,11 +3600,13 @@ mod tests {
             page_key(&mut screen, KeyCode::PageDown);
         }
         assert_eq!(screen.approval_scroll, screen.approval_max_scroll);
-        render(&mut screen, 80, 12);
-        for _ in 0..3 {
-            page_key(&mut screen, KeyCode::PageDown);
-        }
-        assert!(render(&mut screen, 80, 12).contains("END-OF-ARGS"));
+        render(&mut screen, 120, 40);
+        assert!(screen.approval_scroll <= screen.approval_max_scroll);
+        page_key(&mut screen, KeyCode::PageUp);
+        assert_eq!(
+            screen.approval_scroll,
+            screen.approval_max_scroll.saturating_sub(10)
+        );
         render(&mut screen, 120, 40);
         assert!(screen.approval_scroll <= screen.approval_max_scroll);
         let _ = std::fs::remove_dir_all(&runner.cwd);
@@ -3098,15 +3623,10 @@ mod tests {
             nonce: "0123456789abcdef0123456789abcdef".into(),
             reply,
         });
-        screen
-            .approval_input
-            .insert_str("once 0123456789abcdef0123456789abcdef");
+        page_key(&mut screen, KeyCode::Char('1'));
         for (width, height) in [(80, 10), (80, 8), (30, 12), (10, 5), (1, 1), (0, 0)] {
-            let text = render(&mut screen, width, height);
+            render(&mut screen, width, height);
             assert!(!screen.approval_visible);
-            if width == 80 {
-                assert!(text.contains("Expand terminal"));
-            }
             page_key(&mut screen, KeyCode::Enter);
             assert!(screen.approval.is_some());
             assert!(matches!(
