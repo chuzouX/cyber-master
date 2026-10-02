@@ -160,6 +160,7 @@ struct CliScreen {
     effort: ThinkingIntensity,
     cwd: String,
     session: String,
+    session_title: String,
     input: TextArea<'static>,
     approval_input: TextArea<'static>,
     approval: Option<PermissionRequest>,
@@ -302,6 +303,11 @@ impl CliScreen {
             effort: runner.ctx.config.agent.thinking_intensity,
             cwd: runner.cwd.display().to_string(),
             session: runner.index.current.clone(),
+            session_title: runner
+                .index
+                .get(&runner.index.current)
+                .map(|meta| meta.title.clone())
+                .unwrap_or_else(|| "新会话".into()),
             input: composer(),
             approval_input: composer(),
             approval: None,
@@ -389,6 +395,11 @@ impl CliScreen {
         self.model = model;
         self.effort = runner.ctx.config.agent.thinking_intensity;
         self.session = runner.index.current.clone();
+        self.session_title = runner
+            .index
+            .get(&self.session)
+            .map(|meta| meta.title.clone())
+            .unwrap_or_else(|| "新会话".into());
         let mut recent = runner
             .index
             .sessions
@@ -1344,24 +1355,34 @@ impl CliScreen {
             area.width.saturating_sub(logo_width),
             area.height.saturating_sub(u16::from(logo_width != 0)),
         );
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    format!("Cyber Master V{}", env!("CARGO_PKG_VERSION")),
+        let mut lines = vec![
+            Line::styled(
+                format!("Cyber Master V{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!(
+                    "{} with {} effort",
+                    clean(&self.model),
+                    effort_label(self.effort)
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Line::styled(clean(&self.cwd), Style::default().fg(MUTED)),
+        ];
+        if !self.session_title.is_empty()
+            && self.session_title != "新会话"
+            && self.session_title != "默认会话"
+        {
+            lines.push(Line::from(vec![
+                Span::styled("Session · ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    clean(&self.session_title),
                     Style::default().fg(FG).add_modifier(Modifier::BOLD),
                 ),
-                Line::styled(
-                    format!(
-                        "{} with {} effort",
-                        clean(&self.model),
-                        effort_label(self.effort)
-                    ),
-                    Style::default().fg(MUTED),
-                ),
-                Line::styled(clean(&self.cwd), Style::default().fg(MUTED)),
-            ]),
-            info,
-        );
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), info);
     }
 }
 

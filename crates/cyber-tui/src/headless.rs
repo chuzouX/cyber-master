@@ -358,15 +358,18 @@ impl SessionRunner {
                 .join(format!("{}.json", self.index.current)),
             &serde_json::to_vec_pretty(&local)?,
         )?;
+        let challenge_list = self.challenges().unwrap_or_default();
         if let Some(meta) = self.index.get_mut(&self.index.current.clone()) {
             meta.message_count = self.entries.len();
             meta.updated_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if meta.title == "新会话" {
-                if let Some(ChatEntry::User(text)) = self.entries.first() {
-                    meta.title = text.chars().take(40).collect();
+            if meta.title == "新会话" || meta.title == "默认会话" || meta.title.is_empty() {
+                let new_title =
+                    crate::history::derive_session_title(&self.entries, &challenge_list);
+                if new_title != "新会话" {
+                    meta.title = new_title;
                 }
             }
         }

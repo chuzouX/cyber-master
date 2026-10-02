@@ -624,18 +624,25 @@ impl App {
     /// 持久化当前 session：写 entries 文件 + 刷新 meta（message_count/updated_at/title 派生）+ 写 index。
     /// 失败仅记日志（不影响会话）。在 Done/Error/cancel/clear/quit 及退出时调用。
     fn save_history(&mut self) {
+        let challenges: Vec<_> = self
+            .ctf_challenges
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+        if let Some(meta) = self.sessions.get_mut(&self.sessions.current.clone()) {
+            if meta.title == "新会话" || meta.title == "默认会话" || meta.title.is_empty() {
+                let derived = crate::history::derive_session_title(&self.chat.entries, &challenges);
+                if derived != "新会话" {
+                    meta.title = derived;
+                }
+            }
+        }
         crate::history::save_current(
             &self.paths.history_dir,
             &self.paths.cwd,
             &mut self.sessions,
             &self.chat.entries,
         );
-        // CTF 题目：全局题目存 challenges.json，session 题目存 sessions/{id}.json
-        let challenges: Vec<_> = self
-            .ctf_challenges
-            .lock()
-            .map(|l| l.clone())
-            .unwrap_or_default();
         let global: Vec<_> = challenges.iter().filter(|c| c.is_global).cloned().collect();
         let session: Vec<_> = challenges
             .iter()

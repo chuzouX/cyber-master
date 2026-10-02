@@ -274,15 +274,62 @@ pub fn load_current(history_dir: &Path, cwd: &Path) -> (SessionIndex, Vec<ChatEn
 ///
 /// **title 派生**：若当前 meta.title 为 "新会话" 且 entries 首条为 User →
 /// title = 首 40 字符（避免一直显示 "新会话"）。
+/// 为当前会话派生/生成标题（支持根据 CTF 题目或首条用户有效对话提炼）。
+pub fn derive_session_title(
+    entries: &[ChatEntry],
+    challenges: &[cyber_core::CtfChallenge],
+) -> String {
+    if let Some(c) = challenges.first() {
+        return format!("CTF: {}", c.name);
+    }
+    let user_msg = entries.iter().find_map(|e| match e {
+        ChatEntry::User(text) => {
+            let t = text.trim();
+            if !t.is_empty() && !t.starts_with('/') {
+                Some(t)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    });
+    let raw = match user_msg {
+        Some(t) => t,
+        None => {
+            if let Some(ChatEntry::User(t)) = entries.first() {
+                t.trim()
+            } else {
+                return DEFAULT_SESSION_TITLE.into();
+            }
+        }
+    };
+    if raw.is_empty() || raw == DEFAULT_SESSION_TITLE {
+        return DEFAULT_SESSION_TITLE.into();
+    }
+    let first_line = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(raw)
+        .trim();
+    let cleaned = first_line.trim_start_matches(['`', '#', '-']).trim();
+    let title: String = cleaned.chars().take(TITLE_MAX_CHARS).collect();
+    if title.trim().is_empty() {
+        DEFAULT_SESSION_TITLE.into()
+    } else {
+        title
+    }
+}
+
 pub fn save_current(history_dir: &Path, cwd: &Path, idx: &mut SessionIndex, entries: &[ChatEntry]) {
-    // 先派生 title（在写 index 前更新 meta）
+    // 先派生/生成 title（在写 index 前更新 meta）
     if let Some(meta) = idx.get_mut(&idx.current.clone()) {
-        if meta.title == DEFAULT_SESSION_TITLE {
-            if let Some(ChatEntry::User(text)) = entries.first() {
-                let title: String = text.chars().take(TITLE_MAX_CHARS).collect();
-                if !title.trim().is_empty() {
-                    meta.title = title;
-                }
+        if meta.title == DEFAULT_SESSION_TITLE
+            || meta.title == MIGRATED_SESSION_TITLE
+            || meta.title.is_empty()
+        {
+            let derived = derive_session_title(entries, &[]);
+            if derived != DEFAULT_SESSION_TITLE {
+                meta.title = derived;
             }
         }
         meta.message_count = entries.len();
