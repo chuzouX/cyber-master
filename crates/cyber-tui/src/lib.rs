@@ -12,6 +12,8 @@
 pub mod app;
 pub mod bootstrap;
 pub mod chat;
+pub mod cli;
+pub(crate) mod cli_commands;
 pub mod ctf_store;
 pub mod event;
 pub mod headless;
@@ -24,6 +26,7 @@ pub mod views;
 pub use app::{App, AppPaths, AppRegistries, FetchResult, Mode};
 pub use bootstrap::build_registries;
 pub use chat::ChatState;
+pub use cli::run_cli;
 pub use cyber_mcp::McpServersConfig;
 pub use headless::{outcome_to_json, run_headless, HeadlessArgs, HeadlessOutcome};
 pub use theme::Theme;

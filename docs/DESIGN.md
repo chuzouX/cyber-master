@@ -1,12 +1,39 @@
 # Cyber Master — 网络安全智能体终端 设计文档
 
-> Rust + ratatui 构建的双模式（对话 / 工作流）安全智能体 CLI 终端，支持 MCP、Skill、实时监控与日志分析。
+> Rust + ratatui 构建的安全智能体终端，已实现流式对话、CTF 与 MCP/Skill 集成；工作流、Dashboard 实时监控与日志分析仍为规划。
 
-> 📌 **实施进度**：各阶段的实时完成情况见 [PROGRESS.md](./PROGRESS.md)（每完成一项即更新勾选与说明）。本文件为静态设计依据，路线图见 [§13](#13-开发路线图)。
+> 📌 **实施进度**：当前实现与验收见 [PROGRESS.md](./PROGRESS.md)。本文件 §0 记录默认 CLI 已实现行为；后文保留原 TUI 设计与历史实现说明，工作流、Dashboard、SQLite 等规划不代表已交付，路线图见 [§13](#13-开发路线图)。
 
 ---
 
 ## 0. 设计目标
+
+### 当前入口约定
+
+`cyber` 默认进入全屏简洁 coding CLI，替代行式多轮输入；`cyber tui` 显式进入原有全屏功能面板，`cyber run` 保留非交互单次任务，`cyber setup` 提供配置向导。缺少有效配置的首次交互启动先运行向导；脚本不弹向导。此约定替代下文早期的默认 TUI / 唯一界面描述。
+
+CLI 与 headless 在 `cyber-tui` 内共用独立于 `App` 的 `SessionRunner`、JSON 历史和注册表装配，尚未迁移到独立 runtime/storage crate。CLI 启用执行前 nonce 审批；headless 仅接受调用者显式的 `--allow-tool` 授权。两者默认不自动启动 MCP，CLI `/mcp connect` 经显式 nonce 批准才连接，UI deny 不启动 server。原 TUI 的权限和 MCP 行为保持原样，不应视为已有新审批保护。
+
+### 默认 coding CLI 交互约定
+
+- **视觉与 Header**：参考 [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) 的真实 palette 与终端层次，不拷源码、不仿造未实现 agents/LSP。使用暖金、灰白、cyan/紫色，彩色 ASCII `Cy` + `Cyber Master V<版本>` + model/effort + cwd；不沿用原面板的模式导航标题栏。
+- **主区与底部**：可滚动对话区，底部固定输入区与实际状态栏 `provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output`；未知值显示 `--`。不再使用行末 `\` 续行的行式交互，不显示审批模式或 agent 面板入口。
+- **快捷键与补全**：空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。两行圆角输入区上方显示金色无框候选；`/` 与二级参数建议、Tab 接受、Up/Down 选择，Enter 先接受未接受的候选再执行，Esc 关闭候选保留输入。普通 Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，Ctrl+O 展开工具；任务中 Ctrl+C cancel，空输入 Ctrl+D quit。当前实现空闲且空输入的 Ctrl+C 也会退出，不能将其描述为任何状态都只取消。
+- **状态数据**：`ctx` 是当前上下文估算 token 相对有效容量的剩余百分比，容量未知为 `--`；`cache` 是上报命中 token /（命中 + 未命中 token），分母为零为 `--`；input/output 只累计实际 Usage，未上报为 `--`。Usage 仅在本进程当前会话累计，新建/切换会话重置，重开不恢复；切换 provider/model 不重置累计，重新计算上下文容量与估算。
+- **命令目录**：`cli_commands.rs::commands` 复用 TUI 目录，过滤 `/mode` 后支持 16 个主命令，加 `/effort` 共 17 项。执行、表单、picker、任务与二级补全已接入，实际语法及原 TUI 差异见 [TUI_COMMANDS.md](./TUI_COMMANDS.md)；目录覆盖不等于所有多子命令/参数/任务状态组合均已端到端验收。
+- **Provider 与会话**：Provider add/edit 表单 API key 掩码、取消不保存、私有文件原子持久化，use/remove 与默认项回退已实现；model picker 使用已配置模型，不宣称 CLI 自动联网拉取。session picker/list/read/new/delete 与 ID 切换、JSON 保存已实现，跨会话读取只展示，不注入模型历史。
+- **查询与任务**：tools/skill/mcp 查询不执行工具；MCP connect 是独立显式授权启动任务，不是查询副作用。clear 清空保存当前历史，cancel 取消实际任务；compact 调模型生成真实摘要，成功后提交/持久化，失败或取消不覆盖原历史。
+- **CTF 隔离**：enable/disable/status、add/list 与已解题目 writeup 任务已实现；CLI add 必须显式合法分类。writeup 需要 ctf-writeup Skill，成功后保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>/<category>/<name>/writeup.md`，项目/会话/题目隔离；失败或取消不发布成功报告。原 TUI 的旧路径不是 CLI 当前路径，不宣称 Solved writeup 的真实 API 联调。
+- **Memory 与保存边界**：全局/项目 memory CRUD、rule enabled/scope/prompt 表单及 list/edit/delete 已实现；enabled 与合法 scope/prompt 决定后续系统提示词中的记忆写入约束，是 advisory guidance，不是 hard guard。项目 config 已含 memory.rules 时修改项目规则，否则修改全局规则。think/effort/max_steps 仅保存全局目标字段，不把项目 merged 配置整份写入全局；内存立即生效，重新加载仍遵循项目覆盖。
+- **正文与 Thinking**：复用 `cyber-tui::markdown` 支持子集，不支持表格或完整 CommonMark；只有实际 `reasoning_content` / Reasoning 事件才展示斜体 Markdown `Thinking`，不伪造思考。工具使用紧凑状态背景块，Ctrl+O 展开详情，工具数据不伪造 Usage。交错 reasoning/正文合并到同一回复区域，空 Token 或旧空 Assistant 不生成重复 `Cyber` 标题，保留旧 history 兼容。
+- **每轮记录**：CLI 每轮结束将 `TurnSummary { elapsed_ms, finished_at, status }` 写入现有 JSON 历史；显示 `Worked for 3s · done HH:mm`（秒数向下取整，时间按本地时区），状态为 `done` / `error` / `cancelled`。重开保留记录；旧历史无记录时不补造。Worked 展示记录与 Thinking/System 均不回灌模型历史，Usage 累计也不从这些记录恢复；compact 的模型摘要不同，成功后作为压缩上下文供后续 turn 使用。
+- **思考档位**：`/effort low|medium|high|xhigh|auto` 只切换现有 agent 思考档位，`medium` 映射 `Middle`、`xhigh` 映射 `Max`，保留 middle/max 别名及 `/think`，沿用系统提示词注入；不新增 provider API 的 `reasoning_effort` 参数。
+- **执行前审批**：保留每次请求的 nonce 输入要求，须输入 `once <请求码>` 或 `session <请求码>` 后显式提交；paste 不得自动提交或确认，预输入内容不得误批准。session 授权仍只匹配同一工具及完全相同的参数。这是权限流程，不是 mode，精简底栏不取消审批。
+- **Headless 不变**：`cyber run` 的文本/JSON 输出、会话续接、默认拒绝工具和显式 `--allow-tool` 授权保持原样，不引入全屏或交互审批。
+
+已完成真实 Windows ConPTY 119 个断言（47 SSE + 72 commands）：120x30 / 80x12、Unicode 光标、密钥掩码/取消、17 项目录、compact/cancel/session 持久化、memory rule 等。MCP 单测与 5 个真实子进程测试通过，含 lifecycle 修复及 cancel/shutdown，UI connect deny 不会 start。此记录不是完整 Provider 外网或 CTF 已解 writeup 的真实 API 联调证明；不在此填写 workspace/crate 测试总数。
+
+下文 Chat 布局、模式导航及 §9 的原面板键位描述属于 `cyber tui`，不替代以上默认 CLI 实现。§4/§5 的工作流与 Dashboard、SQLite 存储、专用安全工具封装及通用目标白名单校验仍为规划；现有 rules/scope 提示词不构成通用运行时授权边界。
 
 | 目标 | 说明 |
 | --- | --- |
@@ -59,7 +86,7 @@ cyber_master/
 └── docs/
 ```
 
-依赖方向：`app → tui / agent / workflow → core → storage`，禁止反向依赖。
+当前主要依赖方向为 `app → tui / agent / workflow → core`，`tui → mcp / skills → agent / core`；禁止反向依赖。会话仍由 tui 的 JSON 历史模块保存，图中的 SQLite 与 storage 接管属于规划。
 
 ---
 
@@ -117,7 +144,7 @@ rules:
 （目标范围、历史发现、注意事项……）
 ```
 
-YAML frontmatter 提供结构化字段（scope/authorization/rules），正文提供自由描述。frontmatter 中的 `rules` 会注入到 agent 系统提示词，作为安全护栏。
+YAML frontmatter 提供结构化字段（scope/authorization/rules），正文提供自由描述。frontmatter 中的 `rules` 会注入到 agent 系统提示词作为行为约束，不是 hard guard 或通用目标白名单执行器。
 
 ### 2.3 启动流程（启动状态机）
 
@@ -210,7 +237,7 @@ log_level = "info"
 
 - **流式输出**：token-by-token 渲染（SSE/流式 API）
 - **工具调用内联展示**：工具名、参数摘要、状态、耗时、结果计数；可展开看详情
-- **斜杠命令**：`/help /workflow /skill /mcp /model /provider /clear /save /load /report /targets /scan /dashboard`
+- **原 TUI 斜杠命令（实际实现）**：17 个主命令及完整子命令以 [TUI_COMMANDS.md](./TUI_COMMANDS.md) 为准，依据 `slash.rs` 与 `app.rs` handler 核对；原 TUI `/memory rule` 仅出现在目录/补全，尚无 handler（CLI 已实现表单）；`/mode workflow|dashboard` 仅切到占位页，不代表工作流或监控已实现。
 - **斜杠补全菜单**：输入 `/` 自动弹出命令目录（按前缀大小写不敏感过滤），↑/↓ 选择、Enter/Tab 补全命令名+空格、Esc 关闭；菜单展示用法串与描述（详见 §9.7）
 - **服务商管理**：`/provider list|add|edit|use|remove` 在对话中增删改查 LLM 服务商，无需退出到配置文件；表单内「拉取模型」按钮异步 `GET {base}/models` 拉取模型列表供选择（详见 §9.5）
 - **项目上下文感知**：`.cyber.md` 自动注入；`@file` 引用文件；`/add` 添加目录到上下文
@@ -224,9 +251,9 @@ log_level = "info"
 
 ### 3.3 安全护栏
 
-- frontmatter `rules` 注入系统提示词
-- 危险命令（rm、 DoS 类、未授权目标）二次确认
-- 操作目标白名单校验（不在 scope 的目标拒绝执行）
+- frontmatter `rules` 与 scope 注入系统提示词，不是 hard guard。
+- 内置工具已有危险命令/路径护栏；默认 CLI 另有执行前 nonce 审批，原 TUI 尚未接入该审批。
+- 通用 scope 目标白名单与所有危险操作的二次确认尚未实现，不可从提示词注入推断已有运行时保证。
 
 ---
 
@@ -394,7 +421,7 @@ Tab 切换：`Overview / Nodes / Logs / Stats / Assets`。
 
 ### 6.2 能力
 
-- 启动时按 `mcp/servers.toml` **并行**拉起所有 stdio server（`McpRegistry::connect_all`，每 server 独立超时，失败 warn + skip 不阻断启动）
+- 原 `cyber tui` 启动时按 `mcp/servers.toml` 并行连接配置 server（`McpRegistry::connect_all`，每 server 独立超时，失败 warn + skip 不阻断启动）；CLI/headless 默认 no autostart，CLI 仅在 `/mcp connect` nonce 批准后连接，deny 不启动。
 - 握手：`initialize`（协议版本 + client/server info）→ `tools/list` 缓存工具 schema 到 `McpConnection`（避免每次拉取）
 - v0.1 支持 `tools/list` `tools/call`；`resources/*` `prompts/*` 留待后续阶段
 - **统一工具表**：MCP 工具与内置工具、Skill 同等暴露给 agent 与工作流节点（详见 §6.4）
@@ -428,7 +455,7 @@ headers = { Authorization = "Bearer ${MCP_TOKEN}" }
 - JSON-RPC `id` 单调递增无竞争，无需 Mutex；id 用 `AtomicU64`。notification 用 `JsonRpcRequest::notification(...)`（`id: None`，序列化省略 id 字段）。
 - `call(method, params)` 带 30s 超时（`tokio::time::timeout` 包裹 oneshot）；握手用 `spec.timeout_secs`（默认 5s）防卡死。
 - `headers` 支持 `${VAR}` 环境变量展开（`expand_env_headers`），使 `Authorization = "Bearer ${MCP_TOKEN}"` 生效。
-- cancel 时调用方 drop oneshot sender，无害（agent cancel 流程复用 generation 计数器隔离 stale 事件）。
+- lifecycle 已修复并通过单测及真实子进程测试：连接取消与 shutdown 路径清理 actor/子进程；UI deny 在启动前拒绝，不能只把取消理解为丢弃 oneshot。agent 旧事件仍由 generation 隔离。
 
 ### 6.5 统一工具表与命名
 
@@ -448,7 +475,7 @@ headers = { Authorization = "Bearer ${MCP_TOKEN}" }
 
 ## 7. Skill 支持
 
-> **P3 实现状态**：v0.1 已落地目录扫描 + 渐进式披露 + `/skill` 命令 + `skill_<name>` 工具（[cyber-skills](../crates/cyber-skills/src/)）。v0.1 仅**显式触发**（`/skill <name>` 或 LLM 调 `skill_<name>` 工具），不做 `triggers` 自动匹配（`triggers` 字段保留并写入 schema description 供 LLM 参考）。
+> **P3 实现状态**：v0.1 已落地目录扫描 + 渐进式披露 + `/skill` 命令 + `skill_<name>` 工具（[cyber-skills](../crates/cyber-skills/src/)）。`/skill <name>` 仅向 UI 添加 System 展示条目，不注入模型历史；模型获取正文需显式调用 `skill_<name>` 工具。不做 `triggers` 自动匹配（字段保留并写入 schema description 供 LLM 参考）。
 
 ### 7.1 Skill 结构
 
@@ -645,7 +672,7 @@ P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`�
 
 ### 9.6 Markdown 渲染
 
-P2 阶段为 Chat 的 assistant 消息（含流式 buffer）实现轻量 Markdown 渲染，让 LLM 输出的标题、代码块、列表等结构清晰可读。由 `cyber-tui::markdown` 模块负责（手写解析器，不引入外部 markdown crate——TUI 只需 span 级样式，手写可精确映射主题色且避免依赖膨胀，与项目自实现 FNV hash / SSE 行缓冲一致）。
+P2 阶段为 Chat 的 assistant 消息（含流式 buffer）实现轻量 Markdown 渲染，让 LLM 输出的标题、代码块、列表等结构清晰可读。默认 coding CLI 的正文与真实 Thinking 也复用 `cyber-tui::markdown` 模块（手写解析器，不引入外部 markdown crate）。以下是支持子集，不是完整 CommonMark；表格不支持。
 
 **覆盖子集**：
 

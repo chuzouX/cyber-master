@@ -36,7 +36,7 @@ impl McpTool {
             } else {
                 format!("[MCP/{}] {}", server.server_name(), mcp_schema.description)
             },
-            tags: vec![],
+            tags: vec!["mcp".into(), server.server_name().into()],
             parameters: mcp_schema.input_schema,
         };
         Self {
@@ -118,6 +118,7 @@ mod tests {
         assert_eq!(tool.schema().name, "mcp_filesystem_read_file");
         assert!(tool.schema().description.contains("[MCP/filesystem]"));
         assert!(tool.schema().description.contains("read a file"));
+        assert_eq!(tool.schema().tags, vec!["mcp", "filesystem"]);
     }
 
     #[test]
@@ -132,6 +133,7 @@ mod tests {
             },
         );
         assert_eq!(tool.schema().name, "mcp_my_server_v2_tool_name");
+        assert_eq!(tool.schema().tags, vec!["mcp", "my-server.v2"]);
     }
 
     #[test]
@@ -146,5 +148,66 @@ mod tests {
             },
         );
         assert_eq!(tool.schema().description, "[MCP/x]");
+        assert_eq!(tool.schema().tags, vec!["mcp", "x"]);
+    }
+
+    #[tokio::test]
+    async fn registered_mcp_tools_are_discoverable_in_existing_search_catalog() {
+        use cyber_agent::tools::SearchToolsTool;
+        use cyber_agent::ToolRegistry;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SearchToolsTool::new(registry.catalog())));
+        let ctx = ToolCtx {
+            cwd: std::env::temp_dir(),
+            rules: vec![],
+            scope: None,
+            env: vec![],
+        };
+        let before = registry
+            .execute("search_tools", serde_json::json!({"tag": "mcp"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!before.content.contains("mcp_my_server_v2_read_file"));
+
+        for server in ["my-server.v2", "other"] {
+            registry.register(Box::new(McpTool::new(
+                make_conn(server),
+                McpToolSchema {
+                    name: "read_file".into(),
+                    description: "read a file".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            )));
+        }
+
+        for (query, finds_first, finds_other) in [
+            ("mcp", true, true),
+            (" MCP ", true, true),
+            ("MY-SERVER.V2", true, false),
+            ("server.v2", true, false),
+            ("other", false, true),
+            ("", true, true),
+            ("nonexistent", false, false),
+        ] {
+            let output = registry
+                .execute("search_tools", serde_json::json!({"tag": query}), &ctx)
+                .await
+                .unwrap();
+            assert!(!output.is_error);
+            assert_eq!(
+                output.content.contains("mcp_my_server_v2_read_file"),
+                finds_first,
+                "query: {query:?}"
+            );
+            assert_eq!(
+                output.content.contains("mcp_other_read_file"),
+                finds_other,
+                "query: {query:?}"
+            );
+            if finds_first {
+                assert!(output.content.contains("[mcp, my-server.v2]"));
+            }
+        }
     }
 }

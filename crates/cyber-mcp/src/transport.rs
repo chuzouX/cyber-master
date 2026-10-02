@@ -9,6 +9,7 @@
 //! `tokio::io::duplex` 模拟 server，无需 trait 对象（`tokio::spawn` 擦除泛型）。
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -46,6 +47,36 @@ pub struct StdioTransport {
     pub stdout: ChildStdout,
 }
 
+/// Own the process even when its IO has moved into a cancelled actor future.
+pub(crate) struct OwnedChild(pub Option<Child>);
+
+impl OwnedChild {
+    pub async fn shutdown(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.start_kill();
+            if tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                self.0.take();
+            }
+        }
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                });
+            }
+        }
+    }
+}
+
 impl StdioTransport {
     /// 按 spec 启动子进程，取 stdin/stdout。
     ///
@@ -66,20 +97,22 @@ impl StdioTransport {
             .stderr(Stdio::null()) // 不消费 stderr（避免阻塞；server 日志丢弃）
             .kill_on_drop(true); // 父进程退出时 kill 子进程（防泄漏）
 
-        let mut child = cmd.spawn().map_err(|e| McpError::SpawnFailed {
+        let child = cmd.spawn().map_err(|e| McpError::SpawnFailed {
             server: spec.name.clone(),
             detail: format!("spawn `{command}` 失败: {e}"),
         })?;
-        let stdin = child.stdin.take().ok_or_else(|| McpError::SpawnFailed {
+        let mut child = OwnedChild(Some(child));
+        let process = child.0.as_mut().unwrap();
+        let stdin = process.stdin.take().ok_or_else(|| McpError::SpawnFailed {
             server: spec.name.clone(),
             detail: "子进程 stdin 不可用".into(),
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| McpError::SpawnFailed {
+        let stdout = process.stdout.take().ok_or_else(|| McpError::SpawnFailed {
             server: spec.name.clone(),
             detail: "子进程 stdout 不可用".into(),
         })?;
         Ok(Self {
-            child,
+            child: child.0.take().unwrap(),
             stdin,
             stdout,
         })

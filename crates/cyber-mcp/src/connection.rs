@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::{select, sync::mpsc::UnboundedReceiver};
 use tracing::{debug, warn};
@@ -27,7 +27,7 @@ use crate::proto::{
     McpToolSchema, ToolListResult, PROTOCOL_VERSION,
 };
 use crate::sse::{extract_jsonrpc_responses, parse_sse_text, SseEvent, SseParser};
-use crate::transport::StdioTransport;
+use crate::transport::{OwnedChild, StdioTransport};
 use serde_json::Value;
 
 use crate::config::McpServerSpec;
@@ -37,6 +37,42 @@ const CALL_TIMEOUT_SECS: u64 = 30;
 
 /// SSE actor 的共享 pending 表：id → oneshot 回执。
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+/// JoinHandle normally detaches on drop; owned tasks must instead be cancelled.
+struct OwnedTask(Option<JoinHandle<()>>);
+
+impl OwnedTask {
+    fn release(mut self) -> JoinHandle<()> {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for OwnedTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+fn supervise_actor(
+    actor: impl std::future::Future<Output = ()> + Send + 'static,
+    mut child: OwnedChild,
+) -> (watch::Sender<bool>, JoinHandle<()>) {
+    let (shutdown, mut cancelled) = watch::channel(false);
+    let handle = tokio::spawn(async move {
+        // Drop the IO future before killing/waiting for the child.
+        {
+            tokio::pin!(actor);
+            select! {
+                _ = &mut actor => {},
+                _ = cancelled.changed() => {},
+            }
+        }
+        child.shutdown().await;
+    });
+    (shutdown, handle)
+}
 
 /// actor 请求消息。
 enum McpRequest {
@@ -59,6 +95,7 @@ enum McpRequest {
 pub struct McpConnection {
     server_name: String,
     tx: UnboundedSender<McpRequest>,
+    shutdown: watch::Sender<bool>,
     next_id: AtomicU64,
     tools: Vec<McpToolSchema>,
 }
@@ -70,36 +107,21 @@ impl McpConnection {
         let transport = StdioTransport::spawn(spec)?;
         let server_name = spec.name.clone();
         let timeout = spec.normalized_timeout();
-        let (tx, handle) = Self::start_actor(transport.stdout, transport.stdin);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown, handle) = supervise_actor(
+            actor_loop(transport.stdout, transport.stdin, rx),
+            OwnedChild(Some(transport.child)),
+        );
+        let handle = OwnedTask(Some(handle));
         let conn = Self {
             server_name: server_name.clone(),
             tx,
+            shutdown,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         };
-        // 握手带 spec 超时（防子进程卡死）
-        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await
-        {
-            Ok(res) => res?,
-            Err(_) => {
-                return Err(McpError::Timeout {
-                    server: server_name,
-                    secs: timeout,
-                })
-            }
-        };
-        debug!(
-            server = %conn.server_name,
-            tools = tools.len(),
-            "MCP server 握手完成"
-        );
-        let conn = Arc::new(Self {
-            server_name: conn.server_name,
-            tx: conn.tx,
-            next_id: conn.next_id,
-            tools,
-        });
-        Ok((conn, handle))
+        conn.finish_handshake(handle, Duration::from_secs(timeout))
+            .await
     }
 
     /// 启动 Streamable HTTP 连接 + actor + 握手。
@@ -122,31 +144,23 @@ impl McpConnection {
                 detail: format!("构建 HTTP client 失败: {e}"),
             })?;
         let headers = expand_env_headers(&spec.headers);
-        let (tx, handle) = start_http_actor(server_name.clone(), client, url.to_string(), headers);
+        let (tx, shutdown, handle) = start_http_actor(
+            server_name.clone(),
+            client,
+            url.to_string(),
+            headers,
+            Duration::from_secs(CALL_TIMEOUT_SECS),
+        );
+        let handle = OwnedTask(Some(handle));
         let conn = Self {
             server_name: server_name.clone(),
             tx,
+            shutdown,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         };
-        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await
-        {
-            Ok(res) => res?,
-            Err(_) => {
-                return Err(McpError::Timeout {
-                    server: server_name,
-                    secs: timeout,
-                })
-            }
-        };
-        debug!(server = %conn.server_name, tools = tools.len(), "MCP(HTTP) server 握手完成");
-        let conn = Arc::new(Self {
-            server_name: conn.server_name,
-            tx: conn.tx,
-            next_id: conn.next_id,
-            tools,
-        });
-        Ok((conn, handle))
+        conn.finish_handshake(handle, Duration::from_secs(timeout))
+            .await
     }
 
     /// 启动 legacy SSE 连接 + actor + 握手。
@@ -168,48 +182,71 @@ impl McpConnection {
                 detail: format!("构建 HTTP client 失败: {e}"),
             })?;
         let headers = expand_env_headers(&spec.headers);
-        let (tx, handle) = start_sse_actor(
+        let (tx, shutdown, handle) = start_sse_actor(
             server_name.clone(),
             client,
             sse_url.to_string(),
             headers,
             timeout,
+            Duration::from_secs(CALL_TIMEOUT_SECS),
         );
+        let handle = OwnedTask(Some(handle));
         let conn = Self {
             server_name: server_name.clone(),
             tx,
+            shutdown,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         };
-        let tools = match tokio::time::timeout(Duration::from_secs(timeout), conn.handshake()).await
-        {
-            Ok(res) => res?,
-            Err(_) => {
-                return Err(McpError::Timeout {
-                    server: server_name,
-                    secs: timeout,
+        conn.finish_handshake(handle, Duration::from_secs(timeout))
+            .await
+    }
+
+    async fn finish_handshake(
+        mut self,
+        mut handle: OwnedTask,
+        timeout: Duration,
+    ) -> Result<(Arc<Self>, JoinHandle<()>)> {
+        let result = tokio::time::timeout(timeout, self.handshake())
+            .await
+            .unwrap_or_else(|_| {
+                Err(McpError::Timeout {
+                    server: self.server_name.clone(),
+                    secs: timeout.as_secs(),
                 })
+            });
+        match result {
+            Ok(tools) => {
+                self.tools = tools;
+                debug!(server = %self.server_name, tools = self.tools.len(), "MCP handshake complete");
+                Ok((Arc::new(self), handle.release()))
             }
-        };
-        debug!(server = %conn.server_name, tools = tools.len(), "MCP(SSE) server 握手完成");
-        let conn = Arc::new(Self {
-            server_name: conn.server_name,
-            tx: conn.tx,
-            next_id: conn.next_id,
-            tools,
-        });
-        Ok((conn, handle))
+            Err(error) => {
+                self.shutdown();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), handle.0.as_mut().unwrap()).await;
+                Err(error)
+            }
+        }
     }
 
     /// 启动 actor（泛型擦除）。返回 sender + task handle。
-    fn start_actor<R, W>(reader: R, writer: W) -> (UnboundedSender<McpRequest>, JoinHandle<()>)
+    #[cfg(test)]
+    fn start_actor<R, W>(
+        reader: R,
+        writer: W,
+    ) -> (
+        UnboundedSender<McpRequest>,
+        watch::Sender<bool>,
+        JoinHandle<()>,
+    )
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpRequest>();
-        let handle = tokio::spawn(actor_loop(reader, writer, rx));
-        (tx, handle)
+        let (shutdown, handle) = supervise_actor(actor_loop(reader, writer, rx), OwnedChild(None));
+        (tx, shutdown, handle)
     }
 
     /// 握手：initialize → notifications/initialized → tools/list。
@@ -298,6 +335,7 @@ impl McpConnection {
 
     /// 请求 actor 关闭（shutdown writer）。JoinHandle 由 `McpRegistry` await。
     pub fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
         let _ = self.tx.send(McpRequest::Shutdown);
     }
 }
@@ -319,6 +357,7 @@ impl McpConnection {
         Self {
             server_name: server_name.into(),
             tx,
+            shutdown: watch::channel(false).0,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         }
@@ -451,10 +490,18 @@ fn start_http_actor(
     client: reqwest::Client,
     url: String,
     headers: HeaderMap,
-) -> (UnboundedSender<McpRequest>, JoinHandle<()>) {
+    request_timeout: Duration,
+) -> (
+    UnboundedSender<McpRequest>,
+    watch::Sender<bool>,
+    JoinHandle<()>,
+) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpRequest>();
-    let handle = tokio::spawn(http_actor_loop(server_name, client, url, headers, rx));
-    (tx, handle)
+    let (shutdown, handle) = supervise_actor(
+        http_actor_loop(server_name, client, url, headers, request_timeout, rx),
+        OwnedChild(None),
+    );
+    (tx, shutdown, handle)
 }
 
 /// HTTP actor 主循环：串行处理 Call（每次一个 POST）+ Notification + Shutdown。
@@ -467,6 +514,7 @@ async fn http_actor_loop(
     client: reqwest::Client,
     url: String,
     base_headers: HeaderMap,
+    request_timeout: Duration,
     mut req_rx: UnboundedReceiver<McpRequest>,
 ) {
     let mut session_id: Option<String> = None;
@@ -487,6 +535,7 @@ async fn http_actor_loop(
                     id,
                     method,
                     params,
+                    request_timeout,
                 )
                 .await;
                 let _ = reply.send(result);
@@ -500,6 +549,7 @@ async fn http_actor_loop(
                     &session_id,
                     method,
                     params,
+                    request_timeout,
                 )
                 .await
                 {
@@ -527,13 +577,13 @@ async fn do_http_call(
     id: u64,
     method: String,
     params: Value,
+    request_timeout: Duration,
 ) -> Result<Value> {
     let req_obj = JsonRpcRequest::new(id, method, Some(params));
     let body_bytes = serde_json::to_vec(&req_obj)?;
 
     let send_future = build_http_request(client, url, base_headers, session_id, &body_bytes).send();
-    let resp = match tokio::time::timeout(Duration::from_secs(CALL_TIMEOUT_SECS), send_future).await
-    {
+    let resp = match tokio::time::timeout(request_timeout, send_future).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             return Err(McpError::Network {
@@ -544,7 +594,7 @@ async fn do_http_call(
         Err(_) => {
             return Err(McpError::Timeout {
                 server: server_name.into(),
-                secs: CALL_TIMEOUT_SECS,
+                secs: request_timeout.as_secs(),
             })
         }
     };
@@ -566,22 +616,21 @@ async fn do_http_call(
         .unwrap_or("")
         .to_string();
 
-    let bytes =
-        match tokio::time::timeout(Duration::from_secs(CALL_TIMEOUT_SECS), resp.bytes()).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => {
-                return Err(McpError::Network {
-                    server: server_name.into(),
-                    detail: format!("读取 HTTP 响应 body 失败: {e}"),
-                })
-            }
-            Err(_) => {
-                return Err(McpError::Timeout {
-                    server: server_name.into(),
-                    secs: CALL_TIMEOUT_SECS,
-                })
-            }
-        };
+    let bytes = match tokio::time::timeout(request_timeout, resp.bytes()).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            return Err(McpError::Network {
+                server: server_name.into(),
+                detail: format!("读取 HTTP 响应 body 失败: {e}"),
+            })
+        }
+        Err(_) => {
+            return Err(McpError::Timeout {
+                server: server_name.into(),
+                secs: request_timeout.as_secs(),
+            })
+        }
+    };
 
     if content_type.contains("text/event-stream") {
         let text = String::from_utf8_lossy(&bytes);
@@ -629,6 +678,7 @@ fn build_http_request(
 }
 
 /// 发送一次 notification（无 id，best-effort）。
+#[allow(clippy::too_many_arguments)]
 async fn do_http_notification(
     server_name: &str,
     client: &reqwest::Client,
@@ -637,10 +687,12 @@ async fn do_http_notification(
     session_id: &Option<String>,
     method: String,
     params: Value,
+    request_timeout: Duration,
 ) -> Result<()> {
     let req_obj = JsonRpcRequest::notification(method, Some(params));
     let body_bytes = serde_json::to_vec(&req_obj)?;
     let resp = build_http_request(client, url, base_headers, session_id, &body_bytes)
+        .timeout(request_timeout)
         .send()
         .await
         .map_err(|e| McpError::Network {
@@ -672,17 +724,26 @@ fn start_sse_actor(
     sse_url: String,
     headers: HeaderMap,
     timeout: u64,
-) -> (UnboundedSender<McpRequest>, JoinHandle<()>) {
+    request_timeout: Duration,
+) -> (
+    UnboundedSender<McpRequest>,
+    watch::Sender<bool>,
+    JoinHandle<()>,
+) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<McpRequest>();
-    let handle = tokio::spawn(sse_actor_loop(
-        server_name,
-        client,
-        sse_url,
-        headers,
-        timeout,
-        rx,
-    ));
-    (tx, handle)
+    let (shutdown, handle) = supervise_actor(
+        sse_actor_loop(
+            server_name,
+            client,
+            sse_url,
+            headers,
+            timeout,
+            request_timeout,
+            rx,
+        ),
+        OwnedChild(None),
+    );
+    (tx, shutdown, handle)
 }
 
 /// SSE actor 主循环：reader task 长连 GET event-stream 收响应，主循环收 Call → POST endpoint。
@@ -695,6 +756,7 @@ async fn sse_actor_loop(
     sse_url: String,
     headers: HeaderMap,
     timeout: u64,
+    request_timeout: Duration,
     mut req_rx: UnboundedReceiver<McpRequest>,
 ) {
     let endpoint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -702,7 +764,7 @@ async fn sse_actor_loop(
 
     let (reader_done_tx, mut reader_done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-    let reader_task = {
+    let reader_task = OwnedTask(Some({
         let server_name = server_name.clone();
         let client = client.clone();
         let headers = headers.clone();
@@ -712,7 +774,7 @@ async fn sse_actor_loop(
             sse_reader_loop(server_name, client, sse_url, headers, endpoint, pending).await;
             let _ = reader_done_tx.send(());
         })
-    };
+    }));
 
     loop {
         select! {
@@ -720,7 +782,7 @@ async fn sse_actor_loop(
                 match maybe_req {
                     Some(McpRequest::Call { id, method, params, reply }) => {
                         handle_sse_call(
-                            &server_name, &client, &headers, timeout,
+                            &server_name, &client, &headers, timeout, request_timeout,
                             &endpoint, &pending, id, method, params, reply,
                         ).await;
                     }
@@ -734,13 +796,16 @@ async fn sse_actor_loop(
                                     .header(CONTENT_TYPE, "application/json")
                                     .headers(headers.clone())
                                     .body(body)
+                                    .timeout(request_timeout)
                                     .send()
                                     .await;
                             }
                         }
                     }
                     Some(McpRequest::Shutdown) | None => {
-                        reader_task.abort();
+                        let task = reader_task.release();
+                        task.abort();
+                        let _ = task.await;
                         fail_all_pending_shared(&pending);
                         return;
                     }
@@ -763,6 +828,7 @@ async fn handle_sse_call(
     client: &reqwest::Client,
     headers: &HeaderMap,
     timeout: u64,
+    request_timeout: Duration,
     endpoint: &Arc<Mutex<Option<String>>>,
     pending: &PendingMap,
     id: u64,
@@ -802,6 +868,7 @@ async fn handle_sse_call(
         .header(CONTENT_TYPE, "application/json")
         .headers(headers.clone())
         .body(body)
+        .timeout(request_timeout)
         .send()
         .await;
 
@@ -1050,10 +1117,12 @@ mod tests {
         // actor 用 server_side_read（读 client 发的请求）+ server_side_write（写响应给 client）
         let (server_side_read, client_write) = duplex(8 * 1024);
         let (server_side_write, client_read) = duplex(8 * 1024);
-        let (tx, _handle) = McpConnection::start_actor(server_side_read, server_side_write);
+        let (tx, shutdown, _handle) =
+            McpConnection::start_actor(server_side_read, server_side_write);
         let conn = Arc::new(McpConnection {
             server_name: "test".into(),
             tx,
+            shutdown,
             next_id: AtomicU64::new(0),
             tools: Vec::new(),
         });
@@ -1226,6 +1295,281 @@ mod http_sse_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    async fn lifecycle_server(
+        sse: bool,
+        stall: &'static str,
+    ) -> (
+        String,
+        UnboundedReceiver<String>,
+        UnboundedReceiver<String>,
+        OwnedTask,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (arrived_tx, arrived) = tokio::sync::mpsc::unbounded_channel();
+        let (closed_tx, closed) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let task = tokio::spawn(async move {
+            let mut sockets = tokio::task::JoinSet::new();
+            loop {
+                select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        let (head, body) = read_mock_http_request(&mut socket).await.unwrap();
+                        let arrived = arrived_tx.clone();
+                        let closed = closed_tx.clone();
+                        if head.starts_with("GET ") {
+                            arrived.send("GET".into()).unwrap();
+                            if stall != "GET" {
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\n\n").await.unwrap();
+                            }
+                            // The GET task owns the event receiver; no test task detaches.
+                            let mut receiver = std::mem::replace(&mut events, tokio::sync::mpsc::unbounded_channel().1);
+                            sockets.spawn(async move {
+                                let mut byte = [0];
+                                loop {
+                                    select! {
+                                        _ = socket.read(&mut byte) => {
+                                            let _ = closed.send("GET".into());
+                                            return;
+                                        },
+                                        Some(response) = receiver.recv(), if stall != "GET" => {
+                                            let event = format!("event: message\ndata: {response}\n\n");
+                                            if socket.write_all(event.as_bytes()).await.is_err() {
+                                                return;
+                                            }
+                                        },
+                                    }
+                                }
+                            });
+                        } else {
+                            let events = events_tx.clone();
+                            sockets.spawn(async move {
+                                let request: Value = serde_json::from_slice(&body).unwrap();
+                                let method = request["method"].as_str().unwrap().to_string();
+                                let _ = arrived.send(method.clone());
+                                let hang_body = stall == "notification-body" && method == "notifications/initialized";
+                                if method == stall || hang_body {
+                                    if hang_body {
+                                        socket.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n").await.unwrap();
+                                    }
+                                    let _ = socket.read(&mut [0]).await;
+                                    let _ = closed.send(method);
+                                    return;
+                                }
+                                let response = if stall == "error" && method == "initialize" {
+                                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "failed"}})
+                                } else {
+                                    let result = match method.as_str() {
+                                        "initialize" => serde_json::json!({"protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "serverInfo": {"name": "mock", "version": "1"}}),
+                                        _ => serde_json::json!({"tools": []}),
+                                    };
+                                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                                };
+                                if sse {
+                                    if !request["id"].is_null() {
+                                        let _ = events.send(response);
+                                    }
+                                    let _ = socket.write_all(b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await;
+                                } else {
+                                    let body = response.to_string();
+                                    let header = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                                    let _ = socket.write_all(header.as_bytes()).await;
+                                }
+                            });
+                        }
+                    },
+                    Some(_) = sockets.join_next() => {},
+                }
+            }
+        });
+        (url, arrived, closed, OwnedTask(Some(task)))
+    }
+
+    fn lifecycle_connection(
+        sse: bool,
+        url: String,
+        timeout: Duration,
+    ) -> (McpConnection, OwnedTask) {
+        // Do not change production proxy policy; loopback tests explicitly bypass proxies.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (tx, shutdown, handle) = if sse {
+            start_sse_actor("test".into(), client, url, HeaderMap::new(), 1, timeout)
+        } else {
+            start_http_actor("test".into(), client, url, HeaderMap::new(), timeout)
+        };
+        (
+            McpConnection {
+                server_name: "test".into(),
+                tx,
+                shutdown,
+                next_id: AtomicU64::new(0),
+                tools: Vec::new(),
+            },
+            OwnedTask(Some(handle)),
+        )
+    }
+
+    async fn expect_event(receiver: &mut UnboundedReceiver<String>, expected: &str) {
+        expect_events(receiver, &[expected]).await;
+    }
+
+    async fn expect_events(receiver: &mut UnboundedReceiver<String>, expected: &[&str]) {
+        let mut remaining = expected.to_vec();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !remaining.is_empty() {
+                let event = receiver.recv().await.expect("event channel closed");
+                if let Some(index) = remaining.iter().position(|expected| *expected == event) {
+                    remaining.remove(index);
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("missing events: {remaining:?}"));
+    }
+
+    #[tokio::test]
+    async fn handshake_failure_timeout_and_cancellation_close_network_resources() {
+        for sse in [false, true] {
+            for stall in [
+                "initialize",
+                "error",
+                "GET",
+                "notifications/initialized",
+                "notification-body",
+            ] {
+                if !sse && stall == "GET" {
+                    continue;
+                }
+                if sse && stall == "notification-body" {
+                    continue;
+                }
+                for cancel in [false, true] {
+                    let (url, mut arrived, mut closed, _server) =
+                        lifecycle_server(sse, stall).await;
+                    let (conn, actor) = lifecycle_connection(sse, url, Duration::from_secs(1));
+                    let task =
+                        tokio::spawn(conn.finish_handshake(actor, Duration::from_millis(300)));
+                    let stalled_method = match stall {
+                        "GET" => "GET",
+                        "notifications/initialized" | "notification-body" => {
+                            "notifications/initialized"
+                        }
+                        _ => "initialize",
+                    };
+                    expect_event(&mut arrived, stalled_method).await;
+                    if cancel {
+                        task.abort();
+                        // The error response may already have completed the handshake future.
+                        let result = task.await;
+                        assert!(result.is_err() || result.unwrap().is_err());
+                    } else {
+                        assert!(task.await.unwrap().is_err());
+                    }
+                    let mut expected = Vec::new();
+                    if stall != "error" && stall != "GET" {
+                        expected.push(stalled_method);
+                    }
+                    if sse {
+                        expected.push("GET");
+                    }
+                    expect_events(&mut closed, &expected).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initialized_notification_timeout_does_not_block_actor() {
+        for sse in [false, true] {
+            for stall in ["notifications/initialized", "notification-body"] {
+                if sse && stall == "notification-body" {
+                    continue;
+                }
+                let (url, _arrived, mut closed, _server) = lifecycle_server(sse, stall).await;
+                let (conn, actor) = lifecycle_connection(sse, url, Duration::from_millis(150));
+                let (conn, handle) = conn
+                    .finish_handshake(actor, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+                expect_event(&mut closed, "notifications/initialized").await;
+                conn.shutdown();
+                tokio::time::timeout(Duration::from_secs(1), handle)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if sse {
+                    expect_event(&mut closed, "GET").await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_timeout_fails_call_without_blocking_next_request() {
+        for sse in [false, true] {
+            let (url, _arrived, mut closed, _server) = lifecycle_server(sse, "stall").await;
+            let (conn, actor) = lifecycle_connection(sse, url, Duration::from_millis(150));
+            let (conn, handle) = conn
+                .finish_handshake(actor, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), conn.call("stall", Value::Null))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            expect_event(&mut closed, "stall").await;
+            conn.call("tools/list", Value::Null).await.unwrap();
+            conn.shutdown();
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .unwrap()
+                .unwrap();
+            if sse {
+                expect_event(&mut closed, "GET").await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_inflight_post_and_closes_sse_reader() {
+        for sse in [false, true] {
+            for notification in [false, true] {
+                let (url, mut arrived, mut closed, _server) = lifecycle_server(sse, "stall").await;
+                let (conn, actor) = lifecycle_connection(sse, url, Duration::from_secs(30));
+                let (conn, handle) = conn
+                    .finish_handshake(actor, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+                let call = if notification {
+                    conn.send_notification("stall", Value::Null);
+                    None
+                } else {
+                    let conn = conn.clone();
+                    Some(tokio::spawn(async move {
+                        conn.call("stall", Value::Null).await
+                    }))
+                };
+                expect_event(&mut arrived, "stall").await;
+                conn.shutdown();
+                tokio::time::timeout(Duration::from_secs(1), handle)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                expect_events(
+                    &mut closed,
+                    if sse { &["stall", "GET"] } else { &["stall"] },
+                )
+                .await;
+                if let Some(call) = call {
+                    assert!(call.await.unwrap().is_err());
+                }
+            }
+        }
+    }
+
     // ── 单元测试：环境变量展开 ────────────────────────────────────────────
 
     #[test]
@@ -1289,6 +1633,115 @@ mod http_sse_tests {
 
     // ── HTTP e2e：mock TCP server ────────────────────────────────────────
 
+    const MAX_MOCK_HEADER_SIZE: usize = 32 * 1024;
+    const MAX_MOCK_BODY_SIZE: usize = 1024 * 1024;
+
+    async fn read_mock_http_request(
+        sock: &mut (impl AsyncRead + Unpin),
+    ) -> std::io::Result<(String, Vec<u8>)> {
+        use std::io::{Error, ErrorKind};
+
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let remaining = MAX_MOCK_HEADER_SIZE - request.len();
+            if remaining == 0 {
+                return Err(Error::new(ErrorKind::InvalidData, "mock header too large"));
+            }
+            let limit = remaining.min(chunk.len());
+            let n = sock.read(&mut chunk[..limit]).await?;
+            if n == 0 {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "incomplete mock header",
+                ));
+            }
+            request.extend_from_slice(&chunk[..n]);
+        };
+        let head = std::str::from_utf8(&request[..header_end - 4])
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?
+            .to_string();
+        let mut content_length = 0;
+        for line in head.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                }
+            }
+        }
+        if content_length > MAX_MOCK_BODY_SIZE {
+            return Err(Error::new(ErrorKind::InvalidData, "mock body too large"));
+        }
+        let mut body = request.split_off(header_end);
+        body.truncate(content_length);
+        let received = body.len();
+        body.resize(content_length, 0);
+        sock.read_exact(&mut body[received..]).await?;
+        Ok((head, body))
+    }
+
+    #[tokio::test]
+    async fn mock_http_request_reads_fragmented_header_and_body() {
+        // A one-byte buffer forces separate reads, even when writes are coalesced.
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let task = tokio::spawn(async move {
+            for fragment in [
+                &b"POST /message HTTP/1.1\r\ncontent-len"[..],
+                &b"gth: 14\r\n\r"[..],
+                &b"\n{\"met"[..],
+                &b"hod\":\""[..],
+                &b"x\"}"[..],
+            ] {
+                writer.write_all(fragment).await.unwrap();
+            }
+            writer
+        });
+        let (head, body) =
+            tokio::time::timeout(Duration::from_secs(5), read_mock_http_request(&mut reader))
+                .await
+                .unwrap()
+                .unwrap();
+        let _writer = task.await.unwrap();
+        assert_eq!(head, "POST /message HTTP/1.1\r\ncontent-length: 14");
+        assert_eq!(body, br#"{"method":"x"}"#);
+    }
+
+    #[tokio::test]
+    async fn mock_http_request_rejects_incomplete_and_oversized_requests() {
+        for (request, expected) in [
+            (
+                b"POST / HTTP/1.1\r\n".to_vec(),
+                std::io::ErrorKind::UnexpectedEof,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nx".to_vec(),
+                std::io::ErrorKind::UnexpectedEof,
+            ),
+            (
+                vec![b'x'; MAX_MOCK_HEADER_SIZE + 1],
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                format!(
+                    "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                    MAX_MOCK_BODY_SIZE + 1
+                )
+                .into_bytes(),
+                std::io::ErrorKind::InvalidData,
+            ),
+        ] {
+            let mut reader = request.as_slice();
+            let err = read_mock_http_request(&mut reader).await.unwrap_err();
+            assert_eq!(err.kind(), expected);
+        }
+    }
+
     /// mock HTTP MCP server 状态：捕获每次请求收到的 `Mcp-Session-Id`。
     #[derive(Default, Clone)]
     struct HttpCapture {
@@ -1318,15 +1771,9 @@ mod http_sse_tests {
     }
 
     async fn handle_http_conn(sock: &mut tokio::net::TcpStream, capture: HttpCapture) {
-        let mut buf = vec![0u8; 32 * 1024];
-        let n = sock.read(&mut buf).await.unwrap();
-        if n == 0 {
-            return;
-        }
-        let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
-        let (head, body) = match req_str.split_once("\r\n\r\n") {
-            Some(split) => split,
-            None => return,
+        let (head, body) = match read_mock_http_request(sock).await {
+            Ok(request) => request,
+            Err(_) => return,
         };
         let first_line = head.lines().next().unwrap_or("");
 
@@ -1340,16 +1787,18 @@ mod http_sse_tests {
 
         if !first_line.starts_with("POST ") {
             let _ = sock
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
                 .await;
             return;
         }
 
-        let req: serde_json::Value = match serde_json::from_str(body) {
+        let req: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => {
                 let _ = sock
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                     .await;
                 return;
             }
@@ -1362,7 +1811,9 @@ mod http_sse_tests {
         // notification（无 id）→ 202
         if !has_id {
             let _ = sock
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
                 .await;
             return;
         }
@@ -1409,7 +1860,7 @@ mod http_sse_tests {
             ""
         };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
             session_header,
             body_str.len(),
             body_str
@@ -1529,7 +1980,11 @@ mod http_sse_tests {
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                let first_line = read_request_line(&mut sock).await;
+                let (head, body) = match read_mock_http_request(&mut sock).await {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                let first_line = head.lines().next().unwrap_or("");
                 if first_line.starts_with("GET /sse") {
                     let rx = response_rx.clone();
                     let endpoint = endpoint_for_get.clone();
@@ -1537,32 +1992,18 @@ mod http_sse_tests {
                         handle_sse_get(&mut sock, &endpoint, rx).await;
                     });
                 } else if first_line.starts_with("POST /message") {
-                    let body = read_body(&mut sock, &first_line).await;
                     let tx = response_tx.clone();
                     tokio::spawn(async move {
                         handle_sse_post(&mut sock, body, tx).await;
                     });
                 } else {
                     let _ = sock
-                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                         .await;
                 }
             }
         });
         sse_url
-    }
-
-    /// 读 HTTP 请求首行（含可能的部分 body，丢弃 body 由后续 read_body 重读）。
-    /// 简化：一次性读到 32KB，解析首行与头。
-    async fn read_request_line(sock: &mut tokio::net::TcpStream) -> String {
-        let mut buf = vec![0u8; 32 * 1024];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        String::from_utf8_lossy(&buf[..n]).to_string()
-    }
-
-    /// 从已读的整段请求文本中抽 body（split \r\n\r\n）。
-    async fn read_body(_sock: &mut tokio::net::TcpStream, full: &str) -> String {
-        full.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
     }
 
     async fn handle_sse_get(
@@ -1595,11 +2036,11 @@ mod http_sse_tests {
 
     async fn handle_sse_post(
         sock: &mut tokio::net::TcpStream,
-        body: String,
+        body: Vec<u8>,
         tx: tokio::sync::mpsc::UnboundedSender<(u64, serde_json::Value)>,
     ) {
         // 解析 JSON-RPC 请求
-        if let Ok(req) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Ok(req) = serde_json::from_slice::<serde_json::Value>(&body) {
             let id = req["id"].as_u64();
             let method = req["method"].as_str().unwrap_or("");
             if let Some(id) = id {
@@ -1627,7 +2068,7 @@ mod http_sse_tests {
         }
         // POST 回 202（SSE 协议不要求 body）
         let _ = sock
-            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+            .write_all(b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             .await;
     }
 

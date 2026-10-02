@@ -165,6 +165,54 @@ pub enum ChatEntry {
         is_error: bool,
     },
     System(String),
+    /// UI-only turn metadata; never included in model context.
+    TurnSummary {
+        elapsed_ms: u64,
+        finished_at: u64,
+        status: String,
+    },
+}
+
+/// Merge only within the current uninterrupted text step, never across tools/users.
+pub(crate) fn append_stream_text(entries: &mut Vec<ChatEntry>, text: &str, thinking: bool) {
+    if text.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut().rev() {
+        match entry {
+            ChatEntry::Thinking(buffer) if thinking => {
+                buffer.push_str(text);
+                return;
+            }
+            ChatEntry::Assistant(buffer) if !thinking => {
+                buffer.push_str(text);
+                return;
+            }
+            ChatEntry::Thinking(_) | ChatEntry::Assistant(_) => {}
+            _ => break,
+        }
+    }
+    if !text.trim().is_empty() {
+        entries.push(if thinking {
+            ChatEntry::Thinking(text.to_owned())
+        } else {
+            ChatEntry::Assistant(text.to_owned())
+        });
+    }
+}
+
+/// Display the persisted completion time, not the current render time.
+pub fn turn_summary_text(elapsed_ms: u64, finished_at: u64, status: &str) -> String {
+    let time = i64::try_from(finished_at)
+        .ok()
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "--:--".into());
+    format!("Worked for {}s · {status} {time}", elapsed_ms / 1000)
 }
 
 /// `scroll_y` 的哨兵值：表示"跟随底部"（auto-follow），流式新内容自动滚到底。
@@ -912,6 +960,9 @@ pub fn entries_to_messages(entries: &[ChatEntry]) -> Vec<Message> {
                 out.push(Message::user(c.clone()));
             }
             ChatEntry::Assistant(c) => {
+                if c.trim().is_empty() {
+                    continue;
+                }
                 if let Some(m) = pending_assistant.take() {
                     out.push(m);
                 }
@@ -938,7 +989,7 @@ pub fn entries_to_messages(entries: &[ChatEntry]) -> Vec<Message> {
                 }
                 out.push(Message::tool(id.clone(), output.clone()));
             }
-            _ => {} // Thinking / System 不回灌跨轮上下文
+            ChatEntry::Thinking(_) | ChatEntry::System(_) | ChatEntry::TurnSummary { .. } => {}
         }
     }
     if let Some(m) = pending_assistant.take() {
@@ -964,7 +1015,40 @@ pub fn render_entries(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut text_end = 0;
     for (i, entry) in entries.iter().enumerate() {
+        if i < text_end {
+            continue;
+        }
+        // Old sessions may contain alternating text fragments from the stream.
+        // Coalesce for display without changing persisted entries or their indices.
+        if matches!(entry, ChatEntry::Assistant(_) | ChatEntry::Thinking(_)) {
+            text_end = i;
+            let mut merged = Vec::new();
+            let mut thinking_expanded = false;
+            while let Some(fragment) = entries.get(text_end) {
+                match fragment {
+                    ChatEntry::Assistant(text) => append_stream_text(&mut merged, text, false),
+                    ChatEntry::Thinking(text) => {
+                        append_stream_text(&mut merged, text, true);
+                        thinking_expanded |= expanded.contains(&text_end);
+                    }
+                    _ => break,
+                }
+                text_end += 1;
+            }
+            for fragment in merged {
+                match fragment {
+                    ChatEntry::Assistant(text) => push_assistant_lines(&mut lines, theme, &text),
+                    ChatEntry::Thinking(text) => {
+                        push_thinking_lines(&mut lines, theme, &text, thinking_expanded);
+                    }
+                    _ => unreachable!(),
+                }
+                lines.push(Line::from(""));
+            }
+            continue;
+        }
         match entry {
             ChatEntry::User(content) => {
                 push_role_lines(&mut lines, "[user]", theme.accent, content, theme);
@@ -978,6 +1062,16 @@ pub fn render_entries(
             }
             ChatEntry::System(content) => {
                 push_role_lines(&mut lines, "[system]", theme.muted, content, theme);
+            }
+            ChatEntry::TurnSummary {
+                elapsed_ms,
+                finished_at,
+                status,
+            } => {
+                lines.push(Line::from(Span::styled(
+                    turn_summary_text(*elapsed_ms, *finished_at, status),
+                    Style::default().fg(theme.muted),
+                )));
             }
             ChatEntry::ToolCall {
                 id: _,
@@ -1438,6 +1532,21 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use cyber_agent::Role;
 
+    #[test]
+    fn legacy_empty_answer_fragments_are_not_sent_back_to_model() {
+        let entries = vec![
+            ChatEntry::User("hello".into()),
+            ChatEntry::Assistant(String::new()),
+            ChatEntry::Thinking("provider reasoning".into()),
+            ChatEntry::Assistant(" \n".into()),
+            ChatEntry::Assistant("answer".into()),
+        ];
+        let messages = entries_to_messages(&entries);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].content, "answer");
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new_with_kind_and_state(
             code,
@@ -1449,6 +1558,77 @@ mod tests {
 
     fn key_with_mods(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new_with_kind_and_state(code, mods, KeyEventKind::Press, KeyEventState::NONE)
+    }
+
+    #[test]
+    fn legacy_interleaved_entries_render_one_title_per_text_step() {
+        let entries = vec![
+            ChatEntry::User("prompt".into()),
+            ChatEntry::Assistant("".into()),
+            ChatEntry::Thinking("think".into()),
+            ChatEntry::Assistant("hello".into()),
+            ChatEntry::Thinking(" more".into()),
+            ChatEntry::Assistant(" ".into()),
+            ChatEntry::Assistant("world".into()),
+            ChatEntry::ToolCall {
+                id: "1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            },
+            ChatEntry::ToolResult {
+                id: "1".into(),
+                name: "shell".into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+            ChatEntry::Assistant("after".into()),
+            ChatEntry::Thinking("next".into()),
+            ChatEntry::Assistant(" tool".into()),
+            ChatEntry::User("next user".into()),
+            ChatEntry::Assistant("new turn".into()),
+        ];
+        let lines = render_entries(&entries, &Theme::resolve("cyberpunk"), &HashSet::new(), 80);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("[assistant]").count(), 3);
+        assert!(text.contains("hello world"));
+        assert!(text.contains("after tool"));
+        assert!(text.contains("think more"));
+        assert!(text.contains("new turn"));
+    }
+
+    #[test]
+    fn turn_summary_roundtrip_renders_persisted_local_time_without_model_injection() {
+        let finished_at = 1_700_000_000;
+        let entries = vec![
+            ChatEntry::User("prompt".into()),
+            ChatEntry::Thinking("private thought".into()),
+            ChatEntry::Assistant("answer".into()),
+            ChatEntry::TurnSummary {
+                elapsed_ms: 1234,
+                finished_at,
+                status: "done".into(),
+            },
+        ];
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("\"kind\":\"TurnSummary\""));
+        let restored: Vec<ChatEntry> = serde_json::from_str(&json).unwrap();
+        let messages = entries_to_messages(&restored);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "prompt");
+        assert_eq!(messages[1].content, "answer");
+        let local_time = chrono::DateTime::from_timestamp(finished_at as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        let summary = turn_summary_text(1234, finished_at, "done");
+        assert_eq!(summary, format!("Worked for 1s · done {local_time}"));
+        let lines = render_entries(&restored, &Theme::resolve("cyberpunk"), &HashSet::new(), 80);
+        assert!(lines.iter().any(|line| line.to_string() == summary));
     }
 
     #[test]

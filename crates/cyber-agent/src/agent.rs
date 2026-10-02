@@ -142,6 +142,44 @@ pub async fn run_stream(
     }
 }
 
+/// Same event sequence as `run_stream`, with mandatory pre-execution approval.
+/// A closed approval channel or a missing response denies the tool call.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_stream_with_permissions(
+    config: Config,
+    providers: ProvidersConfig,
+    project: Option<ProjectContext>,
+    user_input: String,
+    history: Vec<Message>,
+    tx: UnboundedSender<(u64, AgentEvent)>,
+    gen: u64,
+    mock: bool,
+    cwd: PathBuf,
+    registry: Arc<ToolRegistry>,
+    ctf_enabled: bool,
+    intensity: ThinkingIntensity,
+    memory: String,
+    permissions: Arc<crate::permission::PermissionBroker>,
+) {
+    let registry = Arc::new(ToolRegistry::with_permissions(registry, permissions));
+    run_stream(
+        config,
+        providers,
+        project,
+        user_input,
+        history,
+        tx,
+        gen,
+        mock,
+        cwd,
+        registry,
+        ctf_enabled,
+        intensity,
+        memory,
+    )
+    .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
     config: &Config,

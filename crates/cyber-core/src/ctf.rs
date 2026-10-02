@@ -87,7 +87,7 @@ impl CtfStatus {
 /// 一道 CTF 题目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CtfChallenge {
-    /// 唯一 ID（简短 UUID 前缀）。
+    /// Unique ID; existing persisted IDs are retained unchanged.
     pub id: String,
     /// 题目名称。
     pub name: String,
@@ -135,7 +135,7 @@ impl CtfChallenge {
     /// 创建一道新题目（进行中状态，当前时间作为开始时间）。
     pub fn new(name: String, category: CtfCategory) -> Self {
         Self {
-            id: short_id(),
+            id: generate_challenge_id(),
             name,
             category,
             description: String::new(),
@@ -172,13 +172,16 @@ impl CtfChallenge {
     }
 }
 
-/// 生成 8 字符简短 ID。
-fn short_id() -> String {
+/// Full timestamp plus a process-local sequence, without truncating entropy.
+pub fn generate_challenge_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{now:08x}")[..8].to_string()
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{now:032x}-{:08x}-{sequence:016x}", std::process::id())
 }
 
 /// 当前时间字符串（`HH:MM` 格式，UTC+8）。
@@ -281,5 +284,21 @@ mod tests {
         assert_eq!(c.name, c2.name);
         assert_eq!(c.category, c2.category);
         assert_eq!(c.status, c2.status);
+    }
+
+    #[test]
+    fn new_challenges_have_distinct_path_safe_ids_and_keep_legacy_ids() {
+        let ids: std::collections::HashSet<_> = (0..1000)
+            .map(|_| CtfChallenge::new("test".into(), CtfCategory::Web).id)
+            .collect();
+        assert_eq!(ids.len(), 1000);
+        assert!(ids
+            .iter()
+            .all(|id| id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')));
+        let mut legacy = CtfChallenge::new("legacy".into(), CtfCategory::Misc);
+        legacy.id = "abc123ef".into();
+        let loaded: CtfChallenge =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.id, "abc123ef");
     }
 }

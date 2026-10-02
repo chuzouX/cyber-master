@@ -12,6 +12,7 @@ pub mod mock;
 pub mod models;
 pub mod ollama;
 pub mod openai;
+pub mod permission;
 pub mod prompt;
 pub mod provider;
 pub mod responses;
@@ -20,7 +21,7 @@ pub mod tool;
 pub mod tools;
 pub mod types;
 
-pub use agent::{run_compact_stream, run_stream, run_writeup_stream};
+pub use agent::{run_compact_stream, run_stream, run_stream_with_permissions, run_writeup_stream};
 pub use compact::{
     auto_compact_threshold, compact_messages, compact_prompt, context_remaining_percent,
     estimate_messages_tokens, estimate_tokens, AUTOCOMPACT_BUFFER_TOKENS,
@@ -28,6 +29,7 @@ pub use compact::{
 };
 pub use error::{AgentError, Result};
 pub use models::{extract_model_ids, fetch_models};
+pub use permission::{PermissionBroker, PermissionDecision, PermissionRequest};
 pub use provider::{provider_factory, Provider, StreamRequest};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{

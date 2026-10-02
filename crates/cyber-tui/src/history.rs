@@ -335,6 +335,7 @@ pub fn read_session_text(history_dir: &Path, cwd: &Path, id: &str) -> Option<Str
             ChatEntry::ToolResult { name, output, .. } => {
                 out.push_str(&format!("→ [{name}] {output}\n"));
             }
+            ChatEntry::TurnSummary { .. } => {}
         }
     }
     Some(out)

@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿# Cyber Master 一键安装脚本（Windows / PowerShell）
+﻿# Cyber Master 一键安装脚本（Windows / PowerShell）
 #
 # 用法（PowerShell 5.1+ / PowerShell 7+）：
 #   irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
@@ -7,7 +7,7 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #
 # 高级用法：
-#   $CYBER_VERSION='v0.1.0'; irm https://raw.githubusercontent.com/.../install.ps1 | iex
+#   $env:CYBER_VERSION='v0.1.0'; irm https://raw.githubusercontent.com/.../install.ps1 | iex
 #   irm https://raw.githubusercontent.com/.../install.ps1 | iex  # 默认装到 %USERPROFILE%\.local\bin
 #
 # 环境变量覆盖：
@@ -26,6 +26,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # 关闭 Invoke-WebRequest 的进度条，否则慢且管道场景下报错
 
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    throw 'install.ps1 仅支持 Windows；Linux / macOS / WSL 请使用 install.sh。'
+}
+
 # ─── 合并环境变量 ──────────────────────────────────────────────────────────
 if (-not $Version)    { $Version    = $env:CYBER_VERSION }
 if (-not $InstallDir) { $InstallDir = $env:CYBER_INSTALL_DIR }
@@ -33,6 +37,16 @@ if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE '.local\bin' }
 if ($env:CYBER_REPO)  { $Repo       = $env:CYBER_REPO }
 
 # ─── 平台检测（PowerShell 只支持 Windows 二进制；WSL 用户请用 install.sh）──
+$architecture = if ($env:PROCESSOR_ARCHITEW6432) {
+    $env:PROCESSOR_ARCHITEW6432
+} else {
+    $env:PROCESSOR_ARCHITECTURE
+}
+if ($architecture -ne 'AMD64') {
+    throw "不支持的 Windows 架构：$architecture。当前仅发布 x86_64 (AMD64) 二进制。"
+}
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+if ($InstallDir.Contains(';')) { throw "安装目录不能含 PATH 分隔符 ';'。" }
 $Target = 'x86_64-pc-windows-msvc'
 $Archive = "cyber-$Target.zip"
 
@@ -58,96 +72,71 @@ $ChecksumUrl = "$DownloadUrl.sha256"
 
 Write-Host "→ 安装 cyber $Version ($Target) 到 $InstallDir" -ForegroundColor Cyan
 
-# ─── 下载 ────────────────────────────────────────────────────────────────
-Write-Host "→ 下载 $DownloadUrl"
-$tmp = New-TemporaryFile
+# ─── 下载、强制 SHA256 校验及安装；所有失败路径均清理临时目录 ─────────────
+$tmpDir = Join-Path ([IO.Path]::GetTempPath()) "cyber-install-$([Guid]::NewGuid().ToString('N'))"
+$zipFile = Join-Path $tmpDir $Archive
+$shaFile = "$zipFile.sha256"
+$extractPath = Join-Path $tmpDir 'extract'
+$destBinary = Join-Path $InstallDir 'cyber.exe'
 try {
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $tmp.FullName -UseBasicParsing
-} catch {
-    Write-Error "下载失败：$_"
-    exit 1
-}
-
-# ─── 校验 SHA256（可选：.sha256 不存在则跳过）──────────────────────────────
-$shaFile = "$($tmp.FullName).sha256"
-try {
+    New-Item -ItemType Directory -Path $tmpDir | Out-Null
+    Write-Host "→ 下载 $DownloadUrl"
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $zipFile -UseBasicParsing
     Invoke-WebRequest -Uri $ChecksumUrl -OutFile $shaFile -UseBasicParsing
     Write-Host "→ 校验 SHA256…"
-    $expected = (Get-Content $shaFile -TotalCount 1).Split(' ')[0].Trim().ToLowerInvariant()
-    $actual = (Get-FileHash $tmp.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $checksum = Get-Content -LiteralPath $shaFile -TotalCount 1
+    if ($checksum -notmatch '^([0-9a-fA-F]{64})(\s|$)') {
+        throw 'SHA256 校验文件格式无效，安装已中止。'
+    }
+    $expected = $Matches[1].ToLowerInvariant()
+    $actual = (Get-FileHash -LiteralPath $zipFile -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($expected -ne $actual) {
-        Remove-Item $tmp.FullName, $shaFile -Force -ErrorAction SilentlyContinue
-        Write-Error "SHA256 校验失败：expected=$expected actual=$actual"
-        exit 1
+        throw "SHA256 校验失败：expected=$expected actual=$actual"
     }
-} catch {
-    Write-Host "  (未找到 .sha256 校验文件，跳过校验)" -ForegroundColor DarkGray
-} finally {
-    Remove-Item $shaFile -Force -ErrorAction SilentlyContinue
-}
-
-# ─── 创建安装目录 ─────────────────────────────────────────────────────────
-if (-not (Test-Path $InstallDir)) {
+    Expand-Archive -LiteralPath $zipFile -DestinationPath $extractPath -Force
+    $srcBinary = Join-Path $extractPath 'cyber.exe'
+    if (-not (Test-Path -LiteralPath $srcBinary -PathType Leaf)) {
+        throw '压缩包内未找到 cyber.exe'
+    }
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-}
-
-# ─── 解压 + 安装 ──────────────────────────────────────────────────────────
-$extractPath = Join-Path $env:TEMP "cyber-install-$(Get-Random -Maximum 2147483647)"
-try {
-    Expand-Archive -Path $tmp.FullName -DestinationPath $extractPath -Force
-} catch {
-    Write-Error "解压失败：$_"
-    exit 1
-} finally {
-    Remove-Item $tmp.FullName -Force -ErrorAction SilentlyContinue
-}
-
-$srcBinary = Join-Path $extractPath 'cyber.exe'
-$destBinary = Join-Path $InstallDir 'cyber.exe'
-
-if (-not (Test-Path $srcBinary)) {
-    Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
-    Write-Error "压缩包内未找到 cyber.exe"
-    exit 1
-}
-
-# Move-Item 在目标被占用时会失败；用 .NET Move 兼容覆盖
-if (Test-Path $destBinary) {
+    # 不删除正在使用的旧二进制；覆盖失败时提示关闭进程后重试。
     try {
-        Remove-Item $destBinary -Force
+        Copy-Item -LiteralPath $srcBinary -Destination $destBinary -Force
     } catch {
-        # 文件可能被正在运行的进程占用，重命名后下次启动自动失效
-        $stale = "$destBinary.old.$(Get-Date -Format yyyyMMddHHmmss)"
-        Move-Item $destBinary $stale -Force
+        throw "无法写入 $destBinary；请关闭正在运行的 cyber 并检查目录权限后重试。$_"
     }
+} finally {
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
-
-Move-Item -Path $srcBinary -Destination $destBinary -Force
-Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
 
 # ─── 添加到用户 PATH ──────────────────────────────────────────────────────
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (-not $userPath) { $userPath = '' }
-$pathItems = $userPath -split ';' | Where-Object { $_ -ne '' }
-$alreadyInPath = $false
-foreach ($item in $pathItems) {
-    if ($item -and (Test-Path $item) `
-        -and ((Resolve-Path $item).Path -eq (Resolve-Path $InstallDir).Path)) {
-        $alreadyInPath = $true
-        break
+function Test-CyberPath([string]$PathValue) {
+    foreach ($item in ($PathValue -split ';')) {
+        if (-not $item.Trim()) { continue }
+        $expanded = [Environment]::ExpandEnvironmentVariables($item.Trim().Trim('"'))
+        try {
+            if ([IO.Path]::GetFullPath($expanded).TrimEnd('\') -eq $InstallDir.TrimEnd('\')) {
+                return $true
+            }
+        } catch {
+            # 保留用户原有 PATH 中无法规范化的条目。
+        }
     }
+    return $false
 }
-
-if (-not $alreadyInPath) {
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not (Test-CyberPath $userPath)) {
     $newPath = if ($userPath) { "$userPath;$InstallDir" } else { $InstallDir }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-    # 同步当前进程的 PATH，便于在同一会话内立即试用
-    $env:Path = "$env:Path;$InstallDir"
     Write-Host "✓ 已将 $InstallDir 添加到用户 PATH" -ForegroundColor Green
-    Write-Host "  (新开终端后生效；当前终端已临时加入 PATH)" -ForegroundColor DarkGray
 } else {
-    Write-Host "✓ $InstallDir 已在 PATH 中" -ForegroundColor DarkGray
+    Write-Host "✓ $InstallDir 已在用户 PATH 中" -ForegroundColor DarkGray
 }
+# 即便持久用户 PATH 已有该目录，当前会话也可能尚未继承它。
+if (-not (Test-CyberPath $env:Path)) {
+    $env:Path = if ($env:Path) { "$env:Path;$InstallDir" } else { $InstallDir }
+}
+Write-Host "  请重新打开其他终端；当前 PowerShell 会话的 PATH 已同步。" -ForegroundColor DarkGray
 
 # ─── 完成提示 ────────────────────────────────────────────────────────────
 Write-Host ""

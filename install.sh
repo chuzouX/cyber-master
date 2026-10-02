@@ -19,15 +19,17 @@
 set -eu
 
 REPO="${CYBER_REPO:-chuzouX/cyber-master}"
-VERSION=""
+VERSION="${CYBER_VERSION:-}"
 INSTALL_DIR="${CYBER_INSTALL_DIR:-$HOME/.local/bin}"
 
 # ─── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
     --version|-v)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--version 需要非空 tag" >&2; exit 1; }
       VERSION="$2"; shift 2 ;;
     --install-dir)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--install-dir 需要非空路径" >&2; exit 1; }
       INSTALL_DIR="$2"; shift 2 ;;
     --help|-h)
       cat <<EOF
@@ -51,11 +53,23 @@ EOF
       exit 1 ;;
   esac
 done
-[ -n "${CYBER_VERSION:-}" ] && VERSION="$CYBER_VERSION"
+case "$INSTALL_DIR" in
+  *:*) echo "安装目录不能含 PATH 分隔符 ':'" >&2; exit 1 ;;
+  *'
+'*) echo "安装目录不能含换行" >&2; exit 1 ;;
+  /*) ;;
+  *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;;
+esac
 
 # ─── 平台检测 ──────────────────────────────────────────────────────────────
 case "$(uname -s)" in
-  Linux)  os=unknown-linux-gnu ;;
+  Linux)
+    os=unknown-linux-gnu
+    if ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+      echo "Linux 安装包需要 glibc；无法确认 glibc（需要 getconf），不支持 musl / Alpine。" >&2
+      exit 1
+    fi
+    ;;
   Darwin) os=apple-darwin ;;
   MINGW*|MSYS*|CYGWIN*)
     echo "检测到 Windows / Git Bash。请改用 install.ps1：" >&2
@@ -78,6 +92,14 @@ binary="cyber"
 need() { command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖: $1" >&2; exit 1; }; }
 need curl
 need tar
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256="shasum -a 256"
+else
+  echo "缺少 SHA256 校验工具：需要 sha256sum 或 shasum，安装已中止。" >&2
+  exit 1
+fi
 
 # ─── 解析版本（未指定时取 latest）──────────────────────────────────────────
 if [ -z "$VERSION" ]; then
@@ -97,70 +119,76 @@ echo "→ 安装 cyber $VERSION ($target) 到 $INSTALL_DIR"
 
 # ─── 创建临时目录 ─────────────────────────────────────────────────────────
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t cyber-install)"
-trap 'rm -rf "$tmpdir"' EXIT INT TERM
+trap 'rm -rf "$tmpdir"' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ─── 下载 ────────────────────────────────────────────────────────────────
 echo "→ 下载 $download_url"
 curl -fsSL -o "$tmpdir/$archive" "$download_url"
 
-# ─── 校验 SHA256（可选：若 .sha256 不存在则跳过，不阻断安装）────────────
-# macOS 无 sha256sum，用 shasum -a 256 兜底
-if command -v sha256sum >/dev/null 2>&1; then
-  SHA256=sha256sum
-elif command -v shasum >/dev/null 2>&1; then
-  SHA256="shasum -a 256"
-else
-  SHA256=""
-fi
-
-if [ -n "$SHA256" ]; then
-  if curl -fsSL -o "$tmpdir/$archive.sha256" "$checksum_url"; then
-    echo "→ 校验 SHA256…"
-    # 校验时需在文件同目录下，且 .sha256 内是相对文件名
-    (cd "$tmpdir" && $SHA256 -c "$archive.sha256" 2>/dev/null) \
-      || { echo "SHA256 校验失败，文件可能损坏或被篡改" >&2; exit 1; }
-  else
-    echo "  (未找到 .sha256 校验文件，跳过校验)"
-  fi
-fi
+# ─── 强制校验 SHA256 ─────────────────────────────────────────────────────
+curl -fsSL -o "$tmpdir/$archive.sha256" "$checksum_url" \
+  || { echo "无法下载 SHA256 校验文件，安装已中止。" >&2; exit 1; }
+echo "→ 校验 SHA256…"
+expected=$(awk 'NR == 1 { print $1 }' "$tmpdir/$archive.sha256")
+case "$expected" in
+  ''|*[!0-9a-fA-F]*) echo "SHA256 校验文件格式无效" >&2; exit 1 ;;
+esac
+[ "${#expected}" -eq 64 ] || { echo "SHA256 校验文件格式无效" >&2; exit 1; }
+expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+actual=$($SHA256 "$tmpdir/$archive" | awk '{ print $1 }')
+[ "$expected" = "$actual" ] \
+  || { echo "SHA256 校验失败，文件可能损坏或被篡改" >&2; exit 1; }
 
 # ─── 解压 + 安装 ──────────────────────────────────────────────────────────
-mkdir -p "$INSTALL_DIR"
 tar -xzf "$tmpdir/$archive" -C "$tmpdir"
+[ -f "$tmpdir/$binary" ] && [ ! -L "$tmpdir/$binary" ] \
+  || { echo "压缩包内未找到有效的 cyber 二进制" >&2; exit 1; }
+chmod +x "$tmpdir/$binary"
+mkdir -p "$INSTALL_DIR"
 mv -f "$tmpdir/$binary" "$INSTALL_DIR/$binary"
-chmod +x "$INSTALL_DIR/$binary"
 
-# ─── PATH 提示 ────────────────────────────────────────────────────────────
-case ":$PATH:" in
-  *":$INSTALL_DIR:"*)
-    echo ""
-    echo "✓ 已安装: $INSTALL_DIR/$binary"
-    echo "  直接运行: cyber"
+# ─── 幂等用户 PATH 配置（不覆盖现有启动文件）──────────────────────────────
+# 单引号转义，避免自定义路径被 shell 当作命令展开。
+quoted_dir=$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")
+path_line="case \":\$PATH:\" in *:'$quoted_dir':*) ;; *) export PATH='$quoted_dir':\"\$PATH\" ;; esac"
+append_path() {
+  mkdir -p "$(dirname "$1")"
+  if ! grep -Fqx "$path_line" "$1" 2>/dev/null; then
+    printf '\n# Cyber installer: user PATH\n%s\n' "$path_line" >> "$1"
+  fi
+  echo "→ 用户 PATH 配置: $1"
+}
+shell_name="$(basename "${SHELL:-sh}")"
+case "$shell_name" in
+  fish)
+    # fish 的单引号字符串只需要转义反斜杠和单引号。
+    quoted_dir=$(printf '%s' "$INSTALL_DIR" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g")
+    path_line="contains -- '$quoted_dir' \$PATH; or set -gx PATH '$quoted_dir' \$PATH"
+    append_path "${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/cyber-path.fish"
     ;;
+  zsh) append_path "${ZDOTDIR:-$HOME}/.zshrc" ;;
+  bash)
+    append_path "$HOME/.bashrc"
+    # Bash 登录 shell 只读取第一个存在的用户 profile。
+    if [ -f "$HOME/.bash_profile" ]; then
+      append_path "$HOME/.bash_profile"
+    elif [ -f "$HOME/.bash_login" ]; then
+      append_path "$HOME/.bash_login"
+    else
+      append_path "$HOME/.profile"
+    fi
+    ;;
+  sh|dash|ksh) append_path "$HOME/.profile" ;;
   *)
-    echo ""
-    echo "✓ 已安装: $INSTALL_DIR/$binary"
-    echo ""
-    echo "⚠ $INSTALL_DIR 不在 PATH 中。请添加："
-    # shell 检测，给出最贴合的命令
-    shell_name="$(basename "${SHELL:-}")"
-    case "$shell_name" in
-      fish)
-        echo "    set -Ux fish_user_paths $INSTALL_DIR \$fish_user_paths"
-        ;;
-      zsh)
-        echo "    echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
-        ;;
-      bash)
-        echo "    echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
-        ;;
-      *)
-        echo "    echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile"
-        ;;
-    esac
-    echo "  然后运行: cyber"
+    echo "未知 shell '$shell_name'，未修改启动文件。请手动将 $INSTALL_DIR 加入 PATH。" >&2
     ;;
 esac
+echo ""
+echo "✓ 已安装: $INSTALL_DIR/$binary"
+echo "请重新打开终端后运行 cyber（POSIX shell 需重新登录）；管道安装无法修改父 shell 的 PATH。"
+echo "也可立即运行: \"$INSTALL_DIR/$binary\""
 
 # ─── 首次启动提示 ─────────────────────────────────────────────────────────
 echo ""

@@ -95,6 +95,47 @@ pub struct ToolRegistry {
     catalog: ToolCatalog,
 }
 
+/// Wrap the Tool itself so even get(...).run(...) cannot bypass approval.
+struct PermissionTool {
+    schema: ToolSchema,
+    inner: Arc<ToolRegistry>,
+    broker: Arc<crate::permission::PermissionBroker>,
+}
+
+impl Tool for PermissionTool {
+    fn schema(&self) -> ToolSchema {
+        self.schema.clone()
+    }
+
+    fn run<'a>(
+        &'a self,
+        input: Value,
+        ctx: &'a ToolCtx,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+        self.run_streaming(input, ctx, None)
+    }
+
+    fn run_streaming<'a>(
+        &'a self,
+        input: Value,
+        ctx: &'a ToolCtx,
+        progress: Option<UnboundedSender<String>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+        Box::pin(async move {
+            let name = &self.schema.name;
+            if !self.broker.authorize(name, &input).await {
+                return Ok(ToolOutput {
+                    content: format!("Permission denied: {name}; tool was not executed"),
+                    is_error: true,
+                });
+            }
+            self.inner
+                .execute_streaming(name, input, ctx, progress)
+                .await
+        })
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -106,11 +147,18 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let schema = tool.schema();
         let mut catalog = self.catalog.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(index) = catalog.iter().position(|item| item.name == schema.name) {
+        if let Some(index) = self
+            .tools
+            .iter()
+            .position(|item| item.schema().name == schema.name)
+        {
             self.tools[index] = tool;
-            catalog[index] = schema;
         } else {
             self.tools.push(tool);
+        }
+        if let Some(index) = catalog.iter().position(|item| item.name == schema.name) {
+            catalog[index] = schema;
+        } else {
             catalog.push(schema);
         }
     }
@@ -163,6 +211,28 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    /// All execution entry points on this view require explicit approval.
+    pub fn with_permissions(
+        inner: Arc<Self>,
+        broker: Arc<crate::permission::PermissionBroker>,
+    ) -> Self {
+        let tools = inner
+            .all_schemas()
+            .into_iter()
+            .map(|schema| {
+                Box::new(PermissionTool {
+                    schema,
+                    inner: inner.clone(),
+                    broker: broker.clone(),
+                }) as Box<dyn Tool>
+            })
+            .collect();
+        Self {
+            tools,
+            catalog: Arc::new(RwLock::new(inner.schemas())),
+        }
     }
 
     /// 执行工具。未知工具名 → `AgentError::Provider`（回灌给 LLM 让其修正）。
@@ -309,5 +379,125 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("123"));
+    }
+
+    struct CountingTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Tool for CountingTool {
+        fn schema(&self) -> ToolSchema {
+            EchoTool.schema()
+        }
+
+        fn run<'a>(
+            &'a self,
+            input: Value,
+            ctx: &'a ToolCtx,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            EchoTool.run(input, ctx)
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_denial_blocks_both_execution_paths_including_hidden_tools() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut inner = ToolRegistry::new();
+        inner.register_hidden(Box::new(CountingTool(count.clone())));
+        let registry = ToolRegistry::with_permissions(
+            Arc::new(inner),
+            Arc::new(crate::PermissionBroker::deny_all()),
+        );
+        assert!(registry.schemas().is_empty());
+        assert_eq!(registry.all_schemas().len(), 1);
+        let output = registry
+            .execute("echo", serde_json::json!({}), &ctx())
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let output = registry
+            .execute_streaming("echo", serde_json::json!({}), &ctx(), None)
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let output = registry
+            .get("echo")
+            .unwrap()
+            .run(serde_json::json!({}), &ctx())
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        let output = registry
+            .get("echo")
+            .unwrap()
+            .run_streaming(serde_json::json!({}), &ctx(), None)
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn approval_precedes_execution_and_closed_ui_denies() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut inner = ToolRegistry::new();
+        inner.register(Box::new(CountingTool(count.clone())));
+        let (broker, mut requests) = crate::PermissionBroker::interactive();
+        let registry = Arc::new(ToolRegistry::with_permissions(
+            Arc::new(inner),
+            Arc::new(broker),
+        ));
+        let worker_registry = registry.clone();
+        let worker = tokio::spawn(async move {
+            worker_registry
+                .execute("echo", serde_json::json!({"x": 1}), &ctx())
+                .await
+                .unwrap()
+        });
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.tool, "echo");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        request
+            .reply
+            .send(crate::PermissionDecision::AllowOnce)
+            .unwrap();
+        assert!(!worker.await.unwrap().is_error);
+        drop(requests);
+        assert!(
+            registry
+                .execute("echo", serde_json::json!({"x": 1}), &ctx())
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn visible_registration_replaces_actual_tool_after_hidden_registration() {
+        let mut registry = ToolRegistry::new();
+        registry.register_hidden(Box::new(EchoTool));
+        crate::tools::register_builtins(&mut registry);
+        crate::tools::register_builtins(&mut registry);
+        assert_eq!(registry.all_schemas().len(), 8);
+        assert!(registry.get("echo").is_some());
+        assert!(registry.get("list_dir").is_some());
+        // Promoting a hidden tool must replace it, rather than duplicate it.
+        registry.register(Box::new(EchoTool));
+        assert_eq!(registry.all_schemas().len(), 8);
+        assert_eq!(registry.schemas().len(), 8);
+    }
+
+    #[test]
+    fn permission_view_catalog_changes_do_not_modify_source_catalog() {
+        let mut inner = ToolRegistry::new();
+        inner.register(Box::new(EchoTool));
+        let inner = Arc::new(inner);
+        let mut protected = ToolRegistry::with_permissions(
+            inner.clone(),
+            Arc::new(crate::PermissionBroker::deny_all()),
+        );
+        protected.register_hidden(Box::new(EchoTool));
+        assert!(protected.schemas().is_empty());
+        assert_eq!(inner.schemas().len(), 1);
     }
 }

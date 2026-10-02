@@ -34,6 +34,16 @@ pub struct Paths {
 impl Paths {
     /// 定位 `~/.cyber`，不保证目录已存在（首次启动时尚未创建）。
     pub fn detect() -> Result<Self> {
+        // An explicit data home supports portable installations and isolated
+        // subprocess tests; Windows home lookup does not honor USERPROFILE.
+        if let Some(home) = std::env::var_os("CYBER_HOME").filter(|value| !value.is_empty()) {
+            let home = PathBuf::from(home);
+            return Self::at(if home.is_absolute() {
+                home
+            } else {
+                std::env::current_dir()?.join(home)
+            });
+        }
         let home = dirs::home_dir().ok_or_else(|| {
             error!("无法定位用户 home 目录（USERPROFILE / FOLDERID_Profile 均不可用）");
             CoreError::NoHomeDir

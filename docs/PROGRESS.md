@@ -3,7 +3,55 @@
 > 本文件实时反映各阶段实施进度。每完成一项即更新对应勾选状态与说明。
 > 设计依据见 [DESIGN.md](./DESIGN.md)，路线图对应 [§13](./DESIGN.md#13-开发路线图)。
 
-**最近更新**：2026-08-04（max_steps 调大至 50 + 死循环检测 + shell PATHEXT 修复）
+**最近更新**：2026-10-02（CLI 命令/表单/任务已实现行为、OMP 视觉、ConPTY 验收与 MCP lifecycle）
+
+## CLI 入口升级
+
+- [x] `cyber` 默认持续对话入口；界面约定更新为全屏简洁 coding CLI，`cyber tui` 保留原全屏功能面板。
+- [x] `cyber setup` 与首次缺配置引导，隐藏凭据、私有文件权限、中断状态恢复；非交互不询问。
+- [x] CLI/headless 共享单轮执行与现有 JSON 历史，事件顺序与压缩结果持久化，Ctrl+C 取消。
+- [x] CLI 执行前审批；headless 默认拒绝工具，可用重复 `--allow-tool` 显式授权。
+- [x] 安装器强制 SHA256、幂等用户 PATH、Windows zip 修复；发布前格式、测试、Clippy 检查。
+- [x] `CYBER_HOME` 隔离数据目录；初始化锁与原子发布，保留已有文件。
+- [x] 修复 MCP HTTP/SSE 测试夹具的 TCP framing 与连接生命周期问题。
+- [x] 最新 release build、workspace 测试（874 项）、fmt、Clippy 全部通过；安装脚本语法检查通过。测试使用独立 target 目录，未终止用户正在运行的旧程序。
+- [x] CLI/headless 默认不自动启动 MCP；CLI `/mcp connect` 已接入 nonce 显式启动授权，UI deny 不会 start。
+- [ ] 原 TUI 接入新审批机制与 MCP 可信启动策略（原面板仍保持原行为）。
+- [ ] 会话存储迁入 `cyber-storage`、独立 runtime crate 与跨前端并发会话写保护。
+- [x] Windows ConPTY 真实终端启动、审批、任务完成、正常退出与会话保存；120x30 和 80x12 resize 验收。
+- [ ] 跨平台安装验收、发布包含新入口的 Release。
+
+### 全屏 coding CLI 需求与验收
+
+已实现独立 coding CLI 布局，保留原 `cyber tui` 面板；正常日志写文件，退出、取消或异常会恢复终端。
+
+- [x] 行式 CLI 替换为全屏简洁 coding 界面；视觉参考 [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)，不拷源码、不仿造未实现 agents/LSP。真实 palette 为暖金/灰白/cyan/紫色，彩色 ASCII `Cy` + 版本/model/effort/cwd，两行圆角输入与金色无框候选，实际状态栏 `provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output`，未知为 `--`；移除旧审批模式提示与 agent 面板入口。
+- [x] 空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，任务中 Ctrl+C cancel，空输入 Ctrl+D quit；当前空闲且空输入的 Ctrl+C 也可退出，不宣称它在所有状态都只取消。
+- [x] `/effort low|medium|high|xhigh|auto` 切换现有 agent 思考档位；medium→Middle、xhigh→Max，保留 middle/max aliases 与 `/think`，只沿用系统提示词注入，不新增 provider API `reasoning_effort`。
+- [x] 执行前审批保留当前 nonce 与精确参数授权，不是可切换 mode；bracketed paste 只插入文本，Windows 键事件粘贴使用 burst 缓冲；长参数审批固定显示控件并独立滚动，小窗口不足时禁止确认。
+- [x] headless 文本/JSON、会话续接、默认拒绝工具和显式 `--allow-tool` 授权回归通过；布局覆盖小尺寸与超过 65535 行历史。
+- [x] 底栏 ctx 使用当前上下文估算与有效容量计算剩余百分比；cache 使用上报命中/(命中+未命中) token；input/output 为本进程当前会话实际 Usage 累计。新建/切换会话重置，切换 provider/model 不重置累计，重开不恢复；Usage 未上报或 cache 分母为零时显示 `--`。
+- [x] CLI 正文与真实 `reasoning_content` 复用 Markdown 支持子集，不宣称表格或完整 CommonMark；实际 Reasoning 显示斜体 Markdown `Thinking`，不伪造思考。工具使用紧凑 status 背景块，Ctrl+O 展开/折叠；工具数据不伪造令牌 stats。
+- [x] 修复空 Assistant 与 interleaved Reasoning/正文导致重复 `Cyber` 标题；空 Token 不创建空回复标题，旧 history 兼容读取。
+- [x] 每轮持久化 `TurnSummary`，重开显示 `Worked for 3s · done HH:mm` 或 `error` / `cancelled`；旧历史没有摘要时不补造，展示记录不注入模型上下文。
+- [x] Windows ConPTY 真实终端共 119 个断言通过（47 SSE + 72 commands），覆盖交错 Reasoning/空 Token/Markdown/Usage、120x30 与 80x12、Unicode 光标、secrets masked/cancel、17 项命令目录、compact/cancel/session 持久化与 memory rule 等。
+- [x] `cli_commands.rs` 支持 TUI 目录除 mode 外的 16 个主命令，加 effort 共 17 项；完整 slash/二级建议、Tab/Up/Down、Enter 先补全再 execute、Esc 关闭候选保留输入已实现。
+- [x] Provider add/edit 表单、掩码 API key 与 endpoint、取消不写盘、私有文件持久化、use/remove 与默认项回退；model picker 使用已配置模型，不宣称 CLI 联网拉取模型。
+- [x] Session picker/list/read/new/delete、按 ID 切换与 JSON 持久化；Skill/跨会话读取仅 UI 展示，不注入模型历史。
+- [x] tools/skill/mcp 查询；显式 `/mcp connect` 经 nonce 授权启动，默认 no autostart，UI deny 不启动。
+- [x] clear 清空保存当前历史、cancel 取消真实任务、compact 执行真实模型 summary task；成功摘要持久化，失败/取消不提交排队摘要。
+- [x] CTF enable/disable/status、add/list、已解题目 writeup 生成任务；CLI add 必须合法显式分类。writeup 当前保存到隔离项目路径 `.cyber/ctf/sessions/<sessionid>/<challengeid>/<category>/<name>/writeup.md`，失败/取消不发布成功报告。
+- [x] Memory 全局/项目 CRUD；rule enabled/scope/prompt 表单及 list/edit/delete。规则按 enabled、合法 scope 和非空 prompt 进入后续提示词约束，不是 hard guard。项目已有 memory.rules 则写项目，否则写全局。
+- [x] think/effort/max_steps 仅保存正确全局目标字段，保留其他配置，不把项目 merged 配置写入全局；项目覆盖在重新加载时仍优先。
+- [x] [TUI_COMMANDS.md](./TUI_COMMANDS.md) 区分 CLI handler 与原 TUI 的子命令差异；原 TUI memory rule 无 handler、workflow/dashboard 占位，不把 CLI 能力反向宣称为旧面板能力。
+
+### MCP lifecycle 与验收边界
+
+- [x] MCP 单测与 5 个真实子进程测试通过；连接 lifecycle、cancel/shutdown 路径清理已修复。UI connect deny 不会启动 server。
+- [ ] 完整 Provider 网络联调，以及 CTF Solved→writeup 的真实 API 全链路联调；当前本地 SSE、mock/回归与隔离路径验收不代表这些已完成。
+- [ ] 所有多级子命令、自由文本/额外参数、大小写与任务状态组合的真实终端验收；主目录与二级补全支持不能推断所有组合均已验证，具体边界见命令参考。
+
+本节记录已完成的实现与既有验收，不在本次文档更新中重新运行或补造业务测试结果；下文阶段条目和测试数字为历史快照，不是当前测试总数。
 
 ---
 
@@ -303,7 +351,7 @@
 - [x] `App::new` 加 `registries: AppRegistries` 参数；`App` 持 `self.registries`
 - [x] `spawn_agent`：`let registry = self.registries.tools.clone();` 传入 `run_stream`（跨 turn 共享，MCP 连接长存）
 - [x] `/tools` handler 改用 `self.registries.tools.schemas()`（删 `ToolRegistry::with_builtins()`）
-- [x] `handle_skill_slash(args)`：`/skill list`(空) 列出 skills（名称+来源[全局/项目]+描述）；`/skill <name>` 注入 body 为 System 条目；未知 skill 提示
+- [x] `handle_skill_slash(args)`：`/skill list`(空) 列出 skills（名称+来源[全局/项目]+描述）；`/skill <name>` 添加 body 为 System 展示条目，不注入模型历史；未知 skill 提示
 - [x] `handle_mcp_slash(args)`：`/mcp list|status` 列出 server 连接状态（名称+工具数；mock 或无 server 时提示）
 - [x] `bootstrap.rs`（新文件）：`pub async fn build_registries(paths, cwd, mock) -> (AppRegistries, Vec<String>)` — builtins + skills（同步扫描）+ MCP（非 mock 时 `connect_all`，mock 跳过）；返回 errors 供 toast；**永不返回 Err**（保证 TUI 启动）（[bootstrap.rs](../crates/cyber-tui/src/bootstrap.rs)）
 - [x] `slash.rs`：加 `/skill` + `/mcp` 到 `COMMANDS`/`SlashCommand`/`parse`/`HELP_TEXT` + 测试
@@ -329,7 +377,7 @@
 - `/mcp` 仅 `list`/`status`，不做 `reconnect`（server 配置变更需重启）
 - Skill `scripts/` 目录 v0.1 不自动执行脚本，仅供 body 文本引用
 - HTTP event-stream 响应用 `resp.text()` + 调用级 timeout 读取（v0.1 不支持服务器长连持续推送）
-- 跨 session 读取仅同 cwd 内；`/sessions read` 注入为 System 条目（展示用，不入 agent history）
+- 跨 session 读取仅同 cwd 内；`/sessions read` 添加 System 展示条目，不注入模型历史
 
 ### 3.6 P3.2 扩展：MCP SSE/HTTP + 多 Session ✅
 
@@ -421,6 +469,8 @@
 ---
 
 ## 变更日志
+
+以下历史记录中的 Skill / 跨会话内容“注入 System 条目”指 UI 展示，不是注入模型历史；当前命令行为以 [TUI_COMMANDS.md](./TUI_COMMANDS.md) 为准。
 
 - **2026-08-04**：agent loop 改进——max_steps 默认值 25→50 + 死循环检测。①`max_steps` 默认值从 25 调至 50（`config.rs` + `settings.rs` 回退值同步），给复杂任务更多空间。②死循环检测（`agent.rs` 新增 `LoopDetector` + `fingerprint`）：每轮工具调用算指纹（所有 call 的 `name|arguments` 排序拼接，消除顺序差异），连续 3 轮相同 → 提前中止 agent loop（比空跑到 max_steps 省钱省时）。不同参数不算重复（`read_file(a)` vs `read_file(b)` 指纹不同），单轮多工具时整组指纹参与比较。触发后走与 max_steps 耗尽相同的无工具收尾流式，但提示文案改为「检测到连续多次相同的工具调用，可能已陷入循环」。测试：9 个 LoopDetector unit test（相同/不同/重置/threshold=1/多工具组合/额外工具重置）+ 1 个集成测试 `mock_tool_loop_not_loop_detected`（正常两步收敛不误触发）。`cargo test --workspace` 全过（cyber-agent 93 lib + 8 集成），clippy 干净。
 
