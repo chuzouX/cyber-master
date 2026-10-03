@@ -17,13 +17,16 @@ pub mod todo;
 
 pub use config::{Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity};
 pub use ctf::{current_time_str, CtfCategory, CtfChallenge, CtfStatus};
-pub use custom_tool::{load_custom_tools, CustomToolConfig, CustomToolParam, LoadedCustomTool};
+pub use custom_tool::{
+    load_custom_tools, save_custom_tool, CustomToolConfig, CustomToolParam, LoadedCustomTool,
+};
 pub use error::{CoreError, Result};
 pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};
 pub use memory::{MemoryEntry, MemoryScope, MemoryStore};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
 pub use providers::{
-    resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProvidersConfig, PROVIDER_KINDS,
+    resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProviderPreset, ProvidersConfig,
+    PROVIDER_KINDS, PROVIDER_PRESETS,
 };
 pub use todo::{TodoItem, TodoStatus};

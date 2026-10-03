@@ -17,7 +17,6 @@ use crate::config::{McpServerSpec, McpServersConfig};
 use crate::connection::McpConnection;
 use crate::error::McpError;
 use crate::tool::McpTool;
-use crate::transport::McpTransport;
 
 /// 一个已注册的 MCP server 连接。
 struct RegisteredServer {
@@ -143,9 +142,5 @@ impl std::fmt::Debug for McpRegistry {
 async fn connect_one(
     spec: &McpServerSpec,
 ) -> Result<(Arc<McpConnection>, JoinHandle<()>), McpError> {
-    match spec.transport {
-        McpTransport::Stdio => McpConnection::spawn_stdio(spec).await,
-        McpTransport::Http => McpConnection::spawn_http(spec).await,
-        McpTransport::Sse => McpConnection::spawn_sse(spec).await,
-    }
+    McpConnection::connect(spec).await
 }

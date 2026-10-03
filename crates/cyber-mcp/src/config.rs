@@ -76,6 +76,94 @@ impl McpServerSpec {
     }
 }
 
+/// 常见 MCP 服务预设。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPreset {
+    pub name: &'static str,
+    pub display_name: &'static str,
+    pub description: &'static str,
+    pub transport: McpTransport,
+    pub command: Option<&'static str>,
+    pub args: &'static [&'static str],
+    pub url: Option<&'static str>,
+}
+
+impl McpPreset {
+    /// 转换为初始的 `McpServerSpec`。
+    pub fn to_server_spec(&self) -> McpServerSpec {
+        McpServerSpec {
+            name: self.name.to_string(),
+            transport: self.transport,
+            command: self.command.map(|s| s.to_string()),
+            args: self.args.iter().map(|s| s.to_string()).collect(),
+            env: HashMap::new(),
+            url: self.url.map(|s| s.to_string()),
+            headers: HashMap::new(),
+            timeout_secs: McpServerSpec::DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+/// 热门内置 MCP 模板列表。
+pub const MCP_PRESETS: &[McpPreset] = &[
+    McpPreset {
+        name: "filesystem",
+        display_name: "本地文件系统 (filesystem)",
+        description:
+            "提供安全受限的文件读写与目录浏览能力 (npx @modelcontextprotocol/server-filesystem)",
+        transport: McpTransport::Stdio,
+        command: Some("npx"),
+        args: &["-y", "@modelcontextprotocol/server-filesystem", "."],
+        url: None,
+    },
+    McpPreset {
+        name: "fetch",
+        display_name: "网络抓取服务 (fetch)",
+        description: "快速抓取和解析网页纯文本或 HTML 内容 (uvx mcp-server-fetch)",
+        transport: McpTransport::Stdio,
+        command: Some("uvx"),
+        args: &["mcp-server-fetch"],
+        url: None,
+    },
+    McpPreset {
+        name: "puppeteer",
+        display_name: "浏览器自动化 (puppeteer)",
+        description:
+            "无头 Chrome 浏览器操控、截图与 JS 渲染 (npx @modelcontextprotocol/server-puppeteer)",
+        transport: McpTransport::Stdio,
+        command: Some("npx"),
+        args: &["-y", "@modelcontextprotocol/server-puppeteer"],
+        url: None,
+    },
+    McpPreset {
+        name: "sqlite",
+        display_name: "SQLite 数据库操作 (sqlite)",
+        description: "查询与分析本地 SQLite 数据库文件 (uvx mcp-server-sqlite)",
+        transport: McpTransport::Stdio,
+        command: Some("uvx"),
+        args: &["mcp-server-sqlite", "--db-path", "cyber.db"],
+        url: None,
+    },
+    McpPreset {
+        name: "custom_stdio",
+        display_name: "自定义 stdio 命令服务",
+        description: "指定自定义可执行文件、命令行参数与环境变量",
+        transport: McpTransport::Stdio,
+        command: Some(""),
+        args: &[],
+        url: None,
+    },
+    McpPreset {
+        name: "custom_sse",
+        display_name: "自定义 HTTP / SSE 服务",
+        description: "连接远程 HTTP / SSE MCP 服务器端点",
+        transport: McpTransport::Sse,
+        command: None,
+        args: &[],
+        url: Some("http://localhost:8000/sse"),
+    },
+];
+
 impl McpServersConfig {
     /// 从 `servers.toml` 文件加载。文件不存在 → 空 config（无 server，不报错）。
     pub fn load(path: &Path) -> Result<Self> {
@@ -243,5 +331,17 @@ args = ["server"]
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].name, "fs");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_presets_are_valid() {
+        assert!(!MCP_PRESETS.is_empty());
+        for preset in MCP_PRESETS {
+            assert!(!preset.name.is_empty());
+            assert!(!preset.display_name.is_empty());
+            let spec = preset.to_server_spec();
+            assert_eq!(spec.name, preset.name);
+            assert_eq!(spec.transport, preset.transport);
+        }
     }
 }

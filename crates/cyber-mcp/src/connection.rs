@@ -101,6 +101,15 @@ pub struct McpConnection {
 }
 
 impl McpConnection {
+    /// 连接单个 server：按 transport 分派到对应的 spawn 函数并完成握手。
+    pub async fn connect(spec: &McpServerSpec) -> Result<(Arc<Self>, JoinHandle<()>)> {
+        match spec.transport {
+            crate::transport::McpTransport::Stdio => Self::spawn_stdio(spec).await,
+            crate::transport::McpTransport::Http => Self::spawn_http(spec).await,
+            crate::transport::McpTransport::Sse => Self::spawn_sse(spec).await,
+        }
+    }
+
     /// 启动 stdio 子进程 + actor + 握手（initialize + tools/list）。
     /// 返回 `(Arc<Self>, JoinHandle)`；JoinHandle 供 `McpRegistry` 在关闭时 await。
     pub async fn spawn_stdio(spec: &McpServerSpec) -> Result<(Arc<Self>, JoinHandle<()>)> {

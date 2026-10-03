@@ -175,7 +175,7 @@ async fn main() -> color_eyre::Result<()> {
             init_tracing(cli.log_level.as_deref());
             run_headless_command(&cwd, args, mock).await
         }
-        Some(Command::Setup) => setup::run_setup(&cwd),
+        Some(Command::Setup) => setup::run_setup(&cwd).await,
         Some(Command::Tui) => {
             require_terminal(interactive)?;
             setup::ensure_configured(&cwd, mock, true)?;

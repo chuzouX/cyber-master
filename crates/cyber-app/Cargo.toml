@@ -12,6 +12,7 @@ path = "src/main.rs"
 cyber-core = { workspace = true }
 cyber-agent = { workspace = true }
 cyber-tui = { workspace = true }
+cyber-mcp = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
@@ -21,6 +22,7 @@ toml = { workspace = true }
 crossterm = { workspace = true }
 tempfile = "3"
 url = "2"
+futures = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

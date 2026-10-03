@@ -19,7 +19,7 @@ pub mod sse;
 pub mod tool;
 pub mod transport;
 
-pub use config::{McpServerSpec, McpServersConfig};
+pub use config::{McpPreset, McpServerSpec, McpServersConfig, MCP_PRESETS};
 pub use connection::McpConnection;
 pub use error::{McpError, Result};
 pub use registry::McpRegistry;

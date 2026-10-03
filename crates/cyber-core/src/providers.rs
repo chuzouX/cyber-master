@@ -270,6 +270,154 @@ pub fn resolve_api_key(s: &str) -> String {
     }
 }
 
+/// 大模型厂商与服务商热门预设。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub base_url: &'static str,
+    pub default_model: &'static str,
+    pub suggested_models: &'static [&'static str],
+    pub env_var_suggestion: &'static str,
+    pub description: &'static str,
+}
+
+impl ProviderPreset {
+    /// 转换为初始的 `ProviderConfig`。
+    pub fn to_provider_config(&self) -> ProviderConfig {
+        ProviderConfig {
+            kind: self.kind.to_string(),
+            base_url: self.base_url.to_string(),
+            api_key: if self.env_var_suggestion.is_empty() {
+                String::new()
+            } else {
+                format!("${{{}}}", self.env_var_suggestion)
+            },
+            model: self.default_model.to_string(),
+            max_tokens: 4096,
+            temperature: 0.7,
+            ..Default::default()
+        }
+    }
+}
+
+/// 常见的大模型厂商预设列表。
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "deepseek",
+        name: "DeepSeek 官方",
+        kind: "openai",
+        base_url: "https://api.deepseek.com",
+        default_model: "deepseek-chat",
+        suggested_models: &["deepseek-chat", "deepseek-reasoner"],
+        env_var_suggestion: "DEEPSEEK_API_KEY",
+        description: "国内顶尖推理与通用大模型，支持 deepseek-chat 与 R1 深度思考模型",
+    },
+    ProviderPreset {
+        id: "siliconflow",
+        name: "硅基流动 (SiliconFlow)",
+        kind: "openai",
+        base_url: "https://api.siliconflow.cn/v1",
+        default_model: "deepseek-ai/DeepSeek-V3",
+        suggested_models: &[
+            "deepseek-ai/DeepSeek-V3",
+            "deepseek-ai/DeepSeek-R1",
+            "Qwen/Qwen2.5-72B-Instruct",
+        ],
+        env_var_suggestion: "SILICONFLOW_API_KEY",
+        description: "高并发模型托管云，极速响应 DeepSeek-V3 / R1 与开源生态",
+    },
+    ProviderPreset {
+        id: "dashscope",
+        name: "阿里百炼 (DashScope)",
+        kind: "openai",
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        default_model: "qwen-plus",
+        suggested_models: &["qwen-plus", "qwen-max", "deepseek-v3", "deepseek-r1"],
+        env_var_suggestion: "DASHSCOPE_API_KEY",
+        description: "阿里云千问通义系列，企业级高可用模型服务",
+    },
+    ProviderPreset {
+        id: "zhipu",
+        name: "智谱 AI (GLM)",
+        kind: "openai",
+        base_url: "https://open.bigmodel.cn/api/paas/v4",
+        default_model: "glm-4-plus",
+        suggested_models: &["glm-4-plus", "glm-4-flash"],
+        env_var_suggestion: "ZHIPU_API_KEY",
+        description: "智谱开放平台，中文理解与代码能力强劲",
+    },
+    ProviderPreset {
+        id: "moonshot",
+        name: "月之暗面 (Kimi)",
+        kind: "openai",
+        base_url: "https://api.moonshot.cn/v1",
+        default_model: "moonshot-v1-32k",
+        suggested_models: &["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+        env_var_suggestion: "MOONSHOT_API_KEY",
+        description: "长上下文模型，适合长审计报告与海量日志分析",
+    },
+    ProviderPreset {
+        id: "openai",
+        name: "OpenAI 官方",
+        kind: "openai",
+        base_url: "https://api.openai.com/v1",
+        default_model: "gpt-4o",
+        suggested_models: &["gpt-4o", "gpt-4o-mini", "o3-mini"],
+        env_var_suggestion: "OPENAI_API_KEY",
+        description: "OpenAI 官方服务，支持 GPT-4o 及推理模型",
+    },
+    ProviderPreset {
+        id: "anthropic",
+        name: "Anthropic 官方",
+        kind: "anthropic",
+        base_url: "https://api.anthropic.com",
+        default_model: "claude-3-7-sonnet-20250219",
+        suggested_models: &[
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-haiku-20241022",
+        ],
+        env_var_suggestion: "ANTHROPIC_API_KEY",
+        description: "顶尖代码与推理能力，Claude 3.7 Sonnet 混合思考模型",
+    },
+    ProviderPreset {
+        id: "openrouter",
+        name: "OpenRouter 聚合",
+        kind: "openai",
+        base_url: "https://openrouter.ai/api/v1",
+        default_model: "deepseek/deepseek-chat",
+        suggested_models: &[
+            "deepseek/deepseek-chat",
+            "anthropic/claude-3.7-sonnet",
+            "openai/gpt-4o",
+        ],
+        env_var_suggestion: "OPENROUTER_API_KEY",
+        description: "全球模型聚合网关，统一 API 访问数百款模型",
+    },
+    ProviderPreset {
+        id: "ollama",
+        name: "本地 Ollama",
+        kind: "ollama",
+        base_url: "http://localhost:11434",
+        default_model: "qwen2.5:32b",
+        suggested_models: &["qwen2.5:32b", "deepseek-r1:14b", "llama3.3:70b"],
+        env_var_suggestion: "",
+        description: "完全本地离线运行，数据绝不上云，适合敏感审计与内网测试",
+    },
+    ProviderPreset {
+        id: "custom",
+        name: "自定义 OpenAI 兼容接口",
+        kind: "openai",
+        base_url: "",
+        default_model: "",
+        suggested_models: &[],
+        env_var_suggestion: "",
+        description: "任意兼容 OpenAI 规范的自建模型或第三方代理",
+    },
+];
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
@@ -681,5 +829,18 @@ temperature = 0.7
             custom_cfg.chat_endpoint(),
             "http://localhost:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn provider_presets_are_valid() {
+        assert!(!PROVIDER_PRESETS.is_empty());
+        for preset in PROVIDER_PRESETS {
+            assert!(!preset.id.is_empty());
+            assert!(!preset.name.is_empty());
+            let cfg = preset.to_provider_config();
+            assert_eq!(cfg.kind, preset.kind);
+            assert_eq!(cfg.base_url, preset.base_url);
+            assert_eq!(cfg.model, preset.default_model);
+        }
     }
 }
