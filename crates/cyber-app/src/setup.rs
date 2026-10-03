@@ -1035,7 +1035,9 @@ async fn ask_llm(cfg: &ProviderConfig, system_prompt: &str, user_prompt: &str) -
     while let Some(event) = stream.next().await {
         match event {
             cyber_agent::StreamEvent::Delta(text) => output.push_str(&text),
-            cyber_agent::StreamEvent::Error(err) => bail!("模型返回错误: {err}"),
+            cyber_agent::StreamEvent::Error(err) => {
+                bail!("模型返回错误: {err}");
+            }
             _ => {}
         }
     }
