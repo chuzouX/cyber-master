@@ -16,12 +16,12 @@
 #   $env:CYBER_REPO          GitHub owner/name，默认 chuzouX/cyber-master
 
 #Requires -Version 5.1
-[CmdletBinding()]
-param(
-    [string]$Version = '',
-    [string]$InstallDir = '',
-    [string]$Repo = 'chuzouX/cyber-master'
-)
+
+# 注意：`irm <url> | iex` 以表达式模式解析脚本，不能使用 param() 块；
+# 安装选项统一通过环境变量传入（见下方合并逻辑）。
+$Version    = ''
+$InstallDir = ''
+$Repo       = 'chuzouX/cyber-master'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # 关闭 Invoke-WebRequest 的进度条，否则慢且管道场景下报错
@@ -58,7 +58,7 @@ if (-not $Version) {
                                      -Headers @{ 'User-Agent' = 'cyber-installer' }
         $Version = $release.tag_name
     } catch {
-        Write-Error "无法获取最新版本：$_`n请用 -Version <tag> 或 `$env:CYBER_VERSION 显式指定。"
+        Write-Error "无法获取最新版本：$_`n请设置 `$env:CYBER_VERSION 显式指定版本 tag。"
         exit 1
     }
     if (-not $Version) {
