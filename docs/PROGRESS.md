@@ -3,7 +3,7 @@
 > 本文件实时反映各阶段实施进度。每完成一项即更新对应勾选状态与说明。
 > 设计依据见 [DESIGN.md](./DESIGN.md)，路线图对应 [§13](./DESIGN.md#13-开发路线图)。
 
-**最近更新**：2026-10-03（v0.4.0：子 Agent 委派与独立卡片渲染、Todo 任务管理系统、权限与联网配置放宽、CLI 帮助与快捷键优化）
+**最近更新**：2026-10-03（v0.4.1：修复 Windows Shell 进度条与控制台穿透导致 UI 消失问题、\r 规整、强制全屏重绘及 Ctrl+L 快捷键）
 
 ## CLI 入口升级
 
@@ -26,6 +26,12 @@
   - **权限与审批优化**：对只读与安全探测命令放宽会话授权与自动审批匹配，新增 `tools.web_search` 配置项控制网页检索与抓取。
   - **交互体验与命令优化**：完善 `cyber help` / `--help` 说明与常用示例，支持 `Ctrl+T` 快捷键打开/切换 CTF 题目面板，修复现代 rustc 编译兼容性（`format!` 冗余借用与 `bail!` 尾随分号）。
 
+- [x] **v0.4.1 发布与实施**：
+  - **Windows 控制台子进程隔离**：在 `shell.rs` 及 `cyber-mcp` 中启动子进程时引入 `CREATE_NO_WINDOW (0x08000000)` 标志，杜绝子进程越权写入父控制台屏幕缓冲区；注入 `POWERSHELL_PROGRESS_PREFERENCE = "SilentlyContinue"`，静默 PowerShell 交互式进度条。
+  - **回车符 `\r` 规整与标签修复**：`shell.rs` 与 `cli.rs` 的 `clean()` 支持按 `\r` 提取最终有效进度帧，防止高频覆盖刷新导致单行字符暴涨及 Viewport 折行滚屏；修复 `shell.rs` 中 stdout/stderr 标签倒置的问题。
+  - **全屏强制重绘保底机制**：`CliScreen` 引入 `needs_clear` 状态，在工具执行完毕（`tool_result`）时自动触发 `terminal.clear()` 重置 Ratatui diff 缓冲区并重绘全屏；支持全局 `Ctrl+L` 快捷键随时无损手动刷新终端。
+  - **优化 ※summary 解题流程**：重构 `generate_turn_summary`，彻底杜绝机械列举底层工具名（如 `[shell -> read_file]`），改为从模型回答、writeup 或 key_points 中深度提取结构化解题流程（如 `1. 审计发现注入点 -> 2. 构造盲注脚本 -> 3. 提取flag`）；未解出时提取真实卡点与安全防护分析，常规任务总结实际业务产出。
+  - **大胆自动审批与安全性置信度评估**：重构 `Auto` 模式策略，日常开发与 CTF 操作（工作区内 `write_file`、`edit`、`cargo build`、`python` 脚本、`curl`/`nmap`/`nc` 网络交互、输出重定向、非关键文件清理等）全面自动放行；设计显式「极度危险规则」（毁灭性整盘删除、系统关机、磁盘格式化、设备裸写、Fork炸弹、凭据覆写、安全策略全局旁路等）与安全置信度评估体系（阈值 70%），拦截时在 UI 弹窗实时展示 `[安全置信度: xx%] 拦截原因: ...`。
 ### 全屏 coding CLI 需求与验收
 
 已实现独立 coding CLI 布局，保留原 `cyber tui` 面板；正常日志写文件，退出、取消或异常会恢复终端。
