@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cyber_agent::{
     run_stream_with_permissions, AgentEvent, PermissionBroker, PermissionDecision,
@@ -127,9 +127,330 @@ enum TurnMode<'a> {
     Ui {
         events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         cancel: tokio::sync::oneshot::Receiver<()>,
+        steering: Option<cyber_agent::SteeringReceiver>,
     },
 }
 
+fn strip_markdown_code_blocks(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_code = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn strip_markdown_inline(text: &str) -> String {
+    let mut res = String::new();
+    for c in text.chars() {
+        if c == '*' || c == '`' || c == '#' || c == '>' || c == '_' {
+            continue;
+        }
+        res.push(c);
+    }
+    res.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clean_step_line(line: &str) -> String {
+    let stripped = strip_markdown_inline(line);
+    let trimmed = stripped.trim();
+    let rest = trimmed.trim_start_matches(|c: char| {
+        c.is_ascii_digit()
+            || c == '.'
+            || c == '-'
+            || c == '*'
+            || c == ' '
+            || c == '、'
+            || c == ')'
+            || c == '）'
+            || c == '('
+            || c == '（'
+    });
+    let rest = rest
+        .trim_start_matches("步骤")
+        .trim_start_matches("Step")
+        .trim_start();
+    let rest = rest.trim_start_matches(|c: char| {
+        c.is_ascii_digit()
+            || c == '.'
+            || c == '、'
+            || c == ':'
+            || c == '：'
+            || c == ' '
+            || c == ')'
+            || c == '）'
+    });
+    if rest.is_empty() {
+        trimmed.to_string()
+    } else {
+        rest.to_string()
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let mut truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+fn extract_ctf_solution_flow(answer: &str, challenge: &cyber_core::CtfChallenge) -> String {
+    let cleaned = strip_markdown_code_blocks(answer);
+    let lines: Vec<&str> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // 1. 查找显式的解题流程/解题步骤/利用过程标题
+    let header_keywords = [
+        "解题流程",
+        "解题步骤",
+        "解题思路",
+        "利用过程",
+        "漏洞利用",
+        "复现步骤",
+        "利用流程",
+        "攻击链",
+    ];
+    if let Some(pos) = lines.iter().position(|l| {
+        let stripped = strip_markdown_inline(l);
+        header_keywords.iter().any(|k| stripped.contains(k))
+    }) {
+        let mut steps = Vec::new();
+        for line in lines.iter().skip(pos + 1) {
+            let stripped = strip_markdown_inline(line);
+            if stripped.starts_with('#') || header_keywords.iter().any(|k| stripped.contains(k)) {
+                break;
+            }
+            let is_step = line.starts_with(|c: char| c.is_ascii_digit())
+                || line.starts_with('-')
+                || line.starts_with('*')
+                || line.starts_with('（')
+                || line.starts_with('(')
+                || line.starts_with('①')
+                || line.starts_with('②')
+                || line.starts_with('③')
+                || line.starts_with("步骤")
+                || line.starts_with("Step");
+            if is_step {
+                let clean = clean_step_line(&stripped);
+                if clean.len() >= 3 && !clean.to_lowercase().starts_with("flag:") {
+                    steps.push(clean);
+                }
+            } else if steps.is_empty() && stripped.len() >= 8 {
+                steps.push(stripped);
+                break;
+            }
+            if steps.len() >= 4 {
+                break;
+            }
+        }
+        if !steps.is_empty() {
+            if steps.len() == 1 {
+                return truncate_chars(&steps[0], 120);
+            }
+            let indexed: Vec<String> = steps
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}. {}", i + 1, s))
+                .collect();
+            return truncate_chars(&indexed.join(" -> "), 140);
+        }
+    }
+
+    // 2. 扫描全文提取结构化编号步骤 (如 1. ... 2. ...)
+    let mut numbered = Vec::new();
+    for line in &lines {
+        let trimmed = line.trim();
+        let is_numbered = (trimmed.starts_with(|c: char| c.is_ascii_digit())
+            && (trimmed.contains('.') || trimmed.contains('、') || trimmed.contains(')')))
+            || trimmed.starts_with("步骤")
+            || trimmed.starts_with("Step ")
+            || trimmed.starts_with('①')
+            || trimmed.starts_with('②')
+            || trimmed.starts_with('③');
+        if is_numbered {
+            let stripped = strip_markdown_inline(trimmed);
+            let clean = clean_step_line(&stripped);
+            if clean.len() >= 4 && !clean.to_lowercase().starts_with("flag:") {
+                numbered.push(clean);
+            }
+        }
+        if numbered.len() >= 4 {
+            break;
+        }
+    }
+    if numbered.len() >= 2 {
+        let indexed: Vec<String> = numbered
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {}", i + 1, s))
+            .collect();
+        return truncate_chars(&indexed.join(" -> "), 140);
+    }
+
+    // 3. 扫描包含关键动作词的叙述性描述（漏洞利用与突破过程）
+    let action_keywords = [
+        "分析",
+        "发现",
+        "利用",
+        "绕过",
+        "注入",
+        "读取",
+        "获取",
+        "提权",
+        "逆向",
+        "构造",
+        "探测",
+        "审计",
+        "溢出",
+        "反序列化",
+        "解码",
+        "爆破",
+        "上传",
+        "泄露",
+    ];
+    let mut actions = Vec::new();
+    for line in &lines {
+        let stripped = strip_markdown_inline(line);
+        if stripped.len() < 8 || stripped.len() > 180 {
+            continue;
+        }
+        if stripped.to_lowercase().starts_with("flag:") || stripped.contains("祝你解题愉快") {
+            continue;
+        }
+        if action_keywords.iter().any(|k| stripped.contains(k)) {
+            actions.push(stripped);
+            if actions.len() >= 2 {
+                break;
+            }
+        }
+    }
+    if !actions.is_empty() {
+        return truncate_chars(&actions.join("；"), 120);
+    }
+
+    // 4. 优先尝试使用题目的 key_points 或 writeup
+    if let Some(kp) = challenge
+        .key_points
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return truncate_chars(kp.trim(), 120);
+    }
+    if let Some(wu) = challenge
+        .writeup
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let wu_clean = strip_markdown_code_blocks(wu);
+        let first = wu_clean
+            .lines()
+            .map(str::trim)
+            .find(|l| l.len() >= 10 && !l.starts_with('#'))
+            .unwrap_or(wu.trim());
+        return truncate_chars(&strip_markdown_inline(first), 120);
+    }
+
+    // 5. 提取 answer 中的任意有效首句描述
+    if let Some(first_line) = lines.iter().find(|l| {
+        let s = strip_markdown_inline(l);
+        s.len() >= 10 && !s.to_lowercase().starts_with("flag:")
+    }) {
+        return truncate_chars(&strip_markdown_inline(first_line), 120);
+    }
+
+    // 6. 分类兜底（纯技术流程，不包含工具名称）
+    match challenge.category {
+        cyber_core::CtfCategory::Web => {
+            "经 Web 资产探测、漏洞定位与 Payload 验证成功取得 Flag".into()
+        }
+        cyber_core::CtfCategory::Pwn => {
+            "经二进制防护机制分析、漏洞挖掘与利用链构造成功取得 Flag".into()
+        }
+        cyber_core::CtfCategory::Reverse => {
+            "经逆向反编译算法分析、约束求解与逻辑还原成功取得 Flag".into()
+        }
+        cyber_core::CtfCategory::Crypto => {
+            "经密码体制分析、弱点探测与密钥/明文还原成功取得 Flag".into()
+        }
+        cyber_core::CtfCategory::Misc => "经多源数据分析、隐写提取与协议解析成功取得 Flag".into(),
+    }
+}
+
+fn extract_ctf_blocker(answer: &str, challenge: &cyber_core::CtfChallenge) -> String {
+    if let Some(kp) = challenge
+        .key_points
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return truncate_chars(kp.trim(), 100);
+    }
+    let cleaned = strip_markdown_code_blocks(answer);
+    let lines: Vec<&str> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let blocker_keywords = [
+        "卡点",
+        "难点",
+        "受阻",
+        "失败",
+        "防护",
+        "限制",
+        "WAF",
+        "保护",
+        "报错",
+        "未找到",
+        "拦截",
+        "过滤",
+        "阻碍",
+    ];
+    for line in &lines {
+        let stripped = strip_markdown_inline(line);
+        if stripped.len() >= 8 && blocker_keywords.iter().any(|k| stripped.contains(k)) {
+            return truncate_chars(&stripped, 100);
+        }
+    }
+    if let Some(last_line) = lines.iter().rev().find(|l| {
+        let s = strip_markdown_inline(l);
+        s.len() >= 10 && !s.starts_with('#')
+    }) {
+        return truncate_chars(&strip_markdown_inline(last_line), 100);
+    }
+    "靶机环境分析中，正在尝试绕过安全防护或探测攻击面".into()
+}
+
+fn extract_task_summary(answer: &str) -> String {
+    let cleaned = strip_markdown_code_blocks(answer);
+    let lines: Vec<&str> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    for line in &lines {
+        let stripped = strip_markdown_inline(line);
+        if stripped.len() >= 8 && !stripped.starts_with('#') {
+            return truncate_chars(&stripped, 80);
+        }
+    }
+    "所有操作已顺利执行并返回结果。".into()
+}
 /// Built once per CLI lifetime; session and provider selections are mutable.
 pub(crate) struct SessionRunner {
     pub ctx: AppContext,
@@ -540,109 +861,54 @@ impl SessionRunner {
         &self,
         status: &str,
         answer: &str,
-        tool_calls: &[ToolCallRecord],
+        _tool_calls: &[ToolCallRecord],
         error: Option<&str>,
     ) -> String {
         let challenges = self.challenges().unwrap_or_default();
         let has_challenges = self.ctf_enabled || !challenges.is_empty();
 
         if has_challenges {
-            // 1. 如果有题目解出来，总结题目的解题流程
+            // 1. 如果有题目解出来，总结题目的真实解题流程（杜绝仅列出工具名）
             if let Some(solved) = challenges
                 .iter()
                 .find(|c| c.status == cyber_core::CtfStatus::Solved)
             {
                 let flag_str = solved.flag.as_deref().unwrap_or("已获取");
-                let mut steps = Vec::new();
-                for call in tool_calls {
-                    if !steps.contains(&call.name.as_str()) {
-                        steps.push(call.name.as_str());
-                    }
-                }
-                let flow = if !steps.is_empty() {
-                    format!(
-                        "调用工具 [{}] 探测与利用目标漏洞，成功取得 Flag 并验证解决",
-                        steps.join(" -> ")
-                    )
-                } else if !answer.trim().is_empty() {
-                    let first_line = answer
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("完成验证");
-                    first_line.chars().take(60).collect()
-                } else {
-                    "经综合分析与利用成功获取 Flag 并标记解决".to_string()
-                };
+                let flow = extract_ctf_solution_flow(answer, solved);
                 return format!(
                     "题目【{}】已解出 (Flag: {flag_str})，解题流程：{flow}",
                     solved.name
                 );
             }
 
-            // 2. 有题目但没解出来 -> 说明卡点
+            // 2. 有题目但没解出来 -> 说明实际卡点与防护限制
             if let Some(in_progress) = challenges
                 .iter()
                 .find(|c| c.status == cyber_core::CtfStatus::InProgress)
             {
                 let blocker = if let Some(err) = error {
                     err.to_string()
-                } else if let Some(kp) = &in_progress.key_points {
-                    kp.clone()
                 } else if status == "cancelled" {
                     "解题过程被用户取消".to_string()
-                } else if let Some(last_tool_err) =
-                    tool_calls.iter().rev().find(|c| c.name == "shell")
-                {
-                    format!(
-                        "执行命令 [{}] 遇到阻碍，尚未发现有效利用链",
-                        last_tool_err.name
-                    )
                 } else {
-                    let last_line = answer
-                        .lines()
-                        .rev()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("靶机环境分析中，正在尝试绕过限制或探测攻击面");
-                    last_line.chars().take(60).collect()
+                    extract_ctf_blocker(answer, in_progress)
                 };
                 return format!("题目【{}】尚未解出，卡点：{blocker}", in_progress.name);
             }
         }
 
-        // 3. 如果不是题目则直接总结对话和任务完成情况
+        // 3. 如果不是题目则直接总结对话和任务完成情况（描述成果，不列举底层工具）
         if status == "cancelled" {
             return "任务已取消，已保存当前对话与执行历史。".into();
         }
         if let Some(err) = error {
             return format!("任务执行未完成：{err}");
         }
-        if !tool_calls.is_empty() {
-            let mut tools: Vec<&str> = Vec::new();
-            for call in tool_calls {
-                if !tools.contains(&call.name.as_str()) {
-                    tools.push(call.name.as_str());
-                }
-            }
-            let brief = if !answer.trim().is_empty() {
-                let line = answer
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("任务已完成");
-                line.chars().take(50).collect::<String>()
-            } else {
-                "工具执行完毕并返回输出结果".to_string()
-            };
-            return format!("任务完成：调用 [{}]，{brief}", tools.join(", "));
-        }
         if !answer.trim().is_empty() {
-            let first = answer
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("对话已完成");
-            let brief: String = first.chars().take(60).collect();
-            return format!("对话完成：{brief}");
+            let brief = extract_task_summary(answer);
+            return format!("任务完成：{brief}");
         }
-        "任务已完成。".into()
+        "任务已完成，所有操作已执行完毕并返回结果。".into()
     }
 
     pub(crate) async fn run_cli_task(
@@ -909,12 +1175,17 @@ impl SessionRunner {
         permissions: Arc<PermissionBroker>,
         events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         cancel: tokio::sync::oneshot::Receiver<()>,
+        steering: Option<cyber_agent::SteeringReceiver>,
     ) -> HeadlessOutcome {
         self.run_turn_inner(
             prompt,
             intensity,
             permissions,
-            TurnMode::Ui { events, cancel },
+            TurnMode::Ui {
+                events,
+                cancel,
+                steering,
+            },
         )
         .await
     }
@@ -927,9 +1198,13 @@ impl SessionRunner {
         mode: TurnMode<'_>,
     ) -> HeadlessOutcome {
         let started_at = Instant::now();
-        let (text, mut input, observer, mut cancel) = match mode {
-            TurnMode::Cli { text, input } => (text, input, None, None),
-            TurnMode::Ui { events, cancel } => (false, None, Some(events), Some(cancel)),
+        let (text, mut input, observer, mut cancel, steering) = match mode {
+            TurnMode::Cli { text, input } => (text, input, None, None, None),
+            TurnMode::Ui {
+                events,
+                cancel,
+                steering,
+            } => (false, None, Some(events), Some(cancel), steering),
         };
         let memory = match self.memory_prompt() {
             Ok(memory) => memory,
@@ -961,6 +1236,7 @@ impl SessionRunner {
             intensity,
             memory,
             permissions.clone(),
+            steering,
         ));
         let mut turn = TurnHistory::new(prompt);
         let mut pending: Option<PermissionRequest> = None;
@@ -1006,6 +1282,14 @@ impl SessionRunner {
                     handle.abort();
                     // Drain already-emitted results before completing the history.
                 }
+                _ = tokio::signal::ctrl_c(), if cancelled => {
+                    // 已处于取消状态时再次收到 Ctrl+C：强制立即退出，绝不卡死
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1500)), if cancelled => {
+                    // 取消后排空缓冲最多等待 1.5 秒，超时强制退出
+                    break;
+                }
                 event = rx.recv() => {
                     match event {
                         Some((_, event)) => {
@@ -1018,7 +1302,7 @@ impl SessionRunner {
                                 }
                             }
                             turn.record(event, text);
-                            if done && !cancelled { break; }
+                            if done { break; }
                         }
                         None => break,
                     }
@@ -1237,6 +1521,7 @@ impl TurnHistory {
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::Compacting { .. }
                 | AgentEvent::Compacted { .. }
+                | AgentEvent::SteeringReceived(_)
                 | AgentEvent::Error(_)
                 | AgentEvent::Done
         ) {
@@ -1712,6 +1997,7 @@ pub(crate) mod tests {
                     Arc::new(PermissionBroker::deny_all()),
                     events,
                     cancel,
+                    None,
                 )
                 .await;
             assert!(outcome.answer.contains(PROMPT));
@@ -1729,6 +2015,7 @@ pub(crate) mod tests {
                     Arc::new(PermissionBroker::deny_all()),
                     events,
                     cancel,
+                    None,
                 )
                 .await;
             assert!(outcome.permission_denied);
@@ -1780,6 +2067,7 @@ pub(crate) mod tests {
                     Arc::new(broker),
                     events,
                     cancel,
+                    None,
                 ),
                 async {
                     let request = requests.recv().await.unwrap();
@@ -1832,6 +2120,7 @@ pub(crate) mod tests {
                     broker.clone(),
                     events,
                     cancel,
+                    None,
                 ),
                 async {
                     // The agent emitted text and a call, then blocked on approval.
