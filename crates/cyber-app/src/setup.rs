@@ -1061,6 +1061,26 @@ fn extract_toml_block(content: &str) -> Option<String> {
     None
 }
 
+fn extract_all_toml_blocks(content: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut search = content;
+    while let Some(start) = search.find("```toml") {
+        let after = &search[start + 7..];
+        if let Some(end) = after.find("```") {
+            blocks.push(after[..end].trim().to_string());
+            search = &after[end + 3..];
+        } else {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        if let Some(single) = extract_toml_block(content) {
+            blocks.push(single);
+        }
+    }
+    blocks
+}
+
 fn find_installed_binary(name: &str) -> Option<String> {
     let cmd = if cfg!(windows) { "where" } else { "which" };
     if let Ok(output) = std::process::Command::new(cmd).arg(name).output() {
@@ -1101,80 +1121,219 @@ fn fetch_tool_help(name: &str) -> Option<String> {
     run("-h").or_else(|| run("--help"))
 }
 
-async fn setup_ai_tool_scan(
-    paths: &Paths,
-    config: &Config,
-    providers: &ProvidersConfig,
-) -> Result<()> {
-    eprintln!("\n╭──────────────────────────────────────────────────────────────╮");
-    eprintln!("│              🤖 AI 智能扫描并添加本地安全工具                │");
-    eprintln!("╰──────────────────────────────────────────────────────────────╯");
-
-    let Some(provider_cfg) = providers.providers.get(&config.agent.default_provider) else {
-        eprintln!(
-            "\x1b[31m未配置默认 Provider，AI 智能扫描不可用。请先进入菜单 1 进行配置。\x1b[0m"
-        );
-        return Ok(());
+fn run_help_for_command(cmd_prefix: &str, tool_name: &str) -> Option<String> {
+    let trimmed = cmd_prefix.trim();
+    let (prog, args) = if let Some(rest) = trimmed.strip_prefix("python ") {
+        ("python", vec![rest.trim().trim_matches('"')])
+    } else if let Some(rest) = trimmed.strip_prefix("java -jar ") {
+        ("java", vec!["-jar", rest.trim().trim_matches('"')])
+    } else {
+        (trimmed.trim_matches('"'), Vec::new())
     };
-    if provider_cfg.kind != "ollama" && provider_cfg.resolved_api_key().trim().is_empty() {
-        eprintln!(
-            "\x1b[31m当前 Provider [{}] 未设置 API Key 或有效环境变量，无法调用 AI 分析。\x1b[0m",
-            config.agent.default_provider
-        );
+
+    let run_flag = |flag: &str| -> Option<String> {
+        let mut command = std::process::Command::new(prog);
+        for a in &args {
+            command.arg(a);
+        }
+        command.arg(flag);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let child = command.spawn().ok()?;
+        let output = child.wait_with_output().ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = if stdout.trim().len() > 50 {
+            stdout.to_string()
+        } else {
+            stderr.to_string()
+        };
+        if text.trim().len() > 20 {
+            let lines: Vec<&str> = text.lines().take(200).collect();
+            Some(lines.join("\n"))
+        } else {
+            None
+        }
+    };
+
+    run_flag("-h")
+        .or_else(|| run_flag("--help"))
+        .or_else(|| fetch_tool_help(tool_name))
+}
+
+fn scan_directory_for_tools(dir: &Path) -> Vec<(String, String, Option<String>)> {
+    let mut tools = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return tools;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                let ext_lower = ext.to_ascii_lowercase();
+                if ["exe", "bat", "cmd", "sh", "py", "jar"].contains(&ext_lower.as_str()) {
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("tool")
+                        .to_string();
+                    let cmd = if ext_lower == "py" {
+                        format!("python \"{}\"", path.display())
+                    } else if ext_lower == "jar" {
+                        format!("java -jar \"{}\"", path.display())
+                    } else {
+                        format!("\"{}\"", path.display())
+                    };
+                    let help = run_help_for_command(&cmd, &name);
+                    tools.push((name, cmd, help));
+                }
+            }
+        } else if path.is_dir() {
+            let folder_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                for sub in sub_entries.flatten() {
+                    let sub_path = sub.path();
+                    if sub_path.is_file() {
+                        let stem = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        let ext = sub_path
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if (stem.eq_ignore_ascii_case(&folder_name)
+                            || stem == "main"
+                            || stem == "run")
+                            && ["py", "exe", "jar", "bat", "sh"].contains(&ext.as_str())
+                        {
+                            let name = folder_name.clone();
+                            let cmd = if ext == "py" {
+                                format!("python \"{}\"", sub_path.display())
+                            } else if ext == "jar" {
+                                format!("java -jar \"{}\"", sub_path.display())
+                            } else {
+                                format!("\"{}\"", sub_path.display())
+                            };
+                            let help = run_help_for_command(&cmd, &name);
+                            tools.push((name, cmd, help));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tools
+}
+
+async fn process_freeform_prompt(
+    paths: &Paths,
+    provider_cfg: &ProviderConfig,
+    user_prompt: &str,
+) -> Result<()> {
+    eprintln!("\n正在请求 AI 分析您的提示词并提取安全工具配置...");
+    let system_prompt = "你是一个网络安全渗透测试工具专家。请根据用户的需求和本地工具描述，将其封装为一个或多个合法的 Cyber Master CustomToolConfig 配置。\n\
+每个工具必须输出为一个独立的 ```toml ... ``` 代码块，不要包含前言或解释。\n\
+格式示例：\n\
+```toml\n\
+name = \"sqlmap\"\n\
+description = \"自动化 SQL 注入检测\"\n\
+command = \"python D:/tools/sqlmap/sqlmap.py -u {url} --batch {extra}\"\n\
+tags = [\"sqli\", \"web\"]\n\
+\n\
+[[parameters]]\n\
+name = \"url\"\n\
+description = \"目标 URL 地址\"\n\
+required = true\n\
+\n\
+[[parameters]]\n\
+name = \"extra\"\n\
+description = \"额外参数\"\n\
+required = false\n\
+default = \"--smart\"\n\
+```";
+
+    let reply = ask_llm(provider_cfg, system_prompt, user_prompt).await?;
+    let toml_blocks = extract_all_toml_blocks(&reply);
+    if toml_blocks.is_empty() {
+        eprintln!("\x1b[31mAI 未能生成有效的 TOML 配置块。\x1b[0m");
+        eprintln!("模型输出:\n{reply}");
         return Ok(());
     }
 
-    eprintln!(
-        "当前使用 AI 模型: \x1b[1;36m{} ({})\x1b[0m",
-        config.agent.default_provider, provider_cfg.model
-    );
-    eprintln!("正在检测系统已安装的安全工具与渗透测试二进制...");
+    for toml_code in toml_blocks {
+        match toml::from_str::<CustomToolConfig>(&toml_code) {
+            Ok(tool_cfg) => {
+                eprintln!("\n──────────────────────────────────────────────────────────");
+                eprintln!(
+                    "\x1b[1;32mAI 已生成工具 [{}] 配置草稿:\x1b[0m",
+                    tool_cfg.name
+                );
+                eprintln!("  名称: \x1b[36m{}\x1b[0m", tool_cfg.name);
+                eprintln!("  描述: {}", tool_cfg.description);
+                eprintln!("  命令: \x1b[33m{}\x1b[0m", tool_cfg.command);
+                let p_names: Vec<String> = tool_cfg
+                    .parameters
+                    .iter()
+                    .map(|p| {
+                        if p.required {
+                            format!("{}(必填)", p.name)
+                        } else {
+                            format!("{}(选填)", p.name)
+                        }
+                    })
+                    .collect();
+                eprintln!("  参数: {}", p_names.join(", "));
+                eprintln!("──────────────────────────────────────────────────────────");
 
-    let candidate_defs = [
-        ("nmap", "网络端口与服务版本扫描"),
-        ("sqlmap", "自动化 SQL 注入检测与利用"),
-        ("dirsearch", "Web 路径与敏感目录爆破"),
-        ("subfinder", "被动子域名枚举与收集"),
-        ("nuclei", "基于社区模板的漏洞快速扫描"),
-        ("nikto", "Web 服务器配置缺陷与漏洞扫描"),
-        ("hydra", "网络服务登录暴力破解"),
-        ("gobuster", "URI 与 DNS 目录爆破"),
-        ("ffuf", "高性能 Web Fuzz 模糊测试"),
-        ("whatweb", "Web 网站技术指纹识别"),
-        ("wpscan", "WordPress 站点安全扫描"),
-        ("masscan", "大规模高速端口扫描"),
-    ];
-
-    let mut found_tools = Vec::new();
-    for (name, desc) in candidate_defs {
-        if let Some(bin_path) = find_installed_binary(name) {
-            let already_configured = paths.tools_dir.join(format!("{name}.toml")).exists();
-            found_tools.push((name, desc, bin_path, already_configured));
+                let confirm = prompt_text(
+                    &format!(
+                        "是否确认保存为 ~/.cyber/tools/{}.toml? [Y/n]",
+                        tool_cfg.name
+                    ),
+                    "y",
+                )?;
+                if confirm.as_deref() == Some("y") || confirm.as_deref() == Some("Y") {
+                    match save_custom_tool(&paths.tools_dir, &tool_cfg) {
+                        Ok(p) => eprintln!("\x1b[1;32m✓ 已成功生成: {}\x1b[0m", p.display()),
+                        Err(e) => eprintln!("\x1b[31m保存工具配置失败: {e}\x1b[0m"),
+                    }
+                } else {
+                    eprintln!("已跳过 [{}]。", tool_cfg.name);
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m解析生成的 TOML 失败: {e}\x1b[0m");
+            }
         }
     }
 
-    if found_tools.is_empty() {
-        eprintln!("\x1b[33m未在系统 PATH 中检测到常见的安全测试工具。\x1b[0m");
-        eprintln!(
-            "提示: 如果工具安装在自定义目录，请将其加入系统 PATH 环境变量，或在菜单 3 手动录入。"
-        );
-        return Ok(());
-    }
+    Ok(())
+}
 
-    let items: Vec<(String, bool)> = found_tools
+async fn process_tool_candidates(
+    paths: &Paths,
+    provider_cfg: &ProviderConfig,
+    tools: Vec<(String, String, Option<String>)>,
+) -> Result<()> {
+    let items: Vec<(String, bool)> = tools
         .iter()
-        .map(|(name, desc, path, configured)| {
-            let status = if *configured {
+        .map(|(name, cmd, _)| {
+            let configured = paths.tools_dir.join(format!("{name}.toml")).exists();
+            let status = if configured {
                 " [已配置]"
             } else {
                 " [未配置]"
             };
-            (format!("{name} ({desc}) - {path}{status}"), !*configured)
+            (format!("{name} - {cmd}{status}"), !configured)
         })
         .collect();
 
     let Some(selected_indices) = multi_select_menu(
-        "发现以下本地已安装安全工具，请勾选需要让 AI 分析并生成配置的项:",
+        "发现以下本地工具，请勾选需要让 AI 分析并生成配置的项:",
         &items,
     )?
     else {
@@ -1187,14 +1346,16 @@ async fn setup_ai_tool_scan(
     }
 
     for idx in selected_indices {
-        let (name, desc, _, _) = &found_tools[idx];
-        eprintln!("\n正在探测 [{name}] 帮助信息并让 AI 分析...");
-        let help_text = fetch_tool_help(name).unwrap_or_else(|| format!("{name}: {desc}"));
-        let system_prompt = "你是一个网络安全渗透测试工具专家。请根据提供的命令行工具帮助信息，生成符合 Cyber Master CustomToolConfig 的标准 TOML 配置。";
+        let (name, cmd, help_opt) = &tools[idx];
+        eprintln!("\n正在获取 [{name}] 帮助信息并调用 AI 分析...");
+        let help_text = help_opt
+            .clone()
+            .unwrap_or_else(|| fetch_tool_help(name).unwrap_or_else(|| format!("command: {cmd}")));
+        let system_prompt = "你是一个网络安全渗透测试工具专家。请根据提供的命令行工具与帮助信息，生成符合 Cyber Master CustomToolConfig 的标准 TOML 配置。";
         let user_prompt = format!(
-            "工具名称: {name}\n说明: {desc}\n\n帮助文档输出摘要:\n{help_text}\n\n\
+            "工具名称: {name}\n执行命令基础: {cmd}\n\n帮助文档输出摘要:\n{help_text}\n\n\
             请生成合法的 TOML 配置代码块，要求如下：\n\
-            1. 包含 name（字符串，英文小写），description（中文简述），command（命令行模板，核心参数用 {{param}} 占位符包裹），tags（如 [\"security\", \"scan\"]）。\n\
+            1. 包含 name（字符串，英文小写），description（中文简述），command（命令行模板，保留原执行路径，核心参数用 {{param}} 占位符包裹），tags（如 [\"security\", \"scan\"]）。\n\
             2. 包含 [[parameters]] 数组，必须包含 command 中用到的每个占位符参数（name, description, required, default）。\n\
             3. 只输出 ```toml ... ``` 代码块，严禁包含任何前言或后记解释。"
         );
@@ -1205,7 +1366,7 @@ async fn setup_ai_tool_scan(
                 let toml_code = extract_toml_block(&reply).unwrap_or(reply);
                 match toml::from_str::<CustomToolConfig>(&toml_code) {
                     Ok(mut tool_cfg) => {
-                        tool_cfg.name = (*name).to_string(); // Ensure canonical name
+                        tool_cfg.name = name.clone();
                         eprintln!("\n──────────────────────────────────────────────────────────");
                         eprintln!("\x1b[1;32mAI 已为 [{name}] 生成配置草稿:\x1b[0m");
                         eprintln!("  名称: \x1b[36m{}\x1b[0m", tool_cfg.name);
@@ -1253,6 +1414,141 @@ async fn setup_ai_tool_scan(
     }
 
     Ok(())
+}
+
+async fn setup_ai_tool_scan(
+    paths: &Paths,
+    config: &Config,
+    providers: &ProvidersConfig,
+) -> Result<()> {
+    eprintln!("\n╭──────────────────────────────────────────────────────────────╮");
+    eprintln!("│              🤖 AI 智能扫描并添加本地安全工具                │");
+    eprintln!("╰──────────────────────────────────────────────────────────────╯");
+
+    let Some(provider_cfg) = providers.providers.get(&config.agent.default_provider) else {
+        eprintln!(
+            "\x1b[31m未配置默认 Provider，AI 智能扫描不可用。请先进入菜单 1 进行配置。\x1b[0m"
+        );
+        return Ok(());
+    };
+    if provider_cfg.kind != "ollama" && provider_cfg.resolved_api_key().trim().is_empty() {
+        eprintln!(
+            "\x1b[31m当前 Provider [{}] 未设置 API Key 或有效环境变量，无法调用 AI 分析。\x1b[0m",
+            config.agent.default_provider
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "当前使用 AI 模型: \x1b[1;36m{} ({})\x1b[0m",
+        config.agent.default_provider, provider_cfg.model
+    );
+
+    eprintln!("\n\x1b[1;33m提示:\x1b[0m 您可以直接告诉 AI 您的工具位置或需求，例如:");
+    eprintln!("  * 目录路径: 如 \x1b[36mD:\\tools\x1b[0m (自动扫描目录下的所有安全工具与脚本)");
+    eprintln!("  * 命令提示: 如 \x1b[36m我有 D:\\tools\\fscan.exe 和 python D:\\tools\\sqlmap\\sqlmap.py，请帮我配置\x1b[0m");
+    eprintln!("  * 直接回车: 自动探测系统环境变量 PATH 及常见目录中的工具");
+
+    let user_input = prompt_text("\n请输入工具所在目录、具体命令或提示词", "")?;
+    let input_str = user_input.as_deref().unwrap_or("").trim().trim_matches('"');
+
+    if !input_str.is_empty() {
+        let input_path = Path::new(input_str);
+        if input_path.is_dir() {
+            eprintln!(
+                "\n正在扫描目录 [{}] 下的工具与脚本...",
+                input_path.display()
+            );
+            let scanned = scan_directory_for_tools(input_path);
+            if scanned.is_empty() {
+                eprintln!(
+                    "\x1b[33m在目录 [{}] 下未找到明显的安全可执行文件或脚本。\x1b[0m",
+                    input_path.display()
+                );
+                eprintln!("转为将该目录作为提示词由 AI 深度分析...");
+                return process_freeform_prompt(
+                    paths,
+                    provider_cfg,
+                    &format!("我的工具存放在目录: {input_str}"),
+                )
+                .await;
+            }
+            return process_tool_candidates(paths, provider_cfg, scanned).await;
+        } else if input_path.is_file()
+            || input_str.starts_with("python ")
+            || input_str.starts_with("java -jar ")
+        {
+            let name = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("tool")
+                .to_string();
+            let cmd = input_str.to_string();
+            let help = run_help_for_command(&cmd, &name);
+            return process_tool_candidates(paths, provider_cfg, vec![(name, cmd, help)]).await;
+        } else {
+            // Free-form natural language prompt
+            return process_freeform_prompt(paths, provider_cfg, input_str).await;
+        }
+    }
+
+    // Default: scan PATH and common directories
+    eprintln!("\n正在检测系统 PATH 与常见安全工具目录...");
+    let mut found_tools = Vec::new();
+    let candidate_defs = [
+        ("nmap", "网络端口与服务版本扫描"),
+        ("sqlmap", "自动化 SQL 注入检测与利用"),
+        ("dirsearch", "Web 路径与敏感目录爆破"),
+        ("subfinder", "被动子域名枚举与收集"),
+        ("nuclei", "基于社区模板的漏洞快速扫描"),
+        ("nikto", "Web 服务器配置缺陷与漏洞扫描"),
+        ("hydra", "网络服务登录暴力破解"),
+        ("gobuster", "URI 与 DNS 目录爆破"),
+        ("ffuf", "高性能 Web Fuzz 模糊测试"),
+        ("whatweb", "Web 网站技术指纹识别"),
+        ("wpscan", "WordPress 站点安全扫描"),
+        ("masscan", "大规模高速端口扫描"),
+        ("fscan", "内网综合扫描与弱口令爆破"),
+        ("xray", "安全漏洞评估与主动扫描"),
+        ("httpx", "HTTP 批量探测与存活识别"),
+    ];
+
+    for (name, _desc) in candidate_defs {
+        if let Some(bin_path) = find_installed_binary(name) {
+            let help = fetch_tool_help(name);
+            found_tools.push((name.to_string(), bin_path, help));
+        }
+    }
+
+    // Also scan common tool directories if they exist
+    for common_dir in [
+        "D:\\tools",
+        "C:\\tools",
+        "D:\\SecTools",
+        "C:\\SecTools",
+        "D:\\Program Files (x86)\\Nmap",
+    ] {
+        let p = Path::new(common_dir);
+        if p.is_dir() {
+            let tools = scan_directory_for_tools(p);
+            for (name, cmd, help) in tools {
+                if !found_tools
+                    .iter()
+                    .any(|(n, _, _)| n.eq_ignore_ascii_case(&name))
+                {
+                    found_tools.push((name, cmd, help));
+                }
+            }
+        }
+    }
+
+    if found_tools.is_empty() {
+        eprintln!("\x1b[33m未在系统 PATH 或常见目录中检测到常见工具。\x1b[0m");
+        eprintln!("提示: 您可以重新选择本菜单，并直接输入您存放工具的目录路径 (例如 D:\\tools)。");
+        return Ok(());
+    }
+
+    process_tool_candidates(paths, provider_cfg, found_tools).await
 }
 
 fn save_setup(
