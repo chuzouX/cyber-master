@@ -42,3 +42,9 @@ desktop.ini
 # /.trae/
 
 /assets/
+
+# CTF challenges & solver scripts
+/challenges/
+/ctf2/
+/scripts/
+/work/

@@ -474,7 +474,7 @@ mod tests {
         let cmd = if cfg!(windows) {
             "powershell -NoProfile -Command \"[Console]::Write('10%`r20%`r100%`n')\""
         } else {
-            "printf '10%\\r20%\\r100%\\n'"
+            "printf '%s\\r%s\\r%s\\n' '10%' '20%' '100%'"
         };
         let out = ShellTool::default()
             .run(json!({"command": cmd}), &ctx())
