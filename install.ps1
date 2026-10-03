@@ -97,8 +97,8 @@ try {
         $shaUrl = "$zipUrl.sha256"
         try {
             Write-Host "→ 下载 $zipUrl"
-            Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
-            Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
+            Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing -TimeoutSec 60
+            Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing -TimeoutSec 60
             $downloaded = $true
             break
         } catch {

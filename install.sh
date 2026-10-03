@@ -12,6 +12,7 @@
 #   CYBER_VERSION     指定版本 tag（如 v0.1.0），默认取 latest release
 #   CYBER_INSTALL_DIR 安装目录，默认 ~/.local/bin
 #   CYBER_REPO        GitHub 仓库（owner/name），默认 chuzouX/cyber-master
+#   CYBER_DOWNLOAD_MIRROR 下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
 #
 # Windows 用户请改用 install.ps1：
 #   irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
@@ -46,6 +47,7 @@ Environment:
   CYBER_VERSION          等价于 --version
   CYBER_INSTALL_DIR      等价于 --install-dir
   CYBER_REPO             GitHub owner/name，默认 chuzouX/cyber-master
+  CYBER_DOWNLOAD_MIRROR  下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
 EOF
       exit 0 ;;
     *)
@@ -112,8 +114,13 @@ if [ -z "$VERSION" ]; then
   fi
 fi
 
-download_url="https://github.com/$REPO/releases/download/$VERSION/$archive"
-checksum_url="$download_url.sha256"
+# ─── 下载源：GitHub 主源 + 常用镜像回退（可用 CYBER_DOWNLOAD_MIRROR 指定镜像前缀）──
+github_base="https://github.com/$REPO/releases/download/$VERSION"
+if [ -n "${CYBER_DOWNLOAD_MIRROR:-}" ]; then
+  download_base_list="${CYBER_DOWNLOAD_MIRROR%/}/$github_base $github_base"
+else
+  download_base_list="$github_base https://ghproxy.net/$github_base https://gh-proxy.com/$github_base https://ghfast.top/$github_base"
+fi
 
 echo "→ 安装 cyber $VERSION ($target) 到 $INSTALL_DIR"
 
@@ -123,13 +130,19 @@ trap 'rm -rf "$tmpdir"' 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# ─── 下载 ────────────────────────────────────────────────────────────────
-echo "→ 下载 $download_url"
-curl -fsSL -o "$tmpdir/$archive" "$download_url"
-
-# ─── 强制校验 SHA256 ─────────────────────────────────────────────────────
-curl -fsSL -o "$tmpdir/$archive.sha256" "$checksum_url" \
-  || { echo "无法下载 SHA256 校验文件，安装已中止。" >&2; exit 1; }
+# ─── 下载（主源失败自动回退镜像）──────────────────────────────────────────
+downloaded=0
+for base in $download_base_list; do
+  echo "→ 下载 $base/$archive"
+  if curl -fsSL --connect-timeout 15 --max-time 30 -o "$tmpdir/$archive" "$base/$archive" \
+     && curl -fsSL --connect-timeout 15 --max-time 30 -o "$tmpdir/$archive.sha256" "$base/$archive.sha256"; then
+    downloaded=1
+    break
+  fi
+  echo "  该源失败，尝试下一源…" >&2
+done
+[ "$downloaded" -eq 1 ] \
+  || { echo "所有下载源均失败。请检查网络/代理（需放行 release-assets.githubusercontent.com），或用 CYBER_DOWNLOAD_MIRROR 指定镜像前缀。" >&2; exit 1; }
 echo "→ 校验 SHA256…"
 expected=$(awk 'NR == 1 { print $1 }' "$tmpdir/$archive.sha256")
 case "$expected" in
