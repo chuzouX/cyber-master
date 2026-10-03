@@ -24,9 +24,11 @@
 use cyber_core::{PriceConfig, ProjectContext};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    },
     Frame,
 };
 
@@ -46,6 +48,7 @@ pub fn render(
     usage: &UsageStats,
     price: Option<&PriceConfig>,
     context_usage: &ContextUsage,
+    todos: &[cyber_core::TodoItem],
 ) {
     let scrolled = !state.is_following_bottom();
     let title = if scrolled {
@@ -67,9 +70,17 @@ pub fn render(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // 历史（弹性） / 输入框（3 行含边框） / usage 状态栏（1 行） / hint（1 行）
+    let show_todo_table = !state.todo_closed && !todos.is_empty();
+    let todo_height = if show_todo_table {
+        (todos.len() as u16 + 2).clamp(3, 6)
+    } else {
+        0
+    };
+
+    // 历史（弹性） / [Todo 常驻卡片] / 输入框（3 行含边框） / usage 状态栏（1 行） / hint（1 行）
     let chunks = Layout::vertical([
         Constraint::Min(3),
+        Constraint::Length(todo_height),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -77,21 +88,114 @@ pub fn render(
     .split(inner);
 
     render_history(frame, chunks[0], theme, state, project);
-    render_input(frame, chunks[1], state);
+    if show_todo_table && chunks[1].height >= 2 {
+        render_todo_table(frame, chunks[1], theme, todos);
+    }
+    render_input(frame, chunks[2], state);
     render_usage_bar(
         frame,
-        chunks[2],
+        chunks[3],
         theme,
         provider,
         usage,
         price,
         context_usage,
     );
-    render_hint(frame, chunks[3], theme, state);
-    // 斜杠补全菜单：浮于输入框上方（覆盖历史区底部），最后绘制以叠加在最上层
+    render_hint(frame, chunks[4], theme, state);
+    // 斜杠补全菜单：浮于输入框上方，最后绘制以叠加在最上层
     if state.slash_menu.open && !state.slash_menu.filtered.is_empty() {
-        render_slash_menu(frame, chunks[1], theme, &state.slash_menu);
+        render_slash_menu(frame, chunks[2], theme, &state.slash_menu);
     }
+}
+
+/// 渲染输入框正上方的常驻 Todo 任务清单卡片。
+fn render_todo_table(frame: &mut Frame, area: Rect, theme: &Theme, items: &[cyber_core::TodoItem]) {
+    if area.height < 2 || area.width < 10 {
+        return;
+    }
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|i| i.status == cyber_core::TodoStatus::Completed)
+        .count();
+    let in_progress = items
+        .iter()
+        .filter(|i| i.status == cyber_core::TodoStatus::InProgress)
+        .count();
+
+    let border_color = if in_progress > 0 {
+        theme.accent
+    } else if completed == total && total > 0 {
+        Color::Rgb(137, 210, 129)
+    } else {
+        theme.border
+    };
+
+    let title = format!(" 📋 任务清单 [{completed}/{total}] · 输入 /todo close 收起 ");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_lines = inner.height as usize;
+    if max_lines == 0 {
+        return;
+    }
+
+    let will_truncate = items.len() > max_lines;
+    let display_count = if will_truncate {
+        max_lines.saturating_sub(1)
+    } else {
+        items.len().min(max_lines)
+    };
+
+    let mut lines = Vec::with_capacity(max_lines);
+    for item in items.iter().take(display_count) {
+        let (symbol, color) = match item.status {
+            cyber_core::TodoStatus::Pending => ("[ ]", theme.muted),
+            cyber_core::TodoStatus::InProgress => ("[>]", theme.accent),
+            cyber_core::TodoStatus::Completed => ("[x]", Color::Rgb(137, 210, 129)),
+            cyber_core::TodoStatus::Failed => ("[!]", Color::Rgb(252, 58, 75)),
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("#{} ", item.id), Style::default().fg(theme.muted)),
+            Span::styled(item.title.as_str(), Style::default().fg(theme.fg)),
+        ];
+        if let Some(notes) = &item.notes {
+            if !notes.trim().is_empty() {
+                spans.push(Span::styled(
+                    format!(" (备注: {})", notes.trim()),
+                    Style::default().fg(theme.muted),
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if will_truncate {
+        let remaining = items.len().saturating_sub(display_count);
+        lines.push(Line::from(vec![Span::styled(
+            format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）"),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 渲染消息历史区：已完成的 ChatEntry（user/assistant/tool/system）+ 流式中的 buffer。
@@ -446,6 +550,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -472,6 +577,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -496,6 +602,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -520,6 +627,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -545,6 +653,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -585,6 +694,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -618,6 +728,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -652,6 +763,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -687,6 +799,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -720,6 +833,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -745,6 +859,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -778,6 +893,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -802,6 +918,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -835,6 +952,7 @@ mod tests {
                     &usage,
                     Some(&price),
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -862,6 +980,7 @@ mod tests {
                     &usage,
                     None,
                     &ContextUsage::default(),
+                    &[],
                 )
             })
             .unwrap();
@@ -889,6 +1008,7 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ctx,
+                    &[],
                 )
             })
             .unwrap();
@@ -921,11 +1041,76 @@ mod tests {
                     &empty_usage(),
                     None,
                     &ctx,
+                    &[],
                 )
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(!content.contains("ctx"), "不应显示 ctx 段: {content}");
+    }
+
+    #[test]
+    fn chat_with_pinned_todos_renders_above_input() {
+        use cyber_core::{TodoItem, TodoStatus};
+        let theme = Theme::resolve("cyberpunk");
+        let mut state = ChatState::new();
+        let todos = vec![
+            TodoItem::new("1", "信息收集", TodoStatus::Completed),
+            TodoItem::new("2", "漏洞验证", TodoStatus::InProgress),
+            TodoItem::new("3", "编写报告", TodoStatus::Pending),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                    &todos,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("[1/3]"), "应包含进度 1/3: {content}");
+        assert!(
+            content.contains("todo close"),
+            "应包含 close 提示: {content}"
+        );
+        assert!(content.contains("[x] #1"), "应包含已完成标记: {content}");
+        assert!(content.contains("[>] #2"), "应包含进行中标记: {content}");
+        assert!(content.contains("[ ] #3"), "应包含待办标记: {content}");
+
+        // When closed, panel is hidden
+        state.todo_closed = true;
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                    &todos,
+                )
+            })
+            .unwrap();
+        let buffer2 = terminal.backend().buffer();
+        let content2: String = buffer2.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            !content2.contains("todo close"),
+            "收起后不应包含 close 提示: {content2}"
+        );
     }
 }

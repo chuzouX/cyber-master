@@ -29,6 +29,7 @@ pub(crate) enum CliAction {
     Cancel,
     Quit,
     Mode(cyber_agent::PermissionMode),
+    TodoVisibility(bool),
 }
 
 pub struct CommandForm {
@@ -892,6 +893,14 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 bail!("未找到编号为 #{rest} 的任务");
             }
         }
+        "close" | "hide" => {
+            drop(todos);
+            Ok(CliAction::TodoVisibility(false))
+        }
+        "open" | "show" => {
+            drop(todos);
+            Ok(CliAction::TodoVisibility(true))
+        }
         "clear" => {
             todos.clear();
             drop(todos);
@@ -899,7 +908,9 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             Ok(output("Todo", "任务清单已清空"))
         }
         other => {
-            bail!("未知子命令：{other}（用法：/todo [list|add <title>|done <id>|clear]）");
+            bail!(
+                "未知子命令：{other}（用法：/todo [list|add <title>|done <id>|clear|close|open]）"
+            );
         }
     }
 }
@@ -907,20 +918,23 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
 fn sessions(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (sub, rest) = split(args);
     match sub.to_ascii_lowercase().as_str() {
-        "" | "list" => Ok(CliAction::Picker(CommandPicker {
-            title: "Sessions".into(),
-            kind: PickerKind::Sessions,
-            items: runner
-                .index
-                .sessions
-                .iter()
-                .map(|s| PickerItem {
-                    label: s.title.clone(),
-                    detail: format!("{}  {} messages", s.id, s.message_count),
-                    command: format!("/sessions {}", s.id),
-                })
-                .collect(),
-        })),
+        "" | "list" => {
+            let _ = runner.save();
+            Ok(CliAction::Picker(CommandPicker {
+                title: "Sessions".into(),
+                kind: PickerKind::Sessions,
+                items: runner
+                    .index
+                    .sessions
+                    .iter()
+                    .map(|s| PickerItem {
+                        label: s.title.clone(),
+                        detail: format!("{}  {} messages", s.id, s.message_count),
+                        command: format!("/sessions {}", s.id),
+                    })
+                    .collect(),
+            }))
+        }
         "new" => {
             runner.create_session()?;
             Ok(refresh("New session", true))

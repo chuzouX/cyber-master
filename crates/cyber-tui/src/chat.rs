@@ -360,6 +360,8 @@ pub struct ChatState {
     last_render_width: u16,
     /// 粘贴检测器：基于按键时间间隔区分人打字与粘贴。
     pub paste_detector: PasteDetector,
+    /// 底部常驻 Todo 任务清单是否处于关闭状态（默认 false，有任务时常驻显示；/todo close 时置为 true）。
+    pub todo_closed: bool,
 }
 
 /// `wrapped` 预折行缓存的载体。
@@ -397,6 +399,7 @@ impl ChatState {
             expanded_tool_results: HashSet::new(),
             last_render_width: 0,
             paste_detector: PasteDetector::new(),
+            todo_closed: false,
         }
     }
 
@@ -800,11 +803,8 @@ impl ChatState {
     }
 
     /// 插入粘贴文本（bracketed paste）：整块插入输入框，不触发提交。
-    /// 流式期忽略。粘贴后刷新斜杠菜单（可能以 `/` 开头）。
+    /// 粘贴后刷新斜杠菜单（可能以 `/` 开头）。
     pub fn paste(&mut self, text: &str) {
-        if self.streaming {
-            return;
-        }
         self.input.insert_str(text);
         self.update_slash_menu();
     }

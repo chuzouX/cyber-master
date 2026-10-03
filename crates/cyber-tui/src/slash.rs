@@ -123,8 +123,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/todo",
-        usage: "/todo [list|add <title>|done <id>|clear]",
-        desc: "结构化任务清单：list 查看 / add 添加 / done 完成 / clear 清空",
+        usage: "/todo [list|add <title>|done <id>|clear|close|open]",
+        desc: "结构化任务清单：list 查看 / add 添加 / done 完成 / clear 清空 / close 收起 / open 展开",
     },
     CommandSpec {
         name: "/quit",
@@ -153,7 +153,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/ctf" => vec!["enable", "disable", "add", "list", "writeup"],
         "/mode" => vec!["chat", "workflow", "dashboard"],
         "/provider" => vec!["list", "add", "edit", "use", "remove"],
-        "/sessions" => vec!["list", "read", "new"],
+        "/sessions" | "/session" => vec!["list", "read", "new"],
         "/subagents" => vec![
             "status",
             "enable",
@@ -168,7 +168,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/memory" => vec!["list", "add", "project", "edit", "delete", "rule"],
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
-        "/todo" => vec!["list", "add", "done", "clear"],
+        "/todo" => vec!["list", "add", "done", "clear", "close", "open"],
         _ => Vec::new(),
     }
 }
@@ -255,7 +255,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/max_steps" => SlashCommand::MaxSteps(args.to_string()),
         "/think" => SlashCommand::Think(args.to_string()),
         "/new" => SlashCommand::New,
-        "/sessions" => SlashCommand::Sessions(args.to_string()),
+        "/sessions" | "/session" => SlashCommand::Sessions(args.to_string()),
         "/memory" => SlashCommand::Memory(args.to_string()),
         "/todo" => SlashCommand::Todo(args.to_string()),
         "/quit" => SlashCommand::Quit,
@@ -284,7 +284,7 @@ pub const HELP_TEXT: &str = "\
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
   /memory <sub>      记忆管理：list | add | project | edit | delete | rule
-  /todo <sub>        任务管理：list | add <title> | done <id> | clear
+  /todo <sub>        任务管理：list | add <title> | done <id> | clear | close | open
   /quit              退出 Cyber Master";
 
 #[cfg(test)]
@@ -371,6 +371,8 @@ mod tests {
         );
         assert_eq!(parse("/todo done 1"), SlashCommand::Todo("done 1".into()));
         assert_eq!(parse("/todo clear"), SlashCommand::Todo("clear".into()));
+        assert_eq!(parse("/todo close"), SlashCommand::Todo("close".into()));
+        assert_eq!(parse("/todo open"), SlashCommand::Todo("open".into()));
     }
 
     #[test]
@@ -650,6 +652,7 @@ mod tests {
     #[test]
     fn parse_sessions_no_arg() {
         assert_eq!(parse("/sessions"), SlashCommand::Sessions(String::new()));
+        assert_eq!(parse("/session"), SlashCommand::Sessions(String::new()));
     }
 
     #[test]
