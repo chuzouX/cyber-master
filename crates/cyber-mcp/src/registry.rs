@@ -8,6 +8,7 @@
 //! 共享同一连接，工具表用 `Arc<ToolRegistry>` 跨轮复用。
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -112,16 +113,20 @@ impl McpRegistry {
     /// 先对所有连接发 Shutdown（让 actor 退出 read 循环），再逐个 await handle
     /// （确保子进程资源回收）。幂等：重复调用无副作用（handle 已 take）。
     pub async fn shutdown_all(&self) {
-        // 先发 Shutdown 信号（actor 收到后 shutdown writer 并退出）
+        // 先对所有连接发 Shutdown 信号（让 actor 退出 read 循环）
         for s in &self.servers {
             s.conn.shutdown();
         }
-        // 再 await 所有 actor handle（取出后置 None，幂等）
+        // 并发 await 所有 actor handle，带 1.5s 超时兜底，防止挂起
+        let mut handles = Vec::new();
         for s in &self.servers {
-            let handle = s.handle.lock().unwrap().take();
-            if let Some(handle) = handle {
-                let _ = handle.await;
+            if let Some(handle) = s.handle.lock().unwrap().take() {
+                handles.push(handle);
             }
+        }
+        if !handles.is_empty() {
+            let join_all = futures::future::join_all(handles);
+            let _ = tokio::time::timeout(Duration::from_millis(1500), join_all).await;
         }
     }
 }

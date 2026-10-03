@@ -90,6 +90,11 @@ impl StdioTransport {
                 detail: "stdio 传输缺少 `command` 字段".into(),
             })?;
         let mut cmd = tokio::process::Command::new(command);
+        #[cfg(target_os = "windows")]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.args(&spec.args)
             .envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
