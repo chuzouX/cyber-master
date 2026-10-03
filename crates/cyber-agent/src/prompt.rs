@@ -118,16 +118,25 @@ fn env_info_section() -> String {
 ///
 /// 指示 agent 使用 `ctf_challenge` 工具自动注册/更新题目状态，并规范测试方法论优先级。
 pub const CTF_PROMPT: &str = "\n\n# CTF 模式\n\
-当前已开启 CTF 竞赛模式。请使用 `ctf_challenge` 工具管理题目：\n\
+当前已开启 CTF 竞赛模式。请使用 `ctf_challenge` 工具管理题目状态：\n\
 - 分析题目时调用 `ctf_challenge`（action=register）注册题目名称、分类、描述、靶机地址和标签\n\
 - 解出题目（获得 flag）时调用 `ctf_challenge`（action=solve）标记题目已解出并记录 flag 和关键知识点\n\
 - 可随时调用 `ctf_challenge`（action=list）查看所有题目状态\n\
 题目状态会实时显示在 TUI 题目面板中。\n\n\
-## 重要提醒（必须遵守）\n\
-- **收到题目信息后，第一件事就是调用 `ctf_challenge`（action=register）注册题目**，不要等到解题中途或解出后再注册。\n\
-- 未注册的题目不会被记录到题目面板，容易遗忘或混淆。\n\
-- 每次获取到新的题目信息（名称、靶机地址、描述等）都应立即 register 更新，防止信息丢失。\n\
-- 解题过程中如发现题目信息有变（如补充描述、更换靶机），也要及时 register 更新。\n\n\
+## CTF 标准解题工作流（必须严格按序执行）\n\
+接受到 CTF 题目后，严格遵循「先探测登记 → 列 Todo 计划 → 边做边动态更新 → 步步为营推进」的闭环流程：\n\
+1. **先登记并初步探测（立即执行）**：\n\
+   * 收到题目信息后，**第一件事就是立即调用 `ctf_challenge`（action=\"register\", ...）登记题目**，严禁遗漏。后续若发现靶机变更或补充描述，及时再次 register 更新。\n\
+   * 进行第一轮轻量探测与信息收集（如 HTTP 头、页面源码与注释、robots.txt、端口与服务指纹探测），收集第一手原始线索。\n\
+2. **基于线索列出结构化 Todo List**：\n\
+   * 初步探测并检索对应 Skill 方法论后，**立即调用 `todo` 工具（action=\"add\", items=[...]）** 批量列出解题执行计划。\n\
+   * 拆解为明确清晰的子步骤（例如：1. 探测特定接口与路由；2. 构造特定绕过 Payload 验证漏洞点；3. 获取数据库权限/WebShell；4. 读取 flag 并在 ctf_challenge 中标记 solve）。\n\
+3. **边做题边动态更新 Todo List（透明推进）**：\n\
+   * 开始执行某一具体步骤前，调用 `todo`（action=\"update\"）将其标记为 `in_progress`；\n\
+   * 验证成功后立即将其标记为 `completed`；\n\
+   * 遇到卡点、WAF 拦截或探测发现全新分支线索时，不要盲目蛮干，及时更新任务状态（卡点标记为 `failed` 并说明原因，调用 `todo` 补充新分支步骤）；\n\
+4. **收敛与 Flag 提交**：\n\
+   * 步步为营推进直至拿到 flag，立即调用 `ctf_challenge`（action=\"solve\", flag=...）登记，并将对应 todo 全部标记为 `completed` 收敛任务。\n\n\
 ## 测试优先级（必须遵守）\n\
 CTF 解题按以下优先级推进，**严禁跳级**：\n\
 1. **信息收集**：先从题目描述、靶机响应、页面源码、HTTP 头、注释、robots.txt 等提取线索。每个线索都可能直接指向漏洞点。\n\
@@ -333,5 +342,16 @@ mod tests {
     fn base_prompt_contains_todo_guidance() {
         assert!(BASE_PROMPT_STATIC.contains("todo"));
         assert!(BASE_PROMPT_STATIC.contains("结构化任务管理"));
+    }
+
+    #[test]
+    fn ctf_prompt_contains_standard_workflow_rules() {
+        assert!(CTF_PROMPT.contains("CTF 标准解题工作流"));
+        assert!(CTF_PROMPT.contains("先登记并初步探测"));
+        assert!(CTF_PROMPT.contains("基于线索列出结构化 Todo List"));
+        assert!(CTF_PROMPT.contains("边做题边动态更新 Todo List"));
+        assert!(CTF_PROMPT.contains("收敛与 Flag 提交"));
+        assert!(CTF_PROMPT.contains("ctf_challenge"));
+        assert!(CTF_PROMPT.contains("todo"));
     }
 }

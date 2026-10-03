@@ -44,7 +44,9 @@ pub enum Action {
 pub enum ChatAction {
     /// 提交输入框内容（无修饰 Enter）。
     Submit,
-    /// 输入换行（Shift/Alt+Enter，或 Ctrl+J 兜底——部分终端不报 Shift+Enter）。
+    /// 立即打断并读取新指示（Alt+Enter / Ctrl+Enter）。
+    SubmitImmediate,
+    /// 输入换行（Shift+Enter，或 Ctrl+J 兜底——部分终端不报 Shift+Enter）。
     Newline,
     /// 返回 / 取消流式（Esc；流式期取消，非流式期返回 Welcome/上一模式）。
     Back,
@@ -170,10 +172,11 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
     }
     match k.code {
         KeyCode::Enter => {
-            // Shift/Alt+Enter → 换行；无修饰 Enter → 提交
             if k.modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
+                ChatAction::SubmitImmediate
+            } else if k.modifiers.contains(KeyModifiers::SHIFT) {
                 ChatAction::Newline
             } else {
                 ChatAction::Submit
@@ -315,10 +318,14 @@ mod tests {
     }
 
     #[test]
-    fn chat_alt_enter_newline() {
+    fn chat_alt_enter_submit_immediate() {
         assert_eq!(
             chat_key_to_action(key(KeyCode::Enter, KeyModifiers::ALT)),
-            ChatAction::Newline
+            ChatAction::SubmitImmediate
+        );
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Enter, KeyModifiers::CONTROL)),
+            ChatAction::SubmitImmediate
         );
     }
 

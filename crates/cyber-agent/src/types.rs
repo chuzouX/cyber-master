@@ -191,6 +191,8 @@ pub enum AgentEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
+    /// 成功接收到追加的指示（用户在思考/工具执行期间追加的内容）。
+    SteeringReceived(String),
     Done,
     Error(String),
 }
@@ -300,5 +302,14 @@ mod tests {
             before_tokens: 100_000,
             after_tokens: 5_000,
         };
+    }
+
+    #[test]
+    fn agent_event_steering_variant() {
+        let ev = AgentEvent::SteeringReceived("追加指令".into());
+        match ev {
+            AgentEvent::SteeringReceived(msg) => assert_eq!(msg, "追加指令"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

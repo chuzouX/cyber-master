@@ -182,6 +182,7 @@ impl SubagentRuntime {
                 .effective_context_length()
                 .or(Some(DEFAULT_CONTEXT_LENGTH)),
             &sink,
+            None,
         )
         .await?;
         if output.final_text.trim().is_empty() {
@@ -262,6 +263,32 @@ fn fingerprint(calls: &BTreeMap<u32, ToolCall>) -> String {
 /// - `mock`：强制使用 MockProvider（离线）
 /// - `cwd`：工作目录（工具执行的 ToolCtx.cwd 来源）
 /// - `registry`：统一工具表（builtins + MCP + Skills），跨 agent turn 共享（`Arc` clone）
+pub type SteeringReceiver = tokio::sync::mpsc::UnboundedReceiver<String>;
+pub type SteeringSender = tokio::sync::mpsc::UnboundedSender<String>;
+
+pub fn steering_channel() -> (SteeringSender, SteeringReceiver) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
+fn drain_steering(
+    steering: &mut Option<SteeringReceiver>,
+    messages: &mut Vec<Message>,
+    sink: &EventSink<'_>,
+) -> bool {
+    let mut received_any = false;
+    if let Some(rx) = steering.as_mut() {
+        while let Ok(text) = rx.try_recv() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                messages.push(Message::user(trimmed.to_string()));
+                sink.send(AgentEvent::SteeringReceived(trimmed.to_string()));
+                received_any = true;
+            }
+        }
+    }
+    received_any
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stream(
     config: Config,
@@ -293,6 +320,7 @@ pub async fn run_stream(
         ctf_enabled,
         intensity,
         &memory,
+        None,
     )
     .await;
     if let Err(e) = res {
@@ -303,6 +331,7 @@ pub async fn run_stream(
 
 /// Same event sequence as `run_stream`, with mandatory pre-execution approval.
 /// A closed approval channel or a missing response denies the tool call.
+/// Optional `steering` channel allows appending instructions during thinking/execution.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stream_with_permissions(
     config: Config,
@@ -319,24 +348,31 @@ pub async fn run_stream_with_permissions(
     intensity: ThinkingIntensity,
     memory: String,
     permissions: Arc<crate::permission::PermissionBroker>,
+    steering: Option<SteeringReceiver>,
 ) {
+    let _ = tx.send((gen, AgentEvent::Started));
     let registry = Arc::new(ToolRegistry::with_permissions(registry, permissions));
-    run_stream(
-        config,
-        providers,
-        project,
+    let res = run_inner(
+        &config,
+        &providers,
+        project.as_ref(),
         user_input,
         history,
-        tx,
+        &tx,
         gen,
         mock,
         cwd,
         registry,
         ctf_enabled,
         intensity,
-        memory,
+        &memory,
+        steering,
     )
     .await;
+    if let Err(e) = res {
+        warn!(error = %e, "agent run_stream 失败");
+        let _ = tx.send((gen, AgentEvent::Error(e.to_string())));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -354,6 +390,7 @@ async fn run_inner(
     ctf_enabled: bool,
     intensity: ThinkingIntensity,
     memory: &str,
+    steering: Option<SteeringReceiver>,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg = providers.providers.get(name).ok_or_else(|| {
@@ -418,6 +455,7 @@ async fn run_inner(
         cfg.effective_context_length()
             .or(Some(DEFAULT_CONTEXT_LENGTH)),
         &sink,
+        steering,
     )
     .await?;
     Ok(())
@@ -533,12 +571,14 @@ async fn run_agent_loop(
     max_steps: u32,
     effective_ctx_len: Option<u32>,
     sink: &EventSink<'_>,
+    mut steering: Option<SteeringReceiver>,
 ) -> Result<AgentRunOutput> {
     emit_context_update(sink, &messages, effective_ctx_len);
     let mut detector = LoopDetector::new(3);
     let mut loop_detected = false;
     for step in 0..max_steps {
         debug!(step, gen = sink.gen, "agent loop 迭代");
+        drain_steering(&mut steering, &mut messages, sink);
         if let Some(threshold) = auto_compact_threshold(effective_ctx_len) {
             let used = estimate_messages_tokens(&messages);
             if used >= threshold as usize {
@@ -563,6 +603,10 @@ async fn run_agent_loop(
             let final_text = accumulation.text;
             if !final_text.is_empty() {
                 messages.push(Message::assistant(final_text.clone()));
+            }
+            let has_steer = drain_steering(&mut steering, &mut messages, sink);
+            if has_steer && step + 1 < max_steps {
+                continue;
             }
             emit_context_update(sink, &messages, effective_ctx_len);
             sink.send(AgentEvent::Done);
@@ -670,6 +714,7 @@ async fn run_agent_loop(
             });
             messages.push(Message::tool(call.id.clone(), out.content));
         }
+        drain_steering(&mut steering, &mut messages, sink);
 
         emit_context_update(sink, &messages, effective_ctx_len);
         let (loop_triggered, should_warn) = detector.observe(&calls);
@@ -692,6 +737,7 @@ async fn run_agent_loop(
         )
     };
     messages.push(Message::user(wrap));
+    drain_steering(&mut steering, &mut messages, sink);
     let mut stream = provider.stream(
         StreamRequest::new(messages.clone())
             .with_system(system)
@@ -1260,11 +1306,87 @@ mod tests {
             2,
             Some(DEFAULT_CONTEXT_LENGTH),
             &sink,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(output.final_text, "done");
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_agent_loop_steering_appends_and_continues() {
+        use futures::{stream, Stream};
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SteerScriptProvider {
+            calls: AtomicUsize,
+            steer_tx: SteeringSender,
+        }
+
+        impl Provider for SteerScriptProvider {
+            fn stream(
+                &self,
+                req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                let call_idx = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_idx == 0 {
+                    // 在第一轮生成期间，通过 steering 管道追加新指示
+                    let _ = self.steer_tx.send("追加的新问题".into());
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("第一轮回答".into()),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    // 第二轮应当接收到前序回答以及追加的指示
+                    assert!(req.messages.iter().any(|m| m.content == "第一轮回答"));
+                    assert!(req.messages.iter().any(|m| m.content == "追加的新问题"));
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("第二轮回答".into()),
+                        StreamEvent::Done,
+                    ]))
+                }
+            }
+        }
+
+        let (steer_tx, steer_rx) = steering_channel();
+        let provider = SteerScriptProvider {
+            calls: AtomicUsize::new(0),
+            steer_tx,
+        };
+        let registry = Arc::new(ToolRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::parent(&tx, 1);
+        let output = run_agent_loop(
+            &provider,
+            String::new(),
+            vec![Message::user("初始问题")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            Vec::new(),
+            None,
+            registry,
+            3,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            Some(steer_rx),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.final_text, "第二轮回答");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        // 验证前端 sink 成功收到了 SteeringReceived 事件
+        let mut got_steering_event = false;
+        while let Ok((_, ev)) = rx.try_recv() {
+            if let AgentEvent::SteeringReceived(text) = ev {
+                if text == "追加的新问题" {
+                    got_steering_event = true;
+                }
+            }
+        }
+        assert!(got_steering_event, "sink 应当收到 SteeringReceived 事件");
     }
 
     // ── LoopDetector / fingerprint ──────────────────────────────────────────
