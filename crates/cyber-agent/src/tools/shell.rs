@@ -59,10 +59,27 @@ fn push_output_line(
     if *truncated {
         return;
     }
+    let (prefix, body) = if let Some(rest) = line.strip_prefix("[stderr] ") {
+        ("[stderr] ", rest)
+    } else {
+        ("", line)
+    };
+    let clean_body = if body.contains('\r') {
+        body.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("")
+    } else {
+        body
+    };
+    let formatted;
+    let final_line = if prefix.is_empty() {
+        clean_body
+    } else {
+        formatted = format!("{prefix}{clean_body}");
+        &formatted
+    };
     if let Some(p) = progress {
-        let _ = p.send(format!("{line}\n"));
+        let _ = p.send(format!("{final_line}\n"));
     }
-    buf.push_str(line);
+    buf.push_str(final_line);
     buf.push('\n');
     if buf.len() > MAX_OUTPUT_BYTES {
         // 保留尾部，在字符边界截断头部
@@ -109,10 +126,13 @@ fn sanitize_pathext(pathext: &str) -> String {
 #[cfg(target_os = "windows")]
 fn build_shell_command(command: &str) -> tokio::process::Command {
     use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut std_cmd = std::process::Command::new("cmd");
     std_cmd.arg("/C").raw_arg(command);
+    std_cmd.creation_flags(CREATE_NO_WINDOW);
     let safe_pathext = sanitize_pathext(&std::env::var("PATHEXT").unwrap_or_default());
     std_cmd.env("PATHEXT", safe_pathext);
+    std_cmd.env("POWERSHELL_PROGRESS_PREFERENCE", "SilentlyContinue");
     tokio::process::Command::from(std_cmd)
 }
 
@@ -215,11 +235,11 @@ impl Tool for ShellTool {
                     tokio::select! {
                         biased;
                         line = stdout_lines.next_line(), if !stdout_done => match line {
-                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
+                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
                             Ok(None) | Err(_) => stdout_done = true,
                         },
                         line = stderr_lines.next_line(), if !stderr_done => match line {
-                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
+                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
                             Ok(None) | Err(_) => stderr_done = true,
                         },
                         status = child.wait(), if exit_status.is_none() => {
@@ -241,11 +261,11 @@ impl Tool for ShellTool {
                                     tokio::select! {
                                         biased;
                                         line = stdout_lines.next_line(), if !stdout_done => match line {
-                                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
+                                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
                                             Ok(None) | Err(_) => stdout_done = true,
                                         },
                                         line = stderr_lines.next_line(), if !stderr_done => match line {
-                                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
+                                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
                                             Ok(None) | Err(_) => stderr_done = true,
                                         },
                                     }
@@ -400,5 +420,68 @@ mod tests {
             stdout.to_lowercase().contains("readelf.exe"),
             "应解析到原生 readelf.exe，实际：{stdout}"
         );
+    }
+
+    #[test]
+    fn push_output_line_consolidates_carriage_returns() {
+        let mut buf = String::new();
+        let mut truncated = false;
+        push_output_line(&mut buf, "10%\r20%\r100%", &None, &mut truncated);
+        assert_eq!(buf, "100%\n");
+
+        let mut buf2 = String::new();
+        let mut truncated2 = false;
+        push_output_line(&mut buf2, "[stderr] 10%\r20%\r100%", &None, &mut truncated2);
+        assert_eq!(buf2, "[stderr] 100%\n");
+
+        let mut buf3 = String::new();
+        let mut truncated3 = false;
+        push_output_line(&mut buf3, "progress...\r", &None, &mut truncated3);
+        assert_eq!(buf3, "progress...\n");
+    }
+
+    #[tokio::test]
+    async fn stdout_not_tagged_as_stderr() {
+        let out = ShellTool::default()
+            .run(json!({"command": "echo test_stdout"}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.content.contains("test_stdout"));
+        assert!(
+            !out.content.contains("[stderr]"),
+            "stdout 不应包含 [stderr] 标签: {}",
+            out.content
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_progress_preference_silently_continues() {
+        let out = ShellTool::default()
+            .run(
+                json!({"command": "powershell -NoProfile -Command \"Write-Progress -Activity 'Testing' -Status '50%'; Write-Output 'progress_completed'\""}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("progress_completed"));
+        assert!(!out.content.contains("[stderr]"));
+    }
+
+    #[tokio::test]
+    async fn shell_consolidates_carriage_returns_in_stream() {
+        let cmd = if cfg!(windows) {
+            "powershell -NoProfile -Command \"[Console]::Write('10%`r20%`r100%`n')\""
+        } else {
+            "printf '10%\\r20%\\r100%\\n'"
+        };
+        let out = ShellTool::default()
+            .run(json!({"command": cmd}), &ctx())
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("100%"));
+        assert!(!out.content.contains("10%20%100%"));
     }
 }
