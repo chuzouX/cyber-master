@@ -31,11 +31,16 @@ pub fn render(
     state: &SessionsPanelState,
     idx: &SessionIndex,
 ) {
+    let title_text = if let Some(meta) = idx.current_meta() {
+        format!(" 会话管理 / Sessions · {} ", meta.title)
+    } else {
+        " 会话管理 / Sessions ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(" 会话管理 / Sessions ").style(
+            Line::from(title_text).style(
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),
