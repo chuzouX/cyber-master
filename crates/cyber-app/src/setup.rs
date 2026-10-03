@@ -9,6 +9,7 @@ use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use futures::StreamExt;
+use serde::Deserialize;
 use toml::Value;
 
 use cyber_core::{
@@ -1026,7 +1027,220 @@ fn add_custom_tool_manual_flow(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn ask_llm(cfg: &ProviderConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
+/// 工具在 LLM Agent 自主渗透任务中的适用性分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSuitability {
+    /// 适合 Agent 自主调用（纯 CLI、支持参数占位符、非交互批处理、有明确终止条件）
+    AgentCompatible,
+    /// 需人工操作（GUI 视窗、持续交互式控制台、缺乏非交互模式等）
+    ManualOnly,
+}
+
+/// 经 AI 分析评估后的本地安全工具模型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzedTool {
+    pub name: String,
+    pub suitability: ToolSuitability,
+    pub reason: String,
+    pub description: String,
+    pub command: String,
+    pub parameters: Vec<CustomToolParam>,
+    pub manual_advice: Option<String>,
+}
+
+impl AnalyzedTool {
+    pub fn is_agent_compatible(&self) -> bool {
+        self.suitability == ToolSuitability::AgentCompatible
+    }
+
+    pub fn to_custom_tool_config(&self) -> CustomToolConfig {
+        CustomToolConfig {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            command: self.command.clone(),
+            tags: vec!["security".into(), "scanned".into()],
+            parameters: self.parameters.clone(),
+        }
+    }
+}
+const TOOL_CLASSIFICATION_SYSTEM_PROMPT: &str = "\
+你是一个网络安全渗透测试工具体系与 LLM 自动化架构专家。\n\
+请分析用户提供的工具清单、帮助文档或提示词，对每一个识别到的工具做出【Agent 适用性判定】。\n\
+\n\
+判定标准：\n\
+1. can_agent_use = true：仅限于能够无头（Headless）运行、可通过纯命令行参数全自动执行、支持批处理且有明确终止条件的 CLI 工具（如 nmap, sqlmap, fscan, nuclei, dirsearch, httpx, ffuf, subfinder 等）。\n\
+   - 必须提供 command 命令行模板（保留原执行路径，核心目标/输入参数使用 {param} 占位符包裹）。\n\
+   - 必须提供 parameters 数组，包含所有占位符参数说明、必填/选填状态及默认值。\n\
+   - reason: 简述为什么适合 Agent 自动化调用（如\"纯命令行参数控制，支持非交互式批量执行\"）。\n\
+2. can_agent_use = false：所有 GUI 图形视窗程序（如 Goby, Burp Suite, Wireshark, Postman）、所有持续交互式控制台（如 msfconsole, 交互式 shell/gdb）、或缺少非交互模式必须人工界面的工具。\n\
+   - reason: 详细说明不可作为 Agent 工具的具体原因（如\"图形化界面软件(GUI)，无头子进程调用会导致永久阻塞\"或\"交互式控制台，直接执行会导致进程挂起\"）。\n\
+   - manual_advice: 提供针对安全人员的人工操作与协作建议（如\"适合在安全人员桌面独立视窗中运行，不应加入 Agent 工具表\"）。\n\
+\n\
+输出格式要求：\n\
+请务必输出为一个 ```toml 代码块，格式示例如下：\n\
+```toml\n\
+[[tools]]\n\
+name = \"sqlmap\"\n\
+can_agent_use = true\n\
+reason = \"纯命令行控制，支持 --batch 非交互自动化利用\"\n\
+description = \"自动化 SQL 注入检测与利用工具\"\n\
+command = \"python D:/tools/sqlmap/sqlmap.py -u {url} --batch {extra}\"\n\
+tags = [\"sqli\", \"web\"]\n\
+[[tools.parameters]]\n\
+name = \"url\"\n\
+description = \"目标 URL 地址\"\n\
+required = true\n\
+[[tools.parameters]]\n\
+name = \"extra\"\n\
+description = \"额外参数\"\n\
+required = false\n\
+default = \"--smart\"\n\
+\n\
+[[tools]]\n\
+name = \"goby\"\n\
+can_agent_use = false\n\
+reason = \"图形化视窗软件 (GUI)，需人工在界面点击操作，Agent 在后台无头子进程调用会导致永久阻塞无响应\"\n\
+description = \"图形化网络资产梳理与漏洞探测平台\"\n\
+manual_advice = \"适合安全人员在本地桌面独立视窗中运行，不应封装为 Agent 自动化工具\"\n\
+```\n\
+严禁输出任何多余的解释、前言或总结文字，只输出 ```toml ... ```。";
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawAiToolItem {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    can_agent_use: Option<bool>,
+    #[serde(default)]
+    suitability: Option<String>,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    tags: Vec<String>,
+    #[serde(default)]
+    parameters: Vec<CustomToolParam>,
+    #[serde(default)]
+    manual_advice: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawAiToolBatch {
+    #[serde(default)]
+    tools: Vec<RawAiToolItem>,
+}
+
+fn parse_analyzed_tools(reply: &str) -> Vec<AnalyzedTool> {
+    let blocks = extract_all_toml_blocks(reply);
+    let mut raw_items = Vec::new();
+
+    let try_parse_block = |code: &str, items: &mut Vec<RawAiToolItem>| {
+        if let Ok(batch) = toml::from_str::<RawAiToolBatch>(code) {
+            if !batch.tools.is_empty() {
+                items.extend(batch.tools);
+                return true;
+            }
+        }
+        if let Ok(single) = toml::from_str::<RawAiToolItem>(code) {
+            if !single.name.trim().is_empty() {
+                items.push(single);
+                return true;
+            }
+        }
+        if let Ok(cfg) = toml::from_str::<CustomToolConfig>(code) {
+            if !cfg.name.trim().is_empty() {
+                items.push(RawAiToolItem {
+                    name: cfg.name,
+                    can_agent_use: Some(true),
+                    suitability: None,
+                    reason: "支持纯命令行运行与参数化调用".into(),
+                    description: cfg.description,
+                    command: cfg.command,
+                    tags: cfg.tags,
+                    parameters: cfg.parameters,
+                    manual_advice: None,
+                });
+                return true;
+            }
+        }
+        false
+    };
+
+    if !blocks.is_empty() {
+        for b in &blocks {
+            try_parse_block(b, &mut raw_items);
+        }
+    } else {
+        try_parse_block(reply, &mut raw_items);
+    }
+
+    raw_items
+        .into_iter()
+        .filter_map(|raw| {
+            let name = raw.name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+
+            let is_compatible = if let Some(b) = raw.can_agent_use {
+                b
+            } else if let Some(s) = raw.suitability.as_deref() {
+                let s_lower = s.to_ascii_lowercase();
+                s_lower.contains("agent") || s_lower.contains("cli") || s_lower.contains("compat")
+            } else {
+                let reason_lower = raw.reason.to_ascii_lowercase();
+                let is_gui_or_interactive = reason_lower.contains("gui")
+                    || reason_lower.contains("图形")
+                    || reason_lower.contains("交互")
+                    || reason_lower.contains("视窗");
+                !is_gui_or_interactive && !raw.command.trim().is_empty()
+            };
+
+            let suitability = if is_compatible {
+                ToolSuitability::AgentCompatible
+            } else {
+                ToolSuitability::ManualOnly
+            };
+
+            let reason = if raw.reason.trim().is_empty() {
+                match suitability {
+                    ToolSuitability::AgentCompatible => {
+                        "支持纯命令行运行与非交互批处理".to_string()
+                    }
+                    ToolSuitability::ManualOnly => {
+                        "图形界面程序或持续交互式控制台，不适宜 Agent 自主调用".to_string()
+                    }
+                }
+            } else {
+                raw.reason.trim().to_string()
+            };
+
+            Some(AnalyzedTool {
+                name,
+                suitability,
+                reason,
+                description: raw.description.trim().to_string(),
+                command: raw.command.trim().to_string(),
+                parameters: raw.parameters,
+                manual_advice: raw.manual_advice.map(|s| s.trim().to_string()),
+            })
+        })
+        .collect()
+}
+
+async fn ask_llm_streaming<F>(
+    cfg: &ProviderConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    mut on_delta: F,
+) -> Result<String>
+where
+    F: FnMut(&str),
+{
     let provider = cyber_agent::provider_factory(cfg, false)?;
     let req = cyber_agent::StreamRequest::new(vec![cyber_agent::Message::user(user_prompt)])
         .with_system(system_prompt);
@@ -1034,7 +1248,10 @@ async fn ask_llm(cfg: &ProviderConfig, system_prompt: &str, user_prompt: &str) -
     let mut output = String::new();
     while let Some(event) = stream.next().await {
         match event {
-            cyber_agent::StreamEvent::Delta(text) => output.push_str(&text),
+            cyber_agent::StreamEvent::Delta(text) => {
+                on_delta(&text);
+                output.push_str(&text);
+            }
             cyber_agent::StreamEvent::Error(err) => {
                 bail!("模型返回错误: {err}");
             }
@@ -1045,6 +1262,11 @@ async fn ask_llm(cfg: &ProviderConfig, system_prompt: &str, user_prompt: &str) -
         bail!("模型返回内容为空");
     }
     Ok(output)
+}
+
+#[allow(dead_code)]
+async fn ask_llm(cfg: &ProviderConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    ask_llm_streaming(cfg, system_prompt, user_prompt, |_| {}).await
 }
 
 fn extract_toml_block(content: &str) -> Option<String> {
@@ -1076,11 +1298,66 @@ fn extract_all_toml_blocks(content: &str) -> Vec<String> {
         }
     }
     if blocks.is_empty() {
+        let mut search = content;
+        while let Some(start) = search.find("```") {
+            let after = &search[start + 3..];
+            if let Some(end) = after.find("```") {
+                blocks.push(after[..end].trim().to_string());
+                search = &after[end + 3..];
+            } else {
+                break;
+            }
+        }
+    }
+    if blocks.is_empty() {
         if let Some(single) = extract_toml_block(content) {
             blocks.push(single);
         }
     }
     blocks
+}
+
+fn run_command_with_timeout(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
 }
 
 fn find_installed_binary(name: &str) -> Option<String> {
@@ -1099,13 +1376,9 @@ fn find_installed_binary(name: &str) -> Option<String> {
 
 fn fetch_tool_help(name: &str) -> Option<String> {
     let run = |flag: &str| -> Option<String> {
-        let child = std::process::Command::new(name)
-            .arg(flag)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-        let output = child.wait_with_output().ok()?;
+        let mut cmd = std::process::Command::new(name);
+        cmd.arg(flag);
+        let output = run_command_with_timeout(cmd, std::time::Duration::from_millis(2500))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let text = if stdout.trim().len() > 50 {
@@ -1139,10 +1412,7 @@ fn run_help_for_command(cmd_prefix: &str, tool_name: &str) -> Option<String> {
             command.arg(a);
         }
         command.arg(flag);
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        let child = command.spawn().ok()?;
-        let output = child.wait_with_output().ok()?;
+        let output = run_command_with_timeout(command, std::time::Duration::from_millis(2500))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let text = if stdout.trim().len() > 50 {
@@ -1163,12 +1433,32 @@ fn run_help_for_command(cmd_prefix: &str, tool_name: &str) -> Option<String> {
         .or_else(|| fetch_tool_help(tool_name))
 }
 
-fn scan_directory_for_tools(dir: &Path) -> Vec<(String, String, Option<String>)> {
-    let mut tools = Vec::new();
+#[derive(Debug, Clone)]
+struct DiscoveredCandidate {
+    name: String,
+    command: String,
+}
+
+fn scan_directory_for_candidates(dir: &Path) -> Vec<DiscoveredCandidate> {
+    let mut candidates = Vec::new();
+    let mut scanned_count = 0usize;
+
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return tools;
+        return candidates;
     };
+
+    let update_progress = |scanned: usize, found: usize| {
+        eprint!(
+            "\r\x1b[2K[1/4 扫描] 已检索 {} 个文件/子目录，发现 {} 个候选脚本与可执行文件...",
+            scanned, found
+        );
+        let _ = io::stderr().flush();
+    };
+
     for entry in entries.flatten() {
+        scanned_count += 1;
+        update_progress(scanned_count, candidates.len());
+
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -1186,8 +1476,8 @@ fn scan_directory_for_tools(dir: &Path) -> Vec<(String, String, Option<String>)>
                     } else {
                         format!("\"{}\"", path.display())
                     };
-                    let help = run_help_for_command(&cmd, &name);
-                    tools.push((name, cmd, help));
+                    candidates.push(DiscoveredCandidate { name, command: cmd });
+                    update_progress(scanned_count, candidates.len());
                 }
             }
         } else if path.is_dir() {
@@ -1198,6 +1488,7 @@ fn scan_directory_for_tools(dir: &Path) -> Vec<(String, String, Option<String>)>
                 .to_string();
             if let Ok(sub_entries) = std::fs::read_dir(&path) {
                 for sub in sub_entries.flatten() {
+                    scanned_count += 1;
                     let sub_path = sub.path();
                     if sub_path.is_file() {
                         let stem = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -1219,8 +1510,8 @@ fn scan_directory_for_tools(dir: &Path) -> Vec<(String, String, Option<String>)>
                             } else {
                                 format!("\"{}\"", sub_path.display())
                             };
-                            let help = run_help_for_command(&cmd, &name);
-                            tools.push((name, cmd, help));
+                            candidates.push(DiscoveredCandidate { name, command: cmd });
+                            update_progress(scanned_count, candidates.len());
                             break;
                         }
                     }
@@ -1228,191 +1519,250 @@ fn scan_directory_for_tools(dir: &Path) -> Vec<(String, String, Option<String>)>
             }
         }
     }
-    tools
+
+    eprintln!(
+        "\r\x1b[2K[1/4 扫描] 扫描完成: 检索 {} 个文件/子目录，发现 {} 个候选脚本与可执行文件。",
+        scanned_count,
+        candidates.len()
+    );
+    candidates
 }
 
-async fn process_freeform_prompt(
-    paths: &Paths,
-    provider_cfg: &ProviderConfig,
-    user_prompt: &str,
-) -> Result<()> {
-    eprintln!("\n正在请求 AI 分析您的提示词并提取安全工具配置...");
-    let system_prompt = "你是一个网络安全渗透测试工具专家。请根据用户的需求和本地工具描述，将其封装为一个或多个合法的 Cyber Master CustomToolConfig 配置。\n\
-每个工具必须输出为一个独立的 ```toml ... ``` 代码块，不要包含前言或解释。\n\
-格式示例：\n\
-```toml\n\
-name = \"sqlmap\"\n\
-description = \"自动化 SQL 注入检测\"\n\
-command = \"python D:/tools/sqlmap/sqlmap.py -u {url} --batch {extra}\"\n\
-tags = [\"sqli\", \"web\"]\n\
-\n\
-[[parameters]]\n\
-name = \"url\"\n\
-description = \"目标 URL 地址\"\n\
-required = true\n\
-\n\
-[[parameters]]\n\
-name = \"extra\"\n\
-description = \"额外参数\"\n\
-required = false\n\
-default = \"--smart\"\n\
-```";
+fn fetch_candidates_help(
+    candidates: &[DiscoveredCandidate],
+) -> Vec<(String, String, Option<String>)> {
+    let mut results = Vec::with_capacity(candidates.len());
+    let total = candidates.len();
 
-    let reply = ask_llm(provider_cfg, system_prompt, user_prompt).await?;
-    let toml_blocks = extract_all_toml_blocks(&reply);
-    if toml_blocks.is_empty() {
-        eprintln!("\x1b[31mAI 未能生成有效的 TOML 配置块。\x1b[0m");
-        eprintln!("模型输出:\n{reply}");
+    if total == 0 {
+        eprintln!("[2/4 探测] 无候选工具需采集帮助信息。");
+        return results;
+    }
+
+    for (i, cand) in candidates.iter().enumerate() {
+        let done = i + 1;
+        eprint!(
+            "\r\x1b[2K[2/4 探测] 正在读取 [{}] 命令行参数帮助信息 ({}/{})...",
+            cand.name, done, total
+        );
+        let _ = io::stderr().flush();
+
+        let help = run_help_for_command(&cand.command, &cand.name);
+        results.push((cand.name.clone(), cand.command.clone(), help));
+    }
+
+    eprintln!(
+        "\r\x1b[2K[2/4 探测] 命令行参数帮助信息采集完成 (共 {} 个工具)。",
+        total
+    );
+    results
+}
+
+async fn evaluate_tools_with_ai(
+    provider_cfg: &ProviderConfig,
+    tools: &[(String, String, Option<String>)],
+) -> Result<Vec<AnalyzedTool>> {
+    let mut user_prompt =
+        String::from("请评估以下本地安全工具的 Agent 适用性，并输出 TOML 配置块：\n\n");
+    for (name, cmd, help_opt) in tools {
+        user_prompt.push_str(&format!("--- 工具: {name} ---\n执行命令: {cmd}\n"));
+        if let Some(help) = help_opt {
+            let help_summary: Vec<&str> = help.lines().take(40).collect();
+            user_prompt.push_str(&format!("帮助文档摘要:\n{}\n\n", help_summary.join("\n")));
+        } else {
+            user_prompt.push_str(
+                "帮助文档: (无法通过 -h/--help 获取输出，可能为图形界面程序或非标准工具)\n\n",
+            );
+        }
+    }
+
+    let mut total_chars = 0usize;
+    eprint!("\r\x1b[2K[3/4 AI 分析] 正在评估工具特征并分类建模... (已接收 0 字符)");
+    let _ = io::stderr().flush();
+
+    let reply = ask_llm_streaming(
+        provider_cfg,
+        TOOL_CLASSIFICATION_SYSTEM_PROMPT,
+        &user_prompt,
+        |delta| {
+            total_chars += delta.chars().count();
+            eprint!(
+                "\r\x1b[2K[3/4 AI 分析] 正在评估工具特征并分类建模... (已接收 {} 字符)",
+                total_chars
+            );
+            let _ = io::stderr().flush();
+        },
+    )
+    .await?;
+
+    eprintln!(
+        "\r\x1b[2K[3/4 AI 分析] 评估完成，共接收 {} 字符模型响应。",
+        total_chars
+    );
+
+    let analyzed = parse_analyzed_tools(&reply);
+    Ok(analyzed)
+}
+
+async fn evaluate_freeform_with_ai(
+    provider_cfg: &ProviderConfig,
+    user_input: &str,
+) -> Result<Vec<AnalyzedTool>> {
+    let mut total_chars = 0usize;
+    eprint!("\r\x1b[2K[3/4 AI 分析] 正在评估工具特征并分类建模... (已接收 0 字符)");
+    let _ = io::stderr().flush();
+
+    let reply = ask_llm_streaming(
+        provider_cfg,
+        TOOL_CLASSIFICATION_SYSTEM_PROMPT,
+        user_input,
+        |delta| {
+            total_chars += delta.chars().count();
+            eprint!(
+                "\r\x1b[2K[3/4 AI 分析] 正在评估工具特征并分类建模... (已接收 {} 字符)",
+                total_chars
+            );
+            let _ = io::stderr().flush();
+        },
+    )
+    .await?;
+
+    eprintln!(
+        "\r\x1b[2K[3/4 AI 分析] 评估完成，共接收 {} 字符模型响应。",
+        total_chars
+    );
+
+    let analyzed = parse_analyzed_tools(&reply);
+    Ok(analyzed)
+}
+
+async fn present_and_save_analyzed_tools(
+    paths: &Paths,
+    analyzed_tools: Vec<AnalyzedTool>,
+) -> Result<()> {
+    if analyzed_tools.is_empty() {
+        eprintln!("\n\x1b[33mAI 未能识别或解析出任何有效工具配置。\x1b[0m");
         return Ok(());
     }
 
-    for toml_code in toml_blocks {
-        match toml::from_str::<CustomToolConfig>(&toml_code) {
-            Ok(tool_cfg) => {
-                eprintln!("\n──────────────────────────────────────────────────────────");
-                eprintln!(
-                    "\x1b[1;32mAI 已生成工具 [{}] 配置草稿:\x1b[0m",
-                    tool_cfg.name
-                );
-                eprintln!("  名称: \x1b[36m{}\x1b[0m", tool_cfg.name);
-                eprintln!("  描述: {}", tool_cfg.description);
-                eprintln!("  命令: \x1b[33m{}\x1b[0m", tool_cfg.command);
-                let p_names: Vec<String> = tool_cfg
+    let mut compatible_tools = Vec::new();
+    let mut manual_tools = Vec::new();
+
+    for tool in analyzed_tools {
+        if tool.is_agent_compatible() {
+            compatible_tools.push(tool);
+        } else {
+            manual_tools.push(tool);
+        }
+    }
+
+    eprintln!("\n══════════════════════════════════════════════════════════════");
+    eprintln!("                  [4/4 工具分类与 Agent 适配分流]                ");
+    eprintln!("══════════════════════════════════════════════════════════════");
+
+    // 1. 展示人工安全资产工具（不适宜 Agent 调用）
+    if !manual_tools.is_empty() {
+        eprintln!(
+            "\n\x1b[1;33m🟡 【不适宜 Agent 直接调用 / 需人工操作的工具】 (共 {} 项)\x1b[0m",
+            manual_tools.len()
+        );
+        eprintln!("\x1b[90m(以下工具包含 GUI 图形界面、持续交互式控制台或无非交互批处理，后台调用会导致挂起，已自动隔离)\x1b[0m\n");
+        for tool in &manual_tools {
+            eprintln!("  • \x1b[1;37m{}\x1b[0m - {}", tool.name, tool.description);
+            eprintln!("    \x1b[33m原因:\x1b[0m {}", tool.reason);
+            if let Some(advice) = &tool.manual_advice {
+                if !advice.trim().is_empty() {
+                    eprintln!("    \x1b[36m建议:\x1b[0m {}", advice.trim());
+                }
+            }
+            eprintln!();
+        }
+    }
+
+    // 2. 展示 Agent 兼容自动化工具
+    if !compatible_tools.is_empty() {
+        eprintln!(
+            "\n\x1b[1;32m🟢 【可作为 Agent 自主调用的自动化工具】 (共 {} 项)\x1b[0m",
+            compatible_tools.len()
+        );
+        eprintln!("\x1b[90m(支持纯命令行传参、非交互批处理与明确终止条件，可封装为 Agent 安全动作)\x1b[0m\n");
+        for tool in &compatible_tools {
+            eprintln!("  • \x1b[1;32m{}\x1b[0m - {}", tool.name, tool.description);
+            if !tool.reason.trim().is_empty() {
+                eprintln!("    \x1b[90m判定依据: {}\x1b[0m", tool.reason);
+            }
+            eprintln!("    \x1b[90m执行命令: {}\x1b[0m", tool.command);
+            if !tool.parameters.is_empty() {
+                let p_str: Vec<String> = tool
                     .parameters
                     .iter()
                     .map(|p| {
                         if p.required {
                             format!("{}(必填)", p.name)
+                        } else if let Some(def) = &p.default {
+                            format!("{}(选填, 默认: {})", p.name, def)
                         } else {
                             format!("{}(选填)", p.name)
                         }
                     })
                     .collect();
-                eprintln!("  参数: {}", p_names.join(", "));
-                eprintln!("──────────────────────────────────────────────────────────");
+                eprintln!("    \x1b[90m参数列表: {}\x1b[0m", p_str.join(", "));
+            }
+            eprintln!();
+        }
 
-                let confirm = prompt_text(
-                    &format!(
-                        "是否确认保存为 ~/.cyber/tools/{}.toml? [Y/n]",
-                        tool_cfg.name
-                    ),
-                    "y",
-                )?;
-                if confirm.as_deref() == Some("y") || confirm.as_deref() == Some("Y") {
-                    match save_custom_tool(&paths.tools_dir, &tool_cfg) {
-                        Ok(p) => eprintln!("\x1b[1;32m✓ 已成功生成: {}\x1b[0m", p.display()),
-                        Err(e) => eprintln!("\x1b[31m保存工具配置失败: {e}\x1b[0m"),
-                    }
+        // 交互式多选菜单进行持久化保存
+        let menu_items: Vec<(String, bool)> = compatible_tools
+            .iter()
+            .map(|t| {
+                let exists = paths.tools_dir.join(format!("{}.toml", t.name)).exists();
+                let status = if exists {
+                    " [已存在，勾选将覆盖]"
                 } else {
-                    eprintln!("已跳过 [{}]。", tool_cfg.name);
+                    " [新发现]"
+                };
+                (format!("{} - {}{status}", t.name, t.description), !exists)
+            })
+            .collect();
+
+        let Some(selected) = multi_select_menu(
+            "请勾选需要持久化保存至 Agent 工具库 (~/.cyber/tools/) 的工具:",
+            &menu_items,
+        )?
+        else {
+            eprintln!("已取消保存。");
+            return Ok(());
+        };
+
+        if selected.is_empty() {
+            eprintln!("未选择任何工具进行保存。");
+            return Ok(());
+        }
+
+        let mut saved_count = 0;
+        for idx in selected {
+            let tool = &compatible_tools[idx];
+            let cfg = tool.to_custom_tool_config();
+            match save_custom_tool(&paths.tools_dir, &cfg) {
+                Ok(saved_path) => {
+                    saved_count += 1;
+                    eprintln!(
+                        "  \x1b[1;32m✓ [{}] -> {}\x1b[0m",
+                        tool.name,
+                        saved_path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  \x1b[31m✗ [{}] 保存失败: {e}\x1b[0m", tool.name);
                 }
             }
-            Err(e) => {
-                eprintln!("\x1b[31m解析生成的 TOML 失败: {e}\x1b[0m");
-            }
         }
-    }
-
-    Ok(())
-}
-
-async fn process_tool_candidates(
-    paths: &Paths,
-    provider_cfg: &ProviderConfig,
-    tools: Vec<(String, String, Option<String>)>,
-) -> Result<()> {
-    let items: Vec<(String, bool)> = tools
-        .iter()
-        .map(|(name, cmd, _)| {
-            let configured = paths.tools_dir.join(format!("{name}.toml")).exists();
-            let status = if configured {
-                " [已配置]"
-            } else {
-                " [未配置]"
-            };
-            (format!("{name} - {cmd}{status}"), !configured)
-        })
-        .collect();
-
-    let Some(selected_indices) = multi_select_menu(
-        "发现以下本地工具，请勾选需要让 AI 分析并生成配置的项:",
-        &items,
-    )?
-    else {
-        return Ok(());
-    };
-
-    if selected_indices.is_empty() {
-        eprintln!("未选择任何工具。");
-        return Ok(());
-    }
-
-    for idx in selected_indices {
-        let (name, cmd, help_opt) = &tools[idx];
-        eprintln!("\n正在获取 [{name}] 帮助信息并调用 AI 分析...");
-        let help_text = help_opt
-            .clone()
-            .unwrap_or_else(|| fetch_tool_help(name).unwrap_or_else(|| format!("command: {cmd}")));
-        let system_prompt = "你是一个网络安全渗透测试工具专家。请根据提供的命令行工具与帮助信息，生成符合 Cyber Master CustomToolConfig 的标准 TOML 配置。";
-        let user_prompt = format!(
-            "工具名称: {name}\n执行命令基础: {cmd}\n\n帮助文档输出摘要:\n{help_text}\n\n\
-            请生成合法的 TOML 配置代码块，要求如下：\n\
-            1. 包含 name（字符串，英文小写），description（中文简述），command（命令行模板，保留原执行路径，核心参数用 {{param}} 占位符包裹），tags（如 [\"security\", \"scan\"]）。\n\
-            2. 包含 [[parameters]] 数组，必须包含 command 中用到的每个占位符参数（name, description, required, default）。\n\
-            3. 只输出 ```toml ... ``` 代码块，严禁包含任何前言或后记解释。"
+        eprintln!(
+            "\n\x1b[1;32m✓ 成功持久化 {} 个自动化安全工具配置至 ~/.cyber/tools/\x1b[0m",
+            saved_count
         );
-
-        eprintln!("正在请求 AI 生成 [{name}] 配置草稿...");
-        match ask_llm(provider_cfg, system_prompt, &user_prompt).await {
-            Ok(reply) => {
-                let toml_code = extract_toml_block(&reply).unwrap_or(reply);
-                match toml::from_str::<CustomToolConfig>(&toml_code) {
-                    Ok(mut tool_cfg) => {
-                        tool_cfg.name = name.clone();
-                        eprintln!("\n──────────────────────────────────────────────────────────");
-                        eprintln!("\x1b[1;32mAI 已为 [{name}] 生成配置草稿:\x1b[0m");
-                        eprintln!("  名称: \x1b[36m{}\x1b[0m", tool_cfg.name);
-                        eprintln!("  描述: {}", tool_cfg.description);
-                        eprintln!("  命令: \x1b[33m{}\x1b[0m", tool_cfg.command);
-                        let p_names: Vec<String> = tool_cfg
-                            .parameters
-                            .iter()
-                            .map(|p| {
-                                if p.required {
-                                    format!("{}(必填)", p.name)
-                                } else {
-                                    format!("{}(选填)", p.name)
-                                }
-                            })
-                            .collect();
-                        eprintln!("  参数: {}", p_names.join(", "));
-                        eprintln!("──────────────────────────────────────────────────────────");
-
-                        let confirm = prompt_text(
-                            &format!("是否确认将此配置保存为 ~/.cyber/tools/{name}.toml? [Y/n]"),
-                            "y",
-                        )?;
-                        if confirm.as_deref() == Some("y") || confirm.as_deref() == Some("Y") {
-                            match save_custom_tool(&paths.tools_dir, &tool_cfg) {
-                                Ok(p) => {
-                                    eprintln!("\x1b[1;32m✓ 已成功生成: {}\x1b[0m", p.display())
-                                }
-                                Err(e) => eprintln!("\x1b[31m保存工具配置失败: {e}\x1b[0m"),
-                            }
-                        } else {
-                            eprintln!("已跳过 [{name}]。");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("\x1b[31mAI 生成的 TOML 格式无法解析: {e}\x1b[0m");
-                        eprintln!("原始输出:\n{toml_code}");
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("\x1b[31mAI 分析 [{name}] 失败: {e}\x1b[0m");
-            }
-        }
+    } else {
+        eprintln!("\n\x1b[33m未发现可作为 Agent 自主调用的自动化工具。\x1b[0m");
     }
 
     Ok(())
@@ -1448,7 +1798,7 @@ async fn setup_ai_tool_scan(
 
     eprintln!("\n\x1b[1;33m提示:\x1b[0m 您可以直接告诉 AI 您的工具位置或需求，例如:");
     eprintln!("  * 目录路径: 如 \x1b[36mD:\\tools\x1b[0m (自动扫描目录下的所有安全工具与脚本)");
-    eprintln!("  * 命令提示: 如 \x1b[36m我有 D:\\tools\\fscan.exe 和 python D:\\tools\\sqlmap\\sqlmap.py，请帮我配置\x1b[0m");
+    eprintln!("  * 命令提示: 如 \x1b[36m我有 D:\\tools\\fscan.exe 和 C:\\Goby\\goby.exe，请帮我配置\x1b[0m");
     eprintln!("  * 直接回车: 自动探测系统环境变量 PATH 及常见目录中的工具");
 
     let user_input = prompt_text("\n请输入工具所在目录、具体命令或提示词", "")?;
@@ -1457,25 +1807,24 @@ async fn setup_ai_tool_scan(
     if !input_str.is_empty() {
         let input_path = Path::new(input_str);
         if input_path.is_dir() {
-            eprintln!(
-                "\n正在扫描目录 [{}] 下的工具与脚本...",
-                input_path.display()
-            );
-            let scanned = scan_directory_for_tools(input_path);
-            if scanned.is_empty() {
+            eprintln!("\n[目标目录: {}]", input_path.display());
+            let candidates = scan_directory_for_candidates(input_path);
+            if candidates.is_empty() {
                 eprintln!(
-                    "\x1b[33m在目录 [{}] 下未找到明显的安全可执行文件或脚本。\x1b[0m",
+                    "\x1b[33m在目录 [{}] 下未检索到明显的脚本或可执行文件。\x1b[0m",
                     input_path.display()
                 );
-                eprintln!("转为将该目录作为提示词由 AI 深度分析...");
-                return process_freeform_prompt(
-                    paths,
+                eprintln!("转为将该目录作为上下文提示词由 AI 深度推理分析...");
+                let analyzed = evaluate_freeform_with_ai(
                     provider_cfg,
-                    &format!("我的工具存放在目录: {input_str}"),
+                    &format!("我的安全工具存放在目录: {input_str}"),
                 )
-                .await;
+                .await?;
+                return present_and_save_analyzed_tools(paths, analyzed).await;
             }
-            return process_tool_candidates(paths, provider_cfg, scanned).await;
+            let probed = fetch_candidates_help(&candidates);
+            let analyzed = evaluate_tools_with_ai(provider_cfg, &probed).await?;
+            return present_and_save_analyzed_tools(paths, analyzed).await;
         } else if input_path.is_file()
             || input_str.starts_with("python ")
             || input_str.starts_with("java -jar ")
@@ -1486,17 +1835,24 @@ async fn setup_ai_tool_scan(
                 .unwrap_or("tool")
                 .to_string();
             let cmd = input_str.to_string();
-            let help = run_help_for_command(&cmd, &name);
-            return process_tool_candidates(paths, provider_cfg, vec![(name, cmd, help)]).await;
+            eprintln!("\n[1/4 扫描] 针对单文件/指定命令 [{name}] 进行检测...");
+            let cand = DiscoveredCandidate {
+                name: name.clone(),
+                command: cmd,
+            };
+            let probed = fetch_candidates_help(&[cand]);
+            let analyzed = evaluate_tools_with_ai(provider_cfg, &probed).await?;
+            return present_and_save_analyzed_tools(paths, analyzed).await;
         } else {
             // Free-form natural language prompt
-            return process_freeform_prompt(paths, provider_cfg, input_str).await;
+            let analyzed = evaluate_freeform_with_ai(provider_cfg, input_str).await?;
+            return present_and_save_analyzed_tools(paths, analyzed).await;
         }
     }
 
     // Default: scan PATH and common directories
-    eprintln!("\n正在检测系统 PATH 与常见安全工具目录...");
-    let mut found_tools = Vec::new();
+    eprintln!("\n[1/4 扫描] 正在检测系统 PATH 与常见安全工具预设目录...");
+    let mut candidates = Vec::new();
     let candidate_defs = [
         ("nmap", "网络端口与服务版本扫描"),
         ("sqlmap", "自动化 SQL 注入检测与利用"),
@@ -1516,9 +1872,16 @@ async fn setup_ai_tool_scan(
     ];
 
     for (name, _desc) in candidate_defs {
+        eprint!(
+            "\r\x1b[2K[1/4 扫描] 检索系统 PATH: [{name}] (已发现 {} 项)...",
+            candidates.len()
+        );
+        let _ = io::stderr().flush();
         if let Some(bin_path) = find_installed_binary(name) {
-            let help = fetch_tool_help(name);
-            found_tools.push((name.to_string(), bin_path, help));
+            candidates.push(DiscoveredCandidate {
+                name: name.to_string(),
+                command: bin_path,
+            });
         }
     }
 
@@ -1532,25 +1895,32 @@ async fn setup_ai_tool_scan(
     ] {
         let p = Path::new(common_dir);
         if p.is_dir() {
-            let tools = scan_directory_for_tools(p);
-            for (name, cmd, help) in tools {
-                if !found_tools
+            let found = scan_directory_for_candidates(p);
+            for cand in found {
+                if !candidates
                     .iter()
-                    .any(|(n, _, _)| n.eq_ignore_ascii_case(&name))
+                    .any(|c| c.name.eq_ignore_ascii_case(&cand.name))
                 {
-                    found_tools.push((name, cmd, help));
+                    candidates.push(cand);
                 }
             }
         }
     }
 
-    if found_tools.is_empty() {
-        eprintln!("\x1b[33m未在系统 PATH 或常见目录中检测到常见工具。\x1b[0m");
+    eprintln!(
+        "\r\x1b[2K[1/4 扫描] 系统与预设目录检索完毕，共发现 {} 个候选工具。",
+        candidates.len()
+    );
+
+    if candidates.is_empty() {
+        eprintln!("\x1b[33m未在系统 PATH 或预设目录中检测到常见安全工具。\x1b[0m");
         eprintln!("提示: 您可以重新选择本菜单，并直接输入您存放工具的目录路径 (例如 D:\\tools)。");
         return Ok(());
     }
 
-    process_tool_candidates(paths, provider_cfg, found_tools).await
+    let probed = fetch_candidates_help(&candidates);
+    let analyzed = evaluate_tools_with_ai(provider_cfg, &probed).await?;
+    present_and_save_analyzed_tools(paths, analyzed).await
 }
 
 fn save_setup(
@@ -1739,6 +2109,13 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// 消费并清空终端事件队列中的残留事件（如按键释放与 VT 转义字符）。
+pub fn drain_events() {
+    while event::poll(std::time::Duration::from_millis(5)).unwrap_or(false) {
+        let _ = event::read();
+    }
+}
+
 /// 单选菜单：支持方向键 ↑/↓ 移动光标，Enter 确认，Esc 或 Ctrl+C 返回。
 pub fn select_menu(title: &str, items: &[String], default: usize) -> Result<Option<usize>> {
     if items.is_empty() {
@@ -1770,11 +2147,13 @@ pub fn select_menu(title: &str, items: &[String], default: usize) -> Result<Opti
         match key.code {
             KeyCode::Esc => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 bail!("操作已取消");
             }
@@ -1796,6 +2175,7 @@ pub fn select_menu(title: &str, items: &[String], default: usize) -> Result<Opti
             KeyCode::End => selected = items.len() - 1,
             KeyCode::Enter => {
                 drop(_raw);
+                drain_events();
                 eprintln!("\x1b[32m  ✓ 已选择: {}\x1b[0m", items[selected]);
                 return Ok(Some(selected));
             }
@@ -1852,11 +2232,13 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
         match key.code {
             KeyCode::Esc => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 bail!("操作已取消");
             }
@@ -1883,6 +2265,7 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
             }
             KeyCode::Enter => {
                 drop(_raw);
+                drain_events();
                 let chosen: Vec<usize> = checked
                     .iter()
                     .enumerate()
@@ -1913,10 +2296,23 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
 
 /// 交互式文本输入（带默认值回退与 Esc 取消）。
 pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
+    drain_events();
+
+    let (prefix, clean_label) = match label.rfind('\n') {
+        Some(idx) => (&label[..=idx], &label[idx + 1..]),
+        None => ("", label),
+    };
+    if !prefix.is_empty() {
+        eprint!("{prefix}");
+    }
+
     if default.is_empty() {
-        eprint!("{label}: ");
+        eprint!("{clean_label}: ");
     } else {
-        eprint!("{label} \x1b[90m[{}]\x1b[0m: ", default.escape_default());
+        eprint!(
+            "{clean_label} \x1b[90m[{}]\x1b[0m: ",
+            default.escape_default()
+        );
     }
     io::stderr().flush()?;
 
@@ -1933,16 +2329,19 @@ pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
         match key.code {
             KeyCode::Esc => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 bail!("操作已取消");
             }
             KeyCode::Enter => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 if input == ":cancel" {
                     return Ok(None);
@@ -1965,10 +2364,10 @@ pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
             _ => continue,
         }
         if default.is_empty() {
-            eprint!("\r\x1b[2K{label}: {input}");
+            eprint!("\r\x1b[2K{clean_label}: {input}");
         } else {
             eprint!(
-                "\r\x1b[2K{label} \x1b[90m[{}]\x1b[0m: {input}",
+                "\r\x1b[2K{clean_label} \x1b[90m[{}]\x1b[0m: {input}",
                 default.escape_default()
             );
         }
@@ -1978,7 +2377,17 @@ pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
 
 /// 交互式密码/敏感词掩码输入（实时打印星号 `*`）。
 pub fn prompt_password(label: &str) -> Result<Option<String>> {
-    eprint!("{label}: ");
+    drain_events();
+
+    let (prefix, clean_label) = match label.rfind('\n') {
+        Some(idx) => (&label[..=idx], &label[idx + 1..]),
+        None => ("", label),
+    };
+    if !prefix.is_empty() {
+        eprint!("{prefix}");
+    }
+
+    eprint!("{clean_label}: ");
     io::stderr().flush()?;
 
     let _raw = RawModeGuard::new()?;
@@ -1994,16 +2403,19 @@ pub fn prompt_password(label: &str) -> Result<Option<String>> {
         match key.code {
             KeyCode::Esc => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 bail!("操作已取消");
             }
             KeyCode::Enter => {
                 drop(_raw);
+                drain_events();
                 eprintln!();
                 if input == ":cancel" {
                     return Ok(None);
@@ -2021,7 +2433,7 @@ pub fn prompt_password(label: &str) -> Result<Option<String>> {
             _ => continue,
         }
         let stars = "*".repeat(input.len());
-        eprint!("\r\x1b[2K{label}: {stars}");
+        eprint!("\r\x1b[2K{clean_label}: {stars}");
         io::stderr().flush()?;
     }
 }
@@ -2302,5 +2714,121 @@ mod tests {
         .unwrap();
         assert!(restarted);
         assert!(setup_state(&paths).unwrap() == SetupState::Completed);
+    }
+
+    #[test]
+    fn parse_analyzed_tools_correctly_classifies_agent_and_manual_tools() {
+        let ai_response = r#"
+这里是为您分析的工具结果：
+```toml
+[[tools]]
+name = "sqlmap"
+can_agent_use = true
+reason = "纯命令行控制，支持 --batch 非交互批处理"
+description = "自动化 SQL 注入检测与利用"
+command = "python D:/tools/sqlmap/sqlmap.py -u {url} --batch"
+tags = ["sqli", "web"]
+[[tools.parameters]]
+name = "url"
+description = "目标 URL 地址"
+required = true
+
+[[tools]]
+name = "goby"
+can_agent_use = false
+reason = "图形化视窗软件 (GUI)，需人工在界面点击操作，Agent 在后台无头子进程调用会导致永久阻塞无响应"
+description = "图形化网络资产梳理与漏洞探测平台"
+manual_advice = "适合安全人员在本地桌面独立视窗中运行，不应封装为 Agent 自动化工具"
+```
+"#;
+        let tools = parse_analyzed_tools(ai_response);
+        assert_eq!(tools.len(), 2);
+
+        let sqlmap = &tools[0];
+        assert_eq!(sqlmap.name, "sqlmap");
+        assert!(sqlmap.is_agent_compatible());
+        assert_eq!(sqlmap.suitability, ToolSuitability::AgentCompatible);
+        assert!(sqlmap.reason.contains("批处理"));
+        assert_eq!(sqlmap.parameters.len(), 1);
+        assert_eq!(sqlmap.parameters[0].name, "url");
+        assert!(sqlmap.parameters[0].required);
+
+        let cfg = sqlmap.to_custom_tool_config();
+        assert_eq!(cfg.name, "sqlmap");
+        assert_eq!(
+            cfg.command,
+            "python D:/tools/sqlmap/sqlmap.py -u {url} --batch"
+        );
+
+        let goby = &tools[1];
+        assert_eq!(goby.name, "goby");
+        assert!(!goby.is_agent_compatible());
+        assert_eq!(goby.suitability, ToolSuitability::ManualOnly);
+        assert!(goby.reason.contains("GUI"));
+        assert!(goby
+            .manual_advice
+            .as_deref()
+            .unwrap()
+            .contains("本地桌面独立视窗"));
+    }
+
+    #[test]
+    fn parse_analyzed_tools_handles_single_tool_and_fallback_custom_tool_config() {
+        let single_toml = r#"
+```toml
+name = "nmap"
+can_agent_use = true
+reason = "命令行网络扫描器"
+description = "端口扫描与服务探测"
+command = "nmap -sV {target}"
+[[parameters]]
+name = "target"
+description = "扫描目标"
+required = true
+```
+"#;
+        let tools = parse_analyzed_tools(single_toml);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "nmap");
+        assert!(tools[0].is_agent_compatible());
+
+        let legacy_toml = r#"
+```toml
+name = "httpx"
+description = "HTTP 探活"
+command = "httpx -l {file}"
+[[parameters]]
+name = "file"
+description = "输入文件"
+required = true
+```
+"#;
+        let tools_legacy = parse_analyzed_tools(legacy_toml);
+        assert_eq!(tools_legacy.len(), 1);
+        assert_eq!(tools_legacy[0].name, "httpx");
+        assert!(tools_legacy[0].is_agent_compatible());
+    }
+
+    #[test]
+    fn scan_directory_for_candidates_detects_scripts_and_subfolder_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(base.join("fscan.exe"), b"").unwrap();
+        std::fs::write(base.join("test.txt"), b"ignore me").unwrap();
+
+        let sub_sqlmap = base.join("sqlmap");
+        std::fs::create_dir(&sub_sqlmap).unwrap();
+        std::fs::write(sub_sqlmap.join("sqlmap.py"), b"").unwrap();
+
+        let sub_custom = base.join("custom");
+        std::fs::create_dir(&sub_custom).unwrap();
+        std::fs::write(sub_custom.join("main.py"), b"").unwrap();
+
+        let candidates = scan_directory_for_candidates(base);
+        assert_eq!(candidates.len(), 3);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"fscan"));
+        assert!(names.contains(&"sqlmap"));
+        assert!(names.contains(&"custom"));
     }
 }
