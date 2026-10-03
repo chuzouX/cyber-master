@@ -14,6 +14,7 @@
 #   $env:CYBER_VERSION       指定版本 tag，如 'v0.1.0'
 #   $env:CYBER_INSTALL_DIR   安装目录，默认 $env:USERPROFILE\.local\bin
 #   $env:CYBER_REPO          GitHub owner/name，默认 chuzouX/cyber-master
+#   $env:CYBER_DOWNLOAD_MIRROR 下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
 
 #Requires -Version 5.1
 
@@ -67,8 +68,18 @@ if (-not $Version) {
     }
 }
 
-$DownloadUrl = "https://github.com/$Repo/releases/download/$Version/$Archive"
-$ChecksumUrl = "$DownloadUrl.sha256"
+# ─── 下载源：GitHub 主源 + 常用镜像回退（默认自动尝试，可用 $env:CYBER_DOWNLOAD_MIRROR 指定镜像前缀）──
+$GithubBase = "https://github.com/$Repo/releases/download/$Version"
+$Sources = @($GithubBase)
+if ($env:CYBER_DOWNLOAD_MIRROR) {
+    $Sources = @("$($env:CYBER_DOWNLOAD_MIRROR.TrimEnd('/'))/$GithubBase") + $Sources
+} else {
+    $Sources += @(
+        "https://ghproxy.net/$GithubBase",
+        "https://gh-proxy.com/$GithubBase",
+        "https://ghfast.top/$GithubBase"
+    )
+}
 
 Write-Host "→ 安装 cyber $Version ($Target) 到 $InstallDir" -ForegroundColor Cyan
 
@@ -80,9 +91,23 @@ $extractPath = Join-Path $tmpDir 'extract'
 $destBinary = Join-Path $InstallDir 'cyber.exe'
 try {
     New-Item -ItemType Directory -Path $tmpDir | Out-Null
-    Write-Host "→ 下载 $DownloadUrl"
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $zipFile -UseBasicParsing
-    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $shaFile -UseBasicParsing
+    $downloaded = $false
+    foreach ($base in $Sources) {
+        $zipUrl = "$base/$Archive"
+        $shaUrl = "$zipUrl.sha256"
+        try {
+            Write-Host "→ 下载 $zipUrl"
+            Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing
+            Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
+            $downloaded = $true
+            break
+        } catch {
+            Write-Host "   该源失败（$($_.Exception.Message.Split([char]10)[0])），尝试下一源…" -ForegroundColor DarkGray
+        }
+    }
+    if (-not $downloaded) {
+        throw "所有下载源均失败。请检查网络/代理（需放行 release-assets.githubusercontent.com），或用 `$env:CYBER_DOWNLOAD_MIRROR 指定可用镜像前缀。"
+    }
     Write-Host "→ 校验 SHA256…"
     $checksum = Get-Content -LiteralPath $shaFile -TotalCount 1
     if ($checksum -notmatch '^([0-9a-fA-F]{64})(\s|$)') {
