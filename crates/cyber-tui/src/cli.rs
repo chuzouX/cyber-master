@@ -22,7 +22,7 @@ use cyber_agent::{
     estimate_messages_tokens, AgentEvent, ApprovalChoice, PermissionBroker, PermissionDecision,
     PermissionMode, PermissionRequest,
 };
-use cyber_core::ThinkingIntensity;
+use cyber_core::{Config, EnvVar, MemoryRule, ProvidersConfig, ThinkingIntensity};
 use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
@@ -124,6 +124,245 @@ impl Drop for TerminalSession {
 enum Panel {
     Shortcuts,
     Ctf,
+    Settings,
+}
+
+/// 设置面板标签页（共 7 个大类，全面覆盖所有设置）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    AgentModel, // 1. Agent 与核心模型
+    UiWorkflow,    // 2. 界面与交互
+    Subagents,     // 3. 子任务与并发
+    ToolsMcp,      // 4. 工具扩展与 MCP
+    Providers,     // 5. 服务商管理
+    EnvMemory,     // 6. 环境变量与记忆
+    StorageSystem, // 7. 系统与存储日志
+}
+
+impl SettingsTab {
+    pub fn all() -> &'static [SettingsTab] {
+        &[
+            SettingsTab::AgentModel,
+            SettingsTab::UiWorkflow,
+            SettingsTab::Subagents,
+            SettingsTab::ToolsMcp,
+            SettingsTab::Providers,
+            SettingsTab::EnvMemory,
+            SettingsTab::StorageSystem,
+        ]
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::AgentModel => "1. Agent & 模型",
+            Self::UiWorkflow => "2. 界面与交互",
+            Self::Subagents => "3. 子任务并发",
+            Self::ToolsMcp => "4. 工具与 MCP",
+            Self::Providers => "5. 服务商管理",
+            Self::EnvMemory => "6. 环境与记忆",
+            Self::StorageSystem => "7. 系统与存储",
+        }
+    }
+
+    pub fn short_title(self) -> &'static str {
+        match self {
+            Self::AgentModel => "1.Agent模型",
+            Self::UiWorkflow => "2.界面交互",
+            Self::Subagents => "3.子任务",
+            Self::ToolsMcp => "4.工具MCP",
+            Self::Providers => "5.服务商",
+            Self::EnvMemory => "6.环境记忆",
+            Self::StorageSystem => "7.系统存储",
+        }
+    }
+
+    pub fn compact_title(self) -> &'static str {
+        match self {
+            Self::AgentModel => "1.模型",
+            Self::UiWorkflow => "2.界面",
+            Self::Subagents => "3.并发",
+            Self::ToolsMcp => "4.工具",
+            Self::Providers => "5.服务商",
+            Self::EnvMemory => "6.环境",
+            Self::StorageSystem => "7.存储",
+        }
+    }
+
+    pub fn max_row(self, state: &CliSettingsState) -> usize {
+        match self {
+            Self::AgentModel => 6, // 0..=6 (7 rows)
+            Self::UiWorkflow => 6, // 0..=6 (7 rows)
+            Self::Subagents => 4,  // 0..=4 (5 rows)
+            Self::ToolsMcp => 1,   // 0..=1 (2 editable toggles)
+            Self::Providers => state.providers_draft.providers.len().saturating_sub(1),
+            Self::EnvMemory => {
+                let env_count = state.config_draft.env.vars.len();
+                let mem_count = state.config_draft.memory.rules.len();
+                (env_count + mem_count).saturating_sub(1)
+            }
+            Self::StorageSystem => 1, // 0..=1 (2 rows: retention, log_level)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct McpServerSummary {
+    pub name: String,
+    pub connected: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SkillSummary {
+    pub name: String,
+    pub source: String,
+}
+
+/// CLI 设置面板运行时状态
+#[derive(Clone, Debug)]
+pub struct CliSettingsState {
+    pub tab: SettingsTab,
+    pub selected_row: usize,
+    pub dirty: bool,
+    /// 编辑中的配置草稿（保存时落盘并同步至 AppContext；退出时可丢弃）
+    pub config_draft: Config,
+    /// 编辑中的服务商配置草稿
+    pub providers_draft: ProvidersConfig,
+    /// 列表子项选中索引（用于 Providers/Env/Memory 列表的垂直滚动）
+    pub list_selected: usize,
+    /// 未保存退出时的确认拦截态
+    pub pending_discard_confirm: bool,
+    pub mcp_servers: Vec<McpServerSummary>,
+    pub skills: Vec<SkillSummary>,
+    pub config_path: String,
+    pub providers_path: String,
+    pub sessions_dir: String,
+    pub sessions_count: usize,
+    pub has_project_config: bool,
+}
+
+impl CliSettingsState {
+    pub fn new(config: &Config, providers: &ProvidersConfig) -> Self {
+        Self {
+            tab: SettingsTab::AgentModel,
+            selected_row: 0,
+            dirty: false,
+            config_draft: config.clone(),
+            providers_draft: providers.clone(),
+            list_selected: 0,
+            pending_discard_confirm: false,
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            config_path: "~/.cyber/config.toml".into(),
+            providers_path: "~/.cyber/providers.toml".into(),
+            sessions_dir: "~/.cyber/sessions".into(),
+            sessions_count: 0,
+            has_project_config: false,
+        }
+    }
+
+    pub(crate) fn from_runner(runner: &SessionRunner) -> Self {
+        let mut state = Self::new(&runner.ctx.config, &runner.ctx.providers);
+        state.config_path = runner.ctx.paths.config_file.display().to_string();
+        state.providers_path = runner.ctx.paths.providers_file.display().to_string();
+        state.sessions_dir = runner.ctx.paths.history_dir.display().to_string();
+        state.sessions_count = runner.index.sessions.len();
+        state.has_project_config = runner.ctx.project.is_some();
+        if let Ok(mcp_cfg) = cyber_mcp::McpServersConfig::load(&runner.ctx.paths.mcp_servers_file) {
+            state.mcp_servers = mcp_cfg
+                .servers
+                .into_iter()
+                .map(|s| {
+                    let connected = runner
+                        .registries
+                        .mcp
+                        .as_ref()
+                        .is_some_and(|m| m.server_names().contains(&s.name.as_str()));
+                    let detail = match &s.transport {
+                        cyber_mcp::McpTransport::Stdio => {
+                            format!("stdio: {}", s.command.as_deref().unwrap_or(""))
+                        }
+                        cyber_mcp::McpTransport::Sse | cyber_mcp::McpTransport::Http => {
+                            s.url.clone().unwrap_or_default()
+                        }
+                    };
+                    McpServerSummary {
+                        name: s.name,
+                        connected,
+                        detail,
+                    }
+                })
+                .collect();
+        }
+        state.skills = runner
+            .registries
+            .skills
+            .iter()
+            .map(|s| SkillSummary {
+                name: s.name().to_string(),
+                source: match s.source {
+                    cyber_skills::SkillSource::Global => "全局".into(),
+                    cyber_skills::SkillSource::Project => "项目级".into(),
+                },
+            })
+            .collect();
+        state
+    }
+
+    pub fn next_tab(&mut self) {
+        let all = SettingsTab::all();
+        let idx = all.iter().position(|&t| t == self.tab).unwrap_or(0);
+        self.tab = all[(idx + 1) % all.len()];
+        self.selected_row = 0;
+        self.list_selected = 0;
+    }
+
+    pub fn prev_tab(&mut self) {
+        let all = SettingsTab::all();
+        let idx = all.iter().position(|&t| t == self.tab).unwrap_or(0);
+        self.tab = all[(idx + all.len() - 1) % all.len()];
+        self.selected_row = 0;
+        self.list_selected = 0;
+    }
+
+    pub fn set_tab(&mut self, tab: SettingsTab) {
+        self.tab = tab;
+        self.selected_row = 0;
+        self.list_selected = 0;
+    }
+
+    pub fn reset_current_tab(&mut self) {
+        let default = Config::default();
+        match self.tab {
+            SettingsTab::AgentModel => {
+                self.config_draft.agent.default_provider = default.agent.default_provider;
+                self.config_draft.agent.auto_tool_call = default.agent.auto_tool_call;
+                self.config_draft.agent.permission_mode = default.agent.permission_mode;
+                self.config_draft.agent.max_steps = default.agent.max_steps;
+                self.config_draft.agent.thinking_intensity = default.agent.thinking_intensity;
+                self.config_draft.tools.web_search = default.tools.web_search;
+            }
+            SettingsTab::UiWorkflow => {
+                self.config_draft.ui = default.ui;
+                self.config_draft.workflow = default.workflow;
+            }
+            SettingsTab::Subagents => {
+                self.config_draft.agent.subagents = default.agent.subagents;
+            }
+            SettingsTab::ToolsMcp => {
+                self.config_draft.tools.prefer_docker = default.tools.prefer_docker;
+            }
+            SettingsTab::Providers => {}
+            SettingsTab::EnvMemory => {
+                self.config_draft.memory = default.memory;
+            }
+            SettingsTab::StorageSystem => {
+                self.config_draft.storage = default.storage;
+            }
+        }
+        self.dirty = true;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +439,7 @@ struct CliScreen {
     approval_view: WrappedViewport,
     approval_visible: bool,
     panel: Option<Panel>,
+    pub settings: Option<CliSettingsState>,
     ctf_enabled: bool,
     ctf_challenges: Arc<std::sync::Mutex<Vec<cyber_core::CtfChallenge>>>,
     ctf_selected: usize,
@@ -361,6 +601,7 @@ impl CliScreen {
             approval_view: WrappedViewport::default(),
             approval_visible: false,
             panel: None,
+            settings: None,
             ctf_enabled: runner.ctf_enabled,
             ctf_challenges: runner
                 .registries
@@ -1380,7 +1621,7 @@ impl CliScreen {
                 Panel::Shortcuts => {
                     let title = " Shortcuts ";
                     let text = format!(
-                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
+                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nF3 / Ctrl+,     Open Settings center panel\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
                         cli_commands::commands()
                             .iter()
                             .map(|spec| format!("{:<30} {}", spec.usage, spec.desc))
@@ -1418,6 +1659,11 @@ impl CliScreen {
                         true,
                         &self.ctf_list_scroll,
                     );
+                }
+                Panel::Settings => {
+                    if let Some(settings) = &self.settings {
+                        draw_settings_panel(frame, sections[1], settings, self);
+                    }
                 }
             }
         } else if let Some(form) = &self.form {
@@ -2474,6 +2720,1718 @@ fn popup(frame: &mut Frame, bounds: Rect, title: &str, text: &str) {
     );
 }
 
+const SETTINGS_THEMES: &[&str] = &[
+    "catppuccin",
+    "cyberpunk",
+    "dracula",
+    "gruvbox",
+    "nord",
+    "tokyo-night",
+];
+const SETTINGS_MODES: &[&str] = &["chat", "workflow", "dashboard"];
+const SETTINGS_LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
+const SETTINGS_THINKING_LEVELS: &[ThinkingIntensity] = &[
+    ThinkingIntensity::Low,
+    ThinkingIntensity::Middle,
+    ThinkingIntensity::High,
+    ThinkingIntensity::Max,
+    ThinkingIntensity::Auto,
+];
+const SETTINGS_PERMISSION_MODES: &[PermissionMode] = &[
+    PermissionMode::Auto,
+    PermissionMode::Manual,
+    PermissionMode::Unlimited,
+];
+
+fn render_setting_row(
+    selected: bool,
+    label: &'static str,
+    value: String,
+    hint: String,
+    _width: u16,
+) -> Line<'static> {
+    let pointer = if selected { "▶ " } else { "  " };
+    let ptr_style = if selected {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let label_style = if selected {
+        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(FG)
+    };
+    let val_style = if selected {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(180, 220, 255))
+    };
+
+    let label_padded = format!("{:<26}", label);
+    let val_padded = format!("{:<22}", value);
+
+    Line::from(vec![
+        Span::styled(pointer, ptr_style),
+        Span::styled(label_padded, label_style),
+        Span::styled(val_padded, val_style),
+        Span::raw(" "),
+        Span::styled(hint, Style::default().fg(DIM)),
+    ])
+}
+
+fn render_scrollable_content<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'a>>,
+    focused_start: usize,
+    focused_end: usize,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let visible_rows = area.height as usize;
+    let total = lines.len();
+
+    if total <= visible_rows {
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let max_scroll = total.saturating_sub(visible_rows);
+    let mut scroll = if focused_end >= visible_rows {
+        (focused_end + 1)
+            .saturating_sub(visible_rows)
+            .min(max_scroll)
+    } else {
+        0
+    };
+    if focused_start < scroll {
+        scroll = focused_start;
+    }
+    scroll = scroll.min(max_scroll);
+
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
+}
+
+fn draw_tab_agent_model(
+    frame: &mut Frame,
+    area: Rect,
+    settings: &CliSettingsState,
+    _screen: &CliScreen,
+) {
+    let prov = &settings.config_draft.agent.default_provider;
+    let model = settings
+        .providers_draft
+        .providers
+        .get(prov)
+        .map(|p| p.model.clone())
+        .unwrap_or_else(|| "未配置".into());
+    let perm_str = settings
+        .config_draft
+        .agent
+        .permission_mode
+        .as_deref()
+        .unwrap_or("auto");
+    let perm_mode = PermissionMode::parse(perm_str).unwrap_or(PermissionMode::Auto);
+    let prov_count = settings.providers_draft.providers.len();
+
+    let lines = vec![
+        render_setting_row(
+            settings.selected_row == 0,
+            "默认服务商 (Provider)",
+            format!("◄ [ {} ] ►", prov),
+            format!("◄/► 切换 (已配置 {} 个 Provider)", prov_count),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 1,
+            "对应模型 (Model)",
+            model,
+            "由所选 Provider 决定 (/model 细调)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 2,
+            "思考强度 (Thinking)",
+            format!(
+                "◄ [ {} ] ►",
+                settings.config_draft.agent.thinking_intensity.as_str()
+            ),
+            settings
+                .config_draft
+                .agent
+                .thinking_intensity
+                .label()
+                .into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 3,
+            "工具审批模式 (Permission)",
+            format!("◄ [ {} ] ►", perm_mode.label()),
+            match perm_mode {
+                PermissionMode::Auto => "常规放行，高危拦截",
+                PermissionMode::Manual => "每次调用需确认",
+                PermissionMode::Unlimited => "始终自动放行",
+            }
+            .into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 4,
+            "自动工具调用 (Auto Tools)",
+            if settings.config_draft.agent.auto_tool_call {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "允许模型自主规划并执行终端/文件工具".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 5,
+            "工具执行步数上限 (Max Steps)",
+            format!("◄ [ {} 步 ] ►", settings.config_draft.agent.max_steps),
+            "◄/► 调整 (范围: 1-1000 步)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 6,
+            "联网搜索与抓取 (Web Search)",
+            if settings.config_draft.tools.web_search {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "启用/禁用 web_fetch 外部网络查询工具".into(),
+            area.width,
+        ),
+    ];
+
+    render_scrollable_content(
+        frame,
+        area,
+        lines,
+        settings.selected_row,
+        settings.selected_row,
+    );
+}
+
+fn draw_tab_ui_workflow(
+    frame: &mut Frame,
+    area: Rect,
+    settings: &CliSettingsState,
+    _screen: &CliScreen,
+) {
+    let lines = vec![
+        render_setting_row(
+            settings.selected_row == 0,
+            "主题配色 (Theme)",
+            format!("◄ [ {} ] ►", settings.config_draft.ui.theme),
+            "即时生效 (支持 cyberpunk/dracula/nord 等)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 1,
+            "鼠标捕获 (Mouse Capture)",
+            if settings.config_draft.ui.mouse {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "即时生效 (开启滚轮滚动，关闭划词复制)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 2,
+            "默认启动模式 (Default Mode)",
+            format!("◄ [ {} ] ►", settings.config_draft.ui.default_mode),
+            "重启生效 (chat / workflow / dashboard)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 3,
+            "界面动效渲染 (Animations)",
+            if settings.config_draft.ui.animations {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "启用流式字符光标渐变与平滑过渡".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 4,
+            "工作流最大并行节点",
+            format!(
+                "◄ [ {} 节点 ] ►",
+                settings.config_draft.workflow.max_parallel_nodes
+            ),
+            "◄/► 调整 (Workflow 编排最大并行度: 1-64)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 5,
+            "工作流执行超时 (Timeout)",
+            format!(
+                "◄ [ {} 秒 ] ►",
+                settings.config_draft.workflow.default_timeout_secs
+            ),
+            "单个工作流最大允许运行时间 (10-86400秒)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 6,
+            "断点续跑检查点 (Checkpoint)",
+            if settings.config_draft.workflow.checkpoint {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "允许从失败或中断的工作流节点继续恢复".into(),
+            area.width,
+        ),
+    ];
+
+    render_scrollable_content(
+        frame,
+        area,
+        lines,
+        settings.selected_row,
+        settings.selected_row,
+    );
+}
+
+fn draw_tab_subagents(frame: &mut Frame, area: Rect, settings: &CliSettingsState) {
+    let sub = &settings.config_draft.agent.subagents;
+    let lines = vec![
+        render_setting_row(
+            settings.selected_row == 0,
+            "子代理系统 (Subagents)",
+            if sub.enabled {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "暴露 delegate_tasks 批量任务拆解工具".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 1,
+            "单轮最大任务数 (Max Tasks)",
+            format!("◄ [ {} 个 ] ►", sub.max_tasks),
+            "一次最多拆分派发的子任务上限 (1-64)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 2,
+            "最大并行执行数 (Parallel)",
+            format!("◄ [ {} 并发 ] ►", sub.max_parallel),
+            "后台同时运行的独立子代理线程上限 (1-16)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 3,
+            "单任务超时时限 (Timeout)",
+            format!("◄ [ {} 秒 ] ►", sub.timeout_secs),
+            "单个子任务最大执行时限 (10-3600秒)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 4,
+            "子任务最大步数 (Sub Steps)",
+            format!("◄ [ {} 步 ] ►", sub.max_steps),
+            "单个子任务工具调用最大循环次数 (5-100)".into(),
+            area.width,
+        ),
+    ];
+
+    render_scrollable_content(
+        frame,
+        area,
+        lines,
+        settings.selected_row,
+        settings.selected_row,
+    );
+}
+
+fn draw_tab_tools_mcp(
+    frame: &mut Frame,
+    area: Rect,
+    settings: &CliSettingsState,
+    screen: &CliScreen,
+) {
+    let extra_path_str = if settings.config_draft.tools.extra_path.is_empty() {
+        "(空)".to_string()
+    } else {
+        settings.config_draft.tools.extra_path.join(";")
+    };
+
+    let mut lines = vec![
+        render_setting_row(
+            settings.selected_row == 0,
+            "优先容器执行 (Docker)",
+            if settings.config_draft.tools.prefer_docker {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "若环境安装 Docker，则优先容器隔离执行".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 1,
+            "CTF 渗透答题模式 (CTF Mode)",
+            if screen.ctf_enabled {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "启用 Writeup 自动生成与专属解题工具".into(),
+            area.width,
+        ),
+        render_setting_row(
+            false,
+            "额外环境变量 PATH",
+            extra_path_str,
+            "附加注入到 Shell 子进程的 PATH 变量".into(),
+            area.width,
+        ),
+        Line::raw(""),
+    ];
+
+    lines.push(Line::from(vec![Span::styled(
+        format!("  [已配置 MCP 服务 ({} 个)]", settings.mcp_servers.len()),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]));
+    if settings.mcp_servers.is_empty() {
+        lines.push(Line::styled(
+            "    • 暂无配置 MCP 服务（可通过 mcp.json 或 /mcp 添加）",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        for s in settings.mcp_servers.iter().take(3) {
+            let status_badge = if s.connected {
+                Span::styled(" [ ● 已连接 ] ", Style::default().fg(SUCCESS))
+            } else {
+                Span::styled(" [ ○ 未连接 ] ", Style::default().fg(DIM))
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    • "),
+                Span::styled(
+                    format!("{:<14}", s.name),
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+                status_badge,
+                Span::raw(" "),
+                Span::styled(&s.detail, Style::default().fg(DIM)),
+            ]));
+        }
+    }
+
+    lines.push(Line::raw(""));
+
+    lines.push(Line::from(vec![Span::styled(
+        format!("  [已加载 Skills 技能 ({} 个)]", settings.skills.len()),
+        Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+    )]));
+    if settings.skills.is_empty() {
+        lines.push(Line::styled(
+            "    • 暂无已加载 Skill",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        let skills_str = settings
+            .skills
+            .iter()
+            .take(6)
+            .map(|s| format!("{} ({})", s.name, s.source))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(Line::from(vec![
+            Span::raw("    • "),
+            Span::styled(skills_str, Style::default().fg(MUTED)),
+        ]));
+    }
+
+    render_scrollable_content(
+        frame,
+        area,
+        lines,
+        settings.selected_row,
+        settings.selected_row,
+    );
+}
+
+fn draw_tab_providers(frame: &mut Frame, area: Rect, settings: &CliSettingsState) {
+    let names = settings.providers_draft.sorted_names();
+    let default_prov = &settings.config_draft.agent.default_provider;
+    let total_provs = names.len();
+
+    let header_text = if total_provs > 1 {
+        format!(
+            "  已配置服务商列表 [{}/{} 项 · ↑/↓ 切换焦点] (按 Enter 设为默认 · A 添加 · E 编辑 · D 删除):",
+            (settings.selected_row + 1).min(total_provs),
+            total_provs
+        )
+    } else {
+        "  已配置服务商列表 (按 Enter 设为默认 · A 添加 · E 编辑 · D 删除):".to_string()
+    };
+
+    let mut lines = vec![
+        Line::styled(header_text, Style::default().fg(MUTED)),
+        Line::raw(""),
+    ];
+
+    let mut focused_start = 0;
+    let mut focused_end = 0;
+
+    if names.is_empty() {
+        lines.push(Line::styled(
+            "    (暂无配置服务商，按 A 添加)",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        for (i, name) in names.iter().enumerate() {
+            let is_sel = i == settings.selected_row;
+            let is_def = name == default_prov;
+
+            let start_line = lines.len();
+
+            let pointer = if is_sel { "▶ " } else { "  " };
+            let ptr_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let star = if is_def { "★ " } else { "☆ " };
+            let star_style = if is_def {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let def_tag = if is_def { " (默认服务商)" } else { "" };
+            let name_style = if is_sel {
+                Style::default().fg(FG).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FG)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(pointer, ptr_style),
+                Span::styled(star, star_style),
+                Span::styled(format!("[ {} ]", name), name_style),
+                Span::styled(def_tag, Style::default().fg(ACCENT)),
+            ]));
+
+            if let Some(p) = settings.providers_draft.providers.get(name) {
+                let detail = format!(
+                    "      类型: {} · 模型: {} · BaseURL: {}",
+                    p.kind, p.model, p.base_url
+                );
+                lines.push(Line::styled(detail, Style::default().fg(DIM)));
+            }
+            lines.push(Line::raw(""));
+
+            let end_line = start_line + 1;
+            if is_sel {
+                focused_start = start_line;
+                focused_end = end_line;
+            }
+        }
+    }
+
+    render_scrollable_content(frame, area, lines, focused_start, focused_end);
+}
+
+fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsState) {
+    let mut lines = Vec::new();
+    let env_count = settings.config_draft.env.vars.len();
+    let mem_count = settings.config_draft.memory.rules.len();
+    let mut focused_start = 0;
+    let mut focused_end = 0;
+
+    let env_header = if env_count > 0 {
+        format!(
+            "  [自定义环境变量 (注入 Shell/Agent 子进程)] [{}/{} 项] (A 添加 · D 删除 · 空格 切换脱敏):",
+            if settings.selected_row < env_count {
+                settings.selected_row + 1
+            } else {
+                env_count
+            },
+            env_count
+        )
+    } else {
+        "  [自定义环境变量 (注入 Shell/Agent 子进程)] (A 添加 · D 删除 · 空格 切换脱敏):"
+            .to_string()
+    };
+
+    lines.push(Line::styled(
+        env_header,
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    if settings.config_draft.env.vars.is_empty() {
+        lines.push(Line::styled(
+            "    (暂无环境变量，按 A 添加)",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        for (i, var) in settings.config_draft.env.vars.iter().enumerate() {
+            let is_sel = i == settings.selected_row;
+            let start_line = lines.len();
+            let pointer = if is_sel { "▶ " } else { "  " };
+            let ptr_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let val_display = if var.sensitive {
+                "sk-************************ (脱敏保护)"
+            } else {
+                &var.value
+            };
+            lines.push(Line::from(vec![
+                Span::styled(pointer, ptr_style),
+                Span::styled(
+                    format!("{:<20}", var.key),
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    val_display,
+                    Style::default().fg(if var.sensitive { MUTED } else { FG }),
+                ),
+            ]));
+            if is_sel {
+                focused_start = start_line;
+                focused_end = start_line;
+            }
+        }
+    }
+
+    lines.push(Line::raw(""));
+
+    let mem_header = if mem_count > 0 {
+        format!(
+            "  [长期用户记忆约定规则 (Memory Rules)] [{}/{} 项] (空格 切换启用/禁用 · Tab 切换作用域 · A/D 增删):",
+            if settings.selected_row >= env_count {
+                settings.selected_row - env_count + 1
+            } else {
+                mem_count
+            },
+            mem_count
+        )
+    } else {
+        "  [长期用户记忆约定规则 (Memory Rules)] (空格 切换启用/禁用 · Tab 切换作用域 · A/D 增删):"
+            .to_string()
+    };
+
+    lines.push(Line::styled(
+        mem_header,
+        Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+    ));
+    if settings.config_draft.memory.rules.is_empty() {
+        lines.push(Line::styled(
+            "    (暂无记忆规则，按 A 添加)",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        for (i, rule) in settings.config_draft.memory.rules.iter().enumerate() {
+            let row_idx = env_count + i;
+            let is_sel = row_idx == settings.selected_row;
+            let start_line = lines.len();
+            let pointer = if is_sel { "▶ " } else { "  " };
+            let ptr_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let status_badge = if rule.enabled {
+                Span::styled("[ ● 开启 ]", Style::default().fg(SUCCESS))
+            } else {
+                Span::styled("[ ○ 关闭 ]", Style::default().fg(DIM))
+            };
+            let scope_badge = match rule.scope.as_str() {
+                "both" => "[全局与项目]",
+                "project" => "[项目级]",
+                _ => "[全局]",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(pointer, ptr_style),
+                status_badge,
+                Span::raw(" "),
+                Span::styled(format!("{:<10}", scope_badge), Style::default().fg(MUTED)),
+                Span::raw(" "),
+                Span::styled(&rule.prompt, Style::default().fg(FG)),
+            ]));
+            if is_sel {
+                focused_start = start_line;
+                focused_end = start_line;
+            }
+        }
+    }
+
+    render_scrollable_content(frame, area, lines, focused_start, focused_end);
+}
+
+fn draw_tab_storage_system(frame: &mut Frame, area: Rect, settings: &CliSettingsState) {
+    let lines = vec![
+        render_setting_row(
+            settings.selected_row == 0,
+            "会话历史保留天数",
+            format!(
+                "◄ [ {} 天 ] ►",
+                settings.config_draft.storage.history_retention_days
+            ),
+            "◄/► 调整 (超过天数的会话自动清理)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 1,
+            "日志记录级别 (Log Level)",
+            format!("◄ [ {} ] ►", settings.config_draft.storage.log_level),
+            "trace / debug / info / warn / error".into(),
+            area.width,
+        ),
+        Line::raw(""),
+        Line::styled(
+            "  [本地存储路径与状态]",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled("配置文件路径 (Config):     ", Style::default().fg(MUTED)),
+            Span::styled(&settings.config_path, Style::default().fg(FG)),
+            Span::styled(" (已就绪)", Style::default().fg(SUCCESS)),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled("服务商密钥文件 (Providers): ", Style::default().fg(MUTED)),
+            Span::styled(&settings.providers_path, Style::default().fg(FG)),
+            Span::styled(" (已就绪)", Style::default().fg(SUCCESS)),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled("会话历史目录 (Sessions):   ", Style::default().fg(MUTED)),
+            Span::styled(&settings.sessions_dir, Style::default().fg(FG)),
+            Span::styled(
+                format!(" (已保存 {} 个会话)", settings.sessions_count),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled("项目级配置覆盖 (Project):  ", Style::default().fg(MUTED)),
+            if settings.has_project_config {
+                Span::styled("已启用项目级配置覆盖", Style::default().fg(SUCCESS))
+            } else {
+                Span::styled(
+                    "未启用项目级配置 (以全局配置为准)",
+                    Style::default().fg(DIM),
+                )
+            },
+        ]),
+    ];
+
+    render_scrollable_content(
+        frame,
+        area,
+        lines,
+        settings.selected_row,
+        settings.selected_row,
+    );
+}
+
+fn draw_discard_modal(frame: &mut Frame, parent: Rect) {
+    let width = 54.min(parent.width);
+    let height = 11.min(parent.height);
+    let area = Rect::new(
+        parent.x + (parent.width.saturating_sub(width)) / 2,
+        parent.y + (parent.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+        .title(Line::styled(
+            " ⚠️ 未保存的设置修改 ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::styled(
+            "检测到设置已被修改但尚未保存！",
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::styled("是否在关闭前保存这些更改？", Style::default().fg(MUTED)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                " [ Enter / Ctrl+S 保存生效 ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(" [ Esc 确认放弃并退出 ] ", Style::default().fg(ERROR)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                " [ 方向键 ←/→ 取消并留在此处 ] ",
+                Style::default().fg(MUTED),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_tab_bar(area_width: u16, current_tab: SettingsTab) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+
+    let all = SettingsTab::all();
+    let active_idx = all.iter().position(|&t| t == current_tab).unwrap_or(0);
+
+    let full_w: usize = all
+        .iter()
+        .map(|t| format!(" {} ", t.title()).width() + 1)
+        .sum();
+    let short_w: usize = all
+        .iter()
+        .map(|t| format!(" {} ", t.short_title()).width() + 1)
+        .sum();
+
+    let title_fn: fn(SettingsTab) -> &'static str = if (area_width as usize) >= full_w {
+        |t| t.title()
+    } else if (area_width as usize) >= short_w {
+        |t| t.short_title()
+    } else {
+        |t| t.compact_title()
+    };
+
+    let titles: Vec<String> = all.iter().map(|&t| format!(" {} ", title_fn(t))).collect();
+    let widths: Vec<usize> = titles.iter().map(|s| s.width()).collect();
+    let total_w: usize = widths.iter().sum::<usize>() + (all.len().saturating_sub(1));
+
+    if total_w <= area_width as usize {
+        let mut spans = Vec::new();
+        for (i, title) in titles.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            if i == active_idx {
+                spans.push(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Rgb(18, 18, 22))
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(title, Style::default().fg(MUTED)));
+            }
+        }
+        return Line::from(spans);
+    }
+
+    let mut start_idx = active_idx;
+    let mut end_idx = active_idx;
+
+    loop {
+        let left_expandable = start_idx > 0;
+        let right_expandable = end_idx + 1 < all.len();
+        if !left_expandable && !right_expandable {
+            break;
+        }
+
+        let mut changed = false;
+
+        if right_expandable {
+            let next_end = end_idx + 1;
+            let arrow_w = (if start_idx > 0 { 2 } else { 0 })
+                + (if next_end + 1 < all.len() { 2 } else { 0 });
+            let span_w: usize =
+                widths[start_idx..=next_end].iter().sum::<usize>() + (next_end - start_idx);
+            if arrow_w + span_w <= area_width as usize {
+                end_idx = next_end;
+                changed = true;
+            }
+        }
+
+        if left_expandable {
+            let next_start = start_idx - 1;
+            let arrow_w = (if next_start > 0 { 2 } else { 0 })
+                + (if end_idx + 1 < all.len() { 2 } else { 0 });
+            let span_w: usize =
+                widths[next_start..=end_idx].iter().sum::<usize>() + (end_idx - next_start);
+            if arrow_w + span_w <= area_width as usize {
+                start_idx = next_start;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    let mut spans = Vec::new();
+    if start_idx > 0 {
+        spans.push(Span::styled(
+            "◄ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    for (rel_i, i) in (start_idx..=end_idx).enumerate() {
+        if rel_i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let title = &titles[i];
+        if i == active_idx {
+            spans.push(Span::styled(
+                title.clone(),
+                Style::default()
+                    .fg(Color::Rgb(18, 18, 22))
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(title.clone(), Style::default().fg(MUTED)));
+        }
+    }
+
+    if end_idx + 1 < all.len() {
+        spans.push(Span::styled(
+            " ►",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn draw_settings_panel(
+    frame: &mut Frame,
+    bounds: Rect,
+    settings: &CliSettingsState,
+    screen: &CliScreen,
+) {
+    if bounds.width < 40 || bounds.height < 6 {
+        return;
+    }
+
+    let width = bounds
+        .width
+        .saturating_sub(2)
+        .clamp(60, 120)
+        .min(bounds.width);
+    let height = bounds
+        .height
+        .saturating_sub(1)
+        .clamp(6, 36)
+        .min(bounds.height);
+    let popup_area = Rect::new(
+        bounds.x + (bounds.width.saturating_sub(width)) / 2,
+        bounds.y + (bounds.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, popup_area);
+
+    let border_color = if settings.dirty { ACCENT } else { DIM };
+    let dirty_badge = if settings.dirty {
+        " [● 已修改] "
+    } else {
+        ""
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " ⚙ 设置中心 (Settings) ",
+            Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            dirty_badge,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(border_color))
+        .title(title);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // Tabs
+        Constraint::Length(1), // Divider
+        Constraint::Min(3),    // Content
+        Constraint::Length(1), // Tip
+        Constraint::Length(1), // Buttons
+        Constraint::Length(1), // Key hints
+    ])
+    .split(inner);
+
+    let tab_line = render_tab_bar(chunks[0].width, settings.tab);
+    frame.render_widget(Paragraph::new(tab_line), chunks[0]);
+
+    let div_str = "─".repeat(chunks[1].width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::styled(div_str, Style::default().fg(DIM))),
+        chunks[1],
+    );
+
+    match settings.tab {
+        SettingsTab::AgentModel => draw_tab_agent_model(frame, chunks[2], settings, screen),
+        SettingsTab::UiWorkflow => draw_tab_ui_workflow(frame, chunks[2], settings, screen),
+        SettingsTab::Subagents => draw_tab_subagents(frame, chunks[2], settings),
+        SettingsTab::ToolsMcp => draw_tab_tools_mcp(frame, chunks[2], settings, screen),
+        SettingsTab::Providers => draw_tab_providers(frame, chunks[2], settings),
+        SettingsTab::EnvMemory => draw_tab_env_memory(frame, chunks[2], settings),
+        SettingsTab::StorageSystem => draw_tab_storage_system(frame, chunks[2], settings),
+    }
+
+    let tip_text = match settings.tab {
+        SettingsTab::AgentModel => "💡 提示: 思考强度用于控制 DeepSeek reasoning / Claude thinking 预算。按 Ctrl+S 立即保存生效。",
+        SettingsTab::UiWorkflow => "💡 提示: 若需使用终端原生划词复制功能，可在此处将鼠标捕获关闭。主题与鼠标即时生效。",
+        SettingsTab::Subagents => "💡 提示: 子任务并发数受本地 CPU 与服务商 API 频率限制，推荐配置为 2~6 个并发。",
+        SettingsTab::ToolsMcp => "💡 提示: MCP 服务器配置存储于 mcp.json，可输入 /mcp 查看详细状态或通过配置文件增删。",
+        SettingsTab::Providers => "💡 提示: 按 Enter 即可快速将高亮服务商切换为全局默认 Provider；按 A 键可打开表单添加服务商。",
+        SettingsTab::EnvMemory => "💡 提示: 标记为脱敏保护的环境变量在终端界面和日志中均会自动遮蔽，保障凭据安全。",
+        SettingsTab::StorageSystem => "💡 提示: 日志级别调整后将在后台日志中实时生效；如需排查详细工具执行流，建议调至 debug 级别。",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(tip_text, Style::default().fg(MUTED))),
+        chunks[3],
+    );
+
+    let buttons = match settings.tab {
+        SettingsTab::Providers => Line::from(vec![
+            Span::styled(
+                " [ A 添加 ] ",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ E 编辑 ] ", Style::default().fg(CODE)),
+            Span::raw(" "),
+            Span::styled(" [ D 删除 ] ", Style::default().fg(ERROR)),
+            Span::raw(" "),
+            Span::styled(
+                " [ S 保存 (Ctrl+S) ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
+        ]),
+        SettingsTab::EnvMemory => Line::from(vec![
+            Span::styled(
+                " [ A 添加 ] ",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ D 删除 ] ", Style::default().fg(ERROR)),
+            Span::raw(" "),
+            Span::styled(" [ Space 切换 ] ", Style::default().fg(ACCENT)),
+            Span::raw(" "),
+            Span::styled(
+                " [ S 保存 (Ctrl+S) ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
+        ]),
+        _ => Line::from(vec![
+            Span::styled(
+                " [ S 保存生效 (Ctrl+S) ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(" [ Esc 放弃退出 ] ", Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled(" [ R 恢复默认 ] ", Style::default().fg(CODE)),
+        ]),
+    };
+    frame.render_widget(Paragraph::new(buttons), chunks[4]);
+
+    let nav_hint = match settings.tab {
+        SettingsTab::Providers => "操作: ↑/↓ 选择服务商 · Enter 设为默认 · A/E/D 管理 · Tab 切换分类 · 1-7 直达分类 · Esc 关闭",
+        SettingsTab::EnvMemory => "操作: ↑/↓ 选择项目 · A/D 增删 · Space 切换脱敏/启用 · Tab 切换分类 · 1-7 直达 · Esc 关闭",
+        _ => "操作: ↑/↓ 选择项目 · ←/→ 微调数值 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(nav_hint, Style::default().fg(DIM))),
+        chunks[5],
+    );
+
+    if settings.pending_discard_confirm {
+        draw_discard_modal(frame, popup_area);
+    }
+}
+
+fn save_settings_state(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    permissions: &Arc<PermissionBroker>,
+) {
+    let Some(settings) = screen.settings.take() else {
+        screen.panel = None;
+        return;
+    };
+    if let Some(r) = runner.as_mut() {
+        let mouse_changed = settings.config_draft.ui.mouse != r.ctx.config.ui.mouse;
+        let new_mouse = settings.config_draft.ui.mouse;
+
+        if let Err(e) = cyber_core::save_config(&settings.config_draft, &r.ctx.paths.config_file) {
+            screen.status = format!("保存配置失败: {e}");
+            screen.panel = None;
+            return;
+        }
+
+        let _ = cyber_core::save_providers(&settings.providers_draft, &r.ctx.paths.providers_file);
+        r.ctx.providers = settings.providers_draft;
+
+        r.ctx.config = settings.config_draft;
+
+        if let Some(mode_str) = &r.ctx.config.agent.permission_mode {
+            if let Some(mode) = PermissionMode::parse(mode_str) {
+                screen.permission_mode = mode;
+                permissions.set_mode(mode);
+            }
+        }
+        screen.effort = r.ctx.config.agent.thinking_intensity;
+
+        if mouse_changed {
+            if new_mouse {
+                let _ = execute!(io::stdout(), EnableMouseCapture);
+            } else {
+                let _ = execute!(io::stdout(), DisableMouseCapture);
+            }
+        }
+
+        screen.sync(r);
+    }
+    screen.panel = None;
+    screen.status = "✔ 设置已保存并立即生效".into();
+}
+
+fn handle_settings_key(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    permissions: &Arc<PermissionBroker>,
+    key: KeyEvent,
+) -> color_eyre::Result<bool> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // F3 or Ctrl+, toggles settings close (with discard protection)
+    if key.code == KeyCode::F(3) || (control && key.code == KeyCode::Char(',')) {
+        if let Some(settings) = screen.settings.as_mut() {
+            if settings.dirty {
+                settings.pending_discard_confirm = true;
+                return Ok(false);
+            }
+        }
+        screen.panel = None;
+        screen.settings = None;
+        return Ok(false);
+    }
+
+    if let Some(settings) = screen.settings.as_mut() {
+        if settings.pending_discard_confirm {
+            match key.code {
+                KeyCode::Esc => {
+                    screen.panel = None;
+                    screen.settings = None;
+                    screen.status = "已放弃未保存修改".into();
+                    return Ok(false);
+                }
+                KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
+                    save_settings_state(screen, runner, permissions);
+                    return Ok(false);
+                }
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('c')
+                | KeyCode::Char('C') => {
+                    settings.pending_discard_confirm = false;
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    if control && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S')) {
+        save_settings_state(screen, runner, permissions);
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Esc {
+        if let Some(settings) = screen.settings.as_mut() {
+            if settings.dirty {
+                settings.pending_discard_confirm = true;
+                return Ok(false);
+            }
+        }
+        screen.panel = None;
+        screen.settings = None;
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+        if let Some(settings) = screen.settings.as_mut() {
+            if shift || key.code == KeyCode::BackTab {
+                settings.prev_tab();
+            } else {
+                settings.next_tab();
+            }
+        }
+        return Ok(false);
+    }
+
+    if let KeyCode::Char(ch @ '1'..='7') = key.code {
+        if let Some(settings) = screen.settings.as_mut() {
+            let tabs = SettingsTab::all();
+            let idx = (ch as usize) - ('1' as usize);
+            if let Some(&tab) = tabs.get(idx) {
+                settings.set_tab(tab);
+            }
+        }
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+        if let Some(settings) = screen.settings.as_mut() {
+            settings.reset_current_tab();
+            screen.status = format!("已将 {} 恢复为默认配置", settings.tab.title());
+        }
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S') {
+        save_settings_state(screen, runner, permissions);
+        return Ok(false);
+    }
+
+    let Some(settings) = screen.settings.as_mut() else {
+        return Ok(false);
+    };
+
+    let max_row = settings.tab.max_row(settings);
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            settings.selected_row = settings.selected_row.saturating_sub(1);
+            return Ok(false);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            settings.selected_row = (settings.selected_row + 1).min(max_row);
+            return Ok(false);
+        }
+        KeyCode::Home => {
+            settings.selected_row = 0;
+            return Ok(false);
+        }
+        KeyCode::End => {
+            settings.selected_row = max_row;
+            return Ok(false);
+        }
+        KeyCode::PageUp => {
+            settings.selected_row = settings.selected_row.saturating_sub(5);
+            return Ok(false);
+        }
+        KeyCode::PageDown => {
+            settings.selected_row = (settings.selected_row + 5).min(max_row);
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    match settings.tab {
+        SettingsTab::AgentModel => match settings.selected_row {
+            0 => {
+                let names = settings.providers_draft.sorted_names();
+                if !names.is_empty() {
+                    let cur_idx = names
+                        .iter()
+                        .position(|n| n == &settings.config_draft.agent.default_provider)
+                        .unwrap_or(0);
+                    let next_idx = match key.code {
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            (cur_idx + names.len() - 1) % names.len()
+                        }
+                        KeyCode::Right
+                        | KeyCode::Char('l')
+                        | KeyCode::Enter
+                        | KeyCode::Char(' ') => (cur_idx + 1) % names.len(),
+                        _ => cur_idx,
+                    };
+                    if next_idx != cur_idx {
+                        settings.config_draft.agent.default_provider = names[next_idx].clone();
+                        settings.dirty = true;
+                    }
+                }
+            }
+            1 => {}
+            2 => {
+                let cur = settings.config_draft.agent.thinking_intensity;
+                let idx = SETTINGS_THINKING_LEVELS
+                    .iter()
+                    .position(|&t| t == cur)
+                    .unwrap_or(1);
+                let next_idx = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        (idx + SETTINGS_THINKING_LEVELS.len() - 1) % SETTINGS_THINKING_LEVELS.len()
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        (idx + 1) % SETTINGS_THINKING_LEVELS.len()
+                    }
+                    _ => idx,
+                };
+                if next_idx != idx {
+                    settings.config_draft.agent.thinking_intensity =
+                        SETTINGS_THINKING_LEVELS[next_idx];
+                    settings.dirty = true;
+                }
+            }
+            3 => {
+                let cur_str = settings
+                    .config_draft
+                    .agent
+                    .permission_mode
+                    .as_deref()
+                    .unwrap_or("auto");
+                let cur_mode = PermissionMode::parse(cur_str).unwrap_or(PermissionMode::Auto);
+                let idx = SETTINGS_PERMISSION_MODES
+                    .iter()
+                    .position(|&m| m == cur_mode)
+                    .unwrap_or(0);
+                let next_idx = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        (idx + SETTINGS_PERMISSION_MODES.len() - 1)
+                            % SETTINGS_PERMISSION_MODES.len()
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        (idx + 1) % SETTINGS_PERMISSION_MODES.len()
+                    }
+                    _ => idx,
+                };
+                if next_idx != idx {
+                    settings.config_draft.agent.permission_mode =
+                        Some(SETTINGS_PERMISSION_MODES[next_idx].code().into());
+                    settings.dirty = true;
+                }
+            }
+            4 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.agent.auto_tool_call =
+                        !settings.config_draft.agent.auto_tool_call;
+                    settings.dirty = true;
+                }
+            }
+            5 => {
+                let step = if shift { 50 } else { 10 };
+                let cur = settings.config_draft.agent.max_steps;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.max_steps = cur.saturating_sub(step).max(1);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.max_steps = (cur + step).min(1000);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            6 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.tools.web_search =
+                        !settings.config_draft.tools.web_search;
+                    settings.dirty = true;
+                }
+            }
+            _ => {}
+        },
+        SettingsTab::UiWorkflow => match settings.selected_row {
+            0 => {
+                let cur = settings.config_draft.ui.theme.as_str();
+                let idx = SETTINGS_THEMES.iter().position(|&t| t == cur).unwrap_or(1);
+                let next_idx = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        (idx + SETTINGS_THEMES.len() - 1) % SETTINGS_THEMES.len()
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        (idx + 1) % SETTINGS_THEMES.len()
+                    }
+                    _ => idx,
+                };
+                if next_idx != idx {
+                    settings.config_draft.ui.theme = SETTINGS_THEMES[next_idx].into();
+                    settings.dirty = true;
+                }
+            }
+            1 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.ui.mouse = !settings.config_draft.ui.mouse;
+                    settings.dirty = true;
+                }
+            }
+            2 => {
+                let cur = settings.config_draft.ui.default_mode.as_str();
+                let idx = SETTINGS_MODES.iter().position(|&m| m == cur).unwrap_or(0);
+                let next_idx = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        (idx + SETTINGS_MODES.len() - 1) % SETTINGS_MODES.len()
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        (idx + 1) % SETTINGS_MODES.len()
+                    }
+                    _ => idx,
+                };
+                if next_idx != idx {
+                    settings.config_draft.ui.default_mode = SETTINGS_MODES[next_idx].into();
+                    settings.dirty = true;
+                }
+            }
+            3 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.ui.animations = !settings.config_draft.ui.animations;
+                    settings.dirty = true;
+                }
+            }
+            4 => {
+                let cur = settings.config_draft.workflow.max_parallel_nodes;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.workflow.max_parallel_nodes =
+                            cur.saturating_sub(1).max(1);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.workflow.max_parallel_nodes = (cur + 1).min(64);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            5 => {
+                let cur = settings.config_draft.workflow.default_timeout_secs;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.workflow.default_timeout_secs =
+                            cur.saturating_sub(60).max(10);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.workflow.default_timeout_secs = (cur + 60).min(86400);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            6 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.workflow.checkpoint =
+                        !settings.config_draft.workflow.checkpoint;
+                    settings.dirty = true;
+                }
+            }
+            _ => {}
+        },
+        SettingsTab::Subagents => match settings.selected_row {
+            0 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.agent.subagents.enabled =
+                        !settings.config_draft.agent.subagents.enabled;
+                    settings.dirty = true;
+                }
+            }
+            1 => {
+                let cur = settings.config_draft.agent.subagents.max_tasks;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.subagents.max_tasks =
+                            cur.saturating_sub(1).max(1);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.subagents.max_tasks = (cur + 1).min(64);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            2 => {
+                let cur = settings.config_draft.agent.subagents.max_parallel;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.subagents.max_parallel =
+                            cur.saturating_sub(1).max(1);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.subagents.max_parallel = (cur + 1).min(16);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            3 => {
+                let cur = settings.config_draft.agent.subagents.timeout_secs;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.subagents.timeout_secs =
+                            cur.saturating_sub(30).max(10);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.subagents.timeout_secs = (cur + 30).min(3600);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            4 => {
+                let cur = settings.config_draft.agent.subagents.max_steps;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.subagents.max_steps =
+                            cur.saturating_sub(5).max(5);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.subagents.max_steps = (cur + 5).min(100);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        },
+        SettingsTab::ToolsMcp => match settings.selected_row {
+            0 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.tools.prefer_docker =
+                        !settings.config_draft.tools.prefer_docker;
+                    settings.dirty = true;
+                }
+            }
+            1 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    screen.ctf_enabled = !screen.ctf_enabled;
+                    if let Some(r) = runner.as_mut() {
+                        r.ctf_enabled = screen.ctf_enabled;
+                    }
+                    settings.dirty = true;
+                }
+            }
+            _ => {}
+        },
+        SettingsTab::Providers => {
+            let names = settings.providers_draft.sorted_names();
+            if let Some(name) = names.get(settings.selected_row) {
+                match key.code {
+                    KeyCode::Enter => {
+                        settings.config_draft.agent.default_provider = name.clone();
+                        settings.dirty = true;
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if let Some(r) = runner.as_mut() {
+                            if let Ok(CliAction::Form(form)) =
+                                cli_commands::execute(r, "/provider add")
+                            {
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if let Some(r) = runner.as_mut() {
+                            if let Ok(CliAction::Form(form)) =
+                                cli_commands::execute(r, &format!("/provider edit {name}"))
+                            {
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') if names.len() > 1 => {
+                        let deleted_name = name.clone();
+                        settings.providers_draft.providers.remove(&deleted_name);
+                        if settings.config_draft.agent.default_provider == deleted_name {
+                            if let Some(first) = settings.providers_draft.sorted_names().first() {
+                                settings.config_draft.agent.default_provider = first.clone();
+                            }
+                        }
+                        settings.dirty = true;
+                        if settings.selected_row >= settings.providers_draft.providers.len() {
+                            settings.selected_row =
+                                settings.providers_draft.providers.len().saturating_sub(1);
+                        }
+                    }
+                    _ => {}
+                }
+            } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
+                if let Some(r) = runner.as_mut() {
+                    if let Ok(CliAction::Form(form)) = cli_commands::execute(r, "/provider add") {
+                        screen.form = Some(FormState::new(form));
+                        screen.panel = None;
+                    }
+                }
+            }
+        }
+        SettingsTab::EnvMemory => {
+            let env_len = settings.config_draft.env.vars.len();
+            if settings.selected_row < env_len {
+                match key.code {
+                    KeyCode::Char(' ') => {
+                        if let Some(var) = settings
+                            .config_draft
+                            .env
+                            .vars
+                            .get_mut(settings.selected_row)
+                        {
+                            var.sensitive = !var.sensitive;
+                            settings.dirty = true;
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        settings.config_draft.env.vars.remove(settings.selected_row);
+                        settings.dirty = true;
+                        let max_r = settings.tab.max_row(settings);
+                        settings.selected_row = settings.selected_row.min(max_r);
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        let new_key = format!("CUSTOM_VAR_{}", env_len + 1);
+                        settings.config_draft.env.vars.push(EnvVar {
+                            key: new_key,
+                            value: "value".into(),
+                            sensitive: false,
+                        });
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            } else {
+                let rule_idx = settings.selected_row - env_len;
+                if let Some(rule) = settings.config_draft.memory.rules.get_mut(rule_idx) {
+                    match key.code {
+                        KeyCode::Char(' ') | KeyCode::Enter => {
+                            rule.enabled = !rule.enabled;
+                            settings.dirty = true;
+                        }
+                        KeyCode::Tab => {
+                            rule.scope = match rule.scope.as_str() {
+                                "both" => "project".into(),
+                                "project" => "global".into(),
+                                _ => "both".into(),
+                            };
+                            settings.dirty = true;
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            settings.config_draft.memory.rules.remove(rule_idx);
+                            settings.dirty = true;
+                            let max_r = settings.tab.max_row(settings);
+                            settings.selected_row = settings.selected_row.min(max_r);
+                        }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            settings.config_draft.memory.rules.push(MemoryRule {
+                                enabled: true,
+                                scope: "both".into(),
+                                prompt: "新记忆规则".into(),
+                            });
+                            settings.dirty = true;
+                        }
+                        _ => {}
+                    }
+                } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
+                    settings.config_draft.memory.rules.push(MemoryRule {
+                        enabled: true,
+                        scope: "both".into(),
+                        prompt: "新记忆规则".into(),
+                    });
+                    settings.dirty = true;
+                }
+            }
+        }
+        SettingsTab::StorageSystem => match settings.selected_row {
+            0 => {
+                let cur = settings.config_draft.storage.history_retention_days;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.storage.history_retention_days =
+                            cur.saturating_sub(5).max(1);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.storage.history_retention_days = (cur + 5).min(3650);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            1 => {
+                let cur = settings.config_draft.storage.log_level.as_str();
+                let idx = SETTINGS_LOG_LEVELS
+                    .iter()
+                    .position(|&l| l == cur)
+                    .unwrap_or(2);
+                let next_idx = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        (idx + SETTINGS_LOG_LEVELS.len() - 1) % SETTINGS_LOG_LEVELS.len()
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        (idx + 1) % SETTINGS_LOG_LEVELS.len()
+                    }
+                    _ => idx,
+                };
+                if next_idx != idx {
+                    settings.config_draft.storage.log_level = SETTINGS_LOG_LEVELS[next_idx].into();
+                    settings.dirty = true;
+                }
+            }
+            _ => {}
+        },
+    }
+
+    Ok(false)
+}
+
 #[derive(Default)]
 struct WrappedViewport {
     width: u16,
@@ -2779,6 +4737,9 @@ fn handle_key(
         screen.needs_clear = true;
         return Ok(false);
     }
+    if screen.panel == Some(Panel::Settings) {
+        return handle_settings_key(screen, runner, permissions, key);
+    }
     if screen.approval.is_none() && key.code == KeyCode::Esc {
         if screen.form.take().is_some() || screen.picker.take().is_some() {
             screen.delete_pending = None;
@@ -2821,6 +4782,29 @@ fn handle_key(
             screen.panel = Some(Panel::Ctf);
         } else {
             screen.message("CTF", "CTF 模式未开启（可输入 /ctf enable 开启）", MUTED);
+        }
+        return Ok(false);
+    }
+    if (control && key.code == KeyCode::Char(',')) || key.code == KeyCode::F(3) {
+        if screen.panel == Some(Panel::Settings) {
+            if let Some(settings) = screen.settings.as_mut() {
+                if settings.dirty {
+                    settings.pending_discard_confirm = true;
+                    return Ok(false);
+                }
+            }
+            screen.panel = None;
+            screen.settings = None;
+        } else {
+            if let Some(r) = runner.as_ref() {
+                screen.settings = Some(CliSettingsState::from_runner(r));
+            } else {
+                screen.settings = Some(CliSettingsState::new(
+                    &Config::default(),
+                    &ProvidersConfig::default(),
+                ));
+            }
+            screen.panel = Some(Panel::Settings);
         }
         return Ok(false);
     }
@@ -3465,6 +5449,17 @@ fn apply_action(
                 &format!("已切换审批模式为：{}", mode.label()),
                 ACCENT,
             );
+        }
+        CliAction::Settings => {
+            if let Some(owner) = runner.as_ref() {
+                screen.settings = Some(CliSettingsState::from_runner(owner));
+            } else {
+                screen.settings = Some(CliSettingsState::new(
+                    &Config::default(),
+                    &ProvidersConfig::default(),
+                ));
+            }
+            screen.panel = Some(Panel::Settings);
         }
     }
     Ok(false)
@@ -5831,5 +7826,730 @@ mod tests {
 
         let _ = active.take().unwrap().await;
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_approves_delegate_tasks_without_popup() {
+        let (broker, mut requests) = PermissionBroker::interactive();
+        assert_eq!(
+            broker.mode(),
+            PermissionMode::Auto,
+            "interactive 默认必须是 Auto 模式"
+        );
+
+        let delegate_call_args = serde_json::json!({
+            "tasks": [
+                {
+                    "name": "sub1",
+                    "system_prompt": "analyze",
+                    "task": "check security",
+                    "tools": ["read_file"]
+                }
+            ]
+        });
+
+        // 在 Auto 模式下调用 delegate_tasks
+        let authorized = broker
+            .authorize("delegate_tasks", &delegate_call_args)
+            .await;
+        assert!(authorized, "Auto 模式下 delegate_tasks 必须自动放行");
+        assert!(
+            requests.try_recv().is_err(),
+            "Auto 模式下绝对不应向 requests 通道发送弹窗请求"
+        );
+    }
+
+    fn settings_key_with_runner(
+        screen: &mut CliScreen,
+        runner: &mut Option<SessionRunner>,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            screen,
+            KeyEvent::new(code, modifiers),
+            runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn settings_panel_open_via_action_and_key() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        // 1. Slash command execution -> CliAction::Settings
+        let action = cli_commands::execute(runner_opt.as_mut().unwrap(), "/settings").unwrap();
+        assert!(matches!(action, CliAction::Settings));
+
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner_opt,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.settings.is_some());
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+
+        // 2. Close via Esc when clean
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+        assert!(screen.settings.is_none());
+
+        // 3. Open via F3
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.settings.is_some());
+
+        // 4. Toggle close via F3
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+
+        // 5. Open via Ctrl+,
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(','),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+    }
+
+    #[tokio::test]
+    async fn settings_tab_navigation_and_direct_keys() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        // Open settings
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+
+        // Tab forward cycling
+        let expected_tabs = [
+            SettingsTab::UiWorkflow,
+            SettingsTab::Subagents,
+            SettingsTab::ToolsMcp,
+            SettingsTab::Providers,
+            SettingsTab::EnvMemory,
+            SettingsTab::StorageSystem,
+            SettingsTab::AgentModel,
+        ];
+        for expected in expected_tabs {
+            settings_key_with_runner(
+                &mut screen,
+                &mut runner_opt,
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            );
+            assert_eq!(screen.settings.as_ref().unwrap().tab, expected);
+            assert_eq!(screen.settings.as_ref().unwrap().selected_row, 0);
+        }
+
+        // Shift+Tab backward cycling
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::StorageSystem
+        );
+
+        // Direct keys 1-7
+        let direct_keys = [
+            ('1', SettingsTab::AgentModel),
+            ('2', SettingsTab::UiWorkflow),
+            ('3', SettingsTab::Subagents),
+            ('4', SettingsTab::ToolsMcp),
+            ('5', SettingsTab::Providers),
+            ('6', SettingsTab::EnvMemory),
+            ('7', SettingsTab::StorageSystem),
+        ];
+        for (ch, expected) in direct_keys {
+            settings_key_with_runner(
+                &mut screen,
+                &mut runner_opt,
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            );
+            assert_eq!(screen.settings.as_ref().unwrap().tab, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_in_place_value_adjustments() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Tab 1: AgentModel
+        // Row 2: Thinking intensity
+        screen.settings.as_mut().unwrap().selected_row = 2;
+        let orig_effort = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .thinking_intensity;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        let new_effort = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .thinking_intensity;
+        assert_ne!(orig_effort, new_effort);
+        assert!(screen.settings.as_ref().unwrap().dirty);
+
+        // Row 4: Auto tool call toggle
+        screen.settings.as_mut().unwrap().selected_row = 4;
+        let orig_tool = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .auto_tool_call;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .auto_tool_call,
+            !orig_tool
+        );
+
+        // Row 5: Max steps increment
+        screen.settings.as_mut().unwrap().selected_row = 5;
+        let orig_steps = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .max_steps;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .max_steps,
+            orig_steps + 10
+        );
+
+        // Shift+Right -> +50
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .max_steps,
+            orig_steps + 60
+        );
+
+        // Reset tab via 'r'
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .max_steps,
+            500
+        );
+
+        // Tab 2: UiWorkflow
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('2'),
+            KeyModifiers::NONE,
+        );
+        // Row 0: Theme
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        let orig_theme = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .ui
+            .theme
+            .clone();
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_ne!(
+            orig_theme,
+            screen.settings.as_ref().unwrap().config_draft.ui.theme
+        );
+
+        // Tab 3: Subagents
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+        );
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        let orig_sub = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .subagents
+            .enabled;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .subagents
+                .enabled,
+            !orig_sub
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_unsaved_discard_guard() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Make dirty
+        screen.settings.as_mut().unwrap().selected_row = 4;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().dirty);
+
+        // First Esc: triggers pending_discard_confirm, does not close
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.settings.as_ref().unwrap().pending_discard_confirm);
+
+        // Verify rendered modal
+        let rendered = render(&mut screen, 100, 30);
+        assert!(rendered.contains("Enter / Ctrl+S"));
+
+        // Arrow key cancels discard confirm
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        );
+        assert!(!screen.settings.as_ref().unwrap().pending_discard_confirm);
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
+        // First Esc again -> pending_discard_confirm
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().pending_discard_confirm);
+
+        // Second Esc -> confirms discard and exits
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+        assert!(screen.settings.is_none());
+        assert_eq!(screen.status, "已放弃未保存修改");
+    }
+
+    #[tokio::test]
+    async fn settings_save_and_persist() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Change thinking intensity to Max
+        screen
+            .settings
+            .as_mut()
+            .unwrap()
+            .config_draft
+            .agent
+            .thinking_intensity = ThinkingIntensity::Max;
+        screen.settings.as_mut().unwrap().dirty = true;
+
+        // Save with Ctrl+S
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        );
+
+        assert_eq!(screen.panel, None);
+        assert!(screen.settings.is_none());
+        assert!(screen.status.contains("已保存并立即生效"));
+
+        // Verify memory state updated
+        let r = runner_opt.as_ref().unwrap();
+        assert_eq!(
+            r.ctx.config.agent.thinking_intensity,
+            ThinkingIntensity::Max
+        );
+        assert_eq!(screen.effort, ThinkingIntensity::Max);
+
+        // Verify disk file updated
+        let saved_cfg: Config =
+            toml::from_str(&std::fs::read_to_string(&r.ctx.paths.config_file).unwrap()).unwrap();
+        assert_eq!(saved_cfg.agent.thinking_intensity, ThinkingIntensity::Max);
+    }
+
+    #[tokio::test]
+    async fn settings_panel_rendering_all_tabs() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        for tab_idx in 1..=7 {
+            let ch = char::from_digit(tab_idx, 10).unwrap();
+            settings_key_with_runner(
+                &mut screen,
+                &mut runner_opt,
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            );
+
+            for (w, h) in [(80, 24), (100, 30), (120, 35)] {
+                let rendered = render(&mut screen, w, h);
+                assert!(
+                    rendered.contains("Settings"),
+                    "w={w}, h={h} should contain title"
+                );
+                assert!(
+                    rendered.contains(ch),
+                    "w={w}, h={h} should display active tab number {ch}"
+                );
+                assert!(rendered.contains("Esc"), "should display bottom buttons");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_tab_7_focus_following_and_rendering() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Switch to Tab 7
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('7'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::StorageSystem
+        );
+
+        // Render at narrow 80x24, 100x30, and wide 120x35
+        for (w, h) in [(80, 24), (100, 30), (120, 35)] {
+            let rendered = render(&mut screen, w, h);
+            assert!(
+                rendered.contains("7.") || rendered.contains("存储"),
+                "w={w}, h={h} must show tab 7 in tab bar"
+            );
+            assert!(
+                rendered.contains("Log Level") || rendered.contains("日志"),
+                "w={w}, h={h} must show tab 7 content"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_provider_and_env_vertical_focus_following() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // 1. Providers Tab vertical focus following
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::Providers
+        );
+
+        // Add 8 providers so content is long (2 + 8 * 3 = 26 lines)
+        let settings = screen.settings.as_mut().unwrap();
+        for i in 1..=8 {
+            let name = format!("prov_test_{:02}", i);
+            settings.providers_draft.providers.insert(
+                name.clone(),
+                cyber_core::ProviderConfig {
+                    kind: "openai".into(),
+                    base_url: format!("https://api.p{:02}.com", i),
+                    api_key: "sk-test".into(),
+                    model: format!("model-{:02}", i),
+                    max_tokens: 4096,
+                    temperature: 0.7,
+                    price: None,
+                    models: std::collections::HashMap::new(),
+                    chat_endpoint: None,
+                    models_endpoint: None,
+                },
+            );
+        }
+
+        // Navigate down to the last provider
+        let last_idx = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .providers_draft
+            .providers
+            .len()
+            - 1;
+        for _ in 0..last_idx {
+            settings_key_with_runner(
+                &mut screen,
+                &mut runner_opt,
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            );
+        }
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, last_idx);
+
+        // In height 20 (content area height only ~9 lines), prov_test_08 must be rendered and visible!
+        let rendered_bottom = render(&mut screen, 80, 20);
+        assert!(
+            rendered_bottom.contains("prov_test_08"),
+            "focused bottom provider must be visible in scrolled view: {rendered_bottom}"
+        );
+        assert!(
+            rendered_bottom.contains("model-08"),
+            "focused bottom provider details must be visible: {rendered_bottom}"
+        );
+
+        // Navigate up to provider 0
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Home,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 0);
+
+        let rendered_top = render(&mut screen, 80, 20);
+        let first_name = &screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .providers_draft
+            .sorted_names()[0];
+        assert!(
+            rendered_top.contains(first_name),
+            "focused top provider must be visible: {rendered_top}"
+        );
+
+        // 2. Env & Memory Tab vertical focus following
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('6'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::EnvMemory
+        );
+
+        let settings = screen.settings.as_mut().unwrap();
+        for i in 1..=8 {
+            settings.config_draft.env.vars.push(cyber_core::EnvVar {
+                key: format!("VAR_KEY_{:02}", i),
+                value: format!("val_{:02}", i),
+                sensitive: false,
+            });
+        }
+        for i in 1..=4 {
+            settings
+                .config_draft
+                .memory
+                .rules
+                .push(cyber_core::MemoryRule {
+                    enabled: true,
+                    scope: "both".into(),
+                    prompt: format!("memory rule prompt {:02}", i),
+                });
+        }
+
+        // Navigate to the last memory rule
+        let total_items =
+            settings.config_draft.env.vars.len() + settings.config_draft.memory.rules.len();
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::End,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().selected_row,
+            total_items - 1
+        );
+
+        let rendered_mem = render(&mut screen, 80, 20);
+        assert!(
+            rendered_mem.contains("memory rule prompt 04"),
+            "focused last memory rule must be visible: {rendered_mem}"
+        );
     }
 }

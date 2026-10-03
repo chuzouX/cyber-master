@@ -30,6 +30,7 @@ pub(crate) enum CliAction {
     Quit,
     Mode(cyber_agent::PermissionMode),
     TodoVisibility(bool),
+    Settings,
 }
 
 pub struct CommandForm {
@@ -80,11 +81,17 @@ const EFFORT: CommandSpec = CommandSpec {
     usage: "/effort [low|medium|high|xhigh|auto]",
     desc: "Alias for /think",
 };
+const SESSION: CommandSpec = CommandSpec {
+    name: "/session",
+    usage: "/session [id|list|read|new]",
+    desc: "打开指令面板",
+};
 pub fn commands() -> Vec<&'static CommandSpec> {
     slash::COMMANDS
         .iter()
         .filter(|c| c.name != "/mode")
         .chain(std::iter::once(&EFFORT))
+        .chain(std::iter::once(&SESSION))
         .collect()
 }
 fn output(title: &str, text: impl Into<String>) -> CliAction {
@@ -727,6 +734,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         SlashCommand::Sessions(args) => sessions(runner, &args)?,
         SlashCommand::Memory(args) => memory(runner, &args)?,
         SlashCommand::Todo(args) => todo_cmd(runner, &args)?,
+        SlashCommand::Settings => CliAction::Settings,
         SlashCommand::Mode(_) => {
             bail!("/mode is not available in CLI");
         }
@@ -920,8 +928,13 @@ fn sessions(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     match sub.to_ascii_lowercase().as_str() {
         "" | "list" => {
             let _ = runner.save();
+            let current_title = runner
+                .index
+                .current_meta()
+                .map(|m| m.title.as_str())
+                .unwrap_or("默认会话");
             Ok(CliAction::Picker(CommandPicker {
-                title: "Sessions".into(),
+                title: format!("Sessions · {current_title}"),
                 kind: PickerKind::Sessions,
                 items: runner
                     .index
@@ -1358,12 +1371,26 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
         return Vec::new();
     }
     if !input.contains(char::is_whitespace) {
+        let current_session_title = runner
+            .and_then(|r| r.index.current_meta())
+            .map(|m| m.title.clone());
         return commands()
             .into_iter()
             .filter(|c| c.name.starts_with(&input.to_ascii_lowercase()))
-            .map(|c| CompletionItem {
-                value: format!("{} ", c.name),
-                description: c.desc.into(),
+            .map(|c| {
+                let description = if c.name == "/session" || c.name == "/sessions" {
+                    if let Some(title) = &current_session_title {
+                        format!("{} · {}", c.desc, title)
+                    } else {
+                        c.desc.into()
+                    }
+                } else {
+                    c.desc.into()
+                };
+                CompletionItem {
+                    value: format!("{} ", c.name),
+                    description,
+                }
             })
             .collect();
     }
@@ -1397,7 +1424,7 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
     if cmd == "/mcp" && head.is_empty() {
         values.push("connect".into());
     }
-    if cmd == "/sessions" && head.is_empty() {
+    if (cmd == "/sessions" || cmd == "/session") && head.is_empty() {
         values.push("delete".into());
     }
     if cmd == "/memory" && head.eq_ignore_ascii_case("rule") {
@@ -1425,7 +1452,7 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
                 values.push(p.model.clone());
             }
         }
-        if cmd == "/sessions"
+        if (cmd == "/sessions" || cmd == "/session")
             && (head.is_empty()
                 || ["read", "delete"]
                     .iter()
@@ -1449,17 +1476,26 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
     values
         .into_iter()
         .filter(|s| s.to_lowercase().starts_with(&prefix.to_lowercase()))
-        .map(|s| CompletionItem {
-            value: if head.is_empty() {
-                format!("{cmd} {s} ")
+        .map(|s| {
+            let description = if cmd == "/sessions" || cmd == "/session" {
+                runner
+                    .and_then(|r| r.index.get(&s))
+                    .map(|m| m.title.clone())
+                    .unwrap_or_else(|| cmd.clone())
             } else {
-                format!("{cmd} {head} {s} ")
-            },
-            description: cmd.clone(),
+                cmd.clone()
+            };
+            CompletionItem {
+                value: if head.is_empty() {
+                    format!("{cmd} {s} ")
+                } else {
+                    format!("{cmd} {head} {s} ")
+                },
+                description,
+            }
         })
         .collect()
 }
-
 pub async fn run_task(
     runner: &mut SessionRunner,
     task: CliTask,
@@ -1499,7 +1535,8 @@ mod tests {
     #[tokio::test]
     async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 21);
+        assert_eq!(commands().len(), 23);
+        assert!(commands().iter().any(|c| c.name == "/settings"));
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
             if let Err(error) = execute(&mut runner, &command.name.to_uppercase()) {
@@ -1582,6 +1619,34 @@ mod tests {
             execute(&mut runner, "/effort").unwrap(),
             CliAction::Output { .. }
         ));
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn session_command_and_completion_displays_session_title() {
+        let mut runner = test_runner().await;
+        let s_id = runner.index.current.clone();
+        if let Some(m) = runner.index.get_mut(&s_id) {
+            m.title = "测试渗透会话".into();
+        }
+
+        // 1. Completion when typing "/session" shows title behind description
+        let comps = suggestions(Some(&runner), "/session");
+        let session_comp = comps.iter().find(|c| c.value == "/session ").unwrap();
+        assert!(session_comp.description.contains("测试渗透会话"));
+        assert!(session_comp.description.starts_with("打开指令面板"));
+
+        // 2. Completion when typing "/session " shows session title in description
+        let arg_comps = suggestions(Some(&runner), "/session ");
+        let item_comp = arg_comps.iter().find(|c| c.value.contains(&s_id)).unwrap();
+        assert_eq!(item_comp.description, "测试渗透会话");
+
+        // 3. Executing "/session" opens Picker with title containing session title
+        let action = execute(&mut runner, "/session").unwrap();
+        let CliAction::Picker(picker) = action else {
+            panic!("expected picker");
+        };
+        assert!(picker.title.contains("测试渗透会话"));
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 

@@ -127,6 +127,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "结构化任务清单：list 查看 / add 添加 / done 完成 / clear 清空 / close 收起 / open 展开",
     },
     CommandSpec {
+        name: "/settings",
+        usage: "/settings",
+        desc: "打开设置中心面板",
+    },
+    CommandSpec {
         name: "/quit",
         usage: "/quit",
         desc: "退出 Cyber Master",
@@ -223,6 +228,8 @@ pub enum SlashCommand {
     Memory(String),
     /// `/todo [list|add <title>|done <id>|clear]` — 结构化任务清单管理。
     Todo(String),
+    /// `/settings` — 打开设置中心面板。
+    Settings,
     /// `/quit` — 退出。
     Quit,
     /// 未知命令（含原始命令名）。
@@ -258,6 +265,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/sessions" | "/session" => SlashCommand::Sessions(args.to_string()),
         "/memory" => SlashCommand::Memory(args.to_string()),
         "/todo" => SlashCommand::Todo(args.to_string()),
+        "/settings" => SlashCommand::Settings,
         "/quit" => SlashCommand::Quit,
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
     }
@@ -285,6 +293,7 @@ pub const HELP_TEXT: &str = "\
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
   /memory <sub>      记忆管理：list | add | project | edit | delete | rule
   /todo <sub>        任务管理：list | add <title> | done <id> | clear | close | open
+  /settings          打开设置中心面板
   /quit              退出 Cyber Master";
 
 #[cfg(test)]
@@ -295,6 +304,11 @@ mod tests {
     fn parse_help() {
         assert_eq!(parse("/help"), SlashCommand::Help);
         assert_eq!(parse("/help  "), SlashCommand::Help); // 尾空格 trim
+    }
+    #[test]
+    fn parse_settings() {
+        assert_eq!(parse("/settings"), SlashCommand::Settings);
+        assert_eq!(parse("/settings  "), SlashCommand::Settings);
     }
 
     #[test]

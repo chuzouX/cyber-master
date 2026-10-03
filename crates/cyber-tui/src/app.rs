@@ -2640,6 +2640,9 @@ impl App {
             SlashCommand::Todo(args) => {
                 self.handle_todo_slash(&args);
             }
+            SlashCommand::Settings => {
+                self.handle_action(Action::OpenSettings);
+            }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
                     "未知命令：{name}（输入 /help 查看可用命令）"
