@@ -395,6 +395,8 @@ pub struct App {
     agent_tx: UnboundedSender<(u64, AgentEvent)>,
     /// 当前 agent 任务句柄；cancel/新提交时 abort 旧任务，避免事件交错。
     agent_handle: Option<JoinHandle<()>>,
+    /// 当前运行中 agent 的导向通道发送端（用于在思考/执行期间追加指示）。
+    steering_tx: Option<cyber_agent::SteeringSender>,
     /// generation 计数器：每次 spawn/cancel 递增，事件携带 gen，TUI 据此忽略 stale 事件。
     generation: u64,
     /// 模型拉取结果回传通道（clone 给每次 fetch 任务），第 4 路 select! 分支。
@@ -523,6 +525,7 @@ impl App {
             chat: ChatState::new(),
             agent_tx,
             agent_handle: None,
+            steering_tx: None,
             generation: 0,
             fetch_tx,
             provider_form: None,
@@ -691,6 +694,7 @@ impl App {
         if let Some(handle) = self.agent_handle.take() {
             handle.abort();
         }
+        self.steering_tx = None;
         self.generation = self.generation.wrapping_add(1);
         if let Some(request) = self.pending_permission.take() {
             let _ = request.reply.send(PermissionDecision::Deny);
@@ -871,7 +875,15 @@ impl App {
     /// Chat 模式按键分发（文本输入态）。
     fn handle_chat_key(&mut self, k: KeyEvent) {
         if self.pending_permission.is_some() {
-            use crossterm::event::KeyCode;
+            use crossterm::event::{KeyCode, KeyModifiers};
+            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                if let Some(req) = self.pending_permission.take() {
+                    let _ = req.reply.send(PermissionDecision::Deny);
+                }
+                self.permission_choice = None;
+                self.cancel_active_turn();
+                return;
+            }
             match k.code {
                 KeyCode::Char('1') => self.permission_choice = Some(ApprovalChoice::Once),
                 KeyCode::Char('2') => self.permission_choice = Some(ApprovalChoice::Session),
@@ -950,16 +962,52 @@ impl App {
                     let text = self.chat.take_input();
                     self.chat.update_slash_menu(); // 输入已清空 → 关闭菜单
                     self.handle_slash_command(&text);
+                } else if self.chat.streaming {
+                    // 流式期平滑追加（不打断）
+                    let text = self.chat.take_input();
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        self.chat
+                            .entries
+                            .push(ChatEntry::User(format!("{} (追加)", trimmed)));
+                        if let Some(tx) = &self.steering_tx {
+                            let _ = tx.send(trimmed.to_string());
+                        }
+                        self.toast = Some("已追加指示，模型将在下一步骤读取".into());
+                    }
+                } else if let Some((text, history)) = self.chat.submit() {
+                    self.spawn_agent(text, history);
+                }
+            }
+            ChatAction::SubmitImmediate => {
+                let peek: String = self.chat.input.lines().join("\n");
+                if peek.trim_start().starts_with('/') {
+                    let text = self.chat.take_input();
+                    self.chat.update_slash_menu();
+                    self.handle_slash_command(&text);
+                } else if self.chat.streaming {
+                    // 流式期立即打断并读取新指示
+                    let text = self.chat.take_input();
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        self.cancel_active_turn();
+                        let history = self.chat.history();
+                        self.chat.entries.push(ChatEntry::User(trimmed.to_string()));
+                        self.chat.streaming = true;
+                        self.chat.streaming_buffer.clear();
+                        self.chat.thinking_buffer.clear();
+                        self.chat.scroll_to_bottom();
+                        self.spawn_agent(trimmed.to_string(), history);
+                        self.toast = Some("已立即打断并让 AI 读取新指示".into());
+                    }
                 } else if let Some((text, history)) = self.chat.submit() {
                     self.spawn_agent(text, history);
                 }
             }
             ChatAction::Newline => {
-                // Shift/Alt+Enter 或 Ctrl+J：透传给 textarea 插入换行
-                if !self.chat.streaming {
-                    self.chat.input.input(k);
-                    self.chat.update_slash_menu();
-                }
+                // Shift+Enter 或 Ctrl+J：透传给 textarea 插入换行
+                self.chat.input.input(k);
+                self.chat.update_slash_menu();
             }
             ChatAction::Back => {
                 if self.chat.streaming {
@@ -1004,32 +1052,26 @@ impl App {
             ChatAction::ScrollLineDown => self.chat.scroll_history(1),
             ChatAction::HistoryPrev => {
                 // 空输入框时呼出更早的已发送消息；未呼出（非空/无历史）→ 交 textarea 移光标
-                if !self.chat.streaming {
-                    if self.chat.history_prev() {
-                        // 历史浏览态：关闭斜杠菜单，避免菜单拦截后续 Up/Down
-                        self.chat.slash_menu.close();
-                    } else {
-                        self.chat.input.input(k);
-                        self.chat.update_slash_menu();
-                    }
+                if !self.chat.streaming && self.chat.history_prev() {
+                    // 历史浏览态：关闭斜杠菜单，避免菜单拦截后续 Up/Down
+                    self.chat.slash_menu.close();
+                } else {
+                    self.chat.input.input(k);
+                    self.chat.update_slash_menu();
                 }
             }
             ChatAction::HistoryNext => {
                 // 浏览态呼出更新；非浏览态 → 交 textarea 移光标
-                if !self.chat.streaming {
-                    if self.chat.history_next() {
-                        self.chat.slash_menu.close();
-                    } else {
-                        self.chat.input.input(k);
-                        self.chat.update_slash_menu();
-                    }
-                }
-            }
-            ChatAction::Input => {
-                if !self.chat.streaming {
+                if !self.chat.streaming && self.chat.history_next() {
+                    self.chat.slash_menu.close();
+                } else {
                     self.chat.input.input(k);
                     self.chat.update_slash_menu();
                 }
+            }
+            ChatAction::Input => {
+                self.chat.input.input(k);
+                self.chat.update_slash_menu();
             }
         }
     }
@@ -1083,6 +1125,9 @@ impl App {
                 is_error,
             } => {
                 if self.chat.streaming {
+                    if name.eq_ignore_ascii_case("todo") && !is_error {
+                        self.chat.todo_closed = false;
+                    }
                     self.chat.push_tool_result(id, name, output, is_error);
                 }
             }
@@ -1129,6 +1174,7 @@ impl App {
                 }
                 if self.chat.streaming {
                     self.chat.finalize_stream();
+                    self.steering_tx = None;
                     // 任务自然结束，清理句柄（abort 对已完成任务是 no-op，置 None 更整洁）
                     self.agent_handle = None;
                     self.save_history();
@@ -1205,7 +1251,13 @@ impl App {
                         .push(ChatEntry::System(format!("压缩失败: {m}")));
                 }
                 self.agent_handle = None;
+                self.steering_tx = None;
                 self.toast = Some(format!("生成失败: {m}"));
+            }
+            AgentEvent::SteeringReceived(content) => {
+                self.chat
+                    .entries
+                    .push(ChatEntry::System(format!("已接收追加指令: {content}")));
             }
         }
     }
@@ -1605,6 +1657,8 @@ impl App {
         )
         .load_all();
         let permissions = self.permissions.clone();
+        let (s_tx, s_rx) = cyber_agent::steering_channel();
+        self.steering_tx = Some(s_tx);
         let handle = tokio::spawn(async move {
             run_stream_with_permissions(
                 config,
@@ -1621,6 +1675,7 @@ impl App {
                 intensity,
                 memory,
                 permissions,
+                Some(s_rx),
             )
             .await;
         });
@@ -1868,6 +1923,7 @@ impl App {
         let rest = parts.next().unwrap_or("").trim();
         match sub.as_str() {
             "" | "list" => {
+                self.save_history();
                 self.sessions_panel.refresh(&self.sessions);
                 self.form_prev_mode = Mode::Chat;
                 self.mode = Mode::Sessions;
@@ -2631,6 +2687,7 @@ impl App {
                         .entries
                         .push(ChatEntry::System("用法：/todo add <任务标题>".into()));
                 } else {
+                    self.chat.todo_closed = false;
                     let next_num = todos
                         .iter()
                         .filter_map(|t| t.id.parse::<usize>().ok())
@@ -2678,6 +2735,18 @@ impl App {
                         .push(ChatEntry::System("用法：/todo done <任务编号>".into()));
                 }
             }
+            "close" | "hide" => {
+                self.chat.todo_closed = true;
+                self.chat.entries.push(ChatEntry::System(
+                    "任务清单已收起（输入 /todo open 重新展开）".into(),
+                ));
+            }
+            "open" | "show" => {
+                self.chat.todo_closed = false;
+                self.chat
+                    .entries
+                    .push(ChatEntry::System("任务清单已展开".into()));
+            }
             "clear" => {
                 todos.clear();
                 let _ = crate::history::save_todos(
@@ -2692,7 +2761,7 @@ impl App {
             }
             other => {
                 self.chat.entries.push(ChatEntry::System(format!(
-                    "未知子命令：{other}（用法：/todo [list|add <title>|done <id>|clear]）"
+                    "未知子命令：{other}（用法：/todo [list|add <title>|done <id>|clear|close|open]）"
                 )));
             }
         }
@@ -3566,7 +3635,7 @@ impl App {
             self.theme.border
         };
         let title = if self.chat.streaming {
-            " 生成中… "
+            " 思考生成中… (Enter 追加 · Alt+Enter 立即打断并读取) "
         } else {
             " 输入 "
         };
@@ -4033,6 +4102,12 @@ impl App {
                     .providers
                     .get(&self.config.agent.default_provider)
                     .and_then(|p| p.effective_price());
+                let todos = self
+                    .registries
+                    .todos
+                    .lock()
+                    .map(|l| l.clone())
+                    .unwrap_or_default();
                 // 检查是否显示 CTF 面板
                 if self.ctf_enabled && self.ctf_panel_visible {
                     let challenges = self
@@ -4069,6 +4144,7 @@ impl App {
                             &self.usage,
                             effective_price,
                             &self.context_usage,
+                            &todos,
                         );
                         ctf_panel::render(
                             frame,
@@ -4093,6 +4169,7 @@ impl App {
                         &self.usage,
                         effective_price,
                         &self.context_usage,
+                        &todos,
                     );
                 }
             }
@@ -4359,23 +4436,40 @@ impl App {
         frame.render_widget(Clear, popup_area);
         frame.render_widget(block, popup_area);
 
+        let mut tool_header_spans = vec![
+            Span::styled(
+                " TOOL ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                &request.tool,
+                Style::default()
+                    .fg(self.theme.fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !request.risk_reason.is_empty() {
+            tool_header_spans.push(Span::raw("  "));
+            let conf_pct = (request.confidence * 100.0).clamp(0.0, 100.0);
+            let badge_color = if request.confidence >= 0.70 {
+                Color::Rgb(137, 210, 129)
+            } else if request.confidence >= 0.40 {
+                Color::Rgb(240, 180, 80)
+            } else {
+                Color::Rgb(252, 58, 75)
+            };
+            tool_header_spans.push(Span::styled(
+                format!("[安全置信度: {conf_pct:.0}%] {}", request.risk_reason),
+                Style::default().fg(badge_color),
+            ));
+        }
+
         let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    " TOOL ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(self.theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    &request.tool,
-                    Style::default()
-                        .fg(self.theme.fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(tool_header_spans),
             Line::default(),
             Line::from(button_spans),
             Line::styled(
@@ -4627,8 +4721,8 @@ fn parse_sgr(codes: &str, base: Style, theme: &Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use cyber_core::{Config, ProvidersConfig};
-
     #[test]
     fn strip_tool_call_tags_removes_function_calls_block() {
         let text = "# Writeup\n\n<function_calls>\n<invoke name=\"list_dir\">\n<parameter name=\"path\">.cyber/ctf/web</parameter>\n</invoke>\n</function_calls>\n\n## 解题过程\n";
@@ -5711,12 +5805,12 @@ mod tests {
 
         let mut app = make_app(Mode::Chat, temp_config_path());
         let (reply, mut rx) = oneshot::channel();
-        app.pending_permission = Some(PermissionRequest {
-            tool: "shell".into(),
-            arguments: serde_json::json!({"command": "ls -la"}),
-            nonce: "test-nonce".into(),
+        app.pending_permission = Some(PermissionRequest::new(
+            "shell".into(),
+            serde_json::json!({"command": "ls -la"}),
+            "test-nonce".into(),
             reply,
-        });
+        ));
 
         // Render modal dialog
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
@@ -5731,6 +5825,29 @@ mod tests {
         assert!(app.pending_permission.is_none());
         assert_eq!(rx.try_recv().unwrap(), PermissionDecision::AllowSession);
     }
+    #[tokio::test]
+    async fn ctrl_c_during_pending_permission_in_tui_denies_and_cancels() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio::sync::oneshot;
+
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        app.agent_handle = Some(tokio::spawn(std::future::pending::<()>()));
+        let (reply, mut rx) = oneshot::channel();
+        app.pending_permission = Some(PermissionRequest::new(
+            "shell".into(),
+            serde_json::json!({"command": "rm -rf dangerous"}),
+            "test-nonce".into(),
+            reply,
+        ));
+
+        // Press Ctrl+C -> should deny request and cancel turn
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.pending_permission.is_none());
+        assert_eq!(rx.try_recv().unwrap(), PermissionDecision::Deny);
+        assert!(app.agent_handle.is_none());
+        assert!(!app.chat.streaming);
+    }
 
     #[tokio::test]
     async fn cancel_stream_clears_queued_subagent_permissions() {
@@ -5743,21 +5860,21 @@ mod tests {
         app.agent_handle = Some(tokio::spawn(std::future::pending::<()>()));
 
         let (current_reply, mut current_rx) = oneshot::channel();
-        app.pending_permission = Some(PermissionRequest {
-            tool: "read_file".into(),
-            arguments: serde_json::json!({"path": "one"}),
-            nonce: "current".into(),
-            reply: current_reply,
-        });
+        app.pending_permission = Some(PermissionRequest::new(
+            "read_file".into(),
+            serde_json::json!({"path": "one"}),
+            "current".into(),
+            current_reply,
+        ));
         let (queued_reply, mut queued_rx) = oneshot::channel();
         let (permission_tx, mut permission_rx) = mpsc::unbounded_channel();
         permission_tx
-            .send(PermissionRequest {
-                tool: "read_file".into(),
-                arguments: serde_json::json!({"path": "two"}),
-                nonce: "queued".into(),
-                reply: queued_reply,
-            })
+            .send(PermissionRequest::new(
+                "read_file".into(),
+                serde_json::json!({"path": "two"}),
+                "queued".into(),
+                queued_reply,
+            ))
             .unwrap();
 
         app.handle_chat_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -5826,5 +5943,92 @@ mod tests {
         let persisted_on: Config =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(persisted_on.tools.web_search);
+    }
+
+    #[test]
+    fn streaming_input_unlocked_and_can_type() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+
+        // 1. 验证流式期间打字解锁
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        if let Some(text) = app.chat.paste_detector.flush() {
+            app.chat.paste(&text);
+        }
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        if let Some(text) = app.chat.paste_detector.flush() {
+            app.chat.paste(&text);
+        }
+        // Shift+Enter 换行
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        if let Some(text) = app.chat.paste_detector.flush() {
+            app.chat.paste(&text);
+        }
+        assert_eq!(app.chat.input.lines().join("\n"), "hi\n!");
+
+        // 2. 验证动态标题在流式和非流式下的呈现
+        app.style_chat_input();
+        assert!(app.chat.streaming);
+        app.chat.streaming = false;
+        app.style_chat_input();
+        assert!(!app.chat.streaming);
+    }
+
+    #[test]
+    fn streaming_submit_appends_and_sends_to_steering_channel() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        let (tx, mut rx) = cyber_agent::steering_channel();
+        app.steering_tx = Some(tx);
+
+        app.chat.input.insert_str("追加的新问题");
+        // 按无修饰 Enter 触发流式平滑追加
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // 输入框被清空
+        assert!(app.chat.input.lines().join("\n").is_empty());
+        // 历史区添加 [user] (追加) 气泡
+        assert!(matches!(
+            app.chat.entries.last(),
+            Some(ChatEntry::User(c)) if c.contains("追加的新问题 (追加)")
+        ));
+        // 导向通道收到追加文本
+        assert_eq!(rx.try_recv(), Ok("追加的新问题".to_string()));
+        // 界面展示 Toast
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("已追加指示，模型将在下一步骤读取")
+        );
+        // 仍然保持 streaming 状态
+        assert!(app.chat.streaming);
+    }
+
+    #[tokio::test]
+    async fn streaming_submit_immediate_cancels_and_spawns_new() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        app.chat.streaming_buffer.push_str("已生成的部分回答");
+
+        app.chat.input.insert_str("紧急打断的新指示");
+        // 按 Alt+Enter 触发立即打断并读取
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+
+        // 输入框被清空
+        assert!(app.chat.input.lines().join("\n").is_empty());
+        // Toast 提示
+        assert_eq!(app.toast.as_deref(), Some("已立即打断并让 AI 读取新指示"));
+        // 已生成的部分回答被保留归档为 Assistant
+        assert!(app.chat.entries.iter().any(|e| matches!(
+            e,
+            ChatEntry::Assistant(a) if a.contains("已生成的部分回答")
+        )));
+        // 新问题记录为 User
+        assert!(app.chat.entries.iter().any(|e| matches!(
+            e,
+            ChatEntry::User(u) if u == "紧急打断的新指示"
+        )));
+        // 新任务已启动（处于 streaming）
+        assert!(app.chat.streaming);
     }
 }

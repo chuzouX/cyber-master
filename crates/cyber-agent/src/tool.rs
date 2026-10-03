@@ -482,6 +482,7 @@ mod tests {
         let mut inner = ToolRegistry::new();
         inner.register(Box::new(CountingTool(count.clone())));
         let (broker, mut requests) = crate::PermissionBroker::interactive();
+        broker.set_mode(crate::PermissionMode::Manual);
         let registry = Arc::new(ToolRegistry::with_permissions(
             Arc::new(inner),
             Arc::new(broker),

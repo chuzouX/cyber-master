@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -160,6 +160,12 @@ struct ToolCard {
     end: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueuedPrompt {
+    pub text: String,
+    pub displayed: bool,
+}
+
 struct CliScreen {
     provider: String,
     model: String,
@@ -195,7 +201,7 @@ struct CliScreen {
     approval_visible: bool,
     panel: Option<Panel>,
     ctf_enabled: bool,
-    ctf_challenges: Vec<cyber_core::CtfChallenge>,
+    ctf_challenges: Arc<std::sync::Mutex<Vec<cyber_core::CtfChallenge>>>,
     ctf_selected: usize,
     ctf_detail_view: bool,
     ctf_detail_scroll: usize,
@@ -219,7 +225,11 @@ struct CliScreen {
     thinking_started: Option<std::time::Instant>,
     has_run: bool,
     todos: Arc<std::sync::Mutex<Vec<cyber_core::TodoItem>>>,
+    pub todo_closed: bool,
     last_window_title: String,
+    pub needs_clear: bool,
+    pub queued_prompts: std::collections::VecDeque<QueuedPrompt>,
+    pub active_steering_tx: Option<cyber_agent::SteeringSender>,
 }
 
 struct FormState {
@@ -352,7 +362,11 @@ impl CliScreen {
             approval_visible: false,
             panel: None,
             ctf_enabled: runner.ctf_enabled,
-            ctf_challenges: runner.challenges().unwrap_or_default(),
+            ctf_challenges: runner
+                .registries
+                .ctf_challenges
+                .clone()
+                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             ctf_selected: 0,
             ctf_detail_view: false,
             ctf_detail_scroll: 0,
@@ -387,7 +401,11 @@ impl CliScreen {
             thinking_started: None,
             todos: Arc::clone(&runner.registries.todos),
             has_run: false,
+            todo_closed: false,
             last_window_title: String::new(),
+            needs_clear: false,
+            queued_prompts: std::collections::VecDeque::new(),
+            active_steering_tx: None,
         };
         screen.sync(runner);
         screen
@@ -423,9 +441,12 @@ impl CliScreen {
             .map(|meta| meta.title.clone())
             .unwrap_or_else(|| "新会话".into());
         self.ctf_enabled = runner.ctf_enabled;
-        self.ctf_challenges = runner.challenges().unwrap_or_default();
-        if self.ctf_selected >= self.ctf_challenges.len() {
-            self.ctf_selected = self.ctf_challenges.len().saturating_sub(1);
+        if let Some(challenges) = &runner.registries.ctf_challenges {
+            self.ctf_challenges = Arc::clone(challenges);
+        }
+        let challenge_count = self.ctf_challenges_count();
+        if self.ctf_selected >= challenge_count {
+            self.ctf_selected = challenge_count.saturating_sub(1);
         }
         let mut recent = runner
             .index
@@ -599,6 +620,7 @@ impl CliScreen {
             ToolCardState::Success
         };
         self.replace_tool_card(index, self.tool_width());
+        self.needs_clear = true;
     }
 
     fn toggle_tools(&mut self) {
@@ -777,6 +799,19 @@ impl CliScreen {
             .unwrap_or_default();
         format!("Todo: [{completed}/{total}]{active_desc}")
     }
+    fn ctf_challenges_list(&self) -> Vec<cyber_core::CtfChallenge> {
+        self.ctf_challenges
+            .lock()
+            .map(|list| list.clone())
+            .unwrap_or_default()
+    }
+
+    fn ctf_challenges_count(&self) -> usize {
+        self.ctf_challenges
+            .lock()
+            .map(|list| list.len())
+            .unwrap_or(0)
+    }
 
     fn footer(&self) -> String {
         let todo_sum = self.todo_summary();
@@ -876,6 +911,9 @@ impl CliScreen {
                 is_error,
             } => {
                 self.has_run = true;
+                if name.eq_ignore_ascii_case("todo") && !is_error {
+                    self.todo_closed = false;
+                }
                 self.tool_result(&id, &name, &output, is_error);
             }
             AgentEvent::ContextUpdate {
@@ -904,6 +942,10 @@ impl CliScreen {
             AgentEvent::Compacting { .. } => {
                 self.has_run = true;
                 self.status = "Compacting context".into();
+            }
+            AgentEvent::SteeringReceived(text) => {
+                self.queued_prompts.retain(|q| q.text != text);
+                self.status = "已读取追加指示".into();
             }
             AgentEvent::Done => {
                 self.busy = false;
@@ -992,21 +1034,41 @@ impl CliScreen {
             button_spans.push(Span::raw(" "));
             button_spans.extend(button("3", "Deny", ApprovalChoice::Deny, ERROR));
 
+            let mut tool_header_spans = vec![
+                Span::styled(
+                    " TOOL ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(AMBER)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    clean(&request.tool),
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !request.risk_reason.is_empty() {
+                tool_header_spans.push(Span::raw("  "));
+                let conf_pct = (request.confidence * 100.0).clamp(0.0, 100.0);
+                let badge_color = if request.confidence >= 0.70 {
+                    SUCCESS
+                } else if request.confidence >= 0.40 {
+                    AMBER
+                } else {
+                    ERROR
+                };
+                tool_header_spans.push(Span::styled(
+                    format!(
+                        "[安全置信度: {conf_pct:.0}%] {}",
+                        clean(&request.risk_reason)
+                    ),
+                    Style::default().fg(badge_color),
+                ));
+            }
+
             vec![
-                Line::from(vec![
-                    Span::styled(
-                        " TOOL ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(AMBER)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        clean(&request.tool),
-                        Style::default().fg(FG).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
+                Line::from(tool_header_spans),
                 Line::default(),
                 Line::from(button_spans),
                 Line::styled(
@@ -1074,9 +1136,19 @@ impl CliScreen {
         } else {
             normal_header
         };
+        let todo_items = self.todos.lock().map(|g| g.clone()).unwrap_or_default();
+        let show_todo_table = !self.todo_closed && !todo_items.is_empty();
+        let todo_height = if show_todo_table {
+            (todo_items.len() as u16 + 2)
+                .clamp(3, 7)
+                .min(area.height.saturating_sub(header_height + input_height + 4))
+        } else {
+            0
+        };
         let sections = Layout::vertical([
             Constraint::Length(header_height),
             Constraint::Min(0),
+            Constraint::Length(todo_height),
             Constraint::Length(input_height + 1),
             Constraint::Length(1),
         ])
@@ -1167,7 +1239,10 @@ impl CliScreen {
                 .collect::<Vec<_>>();
             frame.render_widget(Paragraph::new(lines), menu);
         }
-        let input_area = sections[2];
+        if show_todo_table && sections[2].height >= 2 {
+            draw_todo_table(frame, sections[2], &todo_items);
+        }
+        let input_area = sections[3];
         let border = if self.approval.is_some() || self.form.is_some() || self.busy {
             ACCENT
         } else {
@@ -1221,7 +1296,7 @@ impl CliScreen {
         }
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(DIM)),
-            sections[3],
+            sections[4],
         );
         if let Some(request) = &self.approval {
             if self.approval_nonce != request.nonce {
@@ -1336,7 +1411,7 @@ impl CliScreen {
                         frame,
                         popup_area,
                         &CLI_THEME,
-                        &self.ctf_challenges,
+                        &self.ctf_challenges_list(),
                         self.ctf_selected,
                         self.ctf_detail_view,
                         self.ctf_detail_scroll,
@@ -1509,9 +1584,26 @@ impl CliScreen {
 }
 
 fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect()
+    if !text.contains('\r') {
+        return text
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect();
+    }
+    text.split('\n')
+        .map(|line| {
+            let effective = if line.contains('\r') {
+                line.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("")
+            } else {
+                line
+            };
+            effective
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\t')
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn single_line(text: &str) -> String {
@@ -2134,6 +2226,91 @@ fn effort_color(effort: ThinkingIntensity) -> Color {
     }
 }
 
+fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]) {
+    if area.height < 2 || area.width < 10 {
+        return;
+    }
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|i| i.status == cyber_core::TodoStatus::Completed)
+        .count();
+    let in_progress = items
+        .iter()
+        .filter(|i| i.status == cyber_core::TodoStatus::InProgress)
+        .count();
+
+    let border_color = if in_progress > 0 {
+        ACCENT
+    } else if completed == total && total > 0 {
+        SUCCESS
+    } else {
+        DIM
+    };
+
+    let title = format!(" 📋 任务清单 [{completed}/{total}] · 输入 /todo close 收起 ");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_lines = inner.height as usize;
+    if max_lines == 0 {
+        return;
+    }
+
+    let will_truncate = items.len() > max_lines;
+    let display_count = if will_truncate {
+        max_lines.saturating_sub(1)
+    } else {
+        items.len().min(max_lines)
+    };
+
+    let mut lines = Vec::with_capacity(max_lines);
+    for item in items.iter().take(display_count) {
+        let (symbol, color) = match item.status {
+            cyber_core::TodoStatus::Pending => ("[ ]", MUTED),
+            cyber_core::TodoStatus::InProgress => ("[>]", ACCENT),
+            cyber_core::TodoStatus::Completed => ("[x]", SUCCESS),
+            cyber_core::TodoStatus::Failed => ("[!]", ERROR),
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {symbol} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("#{} ", item.id), Style::default().fg(MUTED)),
+            Span::styled(clean(&item.title), Style::default().fg(FG)),
+        ];
+        if let Some(notes) = &item.notes {
+            if !notes.trim().is_empty() {
+                spans.push(Span::styled(
+                    format!(" (备注: {})", clean(notes)),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if will_truncate {
+        let remaining = items.len().saturating_sub(display_count);
+        lines.push(Line::from(vec![Span::styled(
+            format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）"),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        )]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
 fn draw_composer(
     frame: &mut Frame,
     area: Rect,
@@ -2400,6 +2577,7 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     let mut screen = CliScreen::new(&runner);
     let mut runner = Some(runner);
     let (broker, mut requests) = PermissionBroker::interactive();
+    broker.set_mode(screen.permission_mode);
     let permissions = Arc::new(broker);
     let (event_tx, mut agent_events) = mpsc::unbounded_channel();
     let mut active: Option<ActiveTurn> = None;
@@ -2421,6 +2599,10 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                         screen.completion_closed = false;
                         screen.completion_accepted = false;
                         screen.update_completions(runner.as_ref());
+                    }
+                    if screen.needs_clear {
+                        terminal.clear()?;
+                        screen.needs_clear = false;
                     }
                     terminal.draw(|frame| screen.draw(frame))?;
                 }
@@ -2459,6 +2641,19 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                     screen.reply(PermissionDecision::Deny);
                     screen.busy = false;
                     screen.status.clear();
+                    screen.active_steering_tx = None;
+                    if let Some(next_prompt) = screen.queued_prompts.pop_front() {
+                        spawn_turn(
+                            &mut screen,
+                            &mut runner,
+                            next_prompt.text,
+                            next_prompt.displayed,
+                            &permissions,
+                            &event_tx,
+                            &mut active,
+                            &mut cancel,
+                        );
+                    }
                 }
                 event = events.next() => {
                     match event {
@@ -2503,10 +2698,11 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                     if screen.panel == Some(Panel::Ctf) {
                                         if screen.ctf_detail_view {
                                             screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(3);
-                                        } else if !screen.ctf_challenges.is_empty()
-                                            && screen.ctf_selected + 1 < screen.ctf_challenges.len()
-                                        {
-                                            screen.ctf_selected += 1;
+                                        } else {
+                                            let len = screen.ctf_challenges_count();
+                                            if len > 0 && screen.ctf_selected + 1 < len {
+                                                screen.ctf_selected += 1;
+                                            }
                                         }
                                     } else if screen.approval.is_some() {
                                         screen.approval_scroll = screen
@@ -2535,9 +2731,14 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     if let Some(cancel) = cancel {
         let _ = cancel.send(());
     }
-    if let Some(active) = active {
-        if let Ok((restored, _)) = active.await {
-            runner = Some(restored);
+    if let Some(mut active) = active {
+        match tokio::time::timeout(Duration::from_millis(1000), &mut active).await {
+            Ok(Ok((restored, _))) => {
+                runner = Some(restored);
+            }
+            _ => {
+                active.abort();
+            }
         }
     }
     if let Some(owner) = &runner {
@@ -2574,6 +2775,10 @@ fn handle_key(
     {
         return Ok(true);
     }
+    if control && key.code == KeyCode::Char('l') {
+        screen.needs_clear = true;
+        return Ok(false);
+    }
     if screen.approval.is_none() && key.code == KeyCode::Esc {
         if screen.form.take().is_some() || screen.picker.take().is_some() {
             screen.delete_pending = None;
@@ -2603,8 +2808,11 @@ fn handle_key(
             screen.ctf_detail_view = false;
             screen.ctf_detail_scroll = 0;
         } else if screen.ctf_enabled {
-            if let Some(r) = runner.as_ref() {
-                screen.ctf_challenges = r.challenges().unwrap_or_default();
+            if let Some(challenges) = runner
+                .as_ref()
+                .and_then(|r| r.registries.ctf_challenges.as_ref())
+            {
+                screen.ctf_challenges = Arc::clone(challenges);
             }
             screen.ctf_selected = 0;
             screen.ctf_detail_view = false;
@@ -2617,7 +2825,7 @@ fn handle_key(
         return Ok(false);
     }
     if screen.panel == Some(Panel::Ctf) {
-        let len = screen.ctf_challenges.len();
+        let len = screen.ctf_challenges_count();
         match key.code {
             KeyCode::Up | KeyCode::Char('8') => {
                 if screen.ctf_detail_view {
@@ -2655,7 +2863,9 @@ fn handle_key(
         }
         return Ok(false);
     }
-    if (control && key.code == KeyCode::Char('c')) || key.code == KeyCode::Esc {
+    let is_ctrl_c = control && key.code == KeyCode::Char('c');
+    let is_esc = key.code == KeyCode::Esc;
+    if is_ctrl_c || is_esc {
         if screen.approval.is_none() && (screen.form.is_some() || screen.picker.is_some()) {
             screen.form = None;
             screen.picker = None;
@@ -2665,9 +2875,16 @@ fn handle_key(
         screen.reply(PermissionDecision::Deny);
         if let Some(cancel) = cancel.take() {
             let _ = cancel.send(());
-            screen.status = "Cancelling".into();
+            if is_ctrl_c {
+                screen.queued_prompts.clear();
+                screen.status = "Cancelling (按 Ctrl+C 强制退出)".into();
+            } else {
+                screen.status = "Cancelling".into();
+            }
+        } else if is_ctrl_c && (screen.busy || screen.status.contains("Cancelling")) {
+            return Ok(true);
         } else if !screen.busy {
-            if screen.input.is_empty() && control {
+            if screen.input.is_empty() && is_ctrl_c {
                 return Ok(true);
             }
             screen.input = composer();
@@ -2995,43 +3212,94 @@ fn handle_key(
         screen.panel = Some(Panel::Shortcuts);
         return Ok(false);
     }
-    if key.code != KeyCode::Enter
-        || key
-            .modifiers
-            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
-    {
-        if key.code == KeyCode::Enter {
-            screen.input.insert_newline();
-        } else {
-            screen.input.input(key);
-        }
+    let is_enter = key.code == KeyCode::Enter;
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let has_alt_or_ctrl = key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+
+    if !is_enter {
+        screen.input.input(key);
         screen.completion_closed = false;
         screen.completion_accepted = false;
         screen.completion_selected = 0;
         screen.update_completions(runner.as_ref());
         return Ok(false);
     }
+
+    if has_shift {
+        screen.input.insert_newline();
+        screen.completion_closed = false;
+        screen.completion_accepted = false;
+        screen.completion_selected = 0;
+        screen.update_completions(runner.as_ref());
+        return Ok(false);
+    }
+
     let text = screen.input.lines().join("\n");
     let text = text.trim();
     if text.is_empty() {
         return Ok(false);
     }
+
     if screen.busy {
-        match text {
-            value if value.eq_ignore_ascii_case("/quit") => return Ok(true),
-            value if value.eq_ignore_ascii_case("/cancel") => {
-                screen.input = composer();
-                screen.completions.clear();
-                screen.reply(PermissionDecision::Deny);
-                if let Some(tx) = cancel.take() {
-                    let _ = tx.send(());
-                }
-                screen.status = "Cancelling".into();
-            }
-            _ => {}
+        if text.eq_ignore_ascii_case("/quit") {
+            return Ok(true);
         }
-        return Ok(false);
+        if text.eq_ignore_ascii_case("/cancel") {
+            screen.input = composer();
+            screen.completions.clear();
+            screen.reply(PermissionDecision::Deny);
+            if let Some(tx) = cancel.take() {
+                let _ = tx.send(());
+            }
+            screen.status = "Cancelling".into();
+            return Ok(false);
+        }
+        if text.starts_with('/') {
+            return Ok(false);
+        }
+
+        if has_alt_or_ctrl {
+            // Alt+Enter / Ctrl+Enter: 即时导向（立刻打断当前生成并读取新指示）
+            screen.input = composer();
+            screen.completions.clear();
+            screen.message("You (立刻打断)", text, ACCENT);
+            screen.prompt_history.push(text.to_owned());
+            screen.history_index = None;
+            screen.saved_draft.clear();
+            screen.scroll = 0;
+            screen.status = "已立即打断并读取新指示…".into();
+            screen.reply(PermissionDecision::Deny);
+            if let Some(tx) = cancel.take() {
+                let _ = tx.send(());
+            }
+            screen.queued_prompts.push_back(QueuedPrompt {
+                text: text.to_owned(),
+                displayed: true,
+            });
+            return Ok(false);
+        } else {
+            // Enter 无修饰键：平滑追加（不打断）
+            screen.input = composer();
+            screen.completions.clear();
+            screen.message("You (追加)", text, ACCENT);
+            screen.prompt_history.push(text.to_owned());
+            screen.history_index = None;
+            screen.saved_draft.clear();
+            screen.scroll = 0;
+            screen.status = "已追加指示（下一步自动读取）".into();
+            if let Some(tx) = &screen.active_steering_tx {
+                let _ = tx.send(text.to_owned());
+            }
+            screen.queued_prompts.push_back(QueuedPrompt {
+                text: text.to_owned(),
+                displayed: true,
+            });
+            return Ok(false);
+        }
     }
+
     screen.input = composer();
     screen.completions.clear();
     if text.starts_with('/') {
@@ -3053,31 +3321,59 @@ fn handle_key(
         }
         return Ok(false);
     }
+
+    spawn_turn(
+        screen,
+        runner,
+        text.to_string(),
+        false,
+        permissions,
+        events,
+        active,
+        cancel,
+    );
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_turn(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    prompt: String,
+    displayed: bool,
+    permissions: &Arc<PermissionBroker>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    active: &mut Option<ActiveTurn>,
+    cancel: &mut Option<oneshot::Sender<()>>,
+) -> bool {
     let Some(mut owned) = runner.take() else {
-        return Ok(false);
+        return false;
     };
-    screen.message("You", text, ACCENT);
-    screen.prompt_history.push(text.to_owned());
-    screen.history_index = None;
-    screen.saved_draft.clear();
-    screen.scroll = 0;
+    if !displayed {
+        screen.message("You", &prompt, ACCENT);
+        screen.prompt_history.push(prompt.clone());
+        screen.history_index = None;
+        screen.saved_draft.clear();
+        screen.scroll = 0;
+    }
     screen.has_run = true;
     screen.busy = true;
     screen.thinking_started = Some(std::time::Instant::now());
     screen.status = "Working".into();
-    let text = text.to_owned();
     let permissions = permissions.clone();
     let events = events.clone();
     let (tx, rx) = oneshot::channel();
     *cancel = Some(tx);
+    let (s_tx, s_rx) = cyber_agent::steering_channel();
+    screen.active_steering_tx = Some(s_tx);
     let intensity = screen.effort;
     *active = Some(tokio::spawn(async move {
         let outcome = owned
-            .run_turn_ui(text, intensity, permissions, events, rx)
+            .run_turn_ui(prompt, intensity, permissions, events, rx, Some(s_rx))
             .await;
         (owned, outcome)
     }));
-    Ok(false)
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3091,7 +3387,20 @@ fn apply_action(
     cancel: &mut Option<oneshot::Sender<()>>,
 ) -> color_eyre::Result<bool> {
     match action {
-        CliAction::Output { title, text } => screen.message(&title, &text, MUTED),
+        CliAction::Output { title, text } => {
+            if title == "Todo" && text.contains("已添加任务") {
+                screen.todo_closed = false;
+            }
+            screen.message(&title, &text, MUTED);
+        }
+        CliAction::TodoVisibility(open) => {
+            screen.todo_closed = !open;
+            if open {
+                screen.status = "任务清单已展开".into();
+            } else {
+                screen.status = "任务清单已收起（输入 /todo open 重新展开）".into();
+            }
+        }
         CliAction::Refresh {
             message,
             reset_usage,
@@ -3597,6 +3906,8 @@ mod tests {
             arguments: serde_json::json!({"command": "echo safe"}),
             nonce: "request-code".into(),
             reply,
+            confidence: 0.0,
+            risk_reason: String::new(),
         });
         screen.insert_text("once request-code\n/quit\n");
         screen.update_completions(None);
@@ -3635,6 +3946,88 @@ mod tests {
         assert!(screen.busy);
         let _ = std::fs::remove_dir_all(owner.cwd);
     }
+    #[tokio::test]
+    async fn ctrl_c_cancels_busy_task_and_second_ctrl_c_forces_exit() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = true;
+        screen.queued_prompts.push_back(QueuedPrompt {
+            text: "queued text".into(),
+            displayed: true,
+        });
+        let (tx, mut cancel_rx) = oneshot::channel();
+        let mut cancel = Some(tx);
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        // First Ctrl+C: cancels the running task, clears queued prompts, does not exit yet
+        let quit = handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut None,
+            &Arc::new(PermissionBroker::deny_all()),
+            &events,
+            &mut None,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(!quit);
+        assert_eq!(cancel_rx.try_recv(), Ok(()));
+        assert!(cancel.is_none());
+        assert!(screen.queued_prompts.is_empty());
+        assert!(screen.status.contains("Cancelling"));
+
+        // Second Ctrl+C while busy / cancelling: forces immediate exit!
+        let quit = handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut None,
+            &Arc::new(PermissionBroker::deny_all()),
+            &events,
+            &mut None,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(quit);
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_idle_behavior_clears_then_exits() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = false;
+        screen.insert_text("some draft");
+        let (events, _rx) = mpsc::unbounded_channel();
+        let mut cancel = None;
+
+        // First Ctrl+C with text: clears composer, does not exit
+        let quit = handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut None,
+            &Arc::new(PermissionBroker::deny_all()),
+            &events,
+            &mut None,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(!quit);
+        assert!(screen.input.is_empty());
+
+        // Second Ctrl+C with empty input: immediately exits!
+        let quit = handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut None,
+            &Arc::new(PermissionBroker::deny_all()),
+            &events,
+            &mut None,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(quit);
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
 
     #[tokio::test]
     async fn approval_number_selects_scope_and_enter_confirms() {
@@ -3646,6 +4039,8 @@ mod tests {
             arguments: serde_json::json!({"path": "report.md"}),
             nonce: "request-code".into(),
             reply,
+            confidence: 0.0,
+            risk_reason: String::new(),
         });
         render(&mut screen, 100, 24);
         assert!(screen.approval_visible);
@@ -3671,6 +4066,8 @@ mod tests {
             arguments: serde_json::json!({"command": "rm -rf tmp"}),
             nonce: "nonce".into(),
             reply,
+            confidence: 0.0,
+            risk_reason: String::new(),
         });
         render(&mut screen, 90, 24);
         // Press 3 directly selects Deny button
@@ -3801,7 +4198,7 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         let mut cancel = Some(tx);
         let mut active = None;
-        for text in ["ordinary text", "/new", "/model", "/compact"] {
+        for text in ["/new", "/model", "/compact"] {
             screen.input = composer();
             screen.insert_text(text);
             assert!(!handle_key(
@@ -3818,6 +4215,49 @@ mod tests {
             assert!(active.is_none());
             assert!(cancel.is_some());
         }
+        // 普通文本在 busy 时按 Enter：平滑追加到 queued_prompts，清空输入框
+        screen.input = composer();
+        screen.insert_text("ordinary text");
+        assert!(!handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut None,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel
+        )
+        .unwrap());
+        assert!(screen.input.lines().join("\n").is_empty());
+        assert_eq!(screen.queued_prompts.len(), 1);
+        assert_eq!(screen.queued_prompts[0].text, "ordinary text");
+        assert_eq!(screen.status, "已追加指示（下一步自动读取）");
+        assert!(active.is_none());
+        assert!(cancel.is_some());
+
+        // 普通文本在 busy 时按 Alt+Enter：立即打断并记录
+        screen.input = composer();
+        screen.insert_text("steer text");
+        assert!(!handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            &mut None,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel
+        )
+        .unwrap());
+        assert!(screen.input.lines().join("\n").is_empty());
+        assert_eq!(screen.queued_prompts.len(), 2);
+        assert_eq!(screen.queued_prompts[1].text, "steer text");
+        assert_eq!(screen.status, "已立即打断并读取新指示…");
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert!(cancel.is_none());
+        // Recreate cancel channel for subsequent /cancel check
+        let (new_tx, new_rx) = oneshot::channel();
+        cancel = Some(new_tx);
+        rx = new_rx;
         screen.input = composer();
         screen.insert_text("/cancel");
         handle_key(
@@ -3963,6 +4403,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_picker_displays_session_title_in_rendered_popup() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        owner
+            .entries
+            .push(ChatEntry::User("webftp_exploit_plan".into()));
+        owner.save().unwrap();
+        let cur_title = owner.index.current_meta().unwrap().title.clone();
+        assert_eq!(cur_title, "webftp_exploit_plan");
+
+        let mut screen = CliScreen::new(&owner);
+        let CliAction::Picker(picker) = cli_commands::execute(&mut owner, "/session").unwrap()
+        else {
+            panic!("expected picker for /session alias");
+        };
+        assert!(picker
+            .items
+            .iter()
+            .any(|item| item.label == "webftp_exploit_plan"));
+        screen.picker = Some(picker);
+        let rendered = render(&mut screen, 100, 25);
+        assert!(
+            rendered.contains("webftp_exploit_plan"),
+            "Picker 面板应展示会话标题: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
     async fn model_picker_executes_selected_engine_command_without_chat_submission() {
         let mut owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
@@ -4083,6 +4551,83 @@ mod tests {
         assert!(screen.todo_summary().is_empty());
 
         let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn todo_pinned_panel_renders_above_composer_and_toggles_visibility() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let cwd = owner.cwd.clone();
+        let mut runner = Some(owner);
+
+        // Initially empty -> no todo table
+        let initial_snapshot = render(&mut screen, 100, 30);
+        assert!(!initial_snapshot.contains("todo close"));
+
+        // Add task 1
+        screen.insert_text("/todo add 基础资产与入口信息收集");
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+
+        // Add task 2
+        screen.insert_text("/todo add Web接口漏洞探测");
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+
+        // Pinned panel should now render above composer
+        let snapshot_open = render(&mut screen, 100, 30);
+        assert!(
+            snapshot_open.contains("todo close"),
+            "Pinned panel should show: {snapshot_open}"
+        );
+        assert!(
+            snapshot_open.contains("[0/2]"),
+            "Pinned panel should show progress [0/2]"
+        );
+        assert!(
+            snapshot_open.contains("#1"),
+            "Pinned panel should show task 1"
+        );
+        assert!(
+            snapshot_open.contains("#2"),
+            "Pinned panel should show task 2"
+        );
+
+        // Close panel via /todo close
+        screen.insert_text("/todo close");
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(screen.todo_closed);
+
+        let snapshot_closed = render(&mut screen, 100, 30);
+        assert!(
+            !snapshot_closed.contains("todo close"),
+            "Closed panel should not show header hint: {snapshot_closed}"
+        );
+        assert!(
+            snapshot_closed.contains("todo open"),
+            "Footer should remind how to reopen: {snapshot_closed}"
+        );
+
+        // Reopen panel via /todo open
+        screen.insert_text("/todo open");
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!screen.todo_closed);
+
+        let snapshot_reopened = render(&mut screen, 100, 30);
+        assert!(
+            snapshot_reopened.contains("todo close"),
+            "Reopened panel should show again: {snapshot_reopened}"
+        );
+
+        // Clear tasks via /todo clear
+        screen.insert_text("/todo clear");
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+
+        let snapshot_cleared = render(&mut screen, 100, 30);
+        assert!(
+            !snapshot_cleared.contains("todo close"),
+            "Cleared list should remove panel: {snapshot_cleared}"
+        );
+
+        let _ = std::fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]
@@ -4508,6 +5053,8 @@ mod tests {
             arguments: serde_json::json!({"command": format!("{}END-OF-ARGS", "long parameter ".repeat(2000))}),
             nonce: nonce.into(),
             reply,
+            confidence: 0.0,
+            risk_reason: String::new(),
         });
         for height in [12, 13, 16, 30] {
             let text = render(&mut screen, 80, height);
@@ -4546,6 +5093,8 @@ mod tests {
             arguments: serde_json::json!({"command": "x".repeat(10000)}),
             nonce: "0123456789abcdef0123456789abcdef".into(),
             reply,
+            confidence: 0.0,
+            risk_reason: String::new(),
         });
         page_key(&mut screen, KeyCode::Char('1'));
         for (width, height) in [(80, 10), (80, 8), (30, 12), (10, 5), (1, 1), (0, 0)] {
@@ -4706,24 +5255,38 @@ mod tests {
         let mut runner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&runner);
 
-        // 1. General task summary
+        // 1. General task summary (describes outcome without mechanical tool names)
         screen.turn_summary(
             5000,
             1_700_000_000,
             "done",
-            Some("任务完成：调用 [list_dir]，已列出当前工作目录条目"),
+            Some("任务完成：已列出当前工作目录条目"),
         );
         render(&mut screen, 100, 20);
-        assert!(history(&screen).contains("※summary：任务完成：调用 [list_dir]"));
-        // 2. CTF Solved summary
+        assert!(history(&screen).contains("※summary：任务完成：已列出当前工作目录条目"));
+
+        // 2. CTF Solved summary (extracts real solution flow from answer even when tools were called)
         let mut ch = cyber_core::CtfChallenge::new("web-sqli".into(), cyber_core::CtfCategory::Web);
         ch.status = cyber_core::CtfStatus::Solved;
         ch.flag = Some("NSSCTF{flag_sqli_success}".into());
         runner.replace_challenges(vec![ch]).unwrap();
 
-        let summary =
-            runner.generate_turn_summary("done", "利用 SQL 盲注成功提取 Flag 并提交", &[], None);
+        let dummy_tools = vec![crate::headless::ToolCallRecord {
+            id: "1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            output: "ok".into(),
+            is_error: false,
+        }];
+        let answer_with_steps = "经过排查与利用：\n### 解题流程\n1. 审计 search.php 发现未过滤的单引号输入点\n2. 构造布尔盲注 Payload 爆破数据库 flags 表\n3. 提取出 flag 字段获取 Flag";
+        let summary = runner.generate_turn_summary("done", answer_with_steps, &dummy_tools, None);
         assert!(summary.contains("题目【web-sqli】已解出 (Flag: NSSCTF{flag_sqli_success})"));
+        assert!(summary.contains("解题流程：1. 审计 search.php 发现未过滤的单引号输入点 -> 2. 构造布尔盲注 Payload 爆破数据库 flags 表 -> 3. 提取出 flag 字段获取 Flag"));
+        assert!(!summary.contains("shell"), "解题流程中绝不包含内部工具名");
+        assert!(
+            !summary.contains("调用工具"),
+            "解题流程中绝不输出无意义的'调用工具'"
+        );
 
         // 3. CTF InProgress blocker summary
         let mut ch_prog =
@@ -5042,6 +5605,229 @@ mod tests {
         .unwrap();
         assert!(screen.panel.is_none());
 
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn ctf_panel_reflects_runtime_tool_registered_challenges() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+        let mut runner = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        // 1. Enable CTF
+        screen.input.insert_str("/ctf enable");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_enabled);
+
+        // 2. Open CTF panel: currently empty
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert_eq!(screen.ctf_challenges_count(), 0);
+
+        // 3. Simulate background / LLM tool registration via runner.registries.tools execute ctf_challenge register
+        let owner = runner.as_mut().unwrap();
+        let register_input = serde_json::json!({
+            "action": "register",
+            "name": "sqli_blind_runtime",
+            "category": "web",
+            "description": "runtime tool registered challenge",
+            "target": "http://10.10.10.10:8080"
+        });
+        let tool_ctx = cyber_agent::ToolCtx::new(owner.cwd.clone(), Vec::new(), None, Vec::new());
+        let tool_result = owner
+            .registries
+            .tools
+            .execute("ctf_challenge", register_input, &tool_ctx)
+            .await;
+        assert!(tool_result.is_ok());
+
+        // 4. Without calling sync or restarting, panel view should reflect the challenge immediately!
+        assert_eq!(screen.ctf_challenges_count(), 1);
+        let rendered = render(&mut screen, 100, 30);
+        assert!(rendered.contains("sqli_blind_runtime"));
+        assert!(rendered.contains("[WEB]"));
+
+        // 5. Navigate enter into detail
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_detail_view);
+        let detail_rendered = render(&mut screen, 100, 30);
+        assert!(detail_rendered.contains("sqli_blind_runtime"));
+        assert!(detail_rendered.contains("http://10.10.10.10:8080"));
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn clean_consolidates_carriage_returns() {
+        assert_eq!(clean("foo\rbar"), "bar");
+        assert_eq!(clean("10%\r20%\r100%"), "100%");
+        assert_eq!(clean("line 1\r\nline 2\r\n"), "line 1\nline 2\n");
+        assert_eq!(clean("\r\r\r"), "");
+        assert_eq!(
+            clean("normal text\nsecond line"),
+            "normal text\nsecond line"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_l_triggers_needs_clear() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+        let mut runner = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+
+        screen.needs_clear = false;
+        let handled = handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        assert!(!handled, "Ctrl+L should not exit run_cli loop");
+        assert!(screen.needs_clear, "Ctrl+L must set needs_clear to true");
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn tool_result_triggers_needs_clear() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+
+        screen.needs_clear = false;
+        screen.tool_call("call_1", "shell", r#"{"command":"echo hi"}"#);
+        screen.tool_result("call_1", "shell", "hi\n", false);
+        assert!(
+            screen.needs_clear,
+            "tool_result must set needs_clear to true"
+        );
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn queued_prompts_auto_spawn_next_turn_on_completion() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut screen = CliScreen::new(&owner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner = Some(owner);
+
+        // 启动第一轮任务
+        assert!(spawn_turn(
+            &mut screen,
+            &mut runner,
+            "first turn".into(),
+            false,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        ));
+        assert!(screen.busy);
+        assert!(active.is_some());
+
+        // 1. 在 busy 状态下按 Enter 平滑追加指令
+        screen.input = composer();
+        screen.insert_text("appended question");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.queued_prompts.len(), 1);
+
+        // 2. 在 busy 状态下按 Alt+Enter 立即打断
+        screen.input = composer();
+        screen.insert_text("immediate steer question");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.queued_prompts.len(), 2);
+        assert_eq!(screen.status, "已立即打断并读取新指示…");
+
+        // 第一轮任务因打断而结束，模拟事件循环的收尾逻辑
+        let (restored, _outcome) = active.take().unwrap().await.unwrap();
+        while let Ok(event) = rx.try_recv() {
+            screen.event(event);
+        }
+        screen.sync(&restored);
+        runner = Some(restored);
+        screen.busy = false;
+        screen.active_steering_tx = None;
+
+        // 收尾时从 queued_prompts 取出未消费的指示自动启动下一轮任务
+        if let Some(next_prompt) = screen.queued_prompts.pop_front() {
+            spawn_turn(
+                &mut screen,
+                &mut runner,
+                next_prompt.text,
+                next_prompt.displayed,
+                &permissions,
+                &events,
+                &mut active,
+                &mut cancel,
+            );
+        }
+
+        // 验证第二轮任务已自动启动
+        assert!(screen.busy);
+        assert!(active.is_some());
+
+        let _ = active.take().unwrap().await;
         let _ = std::fs::remove_dir_all(cwd);
     }
 }

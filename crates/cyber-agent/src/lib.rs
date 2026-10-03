@@ -21,7 +21,10 @@ pub mod tool;
 pub mod tools;
 pub mod types;
 
-pub use agent::{run_compact_stream, run_stream, run_stream_with_permissions, run_writeup_stream};
+pub use agent::{
+    run_compact_stream, run_stream, run_stream_with_permissions, run_writeup_stream,
+    steering_channel, SteeringReceiver, SteeringSender,
+};
 pub use compact::{
     auto_compact_threshold, compact_messages, compact_prompt, context_remaining_percent,
     estimate_messages_tokens, estimate_tokens, AUTOCOMPACT_BUFFER_TOKENS,
@@ -30,8 +33,9 @@ pub use compact::{
 pub use error::{AgentError, Result};
 pub use models::{extract_model_ids, fetch_models};
 pub use permission::{
-    is_high_risk_tool, ApprovalChoice, PermissionBroker, PermissionDecision, PermissionMode,
-    PermissionRequest,
+    assess_tool_safety, check_extreme_danger, is_high_risk_tool, ApprovalChoice, PermissionBroker,
+    PermissionDecision, PermissionMode, PermissionRequest, SafetyAssessment,
+    AUTO_APPROVE_CONFIDENCE_THRESHOLD,
 };
 pub use provider::{provider_factory, Provider, StreamRequest};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
