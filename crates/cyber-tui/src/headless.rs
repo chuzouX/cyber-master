@@ -1705,6 +1705,7 @@ pub fn outcome_to_json(outcome: &HeadlessOutcome) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use cyber_agent::PermissionMode;
 
     #[test]
     fn rejects_traversal_and_index_ids() {
@@ -2057,6 +2058,7 @@ pub(crate) mod tests {
             .or_default()
             .context_length = Some(5000);
         let (broker, mut requests) = PermissionBroker::interactive();
+        broker.set_mode(PermissionMode::Manual);
         let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel, cancel) = tokio::sync::oneshot::channel();
         let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -2108,6 +2110,7 @@ pub(crate) mod tests {
     async fn assert_ui_interruption_saves_emitted_history(close_observer: bool) {
         let mut runner = test_runner().await;
         let (broker, mut requests) = PermissionBroker::interactive();
+        broker.set_mode(PermissionMode::Manual);
         let broker = Arc::new(broker);
         let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let (cancel_tx, cancel) = tokio::sync::oneshot::channel();
@@ -2277,6 +2280,7 @@ pub(crate) mod tests {
     async fn prefetched_bare_approval_never_authorizes_a_tool() {
         let mut runner = test_runner().await;
         let (broker, requests) = PermissionBroker::interactive();
+        broker.set_mode(PermissionMode::Manual);
         let broker = Arc::new(broker);
         let (tx, lines) = tokio::sync::mpsc::channel(1);
         let mut input = CliInput { lines, requests };
@@ -2337,6 +2341,7 @@ pub(crate) mod tests {
         registry.register(Box::new(FailingTool));
         runner.registry = Arc::new(registry);
         let (broker, mut requests) = PermissionBroker::interactive();
+        broker.set_mode(PermissionMode::Manual);
         let broker = Arc::new(broker);
         let responder = tokio::spawn(async move {
             let request = requests.recv().await.unwrap();

@@ -601,9 +601,9 @@ pub fn assess_tool_safety(tool: &str, arguments: &Value) -> SafetyAssessment {
         }
         "mcp_connect" => {
             return SafetyAssessment {
-                confidence: 0.85,
-                auto_approved: true,
-                reason: "MCP 服务外部连接".into(),
+                confidence: 0.50,
+                auto_approved: false,
+                reason: "连接外部 MCP 服务需要用户确认".into(),
             };
         }
         "delegate_tasks" => {
@@ -928,7 +928,7 @@ impl PermissionBroker {
                 grants: Mutex::new(Vec::new()),
                 explicit_tools: HashSet::new(),
                 denials: AtomicU64::new(0),
-                mode: Mutex::new(PermissionMode::Manual),
+                mode: Mutex::new(PermissionMode::Auto),
             },
             rx,
         )

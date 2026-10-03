@@ -3360,6 +3360,7 @@ fn spawn_turn(
     screen.busy = true;
     screen.thinking_started = Some(std::time::Instant::now());
     screen.status = "Working".into();
+    permissions.set_mode(screen.permission_mode);
     let permissions = permissions.clone();
     let events = events.clone();
     let (tx, rx) = oneshot::channel();
@@ -3432,6 +3433,7 @@ fn apply_action(
                 return Ok(false);
             }
             if let Some(mut owned) = runner.take() {
+                permissions.set_mode(screen.permission_mode);
                 let permissions = permissions.clone();
                 let events = events.clone();
                 let (tx, rx) = oneshot::channel();
