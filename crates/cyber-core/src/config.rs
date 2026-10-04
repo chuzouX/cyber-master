@@ -88,8 +88,11 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     pub max_steps: u32,
+    pub retry_attempts: u32,
+    pub retry_delay_secs: u64,
     pub thinking_intensity: ThinkingIntensity,
     pub subagents: SubagentConfig,
+    pub vision: VisionConfig,
 }
 
 impl Default for AgentConfig {
@@ -99,8 +102,11 @@ impl Default for AgentConfig {
             auto_tool_call: true,
             permission_mode: None,
             max_steps: 500,
+            retry_attempts: 5,
+            retry_delay_secs: 3,
             thinking_intensity: ThinkingIntensity::default(),
             subagents: SubagentConfig::default(),
+            vision: VisionConfig::default(),
         }
     }
 }
@@ -141,6 +147,29 @@ impl Default for SubagentConfig {
             max_parallel: 4,
             timeout_secs: 300,
             max_steps: 25,
+        }
+    }
+}
+
+/// 识图引擎专用配置，用于模型多模态能力检测与图生文降级分流。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub detail: String,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            prompt: "请详细分析并描述此图片内容，提取其中的文本、界面元素与安全关键信息。".into(),
+            detail: "auto".into(),
         }
     }
 }
@@ -292,5 +321,32 @@ mod tests {
         assert!(config.tools.web_search);
         let config_disabled: Config = toml::from_str("[tools]\nweb_search = false\n").unwrap();
         assert!(!config_disabled.tools.web_search);
+    }
+
+    #[test]
+    fn vision_config_defaults_load_when_omitted() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.agent.vision.enabled);
+        assert_eq!(config.agent.vision.provider, "deepseek");
+        assert_eq!(config.agent.vision.model, "deepseek-flash");
+        assert_eq!(config.agent.vision.detail, "auto");
+    }
+
+    #[test]
+    fn vision_config_explicit_values() {
+        let toml_str = r#"
+        [agent.vision]
+        enabled = false
+        provider = "custom-provider"
+        model = "custom-vision"
+        prompt = "测试提示词"
+        detail = "high"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.agent.vision.enabled);
+        assert_eq!(config.agent.vision.provider, "custom-provider");
+        assert_eq!(config.agent.vision.model, "custom-vision");
+        assert_eq!(config.agent.vision.prompt, "测试提示词");
+        assert_eq!(config.agent.vision.detail, "high");
     }
 }

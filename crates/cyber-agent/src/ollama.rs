@@ -151,6 +151,7 @@ mod tests {
                 arguments: "{\"path\":\".\"}".into(),
             }],
             tool_call_id: None,
+            ..Default::default()
         };
         let v = message_to_ollama(m);
         assert_eq!(v["role"], "assistant");
@@ -171,6 +172,7 @@ mod tests {
                 arguments: "not valid json".into(),
             }],
             tool_call_id: None,
+            ..Default::default()
         };
         let v = message_to_ollama(m);
         assert_eq!(v["tool_calls"][0]["function"]["arguments"], json!({}));
@@ -190,6 +192,7 @@ mod tests {
             content: "结果2".into(),
             tool_calls: vec![],
             tool_call_id: None,
+            ..Default::default()
         };
         let v_no_id = message_to_ollama(m_no_id);
         assert_eq!(v_no_id["role"], "tool");

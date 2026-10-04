@@ -49,8 +49,9 @@ impl OpenAiProvider {
 /// 将内部 `Message` 翻译为 OpenAI messages 数组条目：
 /// - `Tool` → `{role:"tool", tool_call_id, content}`
 /// - `Assistant` 带 tool_calls → `{role:"assistant", content, tool_calls:[{id,type:"function",function:{name,arguments}}]}`
-/// - 其余 → `{role, content}`
-fn message_to_openai(m: Message) -> Value {
+/// - `User` 带 images → 多模态 `content` 数组：首个为 text 块，后续为 image_url 块（带 `detail`）
+/// - 其余（包含带 images 的非 User 消息） → 严格降级为纯文本，拦截 image_url 块，防止 DeepSeek 400 校验错误
+pub fn message_to_openai(m: Message) -> Value {
     match m.role {
         Role::Tool => json!({
             "role": "tool",
@@ -70,6 +71,27 @@ fn message_to_openai(m: Message) -> Value {
                 })
                 .collect();
             json!({"role": "assistant", "content": m.content, "tool_calls": tcs})
+        }
+        Role::User if !m.images.is_empty() => {
+            let mut parts = Vec::with_capacity(m.images.len() + 1);
+            parts.push(json!({
+                "type": "text",
+                "text": m.content,
+            }));
+            for img in m.images {
+                let detail = img.detail.as_deref().unwrap_or("auto");
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": img.url,
+                        "detail": detail,
+                    }
+                }));
+            }
+            json!({
+                "role": "user",
+                "content": parts,
+            })
         }
         _ => json!({"role": m.role.as_str(), "content": m.content}),
     }
@@ -147,6 +169,7 @@ mod tests {
                 arguments: "{\"path\":\".\"}".into(),
             }],
             tool_call_id: None,
+            ..Default::default()
         };
         let v = message_to_openai(m);
         assert_eq!(v["role"], "assistant");
@@ -199,5 +222,72 @@ mod tests {
             }]);
         // stream 不被驱动，仅构造（HttpStream::Init 状态，未发请求）
         let _stream = p.stream(req);
+    }
+
+    #[test]
+    fn user_with_images_serializes_as_multimodal_array() {
+        use crate::types::ImageContent;
+        let img1 = ImageContent::new("data:image/png;base64,iVBORw0KGgo...")
+            .with_id(1)
+            .with_detail("auto");
+        let img2 = ImageContent::new("https://example.com/photo.jpg")
+            .with_id(2)
+            .with_detail("low");
+        let m = Message::user_with_images(
+            "请分析验证码 [image:1] 与参考图 [image:2]",
+            vec![img1, img2],
+        );
+
+        let v = message_to_openai(m);
+        assert_eq!(v["role"], "user");
+        let content = v["content"].as_array().expect("content must be array");
+        assert_eq!(content.len(), 3);
+
+        // 首块为文本，保留占位符
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[0]["text"],
+            "请分析验证码 [image:1] 与参考图 [image:2]"
+        );
+
+        // 第二块与第三块为 image_url
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo..."
+        );
+        assert_eq!(content[1]["image_url"]["detail"], "auto");
+
+        assert_eq!(content[2]["type"], "image_url");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "https://example.com/photo.jpg"
+        );
+        assert_eq!(content[2]["image_url"]["detail"], "low");
+    }
+
+    #[test]
+    fn non_user_messages_filter_out_image_url_blocks() {
+        use crate::types::ImageContent;
+        let img = ImageContent::new("data:image/png;base64,iVBORw0KGgo...");
+
+        // Assistant 消息即使附带 images，也坚决不生成 image_url 块（防 DeepSeek 400 校验错误）
+        let m_asst = Message::assistant("这是助手的回复").with_image(img.clone());
+        let v_asst = message_to_openai(m_asst);
+        assert_eq!(v_asst["role"], "assistant");
+        assert_eq!(v_asst["content"], "这是助手的回复");
+        assert!(v_asst.get("image_url").is_none());
+
+        // System 消息同理
+        let m_sys = Message::system("系统提示词").with_image(img.clone());
+        let v_sys = message_to_openai(m_sys);
+        assert_eq!(v_sys["role"], "system");
+        assert_eq!(v_sys["content"], "系统提示词");
+
+        // Tool 消息同理
+        let m_tool = Message::tool("call_id", "工具执行结果").with_image(img);
+        let v_tool = message_to_openai(m_tool);
+        assert_eq!(v_tool["role"], "tool");
+        assert_eq!(v_tool["content"], "工具执行结果");
     }
 }

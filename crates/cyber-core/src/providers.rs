@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,9 @@ pub struct ModelConfig {
     /// 备注（自由文本）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// 视觉/识图多模态能力。Some(true) = 支持, Some(false) = 不支持, None = 未知/未探测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 /// token 单价配置（每百万 token）。
@@ -270,6 +274,20 @@ pub fn resolve_api_key(s: &str) -> String {
     }
 }
 
+/// 判定模型是否为 DeepSeek 多模态视觉模型（或变体）。
+pub fn is_deepseek_vision_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("deepseek-flash")
+        || m.contains("flash-vision")
+        || m.contains("deepseek-vl")
+        || m.contains("deepseek-v4-flash")
+}
+
+/// 判定服务商配置是否为 DeepSeek 服务商（官方或包含 DeepSeek 模型的第三方服务）。
+pub fn is_deepseek_provider(cfg: &ProviderConfig) -> bool {
+    cfg.base_url.contains("deepseek.com") || cfg.model.to_ascii_lowercase().contains("deepseek")
+}
+
 /// 大模型厂商与服务商热门预设。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderPreset {
@@ -302,6 +320,202 @@ impl ProviderPreset {
     }
 }
 
+/// 模型视觉/识图多模态支持状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VisionCapability {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+impl VisionCapability {
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Unsupported)
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    pub fn from_bool(val: bool) -> Self {
+        if val {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Supported => Some(true),
+            Self::Unsupported => Some(false),
+            Self::Unknown => None,
+        }
+    }
+
+    /// 用于 UI 或 CLI 展示的状态文本。
+    pub fn badge_text(&self) -> &'static str {
+        match self {
+            Self::Supported => "👁️ [视觉]",
+            Self::Unsupported => "[文本]",
+            Self::Unknown => "",
+        }
+    }
+}
+
+/// 模型能力本地持久化缓存（存放在 `~/.cyber/cache/capabilities.json`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CapabilityStore {
+    #[serde(default)]
+    pub capabilities: HashMap<String, VisionCapability>,
+}
+
+impl CapabilityStore {
+    pub fn new() -> Self {
+        Self {
+            capabilities: HashMap::new(),
+        }
+    }
+
+    /// 规范化缓存 key：`{provider}:{model}`（若 provider 为空则直接使用 model）。
+    pub fn cache_key(provider: &str, model: &str) -> String {
+        let p = provider.trim().to_ascii_lowercase();
+        let m = model.trim();
+        if p.is_empty() {
+            m.to_string()
+        } else {
+            format!("{p}:{m}")
+        }
+    }
+
+    /// 获取模型视觉能力。支持以 `{provider}:{model}` 或 `{model}` 查询。
+    pub fn get(&self, provider: &str, model: &str) -> VisionCapability {
+        let key = Self::cache_key(provider, model);
+        if let Some(&cap) = self.capabilities.get(&key) {
+            return cap;
+        }
+        let m = model.trim();
+        if let Some(&cap) = self.capabilities.get(m) {
+            return cap;
+        }
+        VisionCapability::Unknown
+    }
+
+    /// 设置模型视觉能力。
+    pub fn set(&mut self, provider: &str, model: &str, cap: VisionCapability) {
+        let key = Self::cache_key(provider, model);
+        self.capabilities.insert(key, cap);
+        let m = model.trim().to_string();
+        if !provider.trim().is_empty() {
+            self.capabilities.entry(m).or_insert(cap);
+        }
+    }
+
+    /// 从默认路径加载持久化缓存文件。
+    pub fn load() -> Self {
+        if let Some(path) = Self::default_cache_path() {
+            Self::load_from_path(&path).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    /// 从指定路径读取缓存。
+    pub fn load_from_path(path: &Path) -> std::io::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(path)?;
+        let store: Self = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(store)
+    }
+
+    /// 保存当前缓存到默认路径。
+    pub fn save(&self) -> std::io::Result<()> {
+        if let Some(path) = Self::default_cache_path() {
+            self.save_to_path(&path)?;
+        }
+        Ok(())
+    }
+
+    /// 原子保存当前缓存到指定路径。
+    pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// 默认缓存文件路径：`~/.cyber/cache/capabilities.json`。
+    pub fn default_cache_path() -> Option<PathBuf> {
+        crate::paths::Paths::detect()
+            .ok()
+            .map(|p| p.cyber_home.join("cache").join("capabilities.json"))
+    }
+}
+
+/// 查询指定模型是否具备视觉能力。
+///
+/// 优先级：
+/// 1. `ProviderConfig::models` 中该模型显式配置的 `vision` 字段（Some(true) / Some(false)）；
+/// 2. 传入的或从本地持久化加载的 `CapabilityStore`；
+/// 3. 若均未命中，返回 `VisionCapability::Unknown`。
+pub fn get_model_vision_capability(
+    cfg: &ProviderConfig,
+    provider_name: &str,
+    model: &str,
+    cache: Option<&CapabilityStore>,
+) -> VisionCapability {
+    if let Some(mc) = cfg.models.get(model) {
+        if let Some(v) = mc.vision {
+            return VisionCapability::from_bool(v);
+        }
+    }
+    if let Some(store) = cache {
+        let cap = store.get(provider_name, model);
+        if !cap.is_unknown() {
+            return cap;
+        }
+    } else {
+        let store = CapabilityStore::load();
+        let cap = store.get(provider_name, model);
+        if !cap.is_unknown() {
+            return cap;
+        }
+    }
+    VisionCapability::Unknown
+}
+
+/// 保存模型视觉能力实测结果到持久化缓存，并同步回写至 `ProviderConfig::models`。
+pub fn save_model_vision_capability(
+    provider_name: &str,
+    model: &str,
+    capability: VisionCapability,
+    provider_cfg: Option<&mut ProviderConfig>,
+) -> std::io::Result<()> {
+    let mut store = CapabilityStore::load();
+    store.set(provider_name, model, capability);
+    let _ = store.save();
+
+    if let Some(cfg) = provider_cfg {
+        let mc = cfg.models.entry(model.to_string()).or_default();
+        mc.vision = capability.as_bool();
+    }
+    Ok(())
+}
+
 /// 常见的大模型厂商预设列表。
 pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
@@ -310,9 +524,10 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         kind: "openai",
         base_url: "https://api.deepseek.com",
         default_model: "deepseek-chat",
-        suggested_models: &["deepseek-chat", "deepseek-reasoner"],
+        suggested_models: &["deepseek-chat", "deepseek-reasoner", "deepseek-flash"],
         env_var_suggestion: "DEEPSEEK_API_KEY",
-        description: "国内顶尖推理与通用大模型，支持 deepseek-chat 与 R1 深度思考模型",
+        description:
+            "国内顶尖推理与通用大模型，支持 deepseek-chat、R1 深度思考及 deepseek-flash 视觉多模态",
     },
     ProviderPreset {
         id: "siliconflow",
@@ -462,6 +677,36 @@ mod tests {
         assert_eq!(resolve_api_key("${OPENAI_API_KEY"), "${OPENAI_API_KEY");
     }
 
+    #[test]
+    fn deepseek_detection_tests() {
+        assert!(is_deepseek_vision_model("deepseek-flash"));
+        assert!(is_deepseek_vision_model("DeepSeek-Flash-Vision"));
+        assert!(is_deepseek_vision_model("deepseek-vl-7b"));
+        assert!(is_deepseek_vision_model("deepseek-v4-flash-vision-exp"));
+        assert!(!is_deepseek_vision_model("deepseek-chat"));
+        assert!(!is_deepseek_vision_model("gpt-4o"));
+
+        let p1 = ProviderConfig {
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        };
+        assert!(is_deepseek_provider(&p1));
+
+        let p2 = ProviderConfig {
+            base_url: "https://api.siliconflow.cn/v1".into(),
+            model: "deepseek-ai/DeepSeek-V3".into(),
+            ..Default::default()
+        };
+        assert!(is_deepseek_provider(&p2));
+
+        let p3 = ProviderConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        assert!(!is_deepseek_provider(&p3));
+    }
     #[test]
     fn provider_config_resolved_api_key() {
         std::env::set_var("CYBER_TEST_KEY_CFG", "cfg-value");
@@ -753,12 +998,14 @@ mod tests {
                 ..Default::default()
             }),
             notes: Some("测试备注".into()),
+            vision: Some(true),
         };
         let json = serde_json::to_string(&mc).unwrap();
         let mc2: ModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(mc2.alias, Some("别名".into()));
         assert_eq!(mc2.context_length, Some(128000));
         assert_eq!(mc2.notes, Some("测试备注".into()));
+        assert_eq!(mc2.vision, Some(true));
     }
 
     #[test]
@@ -842,5 +1089,73 @@ temperature = 0.7
             assert_eq!(cfg.base_url, preset.base_url);
             assert_eq!(cfg.model, preset.default_model);
         }
+    }
+
+    #[test]
+    fn vision_capability_store_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cyber_cap_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("capabilities.json");
+
+        let mut store = CapabilityStore::new();
+        store.set("openai", "gpt-4o", VisionCapability::Supported);
+        store.set("deepseek", "deepseek-chat", VisionCapability::Unsupported);
+
+        assert_eq!(store.get("openai", "gpt-4o"), VisionCapability::Supported);
+        assert_eq!(
+            store.get("deepseek", "deepseek-chat"),
+            VisionCapability::Unsupported
+        );
+        assert_eq!(
+            store.get("custom", "unknown-model"),
+            VisionCapability::Unknown
+        );
+
+        store.save_to_path(&path).unwrap();
+        let loaded = CapabilityStore::load_from_path(&path).unwrap();
+        assert_eq!(loaded.get("openai", "gpt-4o"), VisionCapability::Supported);
+        assert_eq!(
+            loaded.get("deepseek", "deepseek-chat"),
+            VisionCapability::Unsupported
+        );
+        assert_eq!(
+            loaded.get("deepseek", "deepseek-chat"),
+            VisionCapability::Unsupported
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_model_vision_capability_precedence() {
+        let mut cfg = ProviderConfig::default();
+        cfg.models.insert(
+            "explicit-model".into(),
+            ModelConfig {
+                vision: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut store = CapabilityStore::new();
+        store.set("test-p", "cached-model", VisionCapability::Supported);
+        store.set("test-p", "explicit-model", VisionCapability::Unsupported);
+
+        // 1. 显式配置优先于缓存
+        assert_eq!(
+            get_model_vision_capability(&cfg, "test-p", "explicit-model", Some(&store)),
+            VisionCapability::Supported
+        );
+
+        // 2. 缓存命中
+        assert_eq!(
+            get_model_vision_capability(&cfg, "test-p", "cached-model", Some(&store)),
+            VisionCapability::Supported
+        );
+
+        // 3. 未知模型
+        assert_eq!(
+            get_model_vision_capability(&cfg, "test-p", "non-existent", Some(&store)),
+            VisionCapability::Unknown
+        );
     }
 }

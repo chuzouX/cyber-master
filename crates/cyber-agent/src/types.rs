@@ -55,14 +55,59 @@ pub struct ToolCallDelta {
     pub arguments_fragment: String,
 }
 
+/// 图片附件与内容块。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageContent {
+    /// 占位符关联序号（如 1 对应 [image:1]）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<usize>,
+    /// 外部 HTTP(S) URL、本地 Base64 data URI 或本地文件路径
+    pub url: String,
+    /// 图像 MIME 类型（如 "image/jpeg", "image/png", "image/webp", "image/gif"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// DeepSeek 细节级别：low (缩放至 512x512 省 token) / high / original (原图) / auto (自动)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ImageContent {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            url: url.into(),
+            media_type: None,
+            detail: None,
+        }
+    }
+
+    pub fn with_id(mut self, id: usize) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn with_media_type(mut self, media_type: impl Into<String>) -> Self {
+        self.media_type = Some(media_type.into());
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
 /// 一条对话消息。
 ///
 /// - assistant 消息可带 `tool_calls`（请求执行工具）
 /// - `role == Tool` 的消息带 `tool_call_id`（对应哪次调用的结果）
+/// - `images` 携带图片附件（如用户通过剪贴板或 /image 传入的图像）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +147,24 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             ..Default::default()
         }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageContent>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            images,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_image(mut self, image: ImageContent) -> Self {
+        self.images.push(image);
+        self
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty()
     }
 }
 
@@ -193,6 +256,13 @@ pub enum AgentEvent {
     },
     /// 成功接收到追加的指示（用户在思考/工具执行期间追加的内容）。
     SteeringReceived(String),
+    /// 模型流式调用异常，正在准备重试。
+    Retry {
+        attempt: u32,
+        max_retries: u32,
+        delay_secs: u64,
+        error: String,
+    },
     Done,
     Error(String),
 }
@@ -235,6 +305,7 @@ mod tests {
         let m = Message {
             role: Role::Assistant,
             content: String::new(),
+            images: vec![],
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "list_dir".into(),
@@ -253,6 +324,25 @@ mod tests {
         assert_eq!(m.role, Role::Tool);
         assert_eq!(m.content, "结果");
         assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn message_user_with_images() {
+        let img = ImageContent::new("data:image/png;base64,abc")
+            .with_id(1)
+            .with_media_type("image/png")
+            .with_detail("auto");
+        let m = Message::user_with_images("请看这幅图 [image:1]", vec![img.clone()]);
+        assert_eq!(m.role, Role::User);
+        assert!(m.has_images());
+        assert_eq!(m.images.len(), 1);
+        assert_eq!(m.images[0].id, Some(1));
+        assert_eq!(m.images[0].detail.as_deref(), Some("auto"));
+
+        let serialized = serde_json::to_string(&m).unwrap();
+        assert!(serialized.contains("data:image/png;base64,abc"));
+        let deserialized: Message = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.images, vec![img]);
     }
 
     #[test]
@@ -309,6 +399,29 @@ mod tests {
         let ev = AgentEvent::SteeringReceived("追加指令".into());
         match ev {
             AgentEvent::SteeringReceived(msg) => assert_eq!(msg, "追加指令"),
+            _ => panic!("wrong variant"),
+        }
+    }
+    #[test]
+    fn agent_event_retry_variant() {
+        let ev = AgentEvent::Retry {
+            attempt: 2,
+            max_retries: 5,
+            delay_secs: 3,
+            error: "connection reset".into(),
+        };
+        match ev {
+            AgentEvent::Retry {
+                attempt,
+                max_retries,
+                delay_secs,
+                error,
+            } => {
+                assert_eq!(attempt, 2);
+                assert_eq!(max_retries, 5);
+                assert_eq!(delay_secs, 3);
+                assert_eq!(error, "connection reset");
+            }
             _ => panic!("wrong variant"),
         }
     }

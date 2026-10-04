@@ -328,6 +328,7 @@ impl ProviderFormState {
             } else {
                 Some(self.notes.trim().to_string())
             },
+            vision: self.models.get(model).and_then(|m| m.vision),
         };
         self.models.insert(model.trim().to_string(), mc);
     }
@@ -512,6 +513,7 @@ impl ProviderFormState {
                 } else {
                     Some(self.notes.trim().to_string())
                 },
+                vision: self.models.get(model_id).and_then(|m| m.vision),
             };
             models.insert(model_id.to_string(), mc);
         }

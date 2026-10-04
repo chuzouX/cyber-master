@@ -16,7 +16,9 @@ pub mod providers;
 pub mod todo;
 pub mod update;
 
-pub use config::{Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity};
+pub use config::{
+    Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity, VisionConfig,
+};
 pub use ctf::{current_time_str, CtfCategory, CtfChallenge, CtfStatus};
 pub use custom_tool::{
     load_custom_tools, save_custom_tool, CustomToolConfig, CustomToolParam, LoadedCustomTool,
@@ -27,8 +29,9 @@ pub use memory::{MemoryEntry, MemoryScope, MemoryStore};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
 pub use providers::{
-    resolve_api_key, ModelConfig, PriceConfig, ProviderConfig, ProviderPreset, ProvidersConfig,
-    PROVIDER_KINDS, PROVIDER_PRESETS,
+    get_model_vision_capability, is_deepseek_provider, is_deepseek_vision_model, resolve_api_key,
+    save_model_vision_capability, CapabilityStore, ModelConfig, PriceConfig, ProviderConfig,
+    ProviderPreset, ProvidersConfig, VisionCapability, PROVIDER_KINDS, PROVIDER_PRESETS,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use update::{check_for_updates, is_newer, ReleaseInfo};

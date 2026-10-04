@@ -8,6 +8,7 @@ use crate::error::{CoreError, Result};
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub cyber_home: PathBuf,
+    pub cache_dir: PathBuf,
     pub config_file: PathBuf,
     pub providers_file: PathBuf,
     pub tools_dir: PathBuf,
@@ -57,6 +58,7 @@ impl Paths {
         let mcp_dir = cyber_home.join("mcp");
         let reports_dir = cyber_home.join("reports");
         let ctf_dir = cyber_home.join("ctf");
+        let cache_dir = cyber_home.join("cache");
         Ok(Self {
             config_file: cyber_home.join("config.toml"),
             providers_file: cyber_home.join("providers.toml"),
@@ -75,6 +77,7 @@ impl Paths {
             mcp_dir,
             reports_dir,
             ctf_dir,
+            cache_dir,
             cyber_home,
         })
     }

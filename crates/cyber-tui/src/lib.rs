@@ -22,11 +22,12 @@ pub mod markdown;
 pub mod slash;
 pub mod theme;
 pub mod views;
+pub mod win_paste;
 
 pub use app::{App, AppPaths, AppRegistries, FetchResult, Mode};
 pub use bootstrap::build_registries;
 pub use chat::ChatState;
-pub use cli::run_cli;
+pub use cli::{restore_terminal, run_cli};
 pub use cyber_mcp::McpServersConfig;
 pub use headless::{outcome_to_json, run_headless, HeadlessArgs, HeadlessOutcome};
 pub use theme::Theme;

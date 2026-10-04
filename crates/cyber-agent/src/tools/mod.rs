@@ -9,6 +9,7 @@ mod delegate_tasks;
 mod download_file;
 mod find_file;
 pub(crate) mod guard;
+pub mod inspect_image;
 mod list_dir;
 mod read_file;
 mod save_memory;
@@ -32,6 +33,7 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(web_fetch::WebFetchTool));
     reg.register(Box::new(download_file::DownloadFileTool));
     reg.register(Box::new(todo::TodoTool::default()));
+    reg.register(Box::new(inspect_image::InspectImageTool));
     reg.register(Box::new(bg::BgShellTool));
     reg.register(Box::new(bg::BgStatusTool));
     reg.register(Box::new(bg::BgKillTool));
@@ -48,6 +50,7 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
         "web_fetch",
         "download_file",
         "todo",
+        "inspect_image",
         "ctf_challenge",
         "save_memory",
         "bg_shell",
@@ -61,6 +64,7 @@ pub use bg::{BgKillTool, BgShellTool, BgStatusTool};
 pub use ctf_challenge::CtfChallengeTool;
 pub use custom_tool::CustomTool;
 pub use delegate_tasks::DelegateTasksTool;
+pub use inspect_image::InspectImageTool;
 pub use save_memory::SaveMemoryTool;
 pub use search_tools::SearchToolsTool;
 pub use todo::TodoTool;

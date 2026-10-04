@@ -76,6 +76,8 @@ pub enum ChatAction {
     HistoryPrev,
     /// 输入历史呼出更新（普通 Down；浏览态呼出，非浏览态交 textarea 移光标）。
     HistoryNext,
+    /// 粘贴剪贴板内容（Ctrl+V，支持位图图片自动转存占位符与文本）。
+    Paste,
     /// 普通输入，交 textarea 处理。
     Input,
 }
@@ -169,6 +171,15 @@ pub fn chat_key_to_action(k: KeyEvent) -> ChatAction {
     // Ctrl+T 切换 CTF 题目面板
     if k.code == KeyCode::Char('t') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return ChatAction::ToggleCtfPanel;
+    }
+    // Ctrl+V 或 Alt+V 粘贴系统剪贴板（文本或图片）
+    // 说明：Windows Terminal 会在终端层默认拦截 Ctrl+V 进行纯文本粘贴；
+    // 提供 Alt+V 快捷键（与 Claude Code Windows 一致），确保按键直达应用层。
+    let is_v = k.code == KeyCode::Char('v') || k.code == KeyCode::Char('V');
+    if is_v
+        && (k.modifiers.contains(KeyModifiers::CONTROL) || k.modifiers.contains(KeyModifiers::ALT))
+    {
+        return ChatAction::Paste;
     }
     match k.code {
         KeyCode::Enter => {
@@ -358,6 +369,18 @@ mod tests {
         assert_eq!(
             chat_key_to_action(key(KeyCode::Char(','), KeyModifiers::CONTROL)),
             ChatAction::OpenSettings
+        );
+    }
+
+    #[test]
+    fn chat_ctrl_v_paste() {
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            ChatAction::Paste
+        );
+        assert_eq!(
+            chat_key_to_action(key(KeyCode::Char('V'), KeyModifiers::CONTROL)),
+            ChatAction::Paste
         );
     }
 

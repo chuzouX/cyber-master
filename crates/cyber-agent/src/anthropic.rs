@@ -161,6 +161,7 @@ mod tests {
                 arguments: "{\"path\":\".\"}".into(),
             }],
             tool_call_id: None,
+            ..Default::default()
         };
         let v = message_to_anthropic(m).unwrap();
         assert_eq!(v["role"], "assistant");
@@ -183,6 +184,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             tool_call_id: None,
+            ..Default::default()
         };
         let v = message_to_anthropic(m).unwrap();
         // 只有 tool_use 块，无 text 块
@@ -211,6 +213,7 @@ mod tests {
                 arguments: "not json{".into(),
             }],
             tool_call_id: None,
+            ..Default::default()
         };
         let v = message_to_anthropic(m).unwrap();
         // 畸形 arguments → input 为 {}

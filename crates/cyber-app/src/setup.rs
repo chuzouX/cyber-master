@@ -14,7 +14,8 @@ use toml::Value;
 
 use cyber_core::{
     load_custom_tools, save_custom_tool, Config, CustomToolConfig, CustomToolParam, Paths,
-    ProviderConfig, ProvidersConfig, PROVIDER_KINDS, PROVIDER_PRESETS,
+    ProviderConfig, ProvidersConfig, VisionCapability, VisionConfig, PROVIDER_KINDS,
+    PROVIDER_PRESETS,
 };
 use cyber_mcp::{McpConnection, McpServerSpec, McpServersConfig, McpTransport, MCP_PRESETS};
 
@@ -168,17 +169,36 @@ pub async fn run_setup(cwd: &Path) -> Result<()> {
         eprint!("│                    Cyber Master Setup 向导                   │\r\n");
         eprint!("│      AI 驱动安全终端体系：Provider · MCP · Custom Tools      │\r\n");
         eprint!("╰──────────────────────────────────────────────────────────────╯\r\n");
+        let vision_status = if config.agent.vision.enabled {
+            let prov = if config.agent.vision.provider.is_empty() {
+                "自动选择"
+            } else {
+                &config.agent.vision.provider
+            };
+            let model = if config.agent.vision.model.is_empty() {
+                "跟随服务商默认"
+            } else {
+                &config.agent.vision.model
+            };
+            format!("\x1b[1;32m开启\x1b[0m (服务商: {prov}, 模型: {model})")
+        } else {
+            "\x1b[90m关闭\x1b[0m".to_string()
+        };
+
         eprint!("当前核心状态:\r\n");
         eprint!("  * 默认 Provider : \x1b[1;36m{current_prov}\x1b[0m ({current_model})\r\n");
-        eprint!("  * 已配置 MCP   : {} 个\r\n", mcp_servers.servers.len());
+        eprint!("  * 识图引擎状态  : {vision_status}\r\n");
+        eprint!("  * 已配置 MCP    : {} 个\r\n", mcp_servers.servers.len());
         eprint!("  * 已加载自定义工具: {} 个\r\n", tools.len());
         let main_items = vec![
             "1. 模型服务商配置 (Provider: 切换默认 / 热门预设添加 / 编辑 / 连通性测试)".to_string(),
-            "2. MCP 服务器配置 (MCP: 热门模板预设 / 自定义 stdio 与 SSE / 连接测试)".to_string(),
-            "3. 自定义安全工具管理 (Custom Tools: 手动录入 / 查看已有)".to_string(),
-            "4. 🤖 AI 智能扫描本地安全工具 (基于当前模型自动探测系统工具并生成配置)".to_string(),
-            "5. 保存配置并退出 (Save & Exit)".to_string(),
-            "6. 放弃修改并退出 (Exit without saving)".to_string(),
+            "2. 👁️ 自适应识图引擎配置 (Vision Engine: 开关 / 专属服务商与模型 / 提示词 / 探针测试)"
+                .to_string(),
+            "3. MCP 服务器配置 (MCP: 热门模板预设 / 自定义 stdio 与 SSE / 连接测试)".to_string(),
+            "4. 自定义安全工具管理 (Custom Tools: 手动录入 / 查看已有)".to_string(),
+            "5. 🤖 AI 智能扫描本地安全工具 (基于当前模型自动探测系统工具并生成配置)".to_string(),
+            "6. 保存配置并退出 (Save & Exit)".to_string(),
+            "7. 放弃修改并退出 (Exit without saving)".to_string(),
         ];
 
         let Some(choice) = select_menu("请选择操作:", &main_items, 0)? else {
@@ -191,15 +211,18 @@ pub async fn run_setup(cwd: &Path) -> Result<()> {
                 setup_providers_menu(&mut config, &mut providers).await?;
             }
             1 => {
-                setup_mcp_menu(&mut mcp_servers).await?;
+                setup_vision_menu(&mut config, &providers).await?;
             }
             2 => {
-                setup_custom_tools_menu(&paths).await?;
+                setup_mcp_menu(&mut mcp_servers).await?;
             }
             3 => {
-                setup_ai_tool_scan(&paths, &config, &providers).await?;
+                setup_custom_tools_menu(&paths).await?;
             }
             4 => {
+                setup_ai_tool_scan(&paths, &config, &providers).await?;
+            }
+            5 => {
                 eprintln!("\n正在执行两阶段原子安全保存...");
                 sync_values(&mut config_val, &mut providers_val, &config, &providers)?;
                 save_setup(&paths, &config_val, &providers_val, write_private)?;
@@ -208,6 +231,7 @@ pub async fn run_setup(cwd: &Path) -> Result<()> {
                 }
                 eprintln!("\x1b[1;32m✓ 全部配置已保存成功！\x1b[0m");
                 eprintln!("  * 服务商凭据已隔离存储至 ~/.cyber/providers.toml");
+                eprintln!("  * 全局核心与识图引擎配置已更新至 ~/.cyber/config.toml");
                 eprintln!("  * MCP 配置已更新至 ~/.cyber/mcp/servers.toml");
                 eprintln!("  * 自定义工具已同步至 ~/.cyber/tools/*.toml");
                 eprintln!("\n运行 \x1b[1;36mcyber\x1b[0m 即可开始使用，或运行 \x1b[1;36mcyber tui\x1b[0m 启动多面板界面。");
@@ -251,6 +275,31 @@ fn sync_values(
                 "default_provider".into(),
                 Value::String(config.agent.default_provider.clone()),
             );
+            let vision = agent_table
+                .entry("vision")
+                .or_insert_with(|| Value::Table(Default::default()));
+            if let Some(vision_table) = vision.as_table_mut() {
+                vision_table.insert(
+                    "enabled".into(),
+                    Value::Boolean(config.agent.vision.enabled),
+                );
+                vision_table.insert(
+                    "provider".into(),
+                    Value::String(config.agent.vision.provider.clone()),
+                );
+                vision_table.insert(
+                    "model".into(),
+                    Value::String(config.agent.vision.model.clone()),
+                );
+                vision_table.insert(
+                    "prompt".into(),
+                    Value::String(config.agent.vision.prompt.clone()),
+                );
+                vision_table.insert(
+                    "detail".into(),
+                    Value::String(config.agent.vision.detail.clone()),
+                );
+            }
         }
     }
     if let Some(prov_table) = providers_val.as_table_mut() {
@@ -400,6 +449,250 @@ async fn setup_providers_menu(config: &mut Config, providers: &mut ProvidersConf
                 }
             }
             _ => break,
+        }
+    }
+    Ok(())
+}
+
+async fn setup_vision_menu(config: &mut Config, providers: &ProvidersConfig) -> Result<()> {
+    loop {
+        let status_label = if config.agent.vision.enabled {
+            "\x1b[1;32m开启 (enabled)\x1b[0m"
+        } else {
+            "\x1b[90m关闭 (disabled)\x1b[0m"
+        };
+        let prov_label = if config.agent.vision.provider.is_empty() {
+            "自动选择 (优先使用支持视觉的服务商或默认服务商)"
+        } else {
+            &config.agent.vision.provider
+        };
+        let model_label = if config.agent.vision.model.is_empty() {
+            "跟随服务商配置 (默认)"
+        } else {
+            &config.agent.vision.model
+        };
+        let detail_label = if config.agent.vision.detail.is_empty() {
+            "auto"
+        } else {
+            &config.agent.vision.detail
+        };
+
+        eprint!("\r\n=== 👁️ 自适应识图引擎 (Vision Engine) 配置 ===\r\n");
+        eprint!("当前配置状态:\r\n");
+        eprint!("  * 引擎开关: {status_label}\r\n");
+        eprint!("  * 识图服务商: \x1b[1;36m{prov_label}\x1b[0m\r\n");
+        eprint!("  * 识图模型: \x1b[1;36m{model_label}\x1b[0m\r\n");
+        eprint!("  * 图像细节: \x1b[1;33m{detail_label}\x1b[0m\r\n");
+        if !config.agent.vision.prompt.is_empty() {
+            eprint!(
+                "  * 专用提示词: \x1b[90m{}\x1b[0m\r\n",
+                config.agent.vision.prompt
+            );
+        }
+
+        let items = vec![
+            format!(
+                "1. 切换引擎开关 (当前: {})",
+                if config.agent.vision.enabled {
+                    "开启"
+                } else {
+                    "关闭"
+                }
+            ),
+            format!("2. 指定专属识图服务商 (当前: {prov_label})"),
+            format!("3. 指定专属识图模型 (当前: {model_label})"),
+            format!("4. 设置图像细节级别 (当前: {detail_label})"),
+            "5. 设置自定义识图分析提示词".to_string(),
+            "6. 🔬 运行多模态识图能力探针测试 (验证指定模型是否支持视觉)".to_string(),
+            "7. 恢复识图引擎默认配置 (DeepSeek Flash)".to_string(),
+            "8. 返回上一级主菜单".to_string(),
+        ];
+
+        let Some(sel) = select_menu("请选择识图引擎操作:", &items, 0)? else {
+            break;
+        };
+
+        match sel {
+            0 => {
+                config.agent.vision.enabled = !config.agent.vision.enabled;
+                let state_str = if config.agent.vision.enabled {
+                    "\x1b[1;32m已开启\x1b[0m"
+                } else {
+                    "\x1b[90m已关闭\x1b[0m"
+                };
+                eprint!("\r\x1b[32m✓ 自适应识图引擎已切换为: {state_str}\x1b[0m\r\n");
+            }
+            1 => {
+                let mut names = vec!["自动选择 (清空指定)".to_string()];
+                names.extend(providers.sorted_names());
+                if let Some(p_sel) = select_menu("请选择用于识图的服务商:", &names, 0)? {
+                    if p_sel == 0 {
+                        config.agent.vision.provider.clear();
+                        eprint!("\r\x1b[32m✓ 已设置为自动选择识图服务商\x1b[0m\r\n");
+                    } else {
+                        let chosen = names[p_sel].clone();
+                        config.agent.vision.provider = chosen.clone();
+                        eprint!("\r\x1b[32m✓ 识图专属服务商已设为: [{chosen}]\x1b[0m\r\n");
+                    }
+                }
+            }
+            2 => {
+                let current_prov = if config.agent.vision.provider.is_empty() {
+                    &config.agent.default_provider
+                } else {
+                    &config.agent.vision.provider
+                };
+                let provider_cfg = providers.providers.get(current_prov);
+
+                let mut options = vec![
+                    "跟随服务商默认模型 (清空专用模型)".to_string(),
+                    "手动输入模型名称".to_string(),
+                ];
+                let mut known_models = Vec::new();
+                if let Some(p) = provider_cfg {
+                    for m in p.models.keys() {
+                        known_models.push(m.clone());
+                        options.push(format!("从已有模型列表选择: {m}"));
+                    }
+                }
+                options.push("DeepSeek 官方视觉模型: deepseek-flash".to_string());
+                options.push("OpenAI 官方视觉模型: gpt-4o".to_string());
+                options.push("OpenAI 迷你视觉模型: gpt-4o-mini".to_string());
+
+                if let Some(m_sel) = select_menu("请选择设置识图模型方式:", &options, 0)?
+                {
+                    match m_sel {
+                        0 => {
+                            config.agent.vision.model.clear();
+                            eprint!("\r\x1b[32m✓ 已重置为跟随服务商默认模型\x1b[0m\r\n");
+                        }
+                        1 => {
+                            let cur = &config.agent.vision.model;
+                            if let Some(input) = prompt_text(
+                                "请输入识图模型名称 (例如 deepseek-flash, gpt-4o)",
+                                cur,
+                            )? {
+                                config.agent.vision.model = input.clone();
+                                eprint!("\r\x1b[32m✓ 识图模型已设为: [{input}]\x1b[0m\r\n");
+                            }
+                        }
+                        _ if m_sel - 2 < known_models.len() => {
+                            let chosen = known_models[m_sel - 2].clone();
+                            config.agent.vision.model = chosen.clone();
+                            eprint!("\r\x1b[32m✓ 识图模型已设为: [{chosen}]\x1b[0m\r\n");
+                        }
+                        _ => {
+                            let preset_model = match options[m_sel].as_str() {
+                                s if s.contains("deepseek-flash") => "deepseek-flash",
+                                s if s.contains("gpt-4o-mini") => "gpt-4o-mini",
+                                s if s.contains("gpt-4o") => "gpt-4o",
+                                _ => "deepseek-flash",
+                            };
+                            config.agent.vision.model = preset_model.to_string();
+                            eprint!("\r\x1b[32m✓ 识图模型已设为: [{preset_model}]\x1b[0m\r\n");
+                        }
+                    }
+                }
+            }
+            3 => {
+                let details = vec![
+                    "auto (自动平衡清晰度与 token 消耗，推荐)".to_string(),
+                    "low (低分辨率快速模式，消耗固定且少)".to_string(),
+                    "high (高分辨率高细节模式，适于细小文本/二维码/图表)".to_string(),
+                ];
+                if let Some(d_sel) = select_menu("请选择图像细节级别 (Detail Level):", &details, 0)?
+                {
+                    let d_val = match d_sel {
+                        1 => "low",
+                        2 => "high",
+                        _ => "auto",
+                    };
+                    config.agent.vision.detail = d_val.to_string();
+                    eprint!("\r\x1b[32m✓ 图像细节级别已设为: [{d_val}]\x1b[0m\r\n");
+                }
+            }
+            4 => {
+                let cur = if config.agent.vision.prompt.is_empty() {
+                    "请详细分析并描述此图片内容，提取其中的文本、界面元素与安全关键信息。"
+                } else {
+                    &config.agent.vision.prompt
+                };
+                if let Some(input) = prompt_text("请输入自定义识图分析提示词", cur)? {
+                    config.agent.vision.prompt = input.clone();
+                    eprint!("\r\x1b[32m✓ 识图提示词已更新\x1b[0m\r\n");
+                }
+            }
+            5 => {
+                run_vision_probe_test(config, providers).await?;
+            }
+            6 => {
+                config.agent.vision = VisionConfig::default();
+                eprint!(
+                    "\r\x1b[32m✓ 识图引擎已恢复默认配置 (DeepSeek Flash, auto, 开启)\x1b[0m\r\n"
+                );
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+async fn run_vision_probe_test(config: &Config, providers: &ProvidersConfig) -> Result<()> {
+    let prov_name = if config.agent.vision.provider.is_empty() {
+        &config.agent.default_provider
+    } else {
+        &config.agent.vision.provider
+    };
+    if prov_name.is_empty() {
+        eprint!("\r\x1b[31m错误: 尚未配置任何服务商，无法执行测试。\x1b[0m\r\n");
+        return Ok(());
+    }
+    let Some(prov_cfg) = providers.providers.get(prov_name) else {
+        eprint!("\r\x1b[31m错误: 服务商 [{prov_name}] 未在配置中找到。\x1b[0m\r\n");
+        return Ok(());
+    };
+    let model = if config.agent.vision.model.is_empty() {
+        if prov_cfg.model.is_empty() {
+            "deepseek-flash"
+        } else {
+            &prov_cfg.model
+        }
+    } else {
+        &config.agent.vision.model
+    };
+
+    eprint!(
+        "\r\x1b[2K正在向 [{prov_name}] 发送极小图片探针测试模型 [{model}] 的多模态视觉能力...\r\n"
+    );
+    let _ = io::stderr().flush();
+
+    match cyber_agent::vision::probe_model_vision(prov_cfg, model).await {
+        Ok(VisionCapability::Supported) => {
+            eprint!(
+                "\r\x1b[1;32m✓ 探针测试成功！模型 [{model}] 原生支持多模态视觉输入。\x1b[0m\r\n"
+            );
+            let _ = cyber_core::save_model_vision_capability(
+                prov_name,
+                model,
+                VisionCapability::Supported,
+                None,
+            );
+        }
+        Ok(VisionCapability::Unsupported) => {
+            eprint!("\r\x1b[1;33m⚠ 探测结果：模型 [{model}] 不支持多模态视觉输入（纯文本模型）。\x1b[0m\r\n");
+            eprint!("  提示: 启用自适应识图引擎后，系统会自动调用识图降级模型完成图生文分析。\r\n");
+            let _ = cyber_core::save_model_vision_capability(
+                prov_name,
+                model,
+                VisionCapability::Unsupported,
+                None,
+            );
+        }
+        Ok(VisionCapability::Unknown) => {
+            eprint!("\r\x1b[33m? 探测结果未能明确判定模型视觉能力。\x1b[0m\r\n");
+        }
+        Err(e) => {
+            eprint!("\r\x1b[31m✗ 探针请求失败: {e}\x1b[0m\r\n");
         }
     }
     Ok(())
@@ -2536,6 +2829,48 @@ mod tests {
         assert_eq!(
             providers["providers"]["other"]["model"].as_str(),
             Some("keep")
+        );
+    }
+
+    #[test]
+    fn sync_values_synchronizes_vision_config() {
+        let mut config_val: Value =
+            toml::from_str("[agent]\ndefault_provider = 'openai'\n").unwrap();
+        let mut providers_val: Value = toml::from_str("[providers]\n").unwrap();
+        let mut config = Config::default();
+        config.agent.default_provider = "deepseek".into();
+        config.agent.vision.enabled = true;
+        config.agent.vision.provider = "deepseek".into();
+        config.agent.vision.model = "deepseek-flash".into();
+        config.agent.vision.detail = "high".into();
+        config.agent.vision.prompt = "自定义识图提示词".into();
+        let providers = ProvidersConfig::default();
+
+        sync_values(&mut config_val, &mut providers_val, &config, &providers).unwrap();
+
+        assert_eq!(
+            config_val["agent"]["default_provider"].as_str(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            config_val["agent"]["vision"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config_val["agent"]["vision"]["provider"].as_str(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            config_val["agent"]["vision"]["model"].as_str(),
+            Some("deepseek-flash")
+        );
+        assert_eq!(
+            config_val["agent"]["vision"]["detail"].as_str(),
+            Some("high")
+        );
+        assert_eq!(
+            config_val["agent"]["vision"]["prompt"].as_str(),
+            Some("自定义识图提示词")
         );
     }
 

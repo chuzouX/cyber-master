@@ -50,6 +50,35 @@ pub fn render(
     context_usage: &ContextUsage,
     todos: &[cyber_core::TodoItem],
 ) {
+    render_with_toast(
+        frame,
+        area,
+        theme,
+        state,
+        project,
+        provider,
+        usage,
+        price,
+        context_usage,
+        todos,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_toast(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &ChatState,
+    project: Option<&ProjectContext>,
+    provider: &str,
+    usage: &UsageStats,
+    price: Option<&PriceConfig>,
+    context_usage: &ContextUsage,
+    todos: &[cyber_core::TodoItem],
+    toast: Option<&str>,
+) {
     let scrolled = !state.is_following_bottom();
     let title = if scrolled {
         format!(" Chat · provider={provider} · ↑已滚动 ")
@@ -101,7 +130,7 @@ pub fn render(
         price,
         context_usage,
     );
-    render_hint(frame, chunks[4], theme, state);
+    render_hint(frame, chunks[4], theme, state, toast);
     // 斜杠补全菜单：浮于输入框上方，最后绘制以叠加在最上层
     if state.slash_menu.open && !state.slash_menu.filtered.is_empty() {
         render_slash_menu(frame, chunks[2], theme, &state.slash_menu);
@@ -364,7 +393,31 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// 渲染底部 hint 行。
-fn render_hint(frame: &mut Frame, area: Rect, theme: &Theme, state: &ChatState) {
+fn render_hint(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    state: &ChatState,
+    toast: Option<&str>,
+) {
+    if let Some(t) = toast {
+        let line = Line::from(vec![
+            Span::styled(
+                " 💡 ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                t,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let hint = if state.streaming {
         " 生成中… Esc 取消 · Tab 切换模式 · Ctrl+, 设置 · Ctrl+C 退出"
     } else {

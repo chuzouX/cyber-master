@@ -65,6 +65,8 @@ pub struct ToolCtx {
     pub(crate) subagent_runtime: Option<Arc<crate::agent::SubagentRuntime>>,
     pub(crate) subagent_archive: Option<Arc<crate::subagent::SubagentArchive>>,
     pub(crate) background: Option<Arc<crate::background::BackgroundRegistry>>,
+    pub(crate) provider_config: Option<cyber_core::ProviderConfig>,
+    pub(crate) mock: bool,
 }
 
 impl ToolCtx {
@@ -82,6 +84,8 @@ impl ToolCtx {
             subagent_runtime: None,
             subagent_archive: None,
             background: None,
+            provider_config: None,
+            mock: false,
         }
     }
 
@@ -91,6 +95,24 @@ impl ToolCtx {
     ) -> Self {
         self.subagent_runtime = Some(runtime);
         self
+    }
+
+    pub fn with_provider_config(mut self, cfg: Option<cyber_core::ProviderConfig>) -> Self {
+        self.provider_config = cfg;
+        self
+    }
+
+    pub fn with_mock(mut self, mock: bool) -> Self {
+        self.mock = mock;
+        self
+    }
+
+    pub fn provider_config(&self) -> Option<&cyber_core::ProviderConfig> {
+        self.provider_config.as_ref()
+    }
+
+    pub fn is_mock(&self) -> bool {
+        self.mock
     }
 
     pub(crate) fn subagent_runtime(&self) -> Option<&Arc<crate::agent::SubagentRuntime>> {
@@ -547,14 +569,15 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 12);
+        assert_eq!(registry.all_schemas().len(), 13);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
         assert!(registry.get("bg_shell").is_some());
+        assert!(registry.get("inspect_image").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 12);
-        assert_eq!(registry.schemas().len(), 12);
+        assert_eq!(registry.all_schemas().len(), 13);
+        assert_eq!(registry.schemas().len(), 13);
     }
 
     #[test]

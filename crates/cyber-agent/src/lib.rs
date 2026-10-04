@@ -22,16 +22,17 @@ pub mod subagent;
 pub mod tool;
 pub mod tools;
 pub mod types;
+pub mod vision;
 
 pub use agent::{
-    run_compact_stream, run_stream, run_stream_with_permissions, run_writeup_stream,
-    steering_channel, SteeringReceiver, SteeringSender,
+    is_retryable_error, run_compact_stream, run_stream, run_stream_with_permissions,
+    run_writeup_stream, steering_channel, SteeringReceiver, SteeringSender,
 };
 pub use background::{BackgroundJob, BackgroundRegistry, JobKind, JobStatus};
 pub use compact::{
-    auto_compact_threshold, compact_messages, compact_prompt, context_remaining_percent,
-    estimate_messages_tokens, estimate_tokens, AUTOCOMPACT_BUFFER_TOKENS,
-    COMPACT_MAX_OUTPUT_TOKENS,
+    auto_compact_threshold, compact_messages, compact_messages_with_retry, compact_prompt,
+    context_remaining_percent, estimate_messages_tokens, estimate_tokens,
+    AUTOCOMPACT_BUFFER_TOKENS, COMPACT_MAX_OUTPUT_TOKENS,
 };
 pub use error::{AgentError, Result};
 pub use models::{extract_model_ids, fetch_models};
@@ -44,7 +45,16 @@ pub use provider::{provider_factory, Provider, StreamRequest};
 pub use subagent::{SubagentArchive, SubagentRun, SubagentStatus};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{
-    builtin_tool_names, CtfChallengeTool, CustomTool, DelegateTasksTool, SaveMemoryTool,
-    SearchToolsTool, TodoTool,
+    builtin_tool_names, CtfChallengeTool, CustomTool, DelegateTasksTool, InspectImageTool,
+    SaveMemoryTool, SearchToolsTool, TodoTool,
 };
-pub use types::{AgentEvent, Message, Role, StreamEvent, ToolCall, ToolCallDelta, Usage};
+pub use types::{
+    AgentEvent, ImageContent, Message, Role, StreamEvent, ToolCall, ToolCallDelta, Usage,
+};
+pub use vision::{
+    detect_image_mime, format_injected_vision_description, get_model_vision_capability,
+    is_deepseek_provider, is_deepseek_vision_model, is_image_extension, prepare_image_for_deepseek,
+    probe_model_vision, resolve_prompt_placeholders, save_model_vision_capability, AttachedImage,
+    CapabilityStore, VisionCapability, VisionConfig, VisionEngine, DEFAULT_IMAGE_TOKENS,
+    MAX_IMAGE_BYTES, TINY_PROBE_PNG_BASE64, TINY_PROBE_PNG_DATA_URI,
+};

@@ -11,10 +11,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cyber_agent::{Message, ToolCall};
+use cyber_agent::{AttachedImage, Message, ToolCall};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -362,6 +363,10 @@ pub struct ChatState {
     pub paste_detector: PasteDetector,
     /// 底部常驻 Todo 任务清单是否处于关闭状态（默认 false，有任务时常驻显示；/todo close 时置为 true）。
     pub todo_closed: bool,
+    /// 待提交的图片附件列表。
+    pub attached_images: Vec<AttachedImage>,
+    /// 下一个分配的图片序列号（从 1 起始单调自增）。
+    pub next_image_id: usize,
 }
 
 /// `wrapped` 预折行缓存的载体。
@@ -379,7 +384,7 @@ impl ChatState {
     pub fn new() -> Self {
         let mut input = TextArea::default();
         // 占位提示文本（样式在 render 时按当前 theme 应用，因 theme 可被 Settings 实时切换）
-        input.set_placeholder_text("输入消息，Enter 发送，Shift+Enter 换行…");
+        input.set_placeholder_text("输入消息，Enter 发送 (Alt+V/Ctrl+V 贴图，/image 传图)…");
         Self {
             entries: Vec::new(),
             input,
@@ -400,6 +405,8 @@ impl ChatState {
             last_render_width: 0,
             paste_detector: PasteDetector::new(),
             todo_closed: false,
+            attached_images: Vec::new(),
+            next_image_id: 1,
         }
     }
 
@@ -754,7 +761,7 @@ impl ChatState {
     }
 
     /// 输入框是否全空（所有行为空串）。
-    fn input_empty(&self) -> bool {
+    pub fn input_empty(&self) -> bool {
         self.input.lines().iter().all(|l| l.is_empty())
     }
 
@@ -807,6 +814,63 @@ impl ChatState {
     pub fn paste(&mut self, text: &str) {
         self.input.insert_str(text);
         self.update_slash_menu();
+    }
+
+    /// 注册本地图片为附件，分配序列号并在输入框光标处插入 `[image:{id}]` 占位符。
+    pub fn attach_image(
+        &mut self,
+        path: impl Into<PathBuf>,
+        display_name: impl Into<String>,
+    ) -> usize {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.attached_images
+            .push(AttachedImage::new(id, path, display_name));
+        self.input.insert_str(format!("[image:{id}]"));
+        self.update_slash_menu();
+        id
+    }
+
+    /// 将待提交文本中包含的 `[image:N]` 占位符展开为内部文件路径，供 agent 任务解析。
+    /// 未在文本中引用的附件自动舍弃。
+    pub fn expand_attached_placeholders(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut last_end = 0;
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        let mut referenced_ids = HashSet::new();
+
+        while i < len {
+            if bytes[i] == b'[' {
+                let rest = &text[i + 1..];
+                if rest.to_ascii_lowercase().starts_with("image:") {
+                    let prefix_len = 1 + "image:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Ok(id) = spec.parse::<usize>() {
+                            if let Some(att) = self.attached_images.iter().find(|a| a.id == id) {
+                                out.push_str(&text[last_end..i]);
+                                out.push_str(&format!("[image: {}]", att.path.display()));
+                                referenced_ids.insert(id);
+                                last_end = end;
+                                i = end;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.push_str(&text[last_end..]);
+
+        // 仅保留当前文本中仍被引用的附件（清理已 Backspace 删掉的无效附件）
+        self.attached_images
+            .retain(|a| referenced_ids.contains(&a.id));
+        out
     }
 
     /// 把当前 `streaming_buffer` 定稿为一条 assistant 条目（仅 buffer 非空时 push），
@@ -931,6 +995,59 @@ impl Default for ChatState {
     fn default() -> Self {
         Self::new()
     }
+}
+/// 将 RGBA8 像素内存位图轻量无损编码为 PNG 格式字节流。
+pub fn encode_rgba_to_png(width: u32, height: u32, rgba_bytes: &[u8]) -> Vec<u8> {
+    let mut raw_scanlines = Vec::with_capacity((1 + width as usize * 4) * height as usize);
+    let row_bytes = width as usize * 4;
+    for y in 0..height as usize {
+        raw_scanlines.push(0); // Filter: None
+        let start = y * row_bytes;
+        let end = start + row_bytes;
+        if end <= rgba_bytes.len() {
+            raw_scanlines.extend_from_slice(&rgba_bytes[start..end]);
+        } else {
+            raw_scanlines.extend(std::iter::repeat_n(0, row_bytes));
+        }
+    }
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw_scanlines, 6);
+
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+    let mut ihdr_data = Vec::with_capacity(13);
+    ihdr_data.extend_from_slice(&width.to_be_bytes());
+    ihdr_data.extend_from_slice(&height.to_be_bytes());
+    ihdr_data.push(8);
+    ihdr_data.push(6); // RGBA
+    ihdr_data.push(0);
+    ihdr_data.push(0);
+    ihdr_data.push(0);
+    write_png_chunk(&mut png, b"IHDR", &ihdr_data);
+
+    write_png_chunk(&mut png, b"IDAT", &compressed);
+    write_png_chunk(&mut png, b"IEND", &[]);
+
+    png
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in chunk_type.iter().chain(data.iter()) {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    out.extend_from_slice(&(!crc).to_be_bytes());
 }
 
 /// 把 `ChatEntry` 列表转为 agent `Message`（作为下一次请求的 history 上下文）。
@@ -1283,13 +1400,12 @@ fn push_role_lines(
 ) {
     for (i, text_line) in content.lines().enumerate() {
         let prefix = if i == 0 { label } else { "        " };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{prefix} "),
-                Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(text_line.to_string(), Style::default().fg(theme.fg)),
-        ]));
+        let mut spans = vec![Span::styled(
+            format!("{prefix} "),
+            Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
+        )];
+        render_text_with_image_badges(&mut spans, text_line, theme);
+        lines.push(Line::from(spans));
     }
     // 空内容消息至少占一行
     if content.is_empty() {
@@ -1297,6 +1413,53 @@ fn push_role_lines(
             format!("{label} "),
             Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
         )]));
+    }
+}
+
+/// 解析文本中的 `[image:N]` 占位符，渲染为醒目的紫色背景徽章。
+fn render_text_with_image_badges(spans: &mut Vec<Span<'static>>, text: &str, theme: &Theme) {
+    let mut last_end = 0;
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'[' {
+            let rest = &text[i + 1..];
+            if rest.to_ascii_lowercase().starts_with("image:") {
+                let prefix_len = 1 + "image:".len();
+                if let Some(close) = text[i + prefix_len..].find(']') {
+                    let end = i + prefix_len + close + 1;
+                    let spec = text[i + prefix_len..end - 1].trim();
+                    if let Ok(id) = spec.parse::<usize>() {
+                        if i > last_end {
+                            spans.push(Span::styled(
+                                text[last_end..i].to_string(),
+                                Style::default().fg(theme.fg),
+                            ));
+                        }
+                        spans.push(Span::styled(
+                            format!("🖼️ [image:{id}]"),
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(112, 48, 160))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        last_end = end;
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if last_end < text.len() {
+        spans.push(Span::styled(
+            text[last_end..].to_string(),
+            Style::default().fg(theme.fg),
+        ));
     }
 }
 
@@ -2680,5 +2843,51 @@ mod tests {
         s.entries.push(ChatEntry::User("uniq".into()));
         s.seed_input_history();
         assert_eq!(s.input_history.entries, vec!["dup", "uniq"]);
+    }
+
+    #[test]
+    fn test_encode_rgba_to_png_valid_magic() {
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let png = encode_rgba_to_png(2, 2, &rgba);
+        assert_eq!(
+            cyber_agent::vision::detect_image_mime(&png),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn test_attach_image_and_expand_placeholders() {
+        let mut s = ChatState::new();
+        let id1 = s.attach_image(std::path::PathBuf::from("/path/to/img1.png"), "img1.png");
+        assert_eq!(id1, 1);
+        assert_eq!(s.input.lines().join(""), "[image:1]");
+
+        let id2 = s.attach_image(std::path::PathBuf::from("/path/to/img2.png"), "img2.png");
+        assert_eq!(id2, 2);
+        assert_eq!(s.input.lines().join(""), "[image:1][image:2]");
+
+        // 场景 1：两个占位符都保留
+        let expanded = s.expand_attached_placeholders("分析 [image:1] 和 [image:2]");
+        assert!(expanded.contains("img1.png"));
+        assert!(expanded.contains("img2.png"));
+        assert_eq!(s.attached_images.len(), 2);
+
+        // 场景 2：用户在输入框删除了 [image:2]
+        let _expanded2 = s.expand_attached_placeholders("仅分析 [image:1]");
+        assert_eq!(s.attached_images.len(), 1);
+        assert_eq!(s.attached_images[0].id, 1);
+    }
+
+    #[test]
+    fn test_render_text_with_image_badges() {
+        let theme = Theme::resolve("cyberpunk");
+        let mut spans = Vec::new();
+        render_text_with_image_badges(&mut spans, "测试图片 [image:1] 内容", &theme);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "测试图片 ");
+        assert_eq!(spans[1].content, "🖼️ [image:1]");
+        assert_eq!(spans[2].content, " 内容");
     }
 }

@@ -18,6 +18,9 @@ pub enum AgentError {
     #[error("provider: {0}")]
     Provider(String),
 
+    #[error("vision: {0}")]
+    Vision(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

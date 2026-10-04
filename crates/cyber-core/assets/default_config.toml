@@ -11,6 +11,8 @@ frame_rate = 60
 default_provider = "openai"  # 见 providers.toml
 auto_tool_call = true
 max_steps = 25               # agent loop 最大步数
+retry_attempts = 5           # 模型异常重连次数（中断、连接超时等，默认 5 次）
+retry_delay_secs = 3         # 重试时间间隔（秒，默认 3 秒）
 
 [agent.subagents]
 enabled = true
@@ -18,6 +20,13 @@ max_tasks = 8
 max_parallel = 4
 timeout_secs = 300
 max_steps = 25
+
+[agent.vision]
+enabled = true
+provider = "deepseek"
+model = "deepseek-flash"
+prompt = "请详细分析并描述此图片内容，提取其中的文本、界面元素与安全关键信息。"
+detail = "auto"
 
 [workflow]
 max_parallel_nodes = 8

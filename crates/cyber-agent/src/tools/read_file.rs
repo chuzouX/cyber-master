@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::error::{AgentError, Result};
 use crate::tool::{Tool, ToolCtx, ToolOutput, ToolSchema};
 use crate::tools::guard::resolve_under_cwd;
+use crate::vision::{detect_image_mime, mime_from_extension};
 
 /// 每页最大字节数（64KB）。
 const PAGE_BYTES: usize = 64 * 1024;
@@ -55,6 +56,17 @@ impl Tool for ReadFileTool {
             let bytes = std::fs::read(&resolved).map_err(|e| {
                 AgentError::Provider(format!("读取 {} 失败: {e}", resolved.display()))
             })?;
+            if let (Some(mime), true) = (
+                detect_image_mime(&bytes),
+                mime_from_extension(&resolved).is_some(),
+            ) {
+                return Ok(ToolOutput {
+                    content: format!(
+                        "（检测到该文件为图片格式 [{mime}]，已跳过文本打印。请使用 inspect_image 工具进行视觉多模态分析）"
+                    ),
+                    is_error: false,
+                });
+            }
             let total = bytes.len();
             // offset 超过文件末尾 → 空内容 + 提示
             if offset >= total {
@@ -105,6 +117,30 @@ mod tests {
             .unwrap();
         assert_eq!(out.content, "你好世界");
         assert!(!out.is_error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn skips_binary_print_for_image_files_and_suggests_inspect_image() {
+        let dir = std::env::temp_dir().join("cyber_read_file_test_image");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("test_logo.png");
+        let png_bytes = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&f, png_bytes).unwrap();
+        let ctx = ctx_with(&dir);
+        let out = ReadFileTool
+            .run(json!({"path": "test_logo.png"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("检测到该文件为图片格式 [image/png]"));
+        assert!(out.content.contains("inspect_image"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -46,6 +46,7 @@ pub fn ensure_global_init(paths: &Paths) -> Result<bool> {
 fn create_global_layout(paths: &Paths) -> Result<()> {
     for dir in [
         paths.cyber_home.as_path(),
+        paths.cache_dir.as_path(),
         paths.skills_dir.as_path(),
         paths.tools_dir.as_path(),
         paths.mcp_dir.as_path(),

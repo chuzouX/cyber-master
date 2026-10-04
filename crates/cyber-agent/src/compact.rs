@@ -56,6 +56,8 @@ pub fn estimate_messages_tokens(messages: &[Message]) -> usize {
     let mut total = 0;
     for m in messages {
         total += estimate_tokens(&m.content);
+        // DeepSeek 官方单图上限 1024 tokens
+        total += m.images.len() * crate::vision::DEFAULT_IMAGE_TOKENS;
         // tool_calls 开销：name + arguments
         for tc in &m.tool_calls {
             total += estimate_tokens(&tc.name) + estimate_tokens(&tc.arguments);
@@ -131,6 +133,18 @@ pub async fn compact_messages(
     messages: &[Message],
     custom_instructions: Option<&str>,
 ) -> Result<Message> {
+    compact_messages_with_retry(provider, system, messages, custom_instructions, 5, 3).await
+}
+
+/// 执行上下文压缩并提供自动重试能力。
+pub async fn compact_messages_with_retry(
+    provider: &dyn Provider,
+    system: &str,
+    messages: &[Message],
+    custom_instructions: Option<&str>,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<Message> {
     if messages.is_empty() {
         return Err(AgentError::Provider("压缩无消息可处理".into()));
     }
@@ -140,24 +154,48 @@ pub async fn compact_messages(
     req_messages.push(Message::user(prompt));
     let req = StreamRequest::new(req_messages).with_system(system.to_string());
     // 压缩不暴露工具 → 模型只能生成文本摘要
-    let mut stream = provider.stream(req);
-    let mut summary = String::new();
-    while let Some(ev) = stream.next().await {
-        match ev {
-            StreamEvent::Delta(t) => summary.push_str(&t),
-            StreamEvent::Done => break,
-            StreamEvent::Error(m) => {
-                return Err(AgentError::Provider(format!("压缩流式失败: {m}")));
-            }
-            _ => {}
-        }
-    }
+    let summary =
+        accumulate_compact_stream_with_retry(provider, &req, max_retries, delay_secs).await?;
     if summary.trim().is_empty() {
         return Err(AgentError::Provider("压缩未生成有效摘要".into()));
     }
     // 摘要包装为 user 消息（与 Claude Code 的 isCompactSummary 一致）
     let content = format!("（上下文已压缩：以下是之前对话的摘要）\n\n{summary}");
     Ok(Message::user(content))
+}
+
+async fn accumulate_compact_stream_with_retry(
+    provider: &dyn Provider,
+    req: &StreamRequest,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<String> {
+    let mut attempt = 0;
+    loop {
+        let mut stream = provider.stream(req.clone());
+        let mut summary = String::new();
+        let mut stream_err: Option<String> = None;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                StreamEvent::Delta(t) => summary.push_str(&t),
+                StreamEvent::Done => break,
+                StreamEvent::Error(m) => {
+                    stream_err = Some(m);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(err_msg) = stream_err {
+            if attempt >= max_retries || !crate::agent::is_retryable_error(&err_msg) {
+                return Err(AgentError::Provider(format!("压缩流式失败: {err_msg}")));
+            }
+            attempt += 1;
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            continue;
+        }
+        return Ok(summary);
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +246,22 @@ mod tests {
         });
         // 0 + 2 + 3 = 5（id 不参与估算）
         assert_eq!(estimate_messages_tokens(&[m]), 5);
+    }
+
+    #[test]
+    fn estimate_messages_tokens_includes_images() {
+        use crate::types::ImageContent;
+        let m1 = Message::user("你好");
+        let t1 = estimate_messages_tokens(&[m1]);
+
+        let img = ImageContent::new("data:image/png;base64,abc");
+        let m2 = Message::user_with_images("你好", vec![img.clone()]);
+        let t2 = estimate_messages_tokens(&[m2]);
+        assert_eq!(t2, t1 + 1024);
+
+        let m3 = Message::user_with_images("你好", vec![img.clone(), img]);
+        let t3 = estimate_messages_tokens(&[m3]);
+        assert_eq!(t3, t1 + 2048);
     }
 
     #[test]

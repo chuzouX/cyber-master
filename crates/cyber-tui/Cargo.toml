@@ -20,6 +20,8 @@ futures = { workspace = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
+arboard = { workspace = true }
+miniz_oxide = { workspace = true }
 # P2.2 历史持久化：ChatEntry 序列化为 JSON
 serde = { workspace = true }
 serde_json = { workspace = true }
