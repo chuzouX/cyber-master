@@ -21,6 +21,7 @@ use crate::tool::McpTool;
 /// 一个已注册的 MCP server 连接。
 struct RegisteredServer {
     name: String,
+    tool_count: usize,
     conn: Arc<McpConnection>,
     /// actor task handle；shutdown 时 take + await。`Mutex` 仅短暂持有（不跨 await）。
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -65,12 +66,21 @@ impl McpRegistry {
         for (name, result) in results {
             match result {
                 Ok((conn, handle)) => {
+                    let server_tools = conn.tools();
+                    let tool_count = server_tools.len();
+                    if tool_count == 0 {
+                        warn!(
+                            server = %name,
+                            "MCP server 握手成功但返回 0 个工具；若为 HTTP 端点，请确认是否为 SSE 端点（可尝试配置 transport = \"sse\"）或服务端是否正确响应 tools/list"
+                        );
+                    }
                     // 收集该 server 的所有工具（命名 mcp_<server>_<tool>）
-                    for mcp_schema in conn.tools() {
+                    for mcp_schema in server_tools {
                         tools.push(McpTool::new(conn.clone(), mcp_schema.clone()));
                     }
                     servers.push(RegisteredServer {
                         name,
+                        tool_count,
                         conn,
                         handle: Mutex::new(Some(handle)),
                     });
@@ -95,6 +105,22 @@ impl McpRegistry {
     /// 已连接的 server 名称列表（供 `/mcp` 展示，顺序同 `servers.toml`）。
     pub fn server_names(&self) -> Vec<&str> {
         self.servers.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// 返回指定 server 的工具数量（若未连接则返回 None）。
+    pub fn tool_count(&self, server_name: &str) -> Option<usize> {
+        self.servers
+            .iter()
+            .find(|s| s.name == server_name)
+            .map(|s| s.tool_count)
+    }
+
+    /// 返回所有已连接 server 及其工具数量的映射。
+    pub fn server_tool_counts(&self) -> std::collections::HashMap<&str, usize> {
+        self.servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.tool_count))
+            .collect()
     }
 
     /// 已连接 server 数量。
@@ -143,4 +169,48 @@ async fn connect_one(
     spec: &McpServerSpec,
 ) -> Result<(Arc<McpConnection>, JoinHandle<()>), McpError> {
     McpConnection::connect(spec).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_registry_methods() {
+        let reg = McpRegistry::empty();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+        assert!(reg.server_names().is_empty());
+        assert_eq!(reg.tool_count("unknown"), None);
+        assert!(reg.server_tool_counts().is_empty());
+    }
+
+    #[test]
+    fn registered_server_tool_count_query() {
+        let conn = Arc::new(McpConnection::for_test("mock_server"));
+        let reg = McpRegistry {
+            servers: vec![
+                RegisteredServer {
+                    name: "srv1".into(),
+                    tool_count: 3,
+                    conn: conn.clone(),
+                    handle: Mutex::new(None),
+                },
+                RegisteredServer {
+                    name: "srv2".into(),
+                    tool_count: 0,
+                    conn,
+                    handle: Mutex::new(None),
+                },
+            ],
+        };
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.server_names(), vec!["srv1", "srv2"]);
+        assert_eq!(reg.tool_count("srv1"), Some(3));
+        assert_eq!(reg.tool_count("srv2"), Some(0));
+        assert_eq!(reg.tool_count("srv3"), None);
+        let counts = reg.server_tool_counts();
+        assert_eq!(counts.get("srv1"), Some(&3));
+        assert_eq!(counts.get("srv2"), Some(&0));
+    }
 }

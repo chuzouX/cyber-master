@@ -390,7 +390,7 @@ where
             maybe_req = req_rx.recv() => {
                 match maybe_req {
                     Some(McpRequest::Call { id, method, params, reply }) => {
-                        let req = JsonRpcRequest::new(id, method, Some(params));
+                        let req = JsonRpcRequest::new(id, method, (!params.is_null()).then_some(params));
                         match serde_json::to_vec(&req) {
                             Ok(bytes) => {
                                 pending.insert(id, reply);
@@ -413,7 +413,7 @@ where
                         }
                     }
                     Some(McpRequest::Notification { method, params }) => {
-                        let req = JsonRpcRequest::notification(method, Some(params));
+                        let req = JsonRpcRequest::notification(method, (!params.is_null()).then_some(params));
                         // notification 无 id，server 不应回响应；若误回，actor 因 pending 无该 id 而忽略。
                         if let Ok(bytes) = serde_json::to_vec(&req) {
                             let _ = writer.write_all(&bytes).await;
@@ -588,7 +588,7 @@ async fn do_http_call(
     params: Value,
     request_timeout: Duration,
 ) -> Result<Value> {
-    let req_obj = JsonRpcRequest::new(id, method, Some(params));
+    let req_obj = JsonRpcRequest::new(id, method, (!params.is_null()).then_some(params));
     let body_bytes = serde_json::to_vec(&req_obj)?;
 
     let send_future = build_http_request(client, url, base_headers, session_id, &body_bytes).send();
@@ -608,14 +608,37 @@ async fn do_http_call(
         }
     };
 
-    // 捕获 server 下发的 session id（initialize 响应头）
+    // 捕获 server 下发的 session id（initialize 响应头，不区分大小写匹配）
     if let Some(sid) = resp
         .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
+        .iter()
+        .find(|(k, _)| k.as_str().eq_ignore_ascii_case("mcp-session-id"))
+        .and_then(|(_, v)| v.to_str().ok())
         .map(|s| s.to_string())
     {
         *session_id = Some(sid);
+    }
+
+    let status = resp.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let reason = status.canonical_reason().unwrap_or("Unknown");
+        let err_snippet = match tokio::time::timeout(Duration::from_millis(500), resp.text()).await
+        {
+            Ok(Ok(text)) if !text.trim().is_empty() => {
+                let trimmed = text.trim();
+                if trimmed.len() > 200 {
+                    format!(": {}...", &trimmed[..200])
+                } else {
+                    format!(": {trimmed}")
+                }
+            }
+            _ => String::new(),
+        };
+        return Err(McpError::BadResponse {
+            server: server_name.into(),
+            detail: format!("HTTP 状态码错误 {code} {reason}{err_snippet}"),
+        });
     }
 
     let content_type = resp
@@ -698,7 +721,7 @@ async fn do_http_notification(
     params: Value,
     request_timeout: Duration,
 ) -> Result<()> {
-    let req_obj = JsonRpcRequest::notification(method, Some(params));
+    let req_obj = JsonRpcRequest::notification(method, (!params.is_null()).then_some(params));
     let body_bytes = serde_json::to_vec(&req_obj)?;
     let resp = build_http_request(client, url, base_headers, session_id, &body_bytes)
         .timeout(request_timeout)
@@ -708,6 +731,12 @@ async fn do_http_notification(
             server: server_name.into(),
             detail: format!("HTTP POST notification 失败: {e}"),
         })?;
+    if !resp.status().is_success() {
+        return Err(McpError::BadResponse {
+            server: server_name.into(),
+            detail: format!("HTTP notification 状态码错误: {}", resp.status()),
+        });
+    }
     // 丢弃 body（notification 无响应；server 可能回 202/200/204）
     let _ = resp.bytes().await;
     Ok(())
@@ -798,7 +827,7 @@ async fn sse_actor_loop(
                     Some(McpRequest::Notification { method, params }) => {
                         let ep_url = endpoint.lock().unwrap().clone();
                         if let Some(ep_url) = ep_url {
-                            let req_obj = JsonRpcRequest::notification(method, Some(params));
+                            let req_obj = JsonRpcRequest::notification(method, (!params.is_null()).then_some(params));
                             if let Ok(body) = serde_json::to_vec(&req_obj) {
                                 let _ = client
                                     .post(&ep_url)
@@ -861,7 +890,7 @@ async fn handle_sse_call(
         pending.lock().unwrap().insert(id, reply);
     }
 
-    let req_obj = JsonRpcRequest::new(id, method, Some(params));
+    let req_obj = JsonRpcRequest::new(id, method, (!params.is_null()).then_some(params));
     let body = match serde_json::to_vec(&req_obj) {
         Ok(b) => b,
         Err(e) => {
@@ -1755,6 +1784,7 @@ mod http_sse_tests {
     #[derive(Default, Clone)]
     struct HttpCapture {
         session_ids: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
     /// 启动 mock HTTP MCP server，返回 URL。
@@ -1803,8 +1833,11 @@ mod http_sse_tests {
             return;
         }
 
-        let req: serde_json::Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
+        let req: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => {
+                capture.bodies.lock().unwrap().push(v.clone());
+                v
+            }
             Err(_) => {
                 let _ = sock
                     .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
@@ -1911,6 +1944,17 @@ mod http_sse_tests {
         assert_eq!(result.content.len(), 1);
         assert_eq!(result.content[0].text, "pong");
 
+        // 验证 tools/list 请求体不含 "params" 字段（符合规范，避免 params: null）
+        let bodies = capture.bodies.lock().unwrap().clone();
+        let tools_list_req = bodies
+            .iter()
+            .find(|b| b.get("method").and_then(|m| m.as_str()) == Some("tools/list"))
+            .expect("应捕获 tools/list 请求");
+        assert!(
+            tools_list_req.get("params").is_none(),
+            "tools/list 请求不应包含 params 字段，实际: {tools_list_req:?}"
+        );
+
         conn.shutdown();
     }
 
@@ -1964,6 +2008,141 @@ mod http_sse_tests {
             Err(McpError::InitFailed { server, .. }) => assert_eq!(server, "no-url"),
             other => panic!("期望 InitFailed，实际: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_status_non_2xx_returns_bad_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = read_mock_http_request(&mut sock).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nNot Found")
+                    .await;
+            }
+        });
+
+        let url = format!("http://{addr}/mcp");
+        let res = McpConnection::spawn_http(&http_spec(url)).await;
+        match res {
+            Err(McpError::BadResponse { detail, .. }) => {
+                assert!(detail.contains("404"), "错误信息应包含 404，实际: {detail}");
+            }
+            other => panic!("期望 BadResponse，实际: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_tool_with_null_description_deserializes_to_empty_string() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok((_head, body)) = read_mock_http_request(&mut sock).await {
+                        if let Ok(req) = serde_json::from_slice::<serde_json::Value>(&body) {
+                            let method = req["method"].as_str().unwrap_or("");
+                            let id = req["id"].clone();
+                            if id.is_null() {
+                                let _ = sock
+                                    .write_all(
+                                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n",
+                                    )
+                                    .await;
+                                return;
+                            }
+                            let result = match method {
+                                "initialize" => serde_json::json!({
+                                    "protocolVersion": "2024-11-05",
+                                    "serverInfo": {"name": "mock-http", "version": "1.0"},
+                                    "capabilities": {}
+                                }),
+                                "tools/list" => serde_json::json!({
+                                    "tools": [{
+                                        "name": "tool_with_null_desc",
+                                        "description": null,
+                                        "inputSchema": {"type": "object"}
+                                    }]
+                                }),
+                                _ => serde_json::json!(null),
+                            };
+                            let resp_body =
+                                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                                    .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                resp_body.len(),
+                                resp_body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/mcp");
+        let (conn, _handle) = McpConnection::spawn_http(&http_spec(url))
+            .await
+            .expect("握手应成功，即使 description 为 null");
+        assert_eq!(conn.tools().len(), 1);
+        assert_eq!(conn.tools()[0].name, "tool_with_null_desc");
+        assert_eq!(conn.tools()[0].description, "");
+        conn.shutdown();
+    }
+
+    #[tokio::test]
+    async fn http_empty_tools_list_records_zero_tools() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok((_head, body)) = read_mock_http_request(&mut sock).await {
+                        if let Ok(req) = serde_json::from_slice::<serde_json::Value>(&body) {
+                            let method = req["method"].as_str().unwrap_or("");
+                            let id = req["id"].clone();
+                            if id.is_null() {
+                                let _ = sock
+                                    .write_all(
+                                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n",
+                                    )
+                                    .await;
+                                return;
+                            }
+                            let result = match method {
+                                "initialize" => serde_json::json!({
+                                    "protocolVersion": "2024-11-05",
+                                    "serverInfo": {"name": "mock-http", "version": "1.0"},
+                                    "capabilities": {}
+                                }),
+                                "tools/list" => serde_json::json!({
+                                    "tools": []
+                                }),
+                                _ => serde_json::json!(null),
+                            };
+                            let resp_body =
+                                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                                    .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                resp_body.len(),
+                                resp_body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/mcp");
+        let (conn, _handle) = McpConnection::spawn_http(&http_spec(url))
+            .await
+            .expect("空工具列表握手应成功");
+        assert_eq!(conn.tools().len(), 0);
+        conn.shutdown();
     }
 
     // ── SSE e2e：mock TCP server ────────────────────────────────────────

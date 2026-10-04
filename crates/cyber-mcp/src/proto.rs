@@ -105,9 +105,9 @@ pub struct ClientInfo {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_empty")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_empty")]
     pub version: String,
 }
 
@@ -123,7 +123,7 @@ pub struct ToolListResult {
 #[serde(rename_all = "camelCase")]
 pub struct McpToolSchema {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_empty")]
     pub description: String,
     #[serde(default)]
     pub input_schema: Value,
@@ -148,12 +148,24 @@ pub struct CallToolResult {
 /// `tools/call` 返回的内容块。
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpContent {
-    #[serde(default, rename = "type")]
+    #[serde(
+        default,
+        rename = "type",
+        deserialize_with = "deserialize_opt_string_or_empty"
+    )]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_empty")]
     pub text: String,
 }
 
+/// 辅助反序列化函数：支持缺失（None）或显式为 null 时降级为空字符串。
+fn deserialize_opt_string_or_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 impl McpContent {
     /// 是否为文本内容块。
     pub fn is_text(&self) -> bool {
@@ -254,5 +266,29 @@ mod tests {
         let raw = r#"{"content":[{"type":"text","text":"x"}]}"#;
         let r: CallToolResult = serde_json::from_str(raw).unwrap();
         assert!(!r.is_error, "缺失 isError 应回退 false");
+    }
+
+    #[test]
+    fn deserialize_tool_list_result_with_null_and_missing_description() {
+        let raw = r#"{
+            "tools": [
+                {"name": "tool_with_null", "description": null, "inputSchema": {"type": "object"}},
+                {"name": "tool_without_desc", "inputSchema": {"type": "object"}}
+            ]
+        }"#;
+        let r: ToolListResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.tools.len(), 2);
+        assert_eq!(r.tools[0].name, "tool_with_null");
+        assert_eq!(r.tools[0].description, "");
+        assert_eq!(r.tools[1].name, "tool_without_desc");
+        assert_eq!(r.tools[1].description, "");
+    }
+
+    #[test]
+    fn deserialize_server_info_with_null_fields() {
+        let raw = r#"{"name": null, "version": null}"#;
+        let info: ServerInfo = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.name, "");
+        assert_eq!(info.version, "");
     }
 }
