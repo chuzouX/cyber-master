@@ -613,7 +613,7 @@ impl ChatState {
                         if is_shift {
                             if let Some(mut sel) = self.selection.take() {
                                 sel.cursor = coord;
-                                sel.selecting = false;
+                                sel.selecting = true;
                                 let wc = self.wrapped.borrow();
                                 let text = crate::selection::extract_text(&wc.source, &sel);
                                 if !text.is_empty() {
@@ -700,16 +700,14 @@ impl ChatState {
 
                 if let Some(mut sel) = self.selection.take() {
                     sel.selecting = false;
-                    if sel.is_empty() {
-                        self.selection = None;
-                    } else {
+                    if !sel.is_empty() {
                         let wc = self.wrapped.borrow();
                         let text = crate::selection::extract_text(&wc.source, &sel);
                         if !text.is_empty() {
                             crate::selection::set_clipboard_text(&text);
                         }
-                        self.selection = Some(sel);
                     }
+                    self.selection = Some(sel);
                     return true;
                 }
             }
@@ -3249,5 +3247,110 @@ mod tests {
         // 4. 清除选区
         state.clear_selection();
         assert!(!state.has_selection());
+    }
+
+    #[test]
+    fn test_chat_state_click_then_shift_click_selection() {
+        let mut state = ChatState::new();
+        state
+            .entries
+            .push(ChatEntry::User("Hello, world from chat!".into()));
+        state
+            .entries
+            .push(ChatEntry::Assistant("Response from assistant line.".into()));
+
+        let theme = Theme::resolve("cyberpunk");
+        let _ = state.wrapped_lines(&theme, 80);
+        state.last_history_area.set(Rect::new(0, 0, 80, 20));
+        let total = state.wrapped.borrow().lines.len();
+        state.set_scroll_metrics(total, 20);
+
+        // 1. 普通单击 (5, 0)（Down + Up，无 Shift）：选区为空锚点，has_selection 为 false
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 5,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!state.has_selection());
+        assert!(state.selection.as_ref().is_some_and(|s| s.is_empty()));
+
+        // 2. 按住 Shift 单击 (15, 0)：建立 (5, 0) 到 (15, 0) 的有效选区
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 15,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        assert!(state.has_selection());
+        let sel = *state.selection.as_ref().unwrap();
+        let text = crate::selection::extract_text(&state.wrapped.borrow().source, &sel);
+        assert!(!text.is_empty());
+        let first_text_len = text.len();
+
+        // 3. 再次按住 Shift 单击 (20, 0)：锚点保持 (5, 0)，选区向后延伸
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 20,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        assert!(state.has_selection());
+        let sel2 = state.selection.as_ref().unwrap();
+        assert_eq!(sel2.anchor, sel.anchor);
+        let text2 = crate::selection::extract_text(&state.wrapped.borrow().source, sel2);
+        assert!(text2.len() > first_text_len);
+
+        // 4. 普通单击 (10, 0)：清除旧选区并重置锚点为 (10, 0)
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!state.has_selection());
+        assert!(state.selection.as_ref().is_some_and(|s| s.is_empty()));
+
+        // 5. 按住 Shift 单击 (18, 0)：生成 (10, 0) 到 (18, 0) 的新选区
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 18,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 18,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        assert!(state.has_selection());
+        let sel3 = state.selection.as_ref().unwrap();
+        assert_eq!(sel3.anchor.char_offset, 10);
+        assert_eq!(sel3.cursor.char_offset, 18);
     }
 }

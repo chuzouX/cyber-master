@@ -1862,7 +1862,7 @@ impl CliScreen {
                         if is_shift {
                             if let Some(mut sel) = self.selection.take() {
                                 sel.cursor = coord;
-                                sel.selecting = false;
+                                sel.selecting = true;
                                 let lines: &[Line<'static>] =
                                     if let Some(view) = self.subagent_view.as_ref() {
                                         &view.viewport.source
@@ -2003,9 +2003,7 @@ impl CliScreen {
 
                 if let Some(mut sel) = self.selection.take() {
                     sel.selecting = false;
-                    if sel.is_empty() {
-                        self.selection = None;
-                    } else {
+                    if !sel.is_empty() {
                         let lines: &[Line<'static>] =
                             if let Some(view) = self.subagent_view.as_ref() {
                                 &view.viewport.source
@@ -2017,8 +2015,8 @@ impl CliScreen {
                             crate::selection::set_clipboard_text(&text);
                             self.status = "✔ 已选中文本并复制到剪贴板".into();
                         }
-                        self.selection = Some(sel);
                     }
+                    self.selection = Some(sel);
                     return true;
                 }
             }
@@ -12831,6 +12829,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mouse_click_then_shift_click_selection() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        screen.message(
+            "Assistant",
+            "Quick brown fox jumps over the lazy dog.",
+            ACCENT,
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let area = screen.history_area;
+
+        // 1. 普通单击 (Down + Up, 无 Shift)
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 3,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x + 3,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!screen.has_selection());
+        assert!(screen.selection.as_ref().is_some_and(|s| s.is_empty()));
+
+        // 2. 按住 Shift 在另一位置单击 (Down + Up, 带 Shift)
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 15,
+            row: area.y + 1,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x + 15,
+            row: area.y + 1,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        assert!(screen.has_selection());
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor.line_idx, 1);
+        let text = crate::selection::extract_text(&screen.messages, sel);
+        assert!(!text.is_empty());
+        assert_eq!(screen.status, "✔ 已选中文本并复制到剪贴板");
+
+        drop(runner);
+    }
+
+    #[tokio::test]
     async fn test_mouse_click_clear_drag_selection_and_key_shortcuts() {
         let runner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&runner);
@@ -12860,7 +12913,8 @@ mod tests {
             row: area.y + 1,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(screen.selection.is_none());
+        assert!(!screen.has_selection());
+        assert!(screen.selection.as_ref().is_some_and(|s| s.is_empty()));
 
         // 2. 拖拽不同坐标：生成非空选区并复制
         screen.handle_mouse(crossterm::event::MouseEvent {
