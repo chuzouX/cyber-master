@@ -157,7 +157,9 @@ pub(crate) fn parse_bg(args: &str) -> Result<CliJobs> {
                 .map_err(|_| eyre!("用法: /bg tail <id>"))?;
             Ok(CliJobs::Tail(id))
         }
-        _ => bail!("用法: /bg <run <prompt>|shell <cmd>|list|kill <id>|tail <id>>"),
+        _ => {
+            bail!("用法: /bg <run <prompt>|shell <cmd>|list|kill <id>|tail <id>>");
+        }
     }
 }
 
