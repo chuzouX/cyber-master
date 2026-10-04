@@ -71,14 +71,19 @@ jobs:
           PRERELEASE=$(jq -r '.isPrerelease' release.json)
           if [ "$PRERELEASE" = "true" ]; then MAKE_LATEST="false"; else MAKE_LATEST="true"; fi
 
-          # CNB target_commitish 传主分支名（由 CNB 自动关联分支 HEAD）
+          # 绑定到对应 Tag（优先使用 Tag 自身或其具体 Commit，而非 main 分支 HEAD），确保 CNB 将 Release 准确与 Tag 强绑定
+          TARGET_COMMIT=$(jq -r '.targetCommitish // empty' release.json)
+          if [ -z "$TARGET_COMMIT" ] || [ "$TARGET_COMMIT" = "main" ] || [ "$TARGET_COMMIT" = "master" ]; then
+            TARGET_COMMIT="$TAG"
+          fi
+
           PAYLOAD=$(jq -n \
             --arg tag_name "$TAG" \
             --arg name "$NAME" \
             --arg body "$BODY" \
             --argjson prerelease "$PRERELEASE" \
             --arg make_latest "$MAKE_LATEST" \
-            --arg target_commitish "main" \
+            --arg target_commitish "$TARGET_COMMIT" \
             '{tag_name:$tag_name, name:$name, body:$body, prerelease:$prerelease, make_latest:$make_latest, target_commitish:$target_commitish}')
 
           RESP=$(curl -s -w "\n%{http_code}" "$API" -X POST \
