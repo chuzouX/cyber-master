@@ -129,6 +129,14 @@ pub struct FetchResult {
     pub result: std::result::Result<Vec<String>, String>,
 }
 
+/// 模型视觉能力探针实测结果回传。
+#[derive(Debug)]
+pub struct ProbeResult {
+    pub provider: String,
+    pub model: String,
+    pub result: std::result::Result<cyber_core::VisionCapability, String>,
+}
+
 /// 统一工具表 + Skill / MCP 注册表。
 ///
 /// `tools` 是 `Arc<ToolRegistry>`，跨 agent turn 共享（MCP 连接长存，不每轮重连）。
@@ -280,6 +288,15 @@ impl SessionsPanelState {
     }
 }
 
+/// 模型选择面板的目标用途。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelPickerTarget {
+    /// 默认主对话 Agent 模型选择（`/model` 触发）。
+    #[default]
+    DefaultAgent,
+    /// 识图引擎专用模型选择（`/vision model` 触发）。
+    VisionEngine,
+}
 /// `/model` 面板状态：双栏选择 provider + model。
 ///
 /// 左栏（providers）选中项变化时自动拉取该 provider 的模型列表；右栏（models）
@@ -304,6 +321,10 @@ pub struct ModelPickerState {
     pub provider_scroll: Cell<usize>,
     /// Model 列表滚动偏移（render 时按选中项自动调整，用 Cell 供 &self render 写回）。
     pub model_scroll: Cell<usize>,
+    /// 正在探测识图能力中的模型（若有）。
+    pub probing_model: Option<String>,
+    /// 选择目标（主 Agent 还是识图引擎）。
+    pub target: ModelPickerTarget,
 }
 
 impl Default for ModelPickerState {
@@ -318,6 +339,8 @@ impl Default for ModelPickerState {
             focus_models: false,
             provider_scroll: Cell::new(0),
             model_scroll: Cell::new(0),
+            probing_model: None,
+            target: ModelPickerTarget::DefaultAgent,
         }
     }
 }
@@ -464,6 +487,8 @@ pub struct App {
     /// true：滚轮翻页（终端原生选区被禁用）；
     /// false：可拖拽选区复制（滚轮事件会被终端翻译为 ↑/↓，不再路由到 scroll_history）。
     mouse_capture: bool,
+    pub probe_tx: UnboundedSender<ProbeResult>,
+    pub probe_rx: Option<UnboundedReceiver<ProbeResult>>,
     pub permissions: Arc<PermissionBroker>,
     pub permission_rx: Option<UnboundedReceiver<PermissionRequest>>,
     pub pending_permission: Option<PermissionRequest>,
@@ -471,6 +496,7 @@ pub struct App {
     pub permission_mode: PermissionMode,
     last_window_title: String,
     streaming_started: Option<std::time::Instant>,
+    pub last_paste_instant: Option<std::time::Instant>,
 }
 
 const WELCOME_OPTIONS: usize = 5;
@@ -511,6 +537,7 @@ impl App {
         let (broker, permission_rx) = PermissionBroker::interactive();
         broker.set_mode(initial_mode);
         let permissions = Arc::new(broker);
+        let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
         Self {
             config_at_entry: config.clone(),
             providers_at_entry: providers.clone(),
@@ -562,6 +589,8 @@ impl App {
             log_viewer: LogViewerState::default(),
             model_picker: ModelPickerState::default(),
             mouse_capture: true,
+            probe_tx,
+            probe_rx: Some(probe_rx),
             permissions,
             permission_rx: Some(permission_rx),
             pending_permission: None,
@@ -569,6 +598,7 @@ impl App {
             permission_mode: initial_mode,
             last_window_title: String::new(),
             streaming_started: None,
+            last_paste_instant: None,
         }
     }
 
@@ -628,12 +658,17 @@ impl App {
             .permission_rx
             .take()
             .unwrap_or_else(|| PermissionBroker::interactive().1);
+        let mut probe_rx = self
+            .probe_rx
+            .take()
+            .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
         let result = self
             .main_loop(
                 &mut terminal,
                 &mut agent_rx,
                 &mut fetch_rx,
                 &mut permission_rx,
+                &mut probe_rx,
             )
             .await;
         // 退出前持久化当前对话（catch-all，覆盖所有退出路径）。
@@ -727,11 +762,14 @@ impl App {
         agent_rx: &mut UnboundedReceiver<(u64, AgentEvent)>,
         fetch_rx: &mut UnboundedReceiver<FetchResult>,
         permission_rx: &mut UnboundedReceiver<PermissionRequest>,
+        probe_rx: &mut UnboundedReceiver<ProbeResult>,
     ) -> io::Result<()> {
         // crossterm EventStream 必须fuse；Windows console handle 可用。
         let mut events = crossterm::event::EventStream::new().fuse();
         // tick：周期重绘兜底（流式期由 agent 事件驱动重绘，idle 期低频刷新）
-        let mut tick = tokio::time::interval(Duration::from_millis(120));
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        #[cfg(windows)]
+        let mut was_ctrl_v_down = false;
         loop {
             let session_title = self
                 .sessions
@@ -779,7 +817,20 @@ impl App {
                         self.handle_fetch_result(fr);
                     }
                 }
+                maybe_probe = probe_rx.recv() => {
+                    if let Some(pr) = maybe_probe {
+                        self.handle_probe_result(pr);
+                    }
+                }
                 _ = tick.tick() => {
+                    #[cfg(windows)]
+                    if crate::win_paste::check_ctrl_v_rising_edge(&mut was_ctrl_v_down)
+                        && crate::win_paste::is_terminal_foreground()
+                        && self.mode == Mode::Chat
+                        && self.pending_permission.is_none()
+                    {
+                        self.handle_clipboard_image_only();
+                    }
                     // 粘贴缓冲兜底：buffer 非空且距上次按键 > 50ms 时 flush
                     if let Some(text) = self.chat.paste_detector.flush_if_stale() {
                         self.chat.paste(&text);
@@ -796,6 +847,9 @@ impl App {
             // 同理排空 fetch 事件。
             while let Ok(fr) = fetch_rx.try_recv() {
                 self.handle_fetch_result(fr);
+            }
+            while let Ok(pr) = probe_rx.try_recv() {
+                self.handle_probe_result(pr);
             }
             if self.should_quit {
                 break;
@@ -838,7 +892,16 @@ impl App {
             },
             // 粘贴（bracketed paste）：整块插入当前活跃的 textarea，不触发提交。
             // 未启用 bracketed paste 的终端不会产生此事件，回退为逐字符 KeyEvent。
-            Event::Paste(text) => self.handle_paste(text),
+            Event::Paste(text) => {
+                if self
+                    .last_paste_instant
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+                {
+                    return;
+                }
+                self.last_paste_instant = Some(std::time::Instant::now());
+                self.handle_paste(text);
+            }
             _ => {}
         }
     }
@@ -846,8 +909,58 @@ impl App {
     /// 处理粘贴事件：把文本整块插入当前活跃的 textarea（不触发提交）。
     /// Chat 模式插入输入框；表单模式仅在字段编辑态时插入。
     fn handle_paste(&mut self, text: String) {
+        self.last_paste_instant = Some(std::time::Instant::now());
         match self.mode {
-            Mode::Chat => self.chat.paste(&text),
+            Mode::Chat => {
+                let trimmed = text.trim();
+                let unquoted = trimmed
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| {
+                        trimmed
+                            .strip_prefix('\'')
+                            .and_then(|s| s.strip_suffix('\''))
+                    })
+                    .or_else(|| trimmed.strip_prefix('“').and_then(|s| s.strip_suffix('”')))
+                    .unwrap_or(trimmed)
+                    .trim();
+
+                if !unquoted.contains('\n') && !unquoted.is_empty() {
+                    let is_url =
+                        unquoted.starts_with("http://") || unquoted.starts_with("https://");
+                    let p = std::path::Path::new(unquoted);
+                    if is_url && cyber_agent::vision::is_image_extension(p) {
+                        let name = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image.png");
+                        let id = self.chat.attach_image(unquoted, name);
+                        self.toast = Some(format!("🖼️ 已记录图片，生成标识符 [image:{id}]"));
+                        return;
+                    }
+                    if cyber_agent::vision::is_image_extension(p) {
+                        let full = if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            self.paths.cwd.join(p)
+                        };
+                        if full.exists() && full.is_file() {
+                            let name = full
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("image.png");
+                            let id = self.chat.attach_image(&full, name);
+                            self.toast = Some(format!("🖼️ 已记录图片，生成标识符 [image:{id}]"));
+                            return;
+                        }
+                    }
+                }
+                if trimmed.is_empty() {
+                    self.handle_clipboard_paste();
+                    return;
+                }
+                self.chat.paste(&text);
+            }
             Mode::ProviderForm => {
                 if let Some(f) = self.provider_form.as_mut() {
                     if f.editing {
@@ -877,6 +990,87 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 处理剪贴板粘贴（Ctrl+V / Alt+V）：支持位图图片自动转存为 PNG 附件并生成 [image:N] 占位符。
+    /// 仅处理剪贴板中的位图图片（Windows Terminal 截图按键丢失兜底）：
+    /// 严格拦截文本粘贴，杜绝与 bracketed paste / 终端按键双重触发导致重复粘贴。
+    fn handle_clipboard_image_only(&mut self) -> bool {
+        if self
+            .last_paste_instant
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+        {
+            return false;
+        }
+        let mut cb_res = arboard::Clipboard::new();
+        for _ in 0..5 {
+            if cb_res.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cb_res = arboard::Clipboard::new();
+        }
+        if let Ok(mut cb) = cb_res {
+            if let Ok(img) = cb.get_image() {
+                let width = img.width as u32;
+                let height = img.height as u32;
+                let png_bytes = crate::chat::encode_rgba_to_png(width, height, &img.bytes);
+
+                let cache_dir = self
+                    .paths
+                    .config_file
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("cache")
+                    .join("images");
+                let _ = std::fs::create_dir_all(&cache_dir);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let id = self.chat.next_image_id;
+                let file_name = format!("clip_{}_{}.png", timestamp, id);
+                let file_path = cache_dir.join(&file_name);
+
+                if let Err(e) = std::fs::write(&file_path, &png_bytes) {
+                    self.toast = Some(format!("保存剪贴板图片失败: {e}"));
+                    return false;
+                }
+
+                let id = self.chat.attach_image(&file_path, file_name);
+                self.toast = Some(format!("🖼️ 已粘贴图片，生成标识符 [image:{id}]"));
+                self.last_paste_instant = Some(std::time::Instant::now());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 处理剪贴板粘贴（Ctrl+V / Alt+V）：优先支持位图图片自动转存，兜底支持文本粘贴并带防重节流保护。
+    fn handle_clipboard_paste(&mut self) {
+        if self
+            .last_paste_instant
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+        {
+            return;
+        }
+        if self.handle_clipboard_image_only() {
+            return;
+        }
+        let mut cb_res = arboard::Clipboard::new();
+        for _ in 0..5 {
+            if cb_res.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cb_res = arboard::Clipboard::new();
+        }
+        if let Ok(mut cb) = cb_res {
+            if let Ok(text) = cb.get_text() {
+                self.last_paste_instant = Some(std::time::Instant::now());
+                self.handle_paste(text);
+            }
         }
     }
 
@@ -962,6 +1156,14 @@ impl App {
                 }
             }
         }
+        // 输入框为空且按 End 键且视口未贴底时：立即复位到最新底部（SCROLL_FOLLOW）
+        if k.code == crossterm::event::KeyCode::End
+            && !self.chat.is_following_bottom()
+            && self.chat.input_empty()
+        {
+            self.chat.scroll_to_bottom();
+            return;
+        }
         match chat_key_to_action(k) {
             ChatAction::Submit => {
                 // 斜杠命令拦截：输入以 `/` 开头时不发 agent，转命令处理
@@ -984,7 +1186,8 @@ impl App {
                         self.toast = Some("已追加指示，模型将在下一步骤读取".into());
                     }
                 } else if let Some((text, history)) = self.chat.submit() {
-                    self.spawn_agent(text, history);
+                    let expanded = self.chat.expand_attached_placeholders(&text);
+                    self.spawn_agent(expanded, history);
                 }
             }
             ChatAction::SubmitImmediate => {
@@ -1005,11 +1208,13 @@ impl App {
                         self.chat.streaming_buffer.clear();
                         self.chat.thinking_buffer.clear();
                         self.chat.scroll_to_bottom();
-                        self.spawn_agent(trimmed.to_string(), history);
+                        let expanded = self.chat.expand_attached_placeholders(trimmed);
+                        self.spawn_agent(expanded, history);
                         self.toast = Some("已立即打断并让 AI 读取新指示".into());
                     }
                 } else if let Some((text, history)) = self.chat.submit() {
-                    self.spawn_agent(text, history);
+                    let expanded = self.chat.expand_attached_placeholders(&text);
+                    self.spawn_agent(expanded, history);
                 }
             }
             ChatAction::Newline => {
@@ -1076,6 +1281,9 @@ impl App {
                     self.chat.input.input(k);
                     self.chat.update_slash_menu();
                 }
+            }
+            ChatAction::Paste => {
+                self.handle_clipboard_paste();
             }
             ChatAction::Input => {
                 self.chat.input.input(k);
@@ -1267,6 +1475,18 @@ impl App {
                     .entries
                     .push(ChatEntry::System(format!("已接收追加指令: {content}")));
             }
+            AgentEvent::Retry {
+                attempt,
+                max_retries,
+                delay_secs,
+                error,
+            } => {
+                self.chat.streaming_buffer.clear();
+                self.chat.thinking_buffer.clear();
+                self.toast = Some(format!(
+                    "连接中断，正在重试 ({attempt}/{max_retries}) · {delay_secs}s 后重试: {error}"
+                ));
+            }
         }
     }
 
@@ -1337,7 +1557,86 @@ impl App {
         });
     }
 
-    /// `/model` 面板：确认选择 → 设 default_provider + 更新 provider.model + 持久化 + 返回。
+    /// `/model` 面板：针对当前选中的模型触发动态视觉能力探针测试。
+    fn start_model_probe(&mut self) {
+        let names = self.providers.sorted_names();
+        let Some(provider_name) = names.get(self.model_picker.provider_selected).cloned() else {
+            return;
+        };
+        let Some(cfg_snapshot) = self.providers.providers.get(&provider_name).cloned() else {
+            return;
+        };
+        let Some(model) = self
+            .model_picker
+            .models
+            .get(self.model_picker.model_selected)
+            .cloned()
+        else {
+            self.toast = Some("请先选择要探测的模型".into());
+            return;
+        };
+
+        if self.model_picker.probing_model.is_some() {
+            self.toast = Some("已有探针正在运行，请稍候...".into());
+            return;
+        }
+
+        self.model_picker.probing_model = Some(model.clone());
+        self.toast = Some(format!("正在探测 [{model}] 识图能力..."));
+        let tx = self.probe_tx.clone();
+        tokio::spawn(async move {
+            let res = cyber_agent::probe_model_vision(&cfg_snapshot, &model).await;
+            let result = res.map_err(|e| e.to_string());
+            let _ = tx.send(ProbeResult {
+                provider: provider_name,
+                model,
+                result,
+            });
+        });
+    }
+
+    /// 接收异步模型探针实测结果并持久化写回。
+    fn handle_probe_result(&mut self, pr: ProbeResult) {
+        if self.model_picker.probing_model.as_deref() == Some(&pr.model) {
+            self.model_picker.probing_model = None;
+        }
+
+        match pr.result {
+            Ok(cap) => {
+                let badge = cap.badge_text();
+                let _ = cyber_core::save_model_vision_capability(
+                    &pr.provider,
+                    &pr.model,
+                    cap,
+                    self.providers.providers.get_mut(&pr.provider),
+                );
+                let _ = cyber_core::save_providers(&self.providers, &self.paths.providers_file);
+
+                let summary = format!(
+                    "模型 [{}] 识图能力探测完成：{}",
+                    pr.model,
+                    if badge.is_empty() {
+                        "未测出明显特征"
+                    } else {
+                        badge
+                    }
+                );
+                self.toast = Some(summary.clone());
+                if self.mode == Mode::Chat {
+                    self.chat.entries.push(ChatEntry::System(summary));
+                }
+            }
+            Err(err) => {
+                let msg = format!("模型 [{}] 探针实测失败: {err}", pr.model);
+                self.toast = Some(msg.clone());
+                if self.mode == Mode::Chat {
+                    self.chat.entries.push(ChatEntry::System(msg));
+                }
+            }
+        }
+    }
+
+    /// `/model` / `/vision model` 面板：确认选择。根据 target 分别更新主 Agent 或识图引擎。
     fn confirm_model_pick(&mut self) {
         let names = self.providers.sorted_names();
         let Some(name) = names.get(self.model_picker.provider_selected).cloned() else {
@@ -1352,23 +1651,46 @@ impl App {
             self.toast = Some("无模型可选".into());
             return;
         };
-        // 更新 provider 的 model 字段
-        if let Some(cfg) = self.providers.providers.get_mut(&name) {
-            cfg.model = model.clone();
-        }
-        self.config.agent.default_provider = name.clone();
-        // 持久化 config + providers
-        let cfg_res = save_config(&self.config, &self.paths.config_file);
-        let prov_res = save_providers(&self.providers, &self.paths.providers_file);
-        match (cfg_res, prov_res) {
-            (Ok(()), Ok(())) => {
-                self.toast = Some(format!("已切换到 {name} · {model}"));
+
+        match self.model_picker.target {
+            ModelPickerTarget::VisionEngine => {
+                self.config.agent.vision.provider = name.clone();
+                self.config.agent.vision.model = model.clone();
+                let cfg_res = save_config(&self.config, &self.paths.config_file);
+                match cfg_res {
+                    Ok(()) => {
+                        self.toast = Some(format!("已设置识图引擎模型为 {name} · {model}"));
+                        if self.form_prev_mode == Mode::Chat {
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "自适应识图引擎已设置服务商与模型：{name} · {model}"
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        self.toast = Some(format!("识图配置保存失败: {e}"));
+                    }
+                }
             }
-            (Err(e), _) => {
-                self.toast = Some(format!("config 保存失败: {e}"));
-            }
-            (_, Err(e)) => {
-                self.toast = Some(format!("providers 保存失败: {e}"));
+            ModelPickerTarget::DefaultAgent => {
+                // 更新 provider 的 model 字段
+                if let Some(cfg) = self.providers.providers.get_mut(&name) {
+                    cfg.model = model.clone();
+                }
+                self.config.agent.default_provider = name.clone();
+                // 持久化 config + providers
+                let cfg_res = save_config(&self.config, &self.paths.config_file);
+                let prov_res = save_providers(&self.providers, &self.paths.providers_file);
+                match (cfg_res, prov_res) {
+                    (Ok(()), Ok(())) => {
+                        self.toast = Some(format!("已切换到 {name} · {model}"));
+                    }
+                    (Err(e), _) => {
+                        self.toast = Some(format!("config 保存失败: {e}"));
+                    }
+                    (_, Err(e)) => {
+                        self.toast = Some(format!("providers 保存失败: {e}"));
+                    }
+                }
             }
         }
         self.mode = self.form_prev_mode;
@@ -1435,6 +1757,9 @@ impl App {
                         self.start_model_fetch();
                     }
                 }
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') if self.model_picker.focus_models => {
+                self.start_model_probe();
             }
             _ => {}
         }
@@ -2486,7 +2811,7 @@ impl App {
                         .entries
                         .push(ChatEntry::System("生成中，无法切换 provider".into()));
                 } else if name.is_empty() {
-                    // 无参数：打开 ModelPicker 面板选择 provider + model
+                    // 无参数：直接打开 ModelPicker 面板选择 provider + model
                     self.open_model_picker();
                 } else if self.providers.providers.contains_key(&name) {
                     self.config.agent.default_provider = name.clone();
@@ -2494,16 +2819,27 @@ impl App {
                         .entries
                         .push(ChatEntry::System(format!("已切换 provider 到 {name}")));
                 } else {
-                    let available: Vec<&str> = self
-                        .providers
-                        .providers
-                        .keys()
-                        .map(String::as_str)
-                        .collect();
-                    self.chat.entries.push(ChatEntry::System(format!(
-                        "未知 provider：{name}（可用：{}）",
-                        available.join(", ")
-                    )));
+                    let target = name.to_ascii_lowercase();
+                    let mut matched_prov = None;
+                    for (prov_name, p) in &self.providers.providers {
+                        if p.model.to_ascii_lowercase() == target
+                            || p.models.keys().any(|m| m.to_ascii_lowercase() == target)
+                        {
+                            matched_prov = Some(prov_name.clone());
+                            break;
+                        }
+                    }
+                    if let Some(prov) = matched_prov {
+                        self.config.agent.default_provider = prov.clone();
+                        if let Some(p_mut) = self.providers.providers.get_mut(&prov) {
+                            p_mut.model = name.clone();
+                        }
+                        self.chat.entries.push(ChatEntry::System(format!(
+                            "已切换服务商 [{prov}] 的模型为 [{name}]"
+                        )));
+                    } else {
+                        self.open_model_picker();
+                    }
                 }
             }
             SlashCommand::Provider(args) => {
@@ -2517,6 +2853,9 @@ impl App {
             }
             SlashCommand::Web(args) => {
                 self.handle_web_slash(&args);
+            }
+            SlashCommand::Vision(args) => {
+                self.handle_vision_slash(&args);
             }
             SlashCommand::Tools => {
                 let mut lines = String::from("可用工具：");
@@ -2658,12 +2997,73 @@ impl App {
             SlashCommand::Settings => {
                 self.handle_action(Action::OpenSettings);
             }
+            SlashCommand::Image(args) => {
+                self.handle_image_slash(&args);
+            }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
                     "未知命令：{name}（输入 /help 查看可用命令）"
                 )));
             }
         }
+    }
+
+    /// 处理 `/image <path> [prompt]` 或 `/paste`：传入图片并提交视觉模型分析。
+    fn handle_image_slash(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("paste") {
+            self.handle_clipboard_paste();
+            return;
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let path_str = parts.next().unwrap_or("").trim();
+        let prompt_str = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        let is_url = path_str.starts_with("http://") || path_str.starts_with("https://");
+        let path = std::path::Path::new(path_str);
+        let full_path = if is_url || path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.paths.cwd.join(path)
+        };
+
+        if !is_url && !full_path.exists() {
+            self.chat.entries.push(ChatEntry::System(format!(
+                "图片文件不存在: {}",
+                full_path.display()
+            )));
+            return;
+        }
+
+        let display_name = full_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path_str);
+
+        let id = self.chat.next_image_id;
+        self.chat.next_image_id += 1;
+        self.chat
+            .attached_images
+            .push(cyber_agent::AttachedImage::new(
+                id,
+                &full_path,
+                display_name,
+            ));
+
+        let user_prompt = match prompt_str {
+            Some(p) => format!("[image:{id}] {p}"),
+            None => format!("[image:{id}] 请详细分析此图片"),
+        };
+
+        let history = self.chat.history();
+        let expanded = self.chat.expand_attached_placeholders(&user_prompt);
+        self.chat.entries.push(ChatEntry::User(user_prompt));
+        self.chat.streaming = true;
+        self.chat.streaming_buffer.clear();
+        self.chat.thinking_buffer.clear();
+        self.chat.scroll_to_bottom();
+        self.spawn_agent(expanded, history);
     }
     /// 处理 `/todo [list|add <title>|done <id>|clear]`：结构化任务清单。
     fn handle_todo_slash(&mut self, args: &str) {
@@ -3051,6 +3451,19 @@ impl App {
             return;
         }
 
+        if command.eq_ignore_ascii_case("stop") {
+            let message = match crate::cli_commands::stop_subagents(
+                &self.registries.background,
+                &self.registries.subagents,
+                value,
+            ) {
+                Ok(msg) => msg,
+                Err(err) => err.to_string(),
+            };
+            self.chat.entries.push(ChatEntry::System(message));
+            return;
+        }
+
         let previous = self.config.clone();
         let result = match command.to_ascii_lowercase().as_str() {
             "enable" if value.is_empty() => {
@@ -3098,7 +3511,7 @@ impl App {
                 })
                 .ok_or("max_steps 必须是正整数"),
             _ => Err(
-                "用法：/subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]",
+                "用法：/subagents [status|enable|disable|stop [id|all]|max_tasks N|max_parallel N|timeout N|max_steps N]",
             ),
         };
         match result {
@@ -3218,6 +3631,172 @@ impl App {
         self.save_command_config(previous, msg.to_string(), "tools", "web_search");
     }
 
+    fn handle_vision_slash(&mut self, args: &str) {
+        let mut parts = args.trim().splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "" | "status" => {
+                let status_str = if self.config.agent.vision.enabled {
+                    "已开启 (enabled)"
+                } else {
+                    "已禁用 (disabled)"
+                };
+                let provider_display = if self.config.agent.vision.provider.is_empty() {
+                    "（未指定，自动使用默认或支持视觉的服务商）"
+                } else {
+                    &self.config.agent.vision.provider
+                };
+                let model_display = if self.config.agent.vision.model.is_empty() {
+                    "（跟随服务商默认模型）"
+                } else {
+                    &self.config.agent.vision.model
+                };
+                let prompt_display = if self.config.agent.vision.prompt.is_empty() {
+                    "（使用系统默认提示词）"
+                } else {
+                    &self.config.agent.vision.prompt
+                };
+                let msg = format!(
+                    "自适应识图引擎状态：\n  状态: {status_str}\n  识图服务商: {provider_display}\n  识图模型: {model_display}\n  细节级别: {}\n  分析提示词: {prompt_display}\n\n用法：/vision on | /vision off | /vision provider <name> | /vision model <name> | /vision test [model]",
+                    self.config.agent.vision.detail
+                );
+                self.chat.entries.push(ChatEntry::System(msg));
+            }
+            "on" | "enable" | "1" | "true" => {
+                self.config.agent.vision.enabled = true;
+                if let Err(e) = cyber_core::save_config(&self.config, &self.paths.config_file) {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("保存配置失败: {e}")));
+                } else {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("自适应识图引擎已开启。".into()));
+                }
+            }
+            "off" | "disable" | "0" | "false" => {
+                self.config.agent.vision.enabled = false;
+                if let Err(e) = cyber_core::save_config(&self.config, &self.paths.config_file) {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("保存配置失败: {e}")));
+                } else {
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System("自适应识图引擎已禁用。".into()));
+                }
+            }
+            "provider" => {
+                if rest.is_empty() {
+                    self.chat.entries.push(ChatEntry::System(format!(
+                        "当前识图服务商：{}（用法：/vision provider <name>）",
+                        if self.config.agent.vision.provider.is_empty() {
+                            "自动选择"
+                        } else {
+                            &self.config.agent.vision.provider
+                        }
+                    )));
+                } else {
+                    self.config.agent.vision.provider = rest.to_string();
+                    if let Err(e) = cyber_core::save_config(&self.config, &self.paths.config_file) {
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System(format!("保存配置失败: {e}")));
+                    } else {
+                        self.chat
+                            .entries
+                            .push(ChatEntry::System(format!("识图服务商已设置为：{rest}")));
+                    }
+                }
+            }
+            "model" => {
+                if rest.is_empty() {
+                    if self.chat.streaming {
+                        self.chat.entries.push(ChatEntry::System(
+                            "生成中，无法切换识图模型（先 /cancel）".into(),
+                        ));
+                    } else {
+                        self.open_vision_model_picker();
+                    }
+                } else {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let p1 = parts.next().unwrap_or("").trim();
+                    let p2 = parts.next().unwrap_or("").trim();
+                    if !p2.is_empty() {
+                        self.config.agent.vision.provider = p1.to_string();
+                        self.config.agent.vision.model = p2.to_string();
+                        if let Err(e) =
+                            cyber_core::save_config(&self.config, &self.paths.config_file)
+                        {
+                            self.chat
+                                .entries
+                                .push(ChatEntry::System(format!("保存配置失败: {e}")));
+                        } else {
+                            self.chat.entries.push(ChatEntry::System(format!(
+                                "识图服务商与模型已设置为：{p1} · {p2}"
+                            )));
+                        }
+                    } else {
+                        self.config.agent.vision.model = rest.to_string();
+                        if let Err(e) =
+                            cyber_core::save_config(&self.config, &self.paths.config_file)
+                        {
+                            self.chat
+                                .entries
+                                .push(ChatEntry::System(format!("保存配置失败: {e}")));
+                        } else {
+                            self.chat
+                                .entries
+                                .push(ChatEntry::System(format!("识图专用模型已设置为：{rest}")));
+                        }
+                    }
+                }
+            }
+            "test" => {
+                let current_provider_name = self.config.agent.default_provider.clone();
+                let Some(cfg_snapshot) = self
+                    .providers
+                    .providers
+                    .get(&current_provider_name)
+                    .cloned()
+                else {
+                    self.chat.entries.push(ChatEntry::System(
+                        "当前默认 Provider 未配置，无法发起探针".into(),
+                    ));
+                    return;
+                };
+                let model = if !rest.is_empty() {
+                    rest.to_string()
+                } else {
+                    cfg_snapshot.model.clone()
+                };
+
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "正在对服务商 [{}] 模型 [{}] 发送 1x1 RGBA PNG 真实能力探针...",
+                    current_provider_name, model
+                )));
+
+                let tx = self.probe_tx.clone();
+                tokio::spawn(async move {
+                    let res = cyber_agent::probe_model_vision(&cfg_snapshot, &model).await;
+                    let result = res.map_err(|e| e.to_string());
+                    let _ = tx.send(ProbeResult {
+                        provider: current_provider_name,
+                        model,
+                        result,
+                    });
+                });
+            }
+            other => {
+                self.chat.entries.push(ChatEntry::System(format!(
+                    "未知 /vision 子命令：{other}（可用：status | on | off | provider <name> | model <name> | test [model]）"
+                )));
+            }
+        }
+    }
+
     /// 处理 `/provider <subcommand>`：list / add / edit <name> / use / remove。
     /// 流式期阻止（与 /model 一致）。add/edit 进入 ProviderForm（prev_mode=Chat，立即持久化）。
     fn handle_provider_slash(&mut self, args: &str) {
@@ -3231,7 +3810,18 @@ impl App {
         let sub = parts.next().unwrap_or("").to_lowercase();
         let rest = parts.next().unwrap_or("").trim();
         match sub.as_str() {
-            "" | "list" => {
+            "" | "panel" | "dashboard" => {
+                if self.mode != Mode::Settings {
+                    self.prev_mode = self.mode;
+                    self.config_at_entry = self.config.clone();
+                    self.providers_at_entry = self.providers.clone();
+                    self.mcp_config_at_entry = self.mcp_config.clone();
+                    self.settings.pending_discard = false;
+                    self.settings.section = 5;
+                    self.mode = Mode::Settings;
+                }
+            }
+            "list" => {
                 let names = self.providers.sorted_names();
                 if names.is_empty() {
                     self.chat.entries.push(ChatEntry::System(
@@ -3391,10 +3981,16 @@ impl App {
                     .push(ChatEntry::System("（无已连接的 MCP server）".into()));
             }
             Some(mcp) => {
-                let names = mcp.server_names();
                 let mut lines = String::from("已连接 MCP server：");
-                for n in &names {
-                    lines.push_str(&format!("\n  {n}"));
+                for n in mcp.server_names() {
+                    let count = mcp.tool_count(n).unwrap_or(0);
+                    if count == 0 {
+                        lines.push_str(&format!(
+                            "\n  {n} (0 工具) - 提示: 未暴露工具，若为 SSE 服务请尝试配置 transport = \"sse\""
+                        ));
+                    } else {
+                        lines.push_str(&format!("\n  {n} ({count} 工具)"));
+                    }
                 }
                 self.chat.entries.push(ChatEntry::System(lines));
             }
@@ -3405,6 +4001,7 @@ impl App {
     fn open_model_picker(&mut self) {
         self.form_prev_mode = self.mode;
         self.model_picker = ModelPickerState::default();
+        self.model_picker.target = ModelPickerTarget::DefaultAgent;
         // 选中当前 default_provider
         let names = self.providers.sorted_names();
         if let Some(idx) = names
@@ -3415,6 +4012,28 @@ impl App {
         }
         self.mode = Mode::ModelPicker;
         // 自动拉取当前 provider 的模型列表
+        if !names.is_empty() {
+            self.start_model_fetch();
+        }
+    }
+
+    /// 打开 `/vision model` 面板：重置状态为识图引擎目标 → 选中当前 vision provider（或默认） → 自动拉取模型列表。
+    fn open_vision_model_picker(&mut self) {
+        self.form_prev_mode = self.mode;
+        self.model_picker = ModelPickerState::default();
+        self.model_picker.target = ModelPickerTarget::VisionEngine;
+
+        let names = self.providers.sorted_names();
+        let target_prov = if !self.config.agent.vision.provider.is_empty() {
+            &self.config.agent.vision.provider
+        } else {
+            &self.config.agent.default_provider
+        };
+
+        if let Some(idx) = names.iter().position(|n| n == target_prov) {
+            self.model_picker.provider_selected = idx;
+        }
+        self.mode = Mode::ModelPicker;
         if !names.is_empty() {
             self.start_model_fetch();
         }
@@ -4152,7 +4771,7 @@ impl App {
                             Constraint::Length(ctf_panel::CTF_PANEL_WIDTH),
                         ])
                         .split(area);
-                        views::chat::render(
+                        views::chat::render_with_toast(
                             frame,
                             chunks[0],
                             &self.theme,
@@ -4163,6 +4782,7 @@ impl App {
                             effective_price,
                             &self.context_usage,
                             &todos,
+                            self.toast.as_deref(),
                         );
                         ctf_panel::render(
                             frame,
@@ -4177,7 +4797,7 @@ impl App {
                         );
                     }
                 } else {
-                    views::chat::render(
+                    views::chat::render_with_toast(
                         frame,
                         area,
                         &self.theme,
@@ -4188,6 +4808,7 @@ impl App {
                         effective_price,
                         &self.context_usage,
                         &todos,
+                        self.toast.as_deref(),
                     );
                 }
             }
@@ -5110,6 +5731,33 @@ mod tests {
     }
 
     #[test]
+    fn chat_retry_event_clears_buffers_and_toasts() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.streaming = true;
+        app.chat.streaming_buffer.push_str("半截内容");
+        app.chat.thinking_buffer.push_str("半截思考");
+        app.handle_agent_event(
+            0,
+            AgentEvent::Retry {
+                attempt: 1,
+                max_retries: 5,
+                delay_secs: 3,
+                error: "connection reset".into(),
+            },
+        );
+        assert!(
+            app.chat.streaming_buffer.is_empty(),
+            "Retry 事件应清空流式片段"
+        );
+        assert!(
+            app.chat.thinking_buffer.is_empty(),
+            "Retry 事件应清空思考片段"
+        );
+        assert!(app.toast.as_deref().unwrap_or("").contains("正在重试"));
+        assert!(app.toast.as_deref().unwrap_or("").contains("1/5"));
+    }
+
+    #[test]
     fn chat_cancel_aborts_and_preserves_buffer() {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.chat.streaming = true;
@@ -5651,6 +6299,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vision_model_no_arg_opens_picker_panel_and_confirms() {
+        let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
+        app.handle_slash_command("/vision model");
+        assert_eq!(
+            app.mode,
+            Mode::ModelPicker,
+            "/vision model 无参数应打开 ModelPicker 面板"
+        );
+        assert_eq!(
+            app.model_picker.target,
+            ModelPickerTarget::VisionEngine,
+            "面板目标应为 VisionEngine"
+        );
+        assert_eq!(app.form_prev_mode, Mode::Chat);
+        assert!(app.model_picker.fetching);
+
+        // 模拟提供模型列表并确认选择
+        let fid = app.model_picker.fetch_id;
+        app.model_picker
+            .deliver_fetch(fid, Ok(vec!["vision-v1".into(), "vision-v2".into()]));
+        // 切到 model 栏选第二个模型
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Tab));
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Down));
+        assert_eq!(app.model_picker.model_selected, 1);
+        // Enter 确认
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Chat, "确认后应返回 Chat");
+        assert_eq!(app.config.agent.vision.model, "vision-v2");
+    }
+    #[tokio::test]
     async fn model_picker_esc_returns_to_prev() {
         let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
         app.handle_slash_command("/model");
@@ -6048,5 +6727,52 @@ mod tests {
         )));
         // 新任务已启动（处于 streaming）
         assert!(app.chat.streaming);
+    }
+
+    #[test]
+    fn ctrl_v_paste_debounces_rapid_duplicate_events() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_event(crossterm::event::Event::Paste("paste_content".to_string()));
+        let text1 = app.chat.input.lines().join("\n");
+        assert_eq!(text1, "paste_content");
+
+        // 模拟终端或快捷键在几毫秒内触发的第二次重复粘贴
+        app.handle_event(crossterm::event::Event::Paste("paste_content".to_string()));
+        let text2 = app.chat.input.lines().join("\n");
+        assert_eq!(
+            text2, "paste_content",
+            "快速重复的粘贴事件应被节流防重，不能重复插入"
+        );
+
+        app.handle_clipboard_paste();
+        let text3 = app.chat.input.lines().join("\n");
+        assert_eq!(
+            text3, "paste_content",
+            "紧随其后的 clipboard_paste 同样应被拦截"
+        );
+    }
+
+    #[test]
+    fn chat_end_key_resets_scroll_when_input_empty() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.chat.set_scroll_metrics(50, 10);
+        // 上滚 10 行
+        app.chat.scroll_history(-10);
+        assert!(!app.chat.is_following_bottom());
+
+        // 输入框为空时按 End 键：应复位回底部 (is_following_bottom = true)
+        let k = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_chat_key(k);
+        assert!(app.chat.is_following_bottom());
+
+        // 若输入框非空，按 End 键不应重置滚动状态（交 textarea 处理）
+        app.chat.scroll_history(-10);
+        assert!(!app.chat.is_following_bottom());
+        app.chat.input.insert_str("some text");
+        app.handle_chat_key(k);
+        assert!(!app.chat.is_following_bottom());
     }
 }

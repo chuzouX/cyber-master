@@ -14,11 +14,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use cyber_core::{Config, ProjectContext, ProviderConfig, ProvidersConfig, ThinkingIntensity};
 
-use crate::compact::{auto_compact_threshold, compact_messages, estimate_messages_tokens};
+use crate::compact::{
+    auto_compact_threshold, compact_messages_with_retry, estimate_messages_tokens,
+};
 use crate::error::{AgentError, Result};
 use crate::prompt::{build_system_prompt, SkillSummary, CTF_PROMPT};
 use crate::provider::{provider_factory, Provider, StreamRequest};
@@ -187,7 +189,9 @@ impl SubagentRuntime {
             .collect();
         let ctx = ToolCtx::new(self.cwd.clone(), rules, scope, env)
             .with_subagent_archive(self.archive().cloned())
-            .with_background(self.background().cloned());
+            .with_background(self.background().cloned())
+            .with_provider_config(Some(provider_config.clone()))
+            .with_mock(self.mock);
         let sink = EventSink::child_with_transcript(
             &self.tx,
             self.gen,
@@ -209,6 +213,8 @@ impl SubagentRuntime {
             &sink,
             None,
             Some(SUBAGENT_TOOL_OUTPUT_BUDGET),
+            self.config.agent.retry_attempts,
+            self.config.agent.retry_delay_secs,
         )
         .await?;
         sink.flush_transcript();
@@ -488,10 +494,12 @@ async fn run_inner(
         subagent_archive.clone(),
         background.clone(),
     ));
-    let ctx = ToolCtx::new(cwd, rules, scope, env)
+    let ctx = ToolCtx::new(cwd.clone(), rules, scope, env)
         .with_subagent_runtime(runtime.clone())
         .with_subagent_archive(runtime.archive().cloned())
-        .with_background(runtime.background().cloned());
+        .with_background(runtime.background().cloned())
+        .with_provider_config(Some(cfg.clone()))
+        .with_mock(mock);
     let mut tools = if config.agent.auto_tool_call && !registry.is_empty() {
         registry.schemas()
     } else {
@@ -501,7 +509,82 @@ async fn run_inner(
         tools.retain(|s| s.name != "web_fetch");
     }
     let mut messages = history;
-    messages.push(Message::user(user_input));
+    let (resolved_text, images) =
+        match crate::vision::resolve_prompt_placeholders(&user_input, &[], &cwd) {
+            Ok((text, imgs)) => (text, imgs),
+            Err(err) => {
+                warn!(error = %err, "解析图片占位符失败，回退为普通文本");
+                (user_input.clone(), Vec::new())
+            }
+        };
+    if !images.is_empty() {
+        if mock {
+            messages.push(Message::user_with_images(resolved_text, images));
+        } else {
+            let mut cap = cyber_core::get_model_vision_capability(cfg, name, &cfg.model, None);
+            if cap.is_unknown() {
+                let _ = tx.send((
+                    gen,
+                    AgentEvent::Reasoning(format!(
+                        "🔍 [视觉探针] 正在动态探测模型 [{}] 的多模态识图能力...\n",
+                        cfg.model
+                    )),
+                ));
+                match crate::vision::probe_model_vision(cfg, &cfg.model).await {
+                    Ok(probed) => {
+                        cap = probed;
+                        let _ = cyber_core::save_model_vision_capability(
+                            name, &cfg.model, probed, None,
+                        );
+                        info!(
+                            model = %cfg.model,
+                            capability = ?probed,
+                            "动态模型视觉能力探测成功并已缓存"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            model = %cfg.model,
+                            error = %e,
+                            "动态模型视觉能力探测失败，按未探测处理"
+                        );
+                    }
+                }
+            }
+
+            if cap.is_supported() {
+                messages.push(Message::user_with_images(resolved_text, images));
+            } else {
+                let _ = tx.send((
+                    gen,
+                    AgentEvent::Reasoning(format!(
+                        "👁️ [识图引擎] 当前模型 [{}] 不支持原生图像输入，正在调用识图引擎分析 {} 张图片...\n",
+                        cfg.model,
+                        images.len()
+                    )),
+                ));
+                let engine = crate::vision::VisionEngine::new(config.agent.vision.clone());
+                match engine.describe_images(providers, &images).await {
+                    Ok(descriptions) => {
+                        let injected = crate::vision::format_injected_vision_description(
+                            &resolved_text,
+                            &descriptions,
+                        );
+                        messages.push(Message::user(injected));
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "识图引擎解析图片失败，回退文本注入错误提示");
+                        let fallback = format!(
+                            "{resolved_text}\n\n[提示: 当前模型不支持视觉多模态，且识图引擎解析失败: {err}]"
+                        );
+                        messages.push(Message::user(fallback));
+                    }
+                }
+            }
+        }
+    } else {
+        messages.push(Message::user(user_input));
+    }
     let sink = EventSink::parent(tx, gen);
     run_agent_loop(
         provider.as_ref(),
@@ -517,6 +600,8 @@ async fn run_inner(
         &sink,
         steering,
         None,
+        config.agent.retry_attempts,
+        config.agent.retry_delay_secs,
     )
     .await?;
     Ok(())
@@ -603,6 +688,16 @@ impl<'a> EventSink<'a> {
                             let _ = tp.send(format!("tool {name} completed\n"));
                         }
                     }
+                    AgentEvent::Retry {
+                        attempt,
+                        max_retries,
+                        delay_secs,
+                        error,
+                    } => {
+                        let _ = tp.send(format!(
+                            "retry {attempt}/{max_retries} ({delay_secs}s): {error}\n"
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -623,6 +718,16 @@ impl<'a> EventSink<'a> {
                         transcript.line(format!(
                             "{name} => {}",
                             crate::background::truncate_chars(output, 300)
+                        ));
+                    }
+                    AgentEvent::Retry {
+                        attempt,
+                        max_retries,
+                        delay_secs,
+                        error,
+                    } => {
+                        transcript.line(format!(
+                            "retry {attempt}/{max_retries} ({delay_secs}s): {error}"
                         ));
                     }
                     _ => {}
@@ -677,6 +782,8 @@ async fn run_agent_loop(
     sink: &EventSink<'_>,
     mut steering: Option<SteeringReceiver>,
     tool_output_budget: Option<usize>,
+    retry_attempts: u32,
+    retry_delay_secs: u64,
 ) -> Result<AgentRunOutput> {
     emit_context_update(sink, &messages, effective_ctx_len);
     let mut detector = LoopDetector::new(3);
@@ -688,20 +795,33 @@ async fn run_agent_loop(
         if let Some(threshold) = auto_compact_threshold(effective_ctx_len) {
             let used = estimate_messages_tokens(&messages);
             if used >= threshold as usize {
-                if let Err(error) =
-                    do_compact(provider, &system, &mut messages, None, sink, true).await
+                if let Err(error) = do_compact(
+                    provider,
+                    &system,
+                    &mut messages,
+                    None,
+                    sink,
+                    true,
+                    retry_attempts,
+                    retry_delay_secs,
+                )
+                .await
                 {
                     warn!(error = %error, gen = sink.gen, "自动压缩失败，回退到原消息继续");
                 }
             }
         }
 
-        let mut stream = provider.stream(
-            StreamRequest::new(messages.clone())
+        let accumulation = accumulate_stream_with_retry(
+            provider,
+            &StreamRequest::new(messages.clone())
                 .with_system(system.clone())
                 .with_tools(tools.clone()),
-        );
-        let accumulation = accumulate_stream(&mut stream, sink).await?;
+            sink,
+            retry_attempts,
+            retry_delay_secs,
+        )
+        .await?;
         if let Some(usage) = accumulation.usage.as_ref() {
             sink.send(AgentEvent::Usage(usage.clone()));
         }
@@ -864,12 +984,16 @@ async fn run_agent_loop(
     };
     messages.push(Message::user(wrap));
     drain_steering(&mut steering, &mut messages, sink);
-    let mut stream = provider.stream(
-        StreamRequest::new(messages.clone())
+    let accumulation = accumulate_stream_with_retry(
+        provider,
+        &StreamRequest::new(messages.clone())
             .with_system(system)
             .with_tools(Vec::new()),
-    );
-    let accumulation = accumulate_stream(&mut stream, sink).await?;
+        sink,
+        retry_attempts,
+        retry_delay_secs,
+    )
+    .await?;
     if let Some(usage) = accumulation.usage.as_ref() {
         sink.send(AgentEvent::Usage(usage.clone()));
     }
@@ -900,6 +1024,7 @@ fn emit_context_update(sink: &EventSink<'_>, messages: &[Message], effective_ctx
 /// 执行上下文压缩：发 Compacting 事件 → 调用 compact_messages 替换 messages → 发 Compacted 事件。
 /// `is_auto` 区分自动触发（达到阈值）与手动 `/compact`。
 /// 压缩成功后 `messages` 将被替换为 `[摘要 user 消息]`。
+#[allow(clippy::too_many_arguments)]
 async fn do_compact(
     provider: &dyn Provider,
     system: &str,
@@ -907,10 +1032,20 @@ async fn do_compact(
     custom_instructions: Option<&str>,
     sink: &EventSink<'_>,
     is_auto: bool,
+    retry_attempts: u32,
+    retry_delay_secs: u64,
 ) -> Result<()> {
     let before_tokens = estimate_messages_tokens(messages);
     sink.send(AgentEvent::Compacting { is_auto });
-    let summary_msg = compact_messages(provider, system, messages, custom_instructions).await?;
+    let summary_msg = compact_messages_with_retry(
+        provider,
+        system,
+        messages,
+        custom_instructions,
+        retry_attempts,
+        retry_delay_secs,
+    )
+    .await?;
     let after_tokens = estimate_messages_tokens(std::slice::from_ref(&summary_msg));
     *messages = vec![summary_msg.clone()];
     sink.send(AgentEvent::Compacted {
@@ -1022,24 +1157,17 @@ async fn run_writeup_inner(
         skill_body
     );
     let req = StreamRequest::new(vec![Message::user(challenge_context)]).with_system(system);
-    let mut stream = provider.stream(req);
-    while let Some(ev) = stream.next().await {
-        match ev {
-            StreamEvent::Delta(t) => {
-                if tx.send((gen, AgentEvent::Token(t))).is_err() {
-                    debug!("TUI 通道已关闭，writeup 生成终止");
-                    return Ok(());
-                }
-            }
-            StreamEvent::Usage(u) => {
-                let _ = tx.send((gen, AgentEvent::Usage(u)));
-            }
-            StreamEvent::Done => break,
-            StreamEvent::Error(m) => {
-                return Err(AgentError::Provider(format!("writeup 生成失败: {m}")));
-            }
-            _ => {}
-        }
+    let sink = EventSink::parent(tx, gen);
+    let accumulation = accumulate_stream_with_retry(
+        provider.as_ref(),
+        &req,
+        &sink,
+        config.agent.retry_attempts,
+        config.agent.retry_delay_secs,
+    )
+    .await?;
+    if let Some(u) = accumulation.usage {
+        let _ = tx.send((gen, AgentEvent::Usage(u)));
     }
     Ok(())
 }
@@ -1077,6 +1205,8 @@ async fn run_compact_inner(
         custom_instructions.as_deref(),
         &sink,
         false,
+        config.agent.retry_attempts,
+        config.agent.retry_delay_secs,
     )
     .await
 }
@@ -1123,6 +1253,61 @@ async fn accumulate_stream(
         }
     }
     Ok(StreamAccumulation { text, calls, usage })
+}
+
+/// 判断错误信息是否属于临时性异常（可安全重试）。
+/// 致命客户端权限/密钥配置错误立即失败不空耗重试；
+/// 网络故障、超时、流中断、5xx 网关错误或 429 窗口限频均可重试。
+pub fn is_retryable_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("401 unauthorized")
+        || lower.contains("401")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid_api_key")
+        || lower.contains("authentication")
+        || lower.contains("403 forbidden")
+        || lower.contains("403")
+        || lower.contains("404 not found")
+        || lower.contains("404")
+        || (lower.contains("400 bad request") && !lower.contains("timeout"))
+    {
+        return false;
+    }
+    true
+}
+
+/// 带自动重试与回滚通知的流式累积执行体。
+async fn accumulate_stream_with_retry(
+    provider: &dyn Provider,
+    req: &StreamRequest,
+    sink: &EventSink<'_>,
+    max_retries: u32,
+    delay_secs: u64,
+) -> Result<StreamAccumulation> {
+    let mut attempt = 0;
+    loop {
+        let mut stream = provider.stream(req.clone());
+        match accumulate_stream(&mut stream, sink).await {
+            Ok(accumulation) => return Ok(accumulation),
+            Err(err) => {
+                let err_msg = err.to_string();
+                if attempt >= max_retries || !is_retryable_error(&err_msg) {
+                    return Err(err);
+                }
+                attempt += 1;
+                sink.send(AgentEvent::Retry {
+                    attempt,
+                    max_retries,
+                    delay_secs,
+                    error: err_msg,
+                });
+                if sink.tx.is_closed() {
+                    return Err(AgentError::Provider("任务已取消".into()));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            }
+        }
+    }
 }
 
 /// 将工具调用参数规范化后写入 assistant 历史，避免非法 JSON 被 provider 拒绝。
@@ -1437,6 +1622,8 @@ mod tests {
             &sink,
             None,
             None,
+            0,
+            0,
         )
         .await
         .unwrap();
@@ -1560,6 +1747,8 @@ mod tests {
             &sink,
             None,
             None,
+            0,
+            0,
         )
         .await
         .unwrap();
@@ -1657,6 +1846,8 @@ mod tests {
             &sink,
             None,
             Some(100),
+            0,
+            0,
         )
         .await
         .unwrap();
@@ -1734,6 +1925,8 @@ mod tests {
             &sink,
             Some(steer_rx),
             None,
+            0,
+            0,
         )
         .await
         .unwrap();
@@ -1880,5 +2073,146 @@ mod tests {
         // 再次非连续重复不应重复提醒
         let (looped, warn4) = d.observe(&c2);
         assert!(!looped && !warn4, "第 4 轮：已提醒过，不再重复提醒");
+    }
+
+    #[test]
+    fn test_is_retryable_error() {
+        assert!(!is_retryable_error(
+            "HTTP 401 Unauthorized: invalid api key"
+        ));
+        assert!(!is_retryable_error("403 Forbidden: access denied"));
+        assert!(!is_retryable_error(
+            "404 Not Found: model deepseek-v9 does not exist"
+        ));
+        assert!(!is_retryable_error("400 Bad Request: unknown field"));
+        assert!(is_retryable_error("500 Internal Server Error"));
+        assert!(is_retryable_error("502 Bad Gateway"));
+        assert!(is_retryable_error("503 Service Unavailable"));
+        assert!(is_retryable_error("504 Gateway Timeout"));
+        assert!(is_retryable_error(
+            "HTTP 429 Too Many Requests: rate limit exceeded"
+        ));
+        assert!(is_retryable_error("stream: connection reset by peer"));
+        assert!(is_retryable_error("request timed out after 30s"));
+    }
+
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockRetryProvider {
+        calls: AtomicUsize,
+        responses: Vec<Vec<StreamEvent>>,
+    }
+
+    impl Provider for MockRetryProvider {
+        fn stream(
+            &self,
+            _req: StreamRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = if idx < self.responses.len() {
+                self.responses[idx].clone()
+            } else {
+                vec![StreamEvent::Error("out of responses".into())]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accumulate_stream_with_retry_success_recovery() {
+        let provider = MockRetryProvider {
+            calls: AtomicUsize::new(0),
+            responses: vec![
+                vec![
+                    StreamEvent::Delta("partial tokens before crash".into()),
+                    StreamEvent::Error("stream: connection reset".into()),
+                ],
+                vec![
+                    StreamEvent::Delta("full answer recovered".into()),
+                    StreamEvent::Done,
+                ],
+            ],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::parent(&tx, 42);
+        let req = StreamRequest::new(vec![Message::user("hello")]);
+        let accumulation = accumulate_stream_with_retry(&provider, &req, &sink, 5, 0)
+            .await
+            .expect("should recover after retry");
+        assert_eq!(accumulation.text, "full answer recovered");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let mut retries = Vec::new();
+        while let Ok((_, ev)) = rx.try_recv() {
+            if let AgentEvent::Retry {
+                attempt,
+                max_retries,
+                delay_secs,
+                error,
+            } = ev
+            {
+                retries.push((attempt, max_retries, delay_secs, error));
+            }
+        }
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].0, 1);
+        assert_eq!(retries[0].1, 5);
+        assert_eq!(retries[0].2, 0);
+        assert!(retries[0].3.contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn test_accumulate_stream_fatal_401_no_retry() {
+        let provider = MockRetryProvider {
+            calls: AtomicUsize::new(0),
+            responses: vec![vec![StreamEvent::Error(
+                "HTTP 401 Unauthorized: Invalid API key".into(),
+            )]],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::parent(&tx, 1);
+        let req = StreamRequest::new(vec![Message::user("hello")]);
+        let err = accumulate_stream_with_retry(&provider, &req, &sink, 5, 0)
+            .await
+            .expect_err("fatal error must not succeed");
+        assert!(err.to_string().contains("401"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        while let Ok((_, ev)) = rx.try_recv() {
+            if let AgentEvent::Retry { .. } = ev {
+                panic!("should not emit Retry event for 401");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accumulate_stream_max_retries_exceeded() {
+        let provider = MockRetryProvider {
+            calls: AtomicUsize::new(0),
+            responses: vec![
+                vec![StreamEvent::Error("timeout 1".into())],
+                vec![StreamEvent::Error("timeout 2".into())],
+                vec![StreamEvent::Error("timeout 3".into())],
+                vec![StreamEvent::Error("timeout 4".into())],
+                vec![StreamEvent::Error("timeout 5".into())],
+                vec![StreamEvent::Error("timeout 6".into())],
+            ],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::parent(&tx, 1);
+        let req = StreamRequest::new(vec![Message::user("hello")]);
+        let err = accumulate_stream_with_retry(&provider, &req, &sink, 5, 0)
+            .await
+            .expect_err("must fail after max retries");
+        assert!(err.to_string().contains("timeout"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+
+        let mut retry_count = 0;
+        while let Ok((_, ev)) = rx.try_recv() {
+            if let AgentEvent::Retry { .. } = ev {
+                retry_count += 1;
+            }
+        }
+        assert_eq!(retry_count, 5);
     }
 }

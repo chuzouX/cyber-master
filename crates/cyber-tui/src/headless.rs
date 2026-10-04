@@ -1544,6 +1544,7 @@ impl TurnHistory {
                 | AgentEvent::Compacted { .. }
                 | AgentEvent::SteeringReceived(_)
                 | AgentEvent::Error(_)
+                | AgentEvent::Retry { .. }
                 | AgentEvent::Done
         ) {
             self.leading_answer.clear();
@@ -1633,6 +1634,19 @@ impl TurnHistory {
                 self.finish_pending();
                 self.entries = vec![ChatEntry::User(summary)];
                 self.compacted = true;
+            }
+            AgentEvent::Retry {
+                attempt,
+                max_retries,
+                delay_secs,
+                error,
+            } if text => {
+                eprintln!(
+                    "{}",
+                    terminal_text(&format!(
+                        "\n[retry {attempt}/{max_retries} ({delay_secs}s)] {error}"
+                    ))
+                );
             }
             _ => {}
         }
