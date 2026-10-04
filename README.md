@@ -13,7 +13,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![CNB 镜像源](https://img.shields.io/badge/CNB-仓库镜像源-blue)](https://cnb.cool/chuzouX/cyber-master)
+[![CNB 镜像源](https://img.shields.io/badge/CNB-仓库镜像源-blue)](https://cnb.cool/funxlink/cyber-master)
 [![Platform](https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
 
 ---
@@ -86,13 +86,13 @@
 Linux / macOS：
 
 ```bash
-curl -fsSL https://cnb.cool/chuzouX/cyber-master/-/git/raw/main/install.sh | sh
+curl -fsSL https://cnb.cool/funxlink/cyber-master/-/git/raw/main/install.sh | sh
 ```
 
 Windows（PowerShell 5.1+）：
 
 ```powershell
-irm https://cnb.cool/chuzouX/cyber-master/-/git/raw/main/install.ps1 | iex
+irm https://cnb.cool/funxlink/cyber-master/-/git/raw/main/install.ps1 | iex
 ```
 
 #### 🌐 GitHub 官方源（海外 / 代理）

@@ -20,7 +20,7 @@
 set -eu
 
 REPO="${CYBER_REPO:-chuzouX/cyber-master}"
-CNB_REPO="${CYBER_CNB_REPO:-$REPO}"
+CNB_REPO="${CYBER_CNB_REPO:-funxlink/cyber-master}"
 VERSION="${CYBER_VERSION:-}"
 INSTALL_DIR="${CYBER_INSTALL_DIR:-$HOME/.local/bin}"
 USE_CNB="${CYBER_USE_CNB:-0}"

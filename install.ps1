@@ -36,7 +36,7 @@ if (-not $Version)    { $Version    = $env:CYBER_VERSION }
 if (-not $InstallDir) { $InstallDir = $env:CYBER_INSTALL_DIR }
 if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE '.local\bin' }
 if ($env:CYBER_REPO)  { $Repo       = $env:CYBER_REPO }
-$CnbRepo = if ($env:CYBER_CNB_REPO) { $env:CYBER_CNB_REPO } else { $Repo }
+$CnbRepo = if ($env:CYBER_CNB_REPO) { $env:CYBER_CNB_REPO } else { 'funxlink/cyber-master' }
 # ─── 平台检测（PowerShell 只支持 Windows 二进制；WSL 用户请用 install.sh）──
 $architecture = if ($env:PROCESSOR_ARCHITEW6432) {
     $env:PROCESSOR_ARCHITEW6432
