@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-10-05
+
+### Added
+- **自定义安全工具聚合清单 (`custom_tools_list`) 与双向前缀容错匹配**：
+  - 新增 `CustomToolsListTool` 聚合所有配置的自定义工具并提供多维度过滤与命令执行模板。
+  - `ToolRegistry::get` 实现 `custom_<name>` 与 `<name>` 双向别名自动匹配。
+  - 增强系统与 CTF 提示词，引导模型在缺少专项工具时优先探索自定义工具清单。
+- **终端鼠标拖拽滚动条与跨视口逻辑文本选区复制**：
+  - `cyber-tui` 新增 `selection` 模块 (`ContentCoord`, `TextSelection`, `extract_text`, `apply_selection_to_row`)。
+  - Chat 和 CLI 视口支持鼠标点击/拖拽滚动条滑块、边缘加速滚动。
+- 支持鼠标框选折行文本、`Ctrl+C` 跨行复制到系统剪贴板以及 `Esc` 清除选区。
+- **MCP 扩展工具聚合清单 (`mcp_tools_list`) 与多级前缀容错匹配**：
+  - 新增 `McpToolsListTool` 聚合外部 MCP 工具，支持多维度关键字过滤与 Schema 参数查看。
+  - 启动阶段将具体 MCP 工具以隐藏模式注册 (`register_hidden`)，避免撑爆模型上下文与单轮工具限制。
+  - `ToolRegistry::get` 支持 `mcp_<server>_<tool>`、`<server>_<tool>` 及 `<tool>` 多级动态别名解析。
+  - `cyber-mcp` 协议层扩展支持服务端返回的纯字符串 JSON-RPC 错误负载。
+- **CI/CD 与自动化镜像同步工作流**：
+  - 新增 Git Pre-Push Hook 与本地发布预检系统 (`.githooks/`)，拦截不合规的 Release Tag 并在本地执行对齐 GHA 的全量检查。
+  - 新增 GitHub 到 CNB.cool 自动化镜像工作流 (`sync-cnb.yml` 整仓镜像，`sync-cnb-release.yml` 资产同步)。
+
+---
+
 ## [0.4.2] - 2026-10-04
 
 ### Added
