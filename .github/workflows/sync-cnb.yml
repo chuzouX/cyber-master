@@ -1,0 +1,49 @@
+name: 同步到 CNB
+
+# 将 GitHub 仓库的所有分支与标签（完整提交历史）镜像同步到 CNB.cool
+# 鉴权使用仓库 Secret: CNB_SYNC_TOKEN（Git 用户名固定为 cnb）
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch: {}
+
+# 串行执行，避免多次推送相互竞争；不取消进行中的同步，防止半路中断
+concurrency:
+  group: sync-cnb
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 镜像克隆 GitHub 源仓库
+        run: |
+          git clone --mirror \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            repo.git
+
+      - name: 镜像推送到 CNB
+        env:
+          CNB_SYNC_TOKEN: ${{ secrets.CNB_SYNC_TOKEN }}
+          CNB_REPO: ${{ vars.CNB_REPO || secrets.CNB_REPO }}
+        run: |
+          if [ -z "$CNB_SYNC_TOKEN" ]; then
+            echo "::error::缺少 CNB_SYNC_TOKEN Secret，请在 GitHub Settings -> Secrets 中配置"
+            exit 1
+          fi
+          if [ -z "$CNB_REPO" ]; then
+            echo "::error::缺少 CNB_REPO 配置（格式如: username/repo-name），请在 GitHub Settings -> Variables 或 Secrets 中配置"
+            exit 1
+          fi
+
+          cd repo.git
+          # 仅同步分支与标签（排除 GitHub 内部 refs/pull/*）
+          # --prune 删除 CNB 上已在 GitHub 删除的远端分支/标签，保持绝对镜像一致
+          git push --prune \
+            "https://cnb:${CNB_SYNC_TOKEN}@cnb.cool/${CNB_REPO}.git" \
+            "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
+          echo "✅ 代码已镜像同步到 https://cnb.cool/${CNB_REPO}"

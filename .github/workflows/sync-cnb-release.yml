@@ -1,0 +1,151 @@
+name: 同步 Release 到 CNB
+
+# 当 GitHub 发布 Release 时，将标题、说明正文及所有附件资产镜像同步到 CNB.cool
+# 支持 release published 事件、workflow_dispatch 手动触发、以及从其他 workflow 直连调用 (workflow_call)
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要同步的 Release tag（例如: v0.5.0）"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "要同步的 Release tag"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# 同一 Tag 串行执行，避免并发重复上传资产
+concurrency:
+  group: sync-cnb-release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CNB_SYNC_TOKEN: ${{ secrets.CNB_SYNC_TOKEN }}
+      CNB_REPO: ${{ vars.CNB_REPO || secrets.CNB_REPO }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: 检查前置配置
+        run: |
+          if [ -z "$CNB_SYNC_TOKEN" ]; then
+            echo "::error::缺少 CNB_SYNC_TOKEN Secret，请在 GitHub Settings -> Secrets 中配置"
+            exit 1
+          fi
+          if [ -z "$CNB_REPO" ]; then
+            echo "::error::缺少 CNB_REPO 配置（格式如: username/repo-name），请在 GitHub Settings -> Variables 或 Secrets 中配置"
+            exit 1
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::无法确定要同步的 Release Tag"
+            exit 1
+          fi
+          echo "准备同步 Release: $TAG 到 https://cnb.cool/${CNB_REPO}"
+
+      - name: 读取 GitHub Release 元数据并下载资产附件
+        run: |
+          # 导出 Release JSON 元信息（避免 shell 字符拼接注入）
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,isPrerelease,targetCommitish > release.json
+          
+          mkdir -p assets
+          # 批量下载 GitHub Release 中的所有发布附件
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
+            || echo "ℹ 该 Release 无附件资产，仅同步 Release 标题与说明"
+
+      - name: 在 CNB 创建 Release 并上传二进制附件
+        run: |
+          API="https://api.cnb.cool/${CNB_REPO}/-/releases"
+          NAME=$(jq -r '.name // .tagName' release.json)
+          BODY=$(jq -r '.body // ""' release.json)
+          PRERELEASE=$(jq -r '.isPrerelease' release.json)
+          if [ "$PRERELEASE" = "true" ]; then MAKE_LATEST="false"; else MAKE_LATEST="true"; fi
+
+          # CNB target_commitish 传主分支名（由 CNB 自动关联分支 HEAD）
+          PAYLOAD=$(jq -n \
+            --arg tag_name "$TAG" \
+            --arg name "$NAME" \
+            --arg body "$BODY" \
+            --argjson prerelease "$PRERELEASE" \
+            --arg make_latest "$MAKE_LATEST" \
+            --arg target_commitish "main" \
+            '{tag_name:$tag_name, name:$name, body:$body, prerelease:$prerelease, make_latest:$make_latest, target_commitish:$target_commitish}')
+
+          RESP=$(curl -s -w "\n%{http_code}" "$API" -X POST \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/vnd.cnb.api+json" \
+            -H "Authorization: Bearer $CNB_SYNC_TOKEN" \
+            -d "$PAYLOAD")
+          CODE=$(echo "$RESP" | tail -n1)
+          B=$(echo "$RESP" | sed '$d')
+
+          if [ "$CODE" = "201" ]; then
+            RID=$(echo "$B" | jq -r '.id')
+            echo "✓ CNB Release 创建成功: $TAG (id=$RID)"
+          else
+            echo "::warning::CNB Release 创建返回 HTTP $CODE: $B"
+            # 兼容已有 Release（例如已被重新触发）：尝试通过 Tag 查询已有 Release ID
+            GET_RESP=$(curl -s -H "Authorization: Bearer $CNB_SYNC_TOKEN" \
+              -H "Accept: application/vnd.cnb.api+json" \
+              "https://api.cnb.cool/${CNB_REPO}/-/releases/tags/${TAG}")
+            RID=$(echo "$GET_RESP" | jq -r '.id // empty')
+            if [ -z "$RID" ]; then
+              echo "::error::无法在 CNB 上创建或定位 Release (HTTP $CODE)"
+              exit 1
+            fi
+            echo "✓ 复用已存在的 CNB Release (id=$RID)"
+          fi
+
+          # 遍历 assets 目录并三步上传到 CNB
+          shopt -s nullglob
+          for FILE in assets/*; do
+            [ -f "$FILE" ] || continue
+            ASSET_NAME=$(basename "$FILE")
+            SIZE=$(stat -c%s "$FILE")
+            echo "--> 正在同步附件: ${ASSET_NAME} (${SIZE} 字节)..."
+
+            # 1. 向 CNB 申请该附件的专属上传 URL 与校验 URL
+            U=$(curl -s -w "\n%{http_code}" "${API}/${RID}/asset-upload-url" -X POST \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/vnd.cnb.api+json" \
+              -H "Authorization: Bearer $CNB_SYNC_TOKEN" \
+              -d "$(jq -n --arg n "$ASSET_NAME" --argjson s "$SIZE" '{asset_name:$n, size:$s, overwrite:true, ttl:0}')")
+            UC=$(echo "$U" | tail -n1)
+            UB=$(echo "$U" | sed '$d')
+            if [ "$UC" != "201" ]; then
+              echo "::error::获取 ${ASSET_NAME} 上传地址失败 (HTTP $UC)：$UB"
+              exit 1
+            fi
+            UURL=$(echo "$UB" | jq -r '.upload_url')
+            VURL=$(echo "$UB" | jq -r '.verify_url')
+
+            # 2. PUT 二进制流上传
+            PC=$(curl -s -o /dev/null -w "%{http_code}" -X PUT --data-binary "@${FILE}" "$UURL")
+            if [ "$PC" -ge 300 ]; then
+              echo "::error::上传 ${ASSET_NAME} 内容失败 (HTTP $PC)"
+              exit 1
+            fi
+
+            # 3. 通知 CNB 验证附件入库
+            VC=$(curl -s -w "\n%{http_code}" -X POST "$VURL" \
+              -H "Accept: application/vnd.cnb.api+json" \
+              -H "Authorization: Bearer $CNB_SYNC_TOKEN")
+            VCODE=$(echo "$VC" | tail -n1)
+            if [ "$VCODE" != "200" ]; then
+              echo "::error::确认 ${ASSET_NAME} 附件入库失败 (HTTP $VCODE)"
+              exit 1
+            fi
+            echo "✓ 附件 ${ASSET_NAME} 已成功同步至 CNB"
+          done
+
+          echo "🎉 全部完成！Release $TAG 已镜像同步到 https://cnb.cool/${CNB_REPO}/-/releases"

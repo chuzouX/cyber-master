@@ -1,0 +1,123 @@
+#!/usr/bin/env sh
+# ==============================================================================
+# .githooks/pre-push
+#
+# Git pre-push hook:
+# 在执行 'git push' 时自动拦截发布请求 (如推送 v* 标签或设置环境变量 CYBER_RELEASE_CHECK=1)，
+# 运行对齐 GitHub Actions (.github/workflows/release.yml) 的全量校验，
+# 确保在触发远程 CI 之前排除格式、版本、日志、未提交变更、测试与构建错误。
+#
+# 跳过方式（紧急情况）：
+#   git push --no-verify
+# ==============================================================================
+
+remote="$1"
+url="$2"
+
+z40="0000000000000000000000000000000000000000"
+
+is_release=0
+release_tags=""
+
+# 逐行读取 git 传给 pre-push 的推送引用
+while read -r local_ref local_oid remote_ref remote_oid; do
+    # 忽略删除引用的操作 (例如 git push origin :tag_name)
+    if [ "$local_oid" = "$z40" ]; then
+        continue
+    fi
+
+    # 检查 remote_ref 或 local_ref 是否为 release tag
+    matched_tag=""
+    case "$remote_ref" in
+        refs/tags/v*|refs/tags/[0-9]*)
+            matched_tag="${remote_ref#refs/tags/}"
+            ;;
+    esac
+
+    if [ -z "$matched_tag" ]; then
+        case "$local_ref" in
+            refs/tags/v*|refs/tags/[0-9]*)
+                matched_tag="${local_ref#refs/tags/}"
+                ;;
+        esac
+    fi
+
+    if [ -n "$matched_tag" ]; then
+        is_release=1
+        if [ -z "$release_tags" ]; then
+            release_tags="$matched_tag"
+        else
+            release_tags="$release_tags $matched_tag"
+        fi
+    fi
+done
+
+# 支持环境变量手动强制触发发布预检: CYBER_RELEASE_CHECK=1 git push
+if [ "$CYBER_RELEASE_CHECK" = "1" ] || [ "$RELEASE_CHECK" = "1" ]; then
+    is_release=1
+fi
+
+# 非发布推送，快速放行，不影响日常开发与普通分支推送
+if [ "$is_release" -eq 0 ]; then
+    exit 0
+fi
+
+# 颜色控制
+if [ -t 1 ]; then
+    YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'
+    RED='\033[0;31m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    YELLOW=''
+    CYAN=''
+    RED=''
+    BOLD=''
+    NC=''
+fi
+
+echo ""
+echo "${BOLD}${CYAN}[Git Pre-Push Hook]${NC} 检测到发布相关推送请求 (目标: $remote -> $url)"
+if [ -n "$release_tags" ]; then
+    echo "${BOLD}${CYAN}[Git Pre-Push Hook]${NC} 涉及发布 Tag: ${BOLD}${YELLOW}${release_tags}${NC}"
+fi
+echo "${BOLD}${CYAN}[Git Pre-Push Hook]${NC} 正在启动本地发布预检，防范 GitHub Actions 远程失败..."
+echo ""
+
+# 查找 check-release.sh 脚本位置
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [ -f "$REPO_ROOT/.githooks/check-release.sh" ]; then
+    CHECK_SCRIPT="$REPO_ROOT/.githooks/check-release.sh"
+elif [ -f "$REPO_ROOT/scripts/check-release.sh" ]; then
+    CHECK_SCRIPT="$REPO_ROOT/scripts/check-release.sh"
+else
+    echo "${RED}[ERROR] 未找到预检脚本 check-release.sh (检查了 .githooks 与 scripts 目录)${NC}"
+    exit 1
+fi
+
+# 针对解析出的每个 tag（若未解析出 tag 则直接运行脚本自身根据 Cargo.toml 检测）依次校验
+if [ -n "$release_tags" ]; then
+    for t in $release_tags; do
+        if ! sh "$CHECK_SCRIPT" "$t"; then
+            echo ""
+            echo "${BOLD}${RED}[Git Pre-Push Hook] 拦截推送！Tag '${t}' 预检未通过，已终止 push。${NC}"
+            echo "${YELLOW}请根据上方提示修正问题后再推送，或在确认已知风险后使用 'git push --no-verify'。${NC}"
+            echo ""
+            exit 1
+        fi
+    done
+else
+    if ! sh "$CHECK_SCRIPT"; then
+        echo ""
+        echo "${BOLD}${RED}[Git Pre-Push Hook] 拦截推送！发布预检未通过，已终止 push。${NC}"
+        echo "${YELLOW}请根据上方提示修正问题后再推送，或在确认已知风险后使用 'git push --no-verify'。${NC}"
+        echo ""
+        exit 1
+    fi
+fi
+
+echo ""
+echo "${BOLD}${CYAN}[Git Pre-Push Hook]${NC} 发布预检全部通过，允许推送至远程！"
+echo ""
+exit 0

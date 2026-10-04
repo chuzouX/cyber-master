@@ -125,3 +125,11 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: artifacts/cyber-*
+
+  sync-cnb:
+    name: Sync Release to CNB
+    needs: release
+    uses: ./.github/workflows/sync-cnb-release.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit
