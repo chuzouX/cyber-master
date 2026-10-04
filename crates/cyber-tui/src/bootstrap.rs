@@ -12,7 +12,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use cyber_agent::{
-    CtfChallengeTool, CustomTool, DelegateTasksTool, SaveMemoryTool, SearchToolsTool, ToolRegistry,
+    CtfChallengeTool, CustomTool, CustomToolsListTool, DelegateTasksTool, SaveMemoryTool,
+    SearchToolsTool, ToolRegistry,
 };
 use cyber_core::{load_custom_tools, CtfChallenge, Paths};
 use cyber_mcp::{McpRegistry, McpServersConfig};
@@ -83,8 +84,17 @@ pub async fn build_registries(
 
     // save_memory 工具：agent 自动保存长期记忆（全局文件路径；项目级从 ctx.cwd 推导）
     tool_reg.register(Box::new(SaveMemoryTool::new(paths.memory_file.clone())));
+    let custom_configs = Arc::new(
+        custom_tools
+            .iter()
+            .map(|t| t.config.clone())
+            .collect::<Vec<_>>(),
+    );
+    tool_reg.register(Box::new(CustomToolsListTool::new(Arc::clone(
+        &custom_configs,
+    ))));
     for tool in &custom_tools {
-        tool_reg.register(Box::new(CustomTool::new(tool.config.clone())));
+        tool_reg.register_hidden(Box::new(CustomTool::new(tool.config.clone())));
     }
 
     // 3. MCP：非 mock 时加载 servers.toml + 并行连接
@@ -134,4 +144,73 @@ pub async fn build_registries(
         },
         errors,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cyber_core::{save_custom_tool, CustomToolConfig, CustomToolParam};
+
+    #[tokio::test]
+    async fn bootstrap_consolidates_50_custom_tools_into_custom_tools_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::at(temp.path().join(".cyber")).unwrap();
+        std::fs::create_dir_all(&paths.tools_dir).unwrap();
+
+        for i in 0..50 {
+            let tool = CustomToolConfig {
+                name: format!("tool_{i}"),
+                description: format!("Security tool #{i}"),
+                command: format!("tool_{i} --arg {{input}}"),
+                tags: vec!["custom".into(), format!("tag_{i}")],
+                parameters: vec![CustomToolParam {
+                    name: "input".into(),
+                    description: "input arg".into(),
+                    required: true,
+                    default: None,
+                }],
+            };
+            save_custom_tool(&paths.tools_dir, &tool).unwrap();
+        }
+
+        let cwd = temp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let (registries, errors) = build_registries(&paths, &cwd, true, false).await;
+        assert!(
+            errors.is_empty(),
+            "bootstrap 过程中不应产生错误: {:?}",
+            errors
+        );
+        assert_eq!(registries.custom_tools.len(), 50);
+
+        let visible_schemas = registries.tools.schemas();
+        let visible_names: Vec<&str> = visible_schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(visible_names.contains(&"custom_tools_list"));
+        for i in 0..50 {
+            let custom_name = format!("custom_tool_{i}");
+            let raw_name = format!("tool_{i}");
+            assert!(
+                !visible_names.contains(&custom_name.as_str()),
+                "具体自定义工具 {} 不应出现在公开 catalog 中",
+                custom_name
+            );
+            assert!(
+                !visible_names.contains(&raw_name.as_str()),
+                "具体自定义工具 {} 不应出现在公开 catalog 中",
+                raw_name
+            );
+        }
+
+        let all_schemas = registries.tools.all_schemas();
+        assert!(
+            all_schemas.len() >= 50,
+            "all_schemas 应该包含全部 50 个自定义工具"
+        );
+
+        assert!(registries.tools.get("custom_tool_0").is_some());
+        assert!(registries.tools.get("tool_0").is_some());
+        assert!(registries.tools.get("custom_tool_49").is_some());
+        assert!(registries.tools.get("tool_49").is_some());
+    }
 }

@@ -73,6 +73,13 @@ pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全�
 - 下方「可用 Skill」段落列出了所有 skill 的名称和简介。开始任务前扫描该列表，匹配到相关 skill 时**必须先调用**。\n\
 - 不要跳过 skill 直接用 curl/Python 操作——skill 中包含的关键步骤、检查点和常见坑能节省大量时间。\n\
 - 调用 skill 后按其指引执行；skill 引用的 .md 资源文件可用 read_file 读取获取更多细节。\n\n\
+# 自定义工具使用（Custom Tools）\n\
+- 系统配置了多种针对特定场景的安全测试、漏洞利用与审计自定义工具。\n\
+- 为防止工具列表超出模型接口限制，所有自定义工具已收敛整合。在需要使用特定安全工具（如专项扫描、SQL注入、密码爆破、网络探测、反编译等）但默认工具列表中未直接列出时，**必须先调用 `custom_tools_list` 工具获取完整的自定义工具清单、参数规格与命令模板**。\n\
+- 获取工具信息后，你可以：\n\
+  1. 直接调用对应工具名称（支持 `custom_<name>` 或 `<name>`），并传入所需参数字典；\n\
+  2. 或根据工具返回的命令行模板，将参数替换后通过 `shell`（或后台 `bg_shell`）工具执行命令。\n\
+- 严禁在未查询 `custom_tools_list` 的情况下盲目编写临时脚本替代系统中已配置的成熟工具。\n\n\
 # 谨慎操作\n\
 - 本地可逆操作（编辑文件、运行测试）可自由执行。\n\
 - 不可逆或高风险操作（删除文件、force push、修改 CI/CD、发送消息）执行前先确认。\n\
@@ -148,6 +155,7 @@ CTF 解题按以下优先级推进，**严禁跳级**：\n\
 - 跳过 skill 知识库直接写脚本测试\n\
 - 用自写脚本替代已有工具——已有工具更成熟、字典更全、效率更高\n\n\
 ## 工具使用规范\n\
+- 遇到特定漏洞利用或渗透测试场景，若默认工具栏中未看到专用工具，**先调用 `custom_tools_list` 查看是否有现成的自定义工具可用**，避免重复造轮子。\n\
 - **目录扫描**用 `shell` 运行 `dirsearch`（已安装），不要自写 Python 脚本扫目录。命令示例：`dirsearch -u <url> -x 404 --exclude-sizes=0B`\n\
 - **端口扫描**用 `shell` 运行 `nmap`，不要自写脚本。\n\
 - **HTTP 请求**优先用 `web_fetch` 或 `shell` 运行 `curl`，不要自写脚本发请求。\n\
@@ -353,5 +361,13 @@ mod tests {
         assert!(CTF_PROMPT.contains("收敛与 Flag 提交"));
         assert!(CTF_PROMPT.contains("ctf_challenge"));
         assert!(CTF_PROMPT.contains("todo"));
+    }
+
+    #[test]
+    fn prompt_includes_custom_tools_list_guidance() {
+        assert!(BASE_PROMPT_STATIC.contains("custom_tools_list"));
+        assert!(BASE_PROMPT_STATIC.contains("自定义工具使用（Custom Tools）"));
+        assert!(CTF_PROMPT.contains("custom_tools_list"));
+        assert!(CTF_PROMPT.contains("先调用 `custom_tools_list` 查看是否有现成的自定义工具可用"));
     }
 }

@@ -291,6 +291,10 @@ impl ToolRegistry {
             .find(|t| {
                 let schema_name = &t.schema().name;
                 schema_name == name
+                    || (schema_name.starts_with("custom_")
+                        && schema_name.strip_prefix("custom_") == Some(name))
+                    || (name.starts_with("custom_")
+                        && name.strip_prefix("custom_") == Some(schema_name.as_str()))
                     || (schema_name.starts_with("skill_")
                         && schema_name.replace('.', "_") == name.replace('.', "_"))
             })
@@ -569,15 +573,15 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 13);
+        assert_eq!(registry.all_schemas().len(), 14);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
         assert!(registry.get("bg_shell").is_some());
         assert!(registry.get("inspect_image").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 13);
-        assert_eq!(registry.schemas().len(), 13);
+        assert_eq!(registry.all_schemas().len(), 14);
+        assert_eq!(registry.schemas().len(), 14);
     }
 
     #[test]
@@ -592,5 +596,47 @@ mod tests {
         protected.register_hidden(Box::new(EchoTool));
         assert!(protected.schemas().is_empty());
         assert_eq!(inner.schemas().len(), 1);
+    }
+
+    #[test]
+    fn registry_get_resolves_custom_prefix_bidirectionally() {
+        struct NamedTool(&'static str);
+        impl Tool for NamedTool {
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: self.0.into(),
+                    description: "test".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: vec![],
+                }
+            }
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async {
+                    Ok(ToolOutput {
+                        content: "ok".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(NamedTool("custom_sqlmap")));
+        reg.register(Box::new(NamedTool("nmap")));
+
+        // 1. Tool named custom_sqlmap: can be accessed via custom_sqlmap and sqlmap
+        assert!(reg.get("custom_sqlmap").is_some());
+        assert!(reg.get("sqlmap").is_some());
+
+        // 2. Tool named nmap: can be accessed via nmap and custom_nmap
+        assert!(reg.get("nmap").is_some());
+        assert!(reg.get("custom_nmap").is_some());
+
+        // 3. Unknown tool
+        assert!(reg.get("unknown_tool").is_none());
     }
 }

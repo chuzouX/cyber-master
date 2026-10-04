@@ -37,6 +37,7 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(bg::BgShellTool));
     reg.register(Box::new(bg::BgStatusTool));
     reg.register(Box::new(bg::BgKillTool));
+    reg.register(Box::new(custom_tool::CustomToolsListTool::empty()));
 }
 
 /// 内置工具名（供 TUI `/tools` 命令展示，避免重复构造 registry）。
@@ -56,13 +57,14 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
         "bg_shell",
         "bg_status",
         "bg_kill",
+        "custom_tools_list",
     ]
 }
 
 pub use bg::{BgKillTool, BgShellTool, BgStatusTool};
 
 pub use ctf_challenge::CtfChallengeTool;
-pub use custom_tool::CustomTool;
+pub use custom_tool::{CustomTool, CustomToolsListTool};
 pub use delegate_tasks::DelegateTasksTool;
 pub use inspect_image::InspectImageTool;
 pub use save_memory::SaveMemoryTool;

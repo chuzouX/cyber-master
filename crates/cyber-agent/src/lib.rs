@@ -45,8 +45,8 @@ pub use provider::{provider_factory, Provider, StreamRequest};
 pub use subagent::{SubagentArchive, SubagentRun, SubagentStatus};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{
-    builtin_tool_names, CtfChallengeTool, CustomTool, DelegateTasksTool, InspectImageTool,
-    SaveMemoryTool, SearchToolsTool, TodoTool,
+    builtin_tool_names, CtfChallengeTool, CustomTool, CustomToolsListTool, DelegateTasksTool,
+    InspectImageTool, SaveMemoryTool, SearchToolsTool, TodoTool,
 };
 pub use types::{
     AgentEvent, ImageContent, Message, Role, StreamEvent, ToolCall, ToolCallDelta, Usage,
