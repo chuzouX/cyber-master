@@ -50,3 +50,8 @@ desktop.ini
 /work/
 /pentest/
 /real/
+
+# Pentest reports & scratch data
+/output/
+siqs.dat
+.cargo/
