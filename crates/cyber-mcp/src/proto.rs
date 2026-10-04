@@ -44,12 +44,33 @@ impl<T> JsonRpcRequest<T> {
 }
 
 /// JSON-RPC 2.0 错误对象。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// 兼容标准 JSON-RPC 错误对象及非标准服务端返回的纯字符串错误。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcErrorPayload {
+    Object(JsonRpcError),
+    String(String),
+}
+
+impl JsonRpcErrorPayload {
+    pub fn into_rpc_error(self) -> JsonRpcError {
+        match self {
+            Self::Object(err) => err,
+            Self::String(msg) => JsonRpcError {
+                code: -1,
+                message: msg,
+                data: None,
+            },
+        }
+    }
 }
 
 /// JSON-RPC 2.0 响应（`id` 为 `None` 时是 notification，应忽略）。
@@ -61,7 +82,7 @@ pub struct JsonRpcResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
+    pub error: Option<JsonRpcErrorPayload>,
 }
 
 impl JsonRpcResponse {
@@ -228,9 +249,19 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}"#;
         let resp: JsonRpcResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.id, Some(3));
-        let err = resp.error.unwrap();
+        let err = resp.error.unwrap().into_rpc_error();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "Method not found");
+    }
+
+    #[test]
+    fn proto_deserializes_string_error_payload() {
+        let raw = r#"{"jsonrpc":"2.0","id":4,"error":"invalid_token"}"#;
+        let resp: JsonRpcResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.id, Some(4));
+        let err = resp.error.unwrap().into_rpc_error();
+        assert_eq!(err.code, -1);
+        assert_eq!(err.message, "invalid_token");
     }
 
     #[test]

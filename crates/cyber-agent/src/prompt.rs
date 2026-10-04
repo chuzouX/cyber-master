@@ -80,6 +80,10 @@ pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全�
   1. 直接调用对应工具名称（支持 `custom_<name>` 或 `<name>`），并传入所需参数字典；\n\
   2. 或根据工具返回的命令行模板，将参数替换后通过 `shell`（或后台 `bg_shell`）工具执行命令。\n\
 - 严禁在未查询 `custom_tools_list` 的情况下盲目编写临时脚本替代系统中已配置的成熟工具。\n\n\
+# MCP 扩展工具使用（MCP Tools）\n\
+- 系统支持通过 MCP（Model Context Protocol）扩展外部服务工具（如外部竞赛平台、靶机环境管理、流量审计代理等）。\n\
+- 为防止工具列表超出模型接口限制，所有 MCP 扩展工具已收敛整合。在需要与外部扩展平台或服务交互时，**必须先调用 `mcp_tools_list` 工具获取当前已连接的 MCP 工具清单、所属服务与参数规格**。\n\
+- 获取工具信息后，你可以直接发起工具调用，工具名支持 `mcp_<server>_<tool>`、`<server>_<tool>` 或简写 `<tool>`，并传入所需参数字典。\n\n\
 # 谨慎操作\n\
 - 本地可逆操作（编辑文件、运行测试）可自由执行。\n\
 - 不可逆或高风险操作（删除文件、force push、修改 CI/CD、发送消息）执行前先确认。\n\
@@ -156,6 +160,7 @@ CTF 解题按以下优先级推进，**严禁跳级**：\n\
 - 用自写脚本替代已有工具——已有工具更成熟、字典更全、效率更高\n\n\
 ## 工具使用规范\n\
 - 遇到特定漏洞利用或渗透测试场景，若默认工具栏中未看到专用工具，**先调用 `custom_tools_list` 查看是否有现成的自定义工具可用**，避免重复造轮子。\n\
+- 遇到需要与外部竞赛平台或靶机系统交互（查询题目详情、启动/管理靶机环境、提交 flag 等），先调用 `mcp_tools_list` 查看已连接的相关扩展工具规格，然后调用对应工具执行操作。\n\
 - **目录扫描**用 `shell` 运行 `dirsearch`（已安装），不要自写 Python 脚本扫目录。命令示例：`dirsearch -u <url> -x 404 --exclude-sizes=0B`\n\
 - **端口扫描**用 `shell` 运行 `nmap`，不要自写脚本。\n\
 - **HTTP 请求**优先用 `web_fetch` 或 `shell` 运行 `curl`，不要自写脚本发请求。\n\
@@ -369,5 +374,20 @@ mod tests {
         assert!(BASE_PROMPT_STATIC.contains("自定义工具使用（Custom Tools）"));
         assert!(CTF_PROMPT.contains("custom_tools_list"));
         assert!(CTF_PROMPT.contains("先调用 `custom_tools_list` 查看是否有现成的自定义工具可用"));
+    }
+
+    #[test]
+    fn prompt_includes_mcp_tools_list_guidance() {
+        assert!(BASE_PROMPT_STATIC.contains("mcp_tools_list"));
+        assert!(BASE_PROMPT_STATIC.contains("MCP 扩展工具使用（MCP Tools）"));
+        assert!(
+            !BASE_PROMPT_STATIC.contains("ctf2"),
+            "系统提示词严禁硬编码特定靶场名称"
+        );
+        assert!(CTF_PROMPT.contains("mcp_tools_list"));
+        assert!(
+            !CTF_PROMPT.contains("ctf2"),
+            "CTF 提示词严禁硬编码特定靶场名称"
+        );
     }
 }

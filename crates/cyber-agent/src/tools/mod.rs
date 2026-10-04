@@ -58,6 +58,7 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
         "bg_status",
         "bg_kill",
         "custom_tools_list",
+        "mcp_tools_list",
     ]
 }
 

@@ -16,7 +16,7 @@ use cyber_agent::{
     SearchToolsTool, ToolRegistry,
 };
 use cyber_core::{load_custom_tools, CtfChallenge, Paths};
-use cyber_mcp::{McpRegistry, McpServersConfig};
+use cyber_mcp::{McpRegistry, McpServersConfig, McpToolsListTool};
 use cyber_skills::{SkillRegistry, SkillTool, UseSkillTool};
 use tracing::warn;
 
@@ -112,11 +112,15 @@ pub async fn build_registries(
             warn!(server = %name, error = %e, "MCP server 连接失败");
             errors.push(format!("MCP server '{name}' 连接失败: {e}"));
         }
+        // 1. 将 mcp_tools_list 注册为公开工具（进入 catalog，发送给 LLM）
+        tool_reg.register(Box::new(McpToolsListTool::from_mcp_tools(&mcp_tools)));
+        // 2. 将所有具体 MCP 工具注册为隐藏工具（不在 catalog 占用 tools 额度，但仍可通过 get 正常执行）
         for tool in mcp_tools {
-            tool_reg.register(Box::new(tool));
+            tool_reg.register_hidden(Box::new(tool));
         }
         Some(Arc::new(mcp_reg))
     } else {
+        tool_reg.register(Box::new(McpToolsListTool::empty()));
         None
     };
 
@@ -212,5 +216,94 @@ mod tests {
         assert!(registries.tools.get("tool_0").is_some());
         assert!(registries.tools.get("custom_tool_49").is_some());
         assert!(registries.tools.get("tool_49").is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_consolidates_mcp_tools_into_mcp_tools_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::at(temp.path().join(".cyber")).unwrap();
+        let cwd = temp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let (registries, errors) = build_registries(&paths, &cwd, true, false).await;
+        assert!(errors.is_empty());
+
+        let visible_schemas = registries.tools.schemas();
+        let visible_names: Vec<&str> = visible_schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(visible_names.contains(&"mcp_tools_list"));
+        assert!(registries.tools.get("mcp_tools_list").is_some());
+
+        // 测试如果有具体 MCP 工具（如 ctf2 和 burp），收敛模式的行为：
+        let mut tool_reg = ToolRegistry::new();
+        let mcp_tools = vec![
+            cyber_mcp::McpToolSnapshot {
+                server_name: "ctf2".into(),
+                original_name: "submit_flag".into(),
+                mcp_name: "mcp_ctf2_submit_flag".into(),
+                description: "submit flag".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            cyber_mcp::McpToolSnapshot {
+                server_name: "burp".into(),
+                original_name: "proxy_history".into(),
+                mcp_name: "mcp_burp_proxy_history".into(),
+                description: "burp history".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        // 1. 公开注册 mcp_tools_list
+        tool_reg.register(Box::new(cyber_mcp::McpToolsListTool::new(Arc::new(
+            mcp_tools,
+        ))));
+
+        // 2. 模拟隐藏注册个体工具
+        struct DummyTool(&'static str);
+        impl cyber_agent::Tool for DummyTool {
+            fn schema(&self) -> cyber_agent::ToolSchema {
+                cyber_agent::ToolSchema {
+                    name: self.0.into(),
+                    description: "dummy".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: vec![],
+                }
+            }
+            fn run<'a>(
+                &'a self,
+                _input: serde_json::Value,
+                _ctx: &'a cyber_agent::ToolCtx,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = cyber_agent::Result<cyber_agent::ToolOutput>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(cyber_agent::ToolOutput {
+                        content: "ok".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        tool_reg.register_hidden(Box::new(DummyTool("mcp_ctf2_submit_flag")));
+        tool_reg.register_hidden(Box::new(DummyTool("mcp_burp_proxy_history")));
+
+        let schemas = tool_reg.schemas();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "mcp_tools_list");
+
+        // all_schemas 包含所有隐藏工具
+        assert_eq!(tool_reg.all_schemas().len(), 3);
+
+        // get 能通过多种名称正确路由
+        assert!(tool_reg.get("mcp_ctf2_submit_flag").is_some());
+        assert!(tool_reg.get("ctf2_submit_flag").is_some());
+        assert!(tool_reg.get("submit_flag").is_some());
+        assert!(tool_reg.get("mcp_burp_proxy_history").is_some());
+        assert!(tool_reg.get("burp_proxy_history").is_some());
+        assert!(tool_reg.get("proxy_history").is_some());
     }
 }

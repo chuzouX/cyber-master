@@ -472,7 +472,8 @@ fn route_response(line: &str, pending: &mut HashMap<u64, oneshot::Sender<Result<
         None => return,
     };
     if let Some(tx) = pending.remove(&id) {
-        if let Some(err) = resp.error {
+        if let Some(err_payload) = resp.error {
+            let err = err_payload.into_rpc_error();
             let _ = tx.send(Err(McpError::Rpc {
                 code: err.code,
                 message: err.message,
@@ -744,7 +745,8 @@ async fn do_http_notification(
 
 /// 把 `JsonRpcResponse` 转 `Result<Value>`（error → Rpc，否则取 result/Null）。
 fn finalize_response(resp: JsonRpcResponse) -> Result<Value> {
-    if let Some(err) = resp.error {
+    if let Some(err_payload) = resp.error {
+        let err = err_payload.into_rpc_error();
         return Err(McpError::Rpc {
             code: err.code,
             message: err.message,

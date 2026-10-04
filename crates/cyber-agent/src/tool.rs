@@ -295,6 +295,15 @@ impl ToolRegistry {
                         && schema_name.strip_prefix("custom_") == Some(name))
                     || (name.starts_with("custom_")
                         && name.strip_prefix("custom_") == Some(schema_name.as_str()))
+                    || (schema_name.starts_with("mcp_")
+                        && schema_name.strip_prefix("mcp_") == Some(name))
+                    || (name.starts_with("mcp_")
+                        && name.strip_prefix("mcp_") == Some(schema_name.as_str()))
+                    || (schema_name.starts_with("mcp_")
+                        && schema_name
+                            .strip_prefix("mcp_")
+                            .and_then(|rest| rest.split_once('_'))
+                            .is_some_and(|(_server, raw_tool)| raw_tool == name))
                     || (schema_name.starts_with("skill_")
                         && schema_name.replace('.', "_") == name.replace('.', "_"))
             })
@@ -638,5 +647,52 @@ mod tests {
 
         // 3. Unknown tool
         assert!(reg.get("unknown_tool").is_none());
+    }
+
+    #[test]
+    fn registry_get_resolves_mcp_prefix_multilevel() {
+        struct NamedTool(&'static str);
+        impl Tool for NamedTool {
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: self.0.into(),
+                    description: "test".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: vec![],
+                }
+            }
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async {
+                    Ok(ToolOutput {
+                        content: "ok".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(NamedTool("mcp_ctf2_submit_flag")));
+        reg.register(Box::new(NamedTool("mcp_burp_proxy_history")));
+
+        // 1. Full schema name: mcp_ctf2_submit_flag
+        assert!(reg.get("mcp_ctf2_submit_flag").is_some());
+        // 2. Server prefix name: ctf2_submit_flag
+        assert!(reg.get("ctf2_submit_flag").is_some());
+        // 3. Raw tool name: submit_flag
+        assert!(reg.get("submit_flag").is_some());
+
+        // Burp tool:
+        assert!(reg.get("mcp_burp_proxy_history").is_some());
+        assert!(reg.get("burp_proxy_history").is_some());
+        assert!(reg.get("proxy_history").is_some());
+
+        // 4. Nonexistent
+        assert!(reg.get("submit_flag_unknown").is_none());
+        assert!(reg.get("other_server_proxy_history").is_none());
     }
 }
