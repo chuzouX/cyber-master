@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 30
     env:
       CNB_SYNC_TOKEN: ${{ secrets.CNB_SYNC_TOKEN }}
-      CNB_REPO: ${{ vars.CNB_REPO || secrets.CNB_REPO }}
+      CNB_REPO: ${{ vars.CNB_REPO || secrets.CNB_REPO || 'funxlink/cyber-master' }}
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
@@ -109,6 +109,22 @@ jobs:
               exit 1
             fi
             echo "✓ 复用已存在的 CNB Release (id=$RID)"
+            # 同步更新 CNB 已有 Release 的标题和正文说明 (Release Note)
+            echo "--> 正在同步更新 CNB Release 元数据与 Note 说明..."
+            UPDATE_RESP=$(curl -s -w "\n%{http_code}" "${API}/${RID}" -X PUT \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/vnd.cnb.api+json" \
+              -H "Authorization: Bearer $CNB_SYNC_TOKEN" \
+              -d "$PAYLOAD")
+            UPDATE_CODE=$(echo "$UPDATE_RESP" | tail -n1)
+            if [ "$UPDATE_CODE" -ge 300 ]; then
+              curl -s -X PATCH "${API}/${RID}" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/vnd.cnb.api+json" \
+                -H "Authorization: Bearer $CNB_SYNC_TOKEN" \
+                -d "$PAYLOAD" || true
+            fi
+            echo "✓ 已更新 CNB Release (id=$RID) 的 Note 说明"
           fi
 
           # 遍历 assets 目录并三步上传到 CNB

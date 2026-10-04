@@ -29,7 +29,7 @@ jobs:
       - name: 镜像推送到 CNB
         env:
           CNB_SYNC_TOKEN: ${{ secrets.CNB_SYNC_TOKEN }}
-          CNB_REPO: ${{ vars.CNB_REPO || secrets.CNB_REPO }}
+          CNB_REPO: ${{ vars.CNB_REPO || secrets.CNB_REPO || 'funxlink/cyber-master' }}
         run: |
           if [ -z "$CNB_SYNC_TOKEN" ]; then
             echo "::error::缺少 CNB_SYNC_TOKEN Secret，请在 GitHub Settings -> Secrets 中配置"
