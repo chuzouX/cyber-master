@@ -34,4 +34,6 @@ pub use providers::{
     ProviderPreset, ProvidersConfig, VisionCapability, PROVIDER_KINDS, PROVIDER_PRESETS,
 };
 pub use todo::{TodoItem, TodoStatus};
-pub use update::{check_for_updates, is_newer, ReleaseInfo};
+pub use update::{
+    check_for_updates, is_newer, ReleaseInfo, CNB_RELEASES_URL, CNB_REPO, GITHUB_REPO,
+};

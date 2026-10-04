@@ -517,7 +517,7 @@ async fn run_update(args: UpdateArgs, cwd: &Path) -> color_eyre::Result<()> {
     println!("Cyber Master 版本更新检查");
     println!("───────────────────────────────────────────────");
     println!("当前安装版本: v{}", cyber_core::update::CURRENT_VERSION);
-    print!("正在连接 GitHub 检查最新版本... ");
+    print!("正在连接版本源检查最新版本 (GitHub / CNB)... ");
     let _ = std::io::stdout().flush();
 
     let release = cyber_core::update::check_for_updates(true).await;
@@ -529,6 +529,7 @@ async fn run_update(args: UpdateArgs, cwd: &Path) -> color_eyre::Result<()> {
             println!();
             println!("  最新版本: v{}", info.version);
             println!("  发布地址: {}", info.html_url);
+            println!("  CNB 镜像: {}", cyber_core::update::CNB_RELEASES_URL);
             if let Some(notes) = &info.release_notes {
                 let clean_notes = notes.trim();
                 if !clean_notes.is_empty() {
@@ -549,25 +550,67 @@ async fn run_update(args: UpdateArgs, cwd: &Path) -> color_eyre::Result<()> {
             }
 
             let is_git_repo = cwd.join(".git").exists();
-            if args.apply && is_git_repo {
-                println!("正在自动拉取并构建最新代码...");
-                let status = std::process::Command::new("git")
-                    .arg("pull")
-                    .current_dir(cwd)
-                    .status()?;
-                if !status.success() {
-                    eprintln!("git pull 失败，请检查网络或本地修改。");
-                    return Ok(());
-                }
-                println!("正在编译最新版本 (cargo build --release)...");
-                let build_status = std::process::Command::new("cargo")
-                    .args(["build", "--release"])
-                    .current_dir(cwd)
-                    .status()?;
-                if build_status.success() {
-                    println!("🎉 更新构建成功！新版本可执行文件位于 target/release/cyber");
+            if args.apply {
+                if is_git_repo {
+                    println!("正在自动拉取并构建最新代码...");
+                    let status = std::process::Command::new("git")
+                        .arg("pull")
+                        .current_dir(cwd)
+                        .status()?;
+                    if !status.success() {
+                        eprintln!("git pull 失败，请检查网络或本地修改。");
+                        return Ok(());
+                    }
+                    println!("正在编译最新版本 (cargo build --release)...");
+                    let build_status = std::process::Command::new("cargo")
+                        .args(["build", "--release"])
+                        .current_dir(cwd)
+                        .status()?;
+                    if build_status.success() {
+                        println!("🎉 更新构建成功！新版本可执行文件位于 target/release/cyber");
+                    } else {
+                        eprintln!("cargo build 失败，请根据编译错误排查。");
+                    }
                 } else {
-                    eprintln!("cargo build 失败，请根据编译错误排查。");
+                    println!("正在通过 CNB 国内极速源执行一键更新升级...");
+                    #[cfg(windows)]
+                    {
+                        let script = format!(
+                            "$env:CYBER_VERSION='v{}'; $env:CYBER_USE_CNB='1'; irm https://cnb.cool/{}/-/git/raw/main/install.ps1 | iex",
+                            info.version,
+                            cyber_core::update::CNB_REPO
+                        );
+                        let status = std::process::Command::new("powershell")
+                            .args([
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-Command",
+                                &script,
+                            ])
+                            .status()?;
+                        if status.success() {
+                            println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
+                        } else {
+                            eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let script = format!(
+                            "curl -fsSL https://cnb.cool/{}/-/git/raw/main/install.sh | sh -s -- --cnb --version v{}",
+                            cyber_core::update::CNB_REPO,
+                            info.version
+                        );
+                        let status = std::process::Command::new("sh")
+                            .args(["-c", &script])
+                            .status()?;
+                        if status.success() {
+                            println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
+                        } else {
+                            eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
+                        }
+                    }
                 }
             } else {
                 println!("推荐升级方式:");
@@ -576,13 +619,32 @@ async fn run_update(args: UpdateArgs, cwd: &Path) -> color_eyre::Result<()> {
                     println!("     git pull && cargo build --release");
                     println!("     或者直接运行: cyber update --apply");
                 } else {
-                    println!("  1. 通过 Cargo 全局安装最新版本:");
+                    println!("  1. 国内极速一键升级（CNB 源，推荐）：");
+                    #[cfg(windows)]
                     println!(
-                        "     cargo install --git https://github.com/chuzouX/cyber-master --locked"
+                        "     irm https://cnb.cool/{}/-/git/raw/main/install.ps1 | iex",
+                        cyber_core::update::CNB_REPO
+                    );
+                    #[cfg(not(windows))]
+                    println!(
+                        "     curl -fsSL https://cnb.cool/{}/-/git/raw/main/install.sh | sh",
+                        cyber_core::update::CNB_REPO
+                    );
+                    println!("     或直接运行自动升级: cyber update --apply");
+                    println!();
+                    println!("  2. GitHub 官方安装源（海外 / 代理）：");
+                    println!(
+                        "     cargo install --git https://github.com/{} --locked",
+                        cyber_core::update::GITHUB_REPO
                     );
                 }
-                println!("  2. 或前往 GitHub Releases 页面下载预编译二进制:");
-                println!("     {}", info.html_url);
+                println!();
+                println!("  3. 前往 Releases 页面下载预编译二进制:");
+                println!("     CNB 镜像: {}", cyber_core::update::CNB_RELEASES_URL);
+                println!(
+                    "     GitHub:   https://github.com/{}/releases",
+                    cyber_core::update::GITHUB_REPO
+                );
             }
         }
         Some(_info) => {
@@ -594,8 +656,16 @@ async fn run_update(args: UpdateArgs, cwd: &Path) -> color_eyre::Result<()> {
         }
         None => {
             println!("检查失败。");
-            println!("未能从 GitHub 获取到最新版本信息，可能是网络不可达或超时。");
-            println!("您可以手动访问项目主页确认：https://github.com/chuzouX/cyber-master");
+            println!("未能获取到最新版本信息，可能是网络不可达或超时。");
+            println!("您可以手动访问以下镜像主页确认：");
+            println!(
+                "  CNB 镜像: https://cnb.cool/{}",
+                cyber_core::update::CNB_REPO
+            );
+            println!(
+                "  GitHub:   https://github.com/{}",
+                cyber_core::update::GITHUB_REPO
+            );
         }
     }
     Ok(())

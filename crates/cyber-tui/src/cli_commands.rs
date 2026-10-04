@@ -864,10 +864,11 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                 output(
                     "更新检查",
                     format!(
-                        "✨ 发现新版本 V{}（当前 V{}）！\n\n发布页面：{}\n可在终端退出后运行 `cyber update` 进行升级。",
+                        "✨ 发现新版本 V{}（当前 V{}）！\n\n发布页面：{}\nCNB 镜像：{}\n可在终端退出后运行 `cyber update` 进行升级。",
                         info.version,
                         cyber_core::update::CURRENT_VERSION,
-                        info.html_url
+                        info.html_url,
+                        cyber_core::update::CNB_RELEASES_URL,
                     ),
                 )
             }
@@ -881,8 +882,10 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
             None => output(
                 "更新检查",
                 format!(
-                    "当前版本 V{}\n未检测到本地版本缓存。请在终端执行 `cyber update` 联网检查最新版本。\n发布地址：https://github.com/chuzouX/cyber-master",
-                    cyber_core::update::CURRENT_VERSION
+                    "当前版本 V{}\n未检测到本地版本缓存。请在终端执行 `cyber update` 联网检查最新版本。\n发布地址：https://github.com/{}\nCNB 镜像：{}",
+                    cyber_core::update::CURRENT_VERSION,
+                    cyber_core::update::GITHUB_REPO,
+                    cyber_core::update::CNB_RELEASES_URL,
                 ),
             ),
         });

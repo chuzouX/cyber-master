@@ -18,6 +18,9 @@ pub const GITHUB_API_URL: &str =
     "https://api.github.com/repos/chuzouX/cyber-master/releases/latest";
 pub const GITHUB_RAW_CARGO: &str =
     "https://raw.githubusercontent.com/chuzouX/cyber-master/main/Cargo.toml";
+pub const CNB_REPO: &str = "funxlink/cyber-master";
+pub const CNB_RAW_CARGO: &str = "https://cnb.cool/funxlink/cyber-master/-/git/raw/main/Cargo.toml";
+pub const CNB_RELEASES_URL: &str = "https://cnb.cool/funxlink/cyber-master/-/releases";
 
 /// 缓存过期时间：1 小时。
 const CACHE_TTL_SECS: u64 = 3600;
@@ -153,23 +156,37 @@ pub async fn check_for_updates(force: bool) -> Option<ReleaseInfo> {
         _ => None,
     };
 
-    // 备用：若 Release 为空或被限频，从 main 分支 Cargo.toml 获取版本
+    // 备用：若 GitHub Release 为空或被限频/不可达，优先尝试 CNB 国内极速源 Raw Cargo.toml
     let release = match release {
         Some(rel) => Some(rel),
         None => {
-            debug!("GitHub Releases 查询未成功，尝试读取 Raw Cargo.toml");
-            match client.get(GITHUB_RAW_CARGO).send().await {
+            debug!("GitHub Releases 查询未成功，尝试从 CNB 国内源读取 Raw Cargo.toml");
+            match client.get(CNB_RAW_CARGO).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let text = resp.text().await.unwrap_or_default();
-                    let ver = parse_cargo_toml_version(&text)?;
-                    Some(ReleaseInfo {
+                    parse_cargo_toml_version(&text).map(|ver| ReleaseInfo {
                         version: ver,
-                        html_url: format!("https://github.com/{GITHUB_REPO}"),
+                        html_url: CNB_RELEASES_URL.to_string(),
                         release_notes: None,
                         published_at: None,
                     })
                 }
-                _ => None,
+                _ => {
+                    debug!("CNB 查询未成功，降级尝试 GitHub Raw Cargo.toml");
+                    match client.get(GITHUB_RAW_CARGO).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            let text = resp.text().await.unwrap_or_default();
+                            let ver = parse_cargo_toml_version(&text)?;
+                            Some(ReleaseInfo {
+                                version: ver,
+                                html_url: format!("https://github.com/{GITHUB_REPO}"),
+                                release_notes: None,
+                                published_at: None,
+                            })
+                        }
+                        _ => None,
+                    }
+                }
             }
         }
     };
@@ -223,6 +240,21 @@ edition = "2021"
         assert_eq!(
             parse_cargo_toml_version(toml_str),
             Some("0.4.9".to_string())
+        );
+    }
+
+    #[test]
+    fn cnb_constants_and_cargo_toml_parsing() {
+        assert_eq!(CNB_REPO, "funxlink/cyber-master");
+        assert!(CNB_RAW_CARGO.starts_with("https://cnb.cool/"));
+        assert!(CNB_RELEASES_URL.starts_with("https://cnb.cool/"));
+        let toml_sample = r#"
+[workspace.package]
+version = "0.5.0"
+"#;
+        assert_eq!(
+            parse_cargo_toml_version(toml_sample),
+            Some("0.5.0".to_string())
         );
     }
 }
