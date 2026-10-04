@@ -19,8 +19,9 @@ use crossterm::{
     },
 };
 use cyber_agent::{
-    estimate_messages_tokens, AgentEvent, ApprovalChoice, PermissionBroker, PermissionDecision,
-    PermissionMode, PermissionRequest,
+    estimate_messages_tokens, AgentEvent, ApprovalChoice, BackgroundJob, BackgroundRegistry,
+    JobKind, JobStatus, PermissionBroker, PermissionDecision, PermissionMode, PermissionRequest,
+    SubagentArchive, SubagentRun, SubagentStatus,
 };
 use cyber_core::{Config, EnvVar, MemoryRule, ProvidersConfig, ThinkingIntensity};
 use futures::StreamExt;
@@ -125,6 +126,8 @@ enum Panel {
     Shortcuts,
     Ctf,
     Settings,
+    Subagents,
+    Jobs,
 }
 
 /// 设置面板标签页（共 7 个大类，全面覆盖所有设置）
@@ -405,6 +408,39 @@ pub struct QueuedPrompt {
     pub displayed: bool,
 }
 
+/// 子代理面板交互状态：仅列表选择（Enter 进入覆盖对话视图）。
+#[derive(Clone, Debug, Default)]
+struct SubagentPanelState {
+    selected: usize,
+}
+
+/// 子代理覆盖视图状态：`run_id` 指向 `SubagentArchive` 条目，转录以对话样式
+/// 覆盖主对话区渲染（Esc 返回）。跨会话/回合保留（归档条目会话级不回删）。
+#[derive(Clone, Debug)]
+struct SubagentViewState {
+    run_id: u64,
+    /// true=跟随底部（新行到达自动下滚）。
+    follow_bottom: bool,
+    /// 自底部上滚行数（语义同旧面板 detail_scroll）。
+    scroll: usize,
+    /// Ctrl+O；独立于对话的 tools_expanded。
+    tools_expanded: bool,
+    /// 上次重建视图行的 (width, tools_expanded, 转录内容指纹)；变化才重建。
+    /// 指纹基于内容而非行数：行数到 MAX_LINES 上限后仍会丢最旧/追加，
+    /// 只用 len 会导致运行后期视图停止更新。
+    built: Option<(u16, bool, u64)>,
+    viewport: WrappedViewport,
+}
+
+/// 后台任务面板交互状态（结构同子代理面板）。
+#[derive(Clone, Debug, Default)]
+struct JobsPanelState {
+    selected: usize,
+    detail: Option<u64>,
+    detail_scroll: usize,
+    follow_bottom: bool,
+}
+
 struct CliScreen {
     provider: String,
     model: String,
@@ -470,6 +506,20 @@ struct CliScreen {
     pub needs_clear: bool,
     pub queued_prompts: std::collections::VecDeque<QueuedPrompt>,
     pub active_steering_tx: Option<cyber_agent::SteeringSender>,
+    /// 子代理转录注册表（Ctrl+G 面板数据源）。
+    subagents: Arc<cyber_agent::SubagentArchive>,
+    /// 后台任务注册表（Ctrl+B 面板 + /bg 命令数据源）。
+    background: Arc<cyber_agent::BackgroundRegistry>,
+    /// 最近一次回合的 (cwd, env) 快照（`/bg shell` busy 时可用）。
+    background_env: Option<(std::path::PathBuf, Vec<(String, String)>)>,
+    /// 回合中完成的后台子代理结果，`sync` 时 flush 进会话。
+    pending_job_results: std::collections::VecDeque<String>,
+    subagent_panel: Option<SubagentPanelState>,
+    jobs_panel: Option<JobsPanelState>,
+    /// 子代理覆盖对话视图（Ctrl+G 面板 Enter 进入；Esc 返回）。
+    subagent_view: Option<SubagentViewState>,
+    /// 检测到的新版本（若有新版本则为 Some(ver)，在顶栏黄色标出）
+    pub new_version: Option<String>,
 }
 
 struct FormState {
@@ -647,7 +697,30 @@ impl CliScreen {
             needs_clear: false,
             queued_prompts: std::collections::VecDeque::new(),
             active_steering_tx: None,
+            subagents: Arc::clone(&runner.registries.subagents),
+            background: Arc::clone(&runner.registries.background),
+            background_env: Some((
+                runner.cwd.clone(),
+                runner
+                    .ctx
+                    .config
+                    .env
+                    .vars
+                    .iter()
+                    .map(|value| (value.key.clone(), value.value.clone()))
+                    .collect(),
+            )),
+            pending_job_results: std::collections::VecDeque::new(),
+            subagent_panel: None,
+            jobs_panel: None,
+            subagent_view: None,
+            new_version: None,
         };
+        if let Some(info) = cyber_core::update::cached_latest_version() {
+            if cyber_core::update::is_newer(cyber_core::update::CURRENT_VERSION, &info.version) {
+                screen.new_version = Some(info.version);
+            }
+        }
         screen.sync(runner);
         screen
     }
@@ -793,6 +866,12 @@ impl CliScreen {
             clean(label),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
+        // 系统消息与通知（含后台子代理注入结果）走 Markdown 渲染，保证表格/粗体/代码块正常显示。
+        if label == "System" || label == "Notice" {
+            let rendered = crate::markdown::render(&clean(text), &CLI_THEME);
+            self.messages.extend(rendered);
+            return;
+        }
         self.messages.extend(clean(text).lines().map(|line| {
             Line::styled(
                 line.to_owned(),
@@ -870,7 +949,7 @@ impl CliScreen {
     }
 
     fn replace_tool_card(&mut self, index: usize, width: u16) {
-        let replacement = render_tool_card(&self.tools[index], self.tools_expanded, width);
+        let replacement = render_tool_card(&self.tools[index], self.tools_expanded, width, false);
         let start = self.tools[index].start;
         let end = self.tools[index].end;
         let delta = replacement.len() as isize - (end - start) as isize;
@@ -1394,7 +1473,30 @@ impl CliScreen {
             Constraint::Length(1),
         ])
         .split(area);
-        self.draw_header(frame, sections[0]);
+        // 子代理覆盖视图：panel/approval 打开时隐藏但不丢状态；run 从快照消失
+        // 时防御性退出（归档条目会话级不回删，属纯防御）。
+        let mut view_run: Option<SubagentRun> = None;
+        let mut view_lost = false;
+        if let Some(view) = &self.subagent_view {
+            if self.panel.is_none() && self.approval.is_none() {
+                view_run = self
+                    .subagents
+                    .snapshot()
+                    .into_iter()
+                    .find(|run| run.id == view.run_id);
+                view_lost = view_run.is_none();
+            }
+        }
+        if view_lost {
+            self.subagent_view = None;
+        }
+        if let Some(run) = view_run.as_ref() {
+            self.draw_subagent_view_header(frame, sections[0], run);
+        } else {
+            self.draw_header(frame, sections[0]);
+        }
+        // 对话自身的 history_view/scroll 照常更新（视图期间不渲染，但返回时
+        // 保证对话内容最新）。
         self.history_view.update(&self.messages, sections[1].width);
         self.max_scroll = self
             .history_view
@@ -1402,41 +1504,68 @@ impl CliScreen {
             .len()
             .saturating_sub(sections[1].height as usize);
         self.scroll = self.scroll.min(self.max_scroll);
-        let start = self.max_scroll - self.scroll;
-        frame.render_widget(
-            Paragraph::new(self.history_view.window(start, sections[1].height)),
-            sections[1],
-        );
-        if self.messages.is_empty() && !self.busy && sections[1].height >= 4 {
-            let mut welcome = vec![
-                Line::styled(
-                    " Start with a question or a file to inspect.",
-                    Style::default().fg(FG),
-                ),
-                Line::styled(
-                    " / commands · Tab complete · ? shortcuts",
-                    Style::default().fg(DIM),
-                ),
-            ];
-            if !self.recent_sessions.is_empty() && sections[1].height >= 7 {
-                welcome.push(Line::default());
-                welcome.push(Line::styled(
-                    " Recent sessions",
-                    Style::default().fg(ACCENT),
-                ));
-                welcome.extend(
-                    self.recent_sessions
-                        .iter()
-                        .take(sections[1].height.saturating_sub(4).min(4) as usize)
-                        .map(|session| {
-                            Line::styled(
-                                format!(" {}", single_line(session)),
-                                Style::default().fg(MUTED),
-                            )
-                        }),
-                );
+        if let (Some(view), Some(run)) = (self.subagent_view.as_mut(), view_run.as_ref()) {
+            let key = (
+                sections[1].width,
+                view.tools_expanded,
+                subagent_lines_fingerprint(&run.lines),
+            );
+            if view.built != Some(key) {
+                let lines = build_subagent_view_lines(run, view.tools_expanded, sections[1].width);
+                view.viewport.update(&lines, sections[1].width);
+                view.built = Some(key);
             }
-            frame.render_widget(Paragraph::new(welcome), sections[1]);
+            let window = scroll_window(
+                &view.viewport.rows,
+                sections[1].height as usize,
+                view.scroll,
+                view.follow_bottom,
+            );
+            frame.render_widget(Paragraph::new(window), sections[1]);
+        } else {
+            let start = self.max_scroll - self.scroll;
+            frame.render_widget(
+                Paragraph::new(self.history_view.window(start, sections[1].height)),
+                sections[1],
+            );
+            if self.messages.is_empty() && !self.busy && sections[1].height >= 4 {
+                let mut welcome = vec![
+                    Line::styled(
+                        " Start with a question or a file to inspect.",
+                        Style::default().fg(FG),
+                    ),
+                    Line::styled(
+                        " / commands · Tab complete · ? shortcuts",
+                        Style::default().fg(DIM),
+                    ),
+                ];
+                if let Some(newer) = &self.new_version {
+                    welcome.push(Line::default());
+                    welcome.push(Line::styled(
+                        format!(" 💡 检测到新版本 V{newer}，可运行 cyber update 进行更新"),
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if !self.recent_sessions.is_empty() && sections[1].height >= 7 {
+                    welcome.push(Line::default());
+                    welcome.push(Line::styled(
+                        " Recent sessions",
+                        Style::default().fg(ACCENT),
+                    ));
+                    welcome.extend(
+                        self.recent_sessions
+                            .iter()
+                            .take(sections[1].height.saturating_sub(4).min(4) as usize)
+                            .map(|session| {
+                                Line::styled(
+                                    format!(" {}", single_line(session)),
+                                    Style::default().fg(MUTED),
+                                )
+                            }),
+                    );
+                }
+                frame.render_widget(Paragraph::new(welcome), sections[1]);
+            }
         }
         if self.approval.is_none()
             && self.form.is_none()
@@ -1531,9 +1660,27 @@ impl CliScreen {
             secret,
             self.busy,
         );
-        let mut footer = self.footer();
+        let mut footer: Vec<Line<'static>> = vec![Line::from(self.footer())];
         if self.approval.is_some() {
-            footer = "  permission required · 1/2/3 select · Enter confirm · Esc deny".into();
+            footer = vec![Line::from(
+                "  permission required · 1/2/3 select · Enter confirm · Esc deny",
+            )];
+        } else if let Some(run) = view_run.as_ref() {
+            let (badge, badge_color) = subagent_badge(run.status);
+            footer = vec![Line::from(vec![
+                Span::styled(
+                    format!(" #{} {} · ", run.id, single_line(&run.name)),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled(badge.to_string(), Style::default().fg(badge_color)),
+                Span::styled(
+                    format!(
+                        " · {} 行 · ↑/↓ 滚动 · End 回底 · Esc 返回对话 · Ctrl+O 工具详情 ",
+                        run.lines.len()
+                    ),
+                    Style::default().fg(DIM),
+                ),
+            ])];
         }
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(DIM)),
@@ -1621,7 +1768,7 @@ impl CliScreen {
                 Panel::Shortcuts => {
                     let title = " Shortcuts ";
                     let text = format!(
-                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nF3 / Ctrl+,     Open Settings center panel\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
+                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nF3 / Ctrl+,     Open Settings center panel\nCtrl+G          Toggle subagent panel (live transcripts)\nCtrl+B          Toggle background jobs panel\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
                         cli_commands::commands()
                             .iter()
                             .map(|spec| format!("{:<30} {}", spec.usage, spec.desc))
@@ -1663,6 +1810,19 @@ impl CliScreen {
                 Panel::Settings => {
                     if let Some(settings) = &self.settings {
                         draw_settings_panel(frame, sections[1], settings, self);
+                    }
+                }
+                Panel::Subagents => {
+                    let snapshot = self.subagents.snapshot();
+                    if let Some(state) = self.subagent_panel.as_mut() {
+                        draw_subagent_panel(frame, sections[1], state, &snapshot);
+                    }
+                }
+                Panel::Jobs => {
+                    let jobs = self.background.snapshot();
+                    let subagents = Arc::clone(&self.subagents);
+                    if let Some(state) = self.jobs_panel.as_mut() {
+                        draw_jobs_panel(frame, sections[1], state, &jobs, &subagents);
                     }
                 }
             }
@@ -1753,56 +1913,25 @@ impl CliScreen {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let logo_width = if area.width >= 38 && area.height >= 5 {
-            15
-        } else {
-            0
-        };
-        if logo_width != 0 {
-            frame.render_widget(
-                Paragraph::new(
-                    CY_LOGO
-                        .iter()
-                        .map(|line| {
-                            Line::from(
-                                line.chars()
-                                    .enumerate()
-                                    .map(|(index, ch)| {
-                                        Span::styled(
-                                            ch.to_string(),
-                                            Style::default()
-                                                .fg(match index {
-                                                    0..=3 => Color::Rgb(215, 135, 175),
-                                                    4..=7 => CODE,
-                                                    _ => Color::Rgb(0, 175, 175),
-                                                })
-                                                .add_modifier(Modifier::BOLD),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                Rect::new(
-                    area.x,
-                    area.y + area.height.saturating_sub(5),
-                    logo_width,
-                    5,
-                ),
-            );
-        }
+        let logo_width = draw_logo(frame, area);
         let info = Rect::new(
             area.x + logo_width,
             area.y + u16::from(logo_width != 0),
             area.width.saturating_sub(logo_width),
             area.height.saturating_sub(u16::from(logo_width != 0)),
         );
+        let mut title_spans = vec![Span::styled(
+            format!("Cyber Master V{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        )];
+        if let Some(newer) = &self.new_version {
+            title_spans.push(Span::styled(
+                format!(" (新版本 V{newer})"),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
         let mut lines = vec![
-            Line::styled(
-                format!("Cyber Master V{}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(FG).add_modifier(Modifier::BOLD),
-            ),
+            Line::from(title_spans),
             Line::styled(
                 format!(
                     "{} with {} effort",
@@ -1813,19 +1942,102 @@ impl CliScreen {
             ),
             Line::styled(clean(&self.cwd), Style::default().fg(MUTED)),
         ];
-        if !self.session_title.is_empty()
-            && self.session_title != "新会话"
-            && self.session_title != "默认会话"
-        {
-            lines.push(Line::from(vec![
-                Span::styled("Session · ", Style::default().fg(ACCENT)),
+        push_session_title_line(&mut lines, &self.session_title);
+        frame.render_widget(Paragraph::new(lines), info);
+    }
+
+    /// 子代理覆盖视图顶栏：logo 同 `draw_header`，信息行替换为子代理标识。
+    fn draw_subagent_view_header(&self, frame: &mut Frame, area: Rect, run: &SubagentRun) {
+        let logo_width = draw_logo(frame, area);
+        let info = Rect::new(
+            area.x + logo_width,
+            area.y + u16::from(logo_width != 0),
+            area.width.saturating_sub(logo_width),
+            area.height.saturating_sub(u16::from(logo_width != 0)),
+        );
+        let (badge, badge_color) = subagent_badge(run.status);
+        let elapsed = std::time::Instant::now()
+            .duration_since(run.started)
+            .as_secs();
+        let mut lines = vec![
+            Line::from(vec![
                 Span::styled(
-                    clean(&self.session_title),
+                    format!("#{} · {}", run.id, clean(&run.name)),
                     Style::default().fg(FG).add_modifier(Modifier::BOLD),
                 ),
-            ]));
-        }
+                Span::styled(format!(" · {badge}"), Style::default().fg(badge_color)),
+                Span::styled(format!(" · {elapsed}s"), Style::default().fg(MUTED)),
+            ]),
+            Line::styled(
+                format!(
+                    "{} with {} effort",
+                    clean(&self.model),
+                    effort_label(self.effort)
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Line::styled(clean(&self.cwd), Style::default().fg(MUTED)),
+        ];
+        push_session_title_line(&mut lines, &self.session_title);
         frame.render_widget(Paragraph::new(lines), info);
+    }
+}
+
+/// 左 logo（与对话顶栏完全一致）；返回 logo 宽度（空间不足时 0）。
+fn draw_logo(frame: &mut Frame, area: Rect) -> u16 {
+    let logo_width = if area.width >= 38 && area.height >= 5 {
+        15
+    } else {
+        0
+    };
+    if logo_width != 0 {
+        frame.render_widget(
+            Paragraph::new(
+                CY_LOGO
+                    .iter()
+                    .map(|line| {
+                        Line::from(
+                            line.chars()
+                                .enumerate()
+                                .map(|(index, ch)| {
+                                    Span::styled(
+                                        ch.to_string(),
+                                        Style::default()
+                                            .fg(match index {
+                                                0..=3 => Color::Rgb(215, 135, 175),
+                                                4..=7 => CODE,
+                                                _ => Color::Rgb(0, 175, 175),
+                                            })
+                                            .add_modifier(Modifier::BOLD),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Rect::new(
+                area.x,
+                area.y + area.height.saturating_sub(5),
+                logo_width,
+                5,
+            ),
+        );
+    }
+    logo_width
+}
+
+/// 顶栏会话行（与 `draw_header` 条件一致：非空且非默认标题才显示）。
+fn push_session_title_line(lines: &mut Vec<Line<'static>>, session_title: &str) {
+    if !session_title.is_empty() && session_title != "新会话" && session_title != "默认会话"
+    {
+        lines.push(Line::from(vec![
+            Span::styled("Session · ", Style::default().fg(ACCENT)),
+            Span::styled(
+                clean(session_title),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 }
 
@@ -1854,6 +2066,17 @@ fn clean(text: &str) -> String {
 
 fn single_line(text: &str) -> String {
     clean(text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// unicode-width 补齐空格至 `width`；已达/超过宽度时原样返回（不截断）。
+fn pad_cells(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let used = UnicodeWidthStr::width(text);
+    if used >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - used))
+    }
 }
 
 fn clip_cells(text: &str, width: usize) -> String {
@@ -2025,20 +2248,27 @@ fn pretty_tool_arguments(arguments: &str) -> String {
         .unwrap_or_else(|| clean(arguments))
 }
 
-fn tool_card_body(card: &ToolCard, kind: ToolCardKind, expanded: bool) -> Vec<String> {
+fn tool_card_body(
+    card: &ToolCard,
+    kind: ToolCardKind,
+    expanded: bool,
+    show_arguments: bool,
+) -> Vec<String> {
     let arguments = pretty_tool_arguments(&card.arguments);
     let body = if card.state == ToolCardState::Pending {
         if !card.progress.is_empty() {
             card.progress.as_str()
-        } else if matches!(
-            kind,
-            ToolCardKind::Shell
-                | ToolCardKind::Read
-                | ToolCardKind::Download
-                | ToolCardKind::Fetch
-                | ToolCardKind::List
-                | ToolCardKind::Find
-        ) {
+        } else if !show_arguments
+            && matches!(
+                kind,
+                ToolCardKind::Shell
+                    | ToolCardKind::Read
+                    | ToolCardKind::Download
+                    | ToolCardKind::Fetch
+                    | ToolCardKind::List
+                    | ToolCardKind::Find
+            )
+        {
             ""
         } else {
             arguments.as_str()
@@ -2051,13 +2281,14 @@ fn tool_card_body(card: &ToolCard, kind: ToolCardKind, expanded: bool) -> Vec<St
         && card.state != ToolCardState::Pending
         && !arguments.trim().is_empty()
         && arguments.trim() != "{}"
-        && matches!(
-            kind,
-            ToolCardKind::Edit
-                | ToolCardKind::Write
-                | ToolCardKind::Generic
-                | ToolCardKind::Delegate
-        )
+        && (show_arguments
+            || matches!(
+                kind,
+                ToolCardKind::Edit
+                    | ToolCardKind::Write
+                    | ToolCardKind::Generic
+                    | ToolCardKind::Delegate
+            ))
     {
         lines.push("Arguments".into());
         lines.extend(arguments.lines().map(str::to_owned));
@@ -2170,9 +2401,12 @@ fn render_delegate_tasks_cards(
         let tools = task_val.get("tools").and_then(|v| v.as_array());
 
         let task_result = results.and_then(|arr| {
-            arr.iter()
-                .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(task_name))
-                .or_else(|| arr.get(i))
+            // 结果按 tasks 数组 index 排序返回：index 精确匹配，name 仅作回退
+            //（同名任务按 name 匹配会串行）。
+            arr.get(i).or_else(|| {
+                arr.iter()
+                    .find(|r| r.get("name").and_then(|v| v.as_str()) == Some(task_name))
+            })
         });
 
         let mut task_progress_msgs = Vec::new();
@@ -2368,7 +2602,12 @@ fn render_delegate_tasks_cards(
     Some(all_lines)
 }
 
-fn render_tool_card(card: &ToolCard, expanded: bool, width: u16) -> Vec<Line<'static>> {
+fn render_tool_card(
+    card: &ToolCard,
+    expanded: bool,
+    width: u16,
+    show_arguments: bool,
+) -> Vec<Line<'static>> {
     let kind = tool_card_kind(&card.name);
     if kind == ToolCardKind::Delegate {
         if let Some(lines) = render_delegate_tasks_cards(card, expanded, width) {
@@ -2377,7 +2616,15 @@ fn render_tool_card(card: &ToolCard, expanded: bool, width: u16) -> Vec<Line<'st
     }
     let parsed_arguments = serde_json::from_str::<serde_json::Value>(&card.arguments).ok();
     let title = tool_card_title(card, kind);
-    let detail = tool_card_detail(kind, parsed_arguments.as_ref());
+    let mut detail = tool_card_detail(kind, parsed_arguments.as_ref());
+    // 子代理转录的参数常被截断（200 字符）导致 JSON 解析失败：标题兜底显示原文。
+    if detail.is_empty()
+        && show_arguments
+        && !card.arguments.trim().is_empty()
+        && card.arguments.trim() != "{}"
+    {
+        detail = single_line(&card.arguments);
+    }
     let (icon, color, bg, status) = match card.state {
         ToolCardState::Pending => ("◇", ACCENT, PENDING_BG, "running"),
         ToolCardState::Success => ("✓", SUCCESS, SUCCESS_BG, "done"),
@@ -2410,7 +2657,7 @@ fn render_tool_card(card: &ToolCard, expanded: bool, width: u16) -> Vec<Line<'st
         ])
         .style(Style::default().bg(bg)),
     ];
-    let body = tool_card_body(card, kind, expanded);
+    let body = tool_card_body(card, kind, expanded, show_arguments);
     let collapsed_limit = match kind {
         ToolCardKind::Edit => 5,
         ToolCardKind::Download => 2,
@@ -2557,6 +2804,555 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
+
+/// 居中面板几何：宽 `area.width-6` clamp 60..100，高 `area.height-2` clamp 12..30。
+/// 过小的区域返回 None（面板不渲染）。
+fn panel_geometry(area: Rect) -> Option<Rect> {
+    let width = area.width.saturating_sub(6).clamp(60, 100).min(area.width);
+    let height = area.height.saturating_sub(2).clamp(12, 30).min(area.height);
+    if width < 20 || height < 6 {
+        return None;
+    }
+    Some(Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    ))
+}
+
+fn subagent_badge(status: SubagentStatus) -> (&'static str, Color) {
+    match status {
+        SubagentStatus::Running => ("⏱ 运行中", ACCENT),
+        SubagentStatus::Completed => ("✓ 完成", SUCCESS),
+        SubagentStatus::Error => ("✗ 错误", ERROR),
+        SubagentStatus::TimedOut => ("⏱ 超时", ACCENT),
+        SubagentStatus::Killed => ("⊘ 已终止", MUTED),
+    }
+}
+
+fn job_badge(status: &JobStatus) -> (String, Color) {
+    match status {
+        JobStatus::Running => ("▶ 运行中".to_string(), ACCENT),
+        JobStatus::Finished(code) => (format!("✓ 完成({code})"), SUCCESS),
+        JobStatus::Killed => ("⊘ 已终止".to_string(), MUTED),
+        JobStatus::Failed(_) => ("✗ 失败".to_string(), ERROR),
+    }
+}
+
+/// 按字符截断（字符边界安全；超 `max` 补 `…`）。
+fn truncate_chars(value: &str, max: usize) -> String {
+    let mut end = value.len().min(max);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = value[..end].to_string();
+    if end < value.len() {
+        result.push('…');
+    }
+    result
+}
+
+/// 滚动窗口：`scroll` 语义为「自底部上滚行数」；`follow=true` 时恒贴底。
+/// 返回 (起始行, 可见行)。
+fn scroll_window(
+    lines: &[Line<'static>],
+    height: usize,
+    scroll: usize,
+    follow: bool,
+) -> Vec<Line<'static>> {
+    let max_scroll = lines.len().saturating_sub(height);
+    let offset = if follow { 0 } else { scroll.min(max_scroll) };
+    let start = max_scroll - offset;
+    lines.iter().skip(start).take(height).cloned().collect()
+}
+
+/// 子代理面板：纯列表（多列：标记/#id/状态/名称/最新活动）。数据来自
+/// `SubagentArchive` 快照；Enter 进入覆盖对话视图。
+fn draw_subagent_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut SubagentPanelState,
+    snapshot: &[SubagentRun],
+) {
+    let Some(popup_area) = panel_geometry(area) else {
+        return;
+    };
+    frame.render_widget(Clear, popup_area);
+    if state.selected >= snapshot.len() && !snapshot.is_empty() {
+        state.selected = snapshot.len() - 1;
+    }
+
+    let title = if snapshot.is_empty() {
+        Line::from(vec![Span::styled(
+            " ◉ 子代理 (Subagents) ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " ◉ 子代理 (Subagents) ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("· {} 次运行 ", snapshot.len()),
+                Style::default().fg(DIM),
+            ),
+        ])
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM))
+        .title(title);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let inner_width = inner.width as usize;
+    let content_height = inner.height.saturating_sub(1) as usize;
+    if content_height == 0 {
+        return;
+    }
+
+    // 列宽：前缀 2 + #id 4 + 状态 8 + 名称 16，其余给最新活动。
+    const PREFIX_W: usize = 2;
+    const ID_W: usize = 4;
+    const BADGE_W: usize = 8;
+    const NAME_W: usize = 16;
+    let last_budget = inner_width
+        .saturating_sub(PREFIX_W + ID_W + BADGE_W + NAME_W)
+        .max(1);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    // 表头 + 分隔线
+    body.push(Line::from(vec![
+        Span::styled("  ", Style::default().fg(DIM)),
+        Span::styled(pad_cells("#", 3) + " ", Style::default().fg(DIM)),
+        Span::styled(pad_cells("状态", BADGE_W), Style::default().fg(DIM)),
+        Span::styled(pad_cells("名称", NAME_W), Style::default().fg(DIM)),
+        Span::styled("最新活动", Style::default().fg(DIM)),
+    ]));
+    body.push(Line::styled(
+        "─".repeat(inner_width),
+        Style::default().fg(DIM),
+    ));
+    for (index, run) in snapshot.iter().enumerate() {
+        let (badge, badge_color) = subagent_badge(run.status);
+        let last = run
+            .lines
+            .last()
+            .map(|line| single_line(line))
+            .unwrap_or_default();
+        let selected = index == state.selected;
+        let name_style = if selected {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(FG)
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                if selected { "▶ " } else { "  " },
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("#{:<3} ", run.id), Style::default().fg(MUTED)),
+            Span::styled(pad_cells(badge, BADGE_W), Style::default().fg(badge_color)),
+            Span::styled(
+                pad_cells(&clip_cells(&single_line(&run.name), NAME_W), NAME_W),
+                name_style,
+            ),
+            Span::styled(clip_cells(&last, last_budget), Style::default().fg(MUTED)),
+        ]);
+        if selected {
+            body.push(line.style(Style::default().bg(PENDING_BG)));
+        } else {
+            body.push(line);
+        }
+    }
+    if snapshot.is_empty() {
+        body.push(Line::default());
+        body.push(Line::styled(
+            "   暂无子代理运行记录".to_string(),
+            Style::default().fg(MUTED),
+        ));
+        body.push(Line::styled(
+            "   （由 delegate_tasks 或 /bg run 产生；Ctrl+B 查看后台任务）".to_string(),
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    let visible = body
+        .iter()
+        .take(content_height)
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().fg(FG)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+    );
+    let footer_hint = " 操作: ↑/↓ 选择 · Enter 覆盖对话查看 · Esc 关闭 · PgUp/PgDn 翻页 ";
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_cells(footer_hint, inner_width),
+            Style::default().fg(DIM),
+        )),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+}
+
+/// 转录行内容指纹（FNV-1a 64）：内容不变则相等，任何追加/丢旧都会变化。
+/// 视图重建以此判定，而非行数（行数到 MAX_LINES 上限后不再变化）。
+fn subagent_lines_fingerprint(lines: &[String]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for line in lines {
+        for byte in line.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= 0xff;
+    }
+    hash
+}
+
+/// 子代理转录 → 对话式渲染：
+/// - 连续 `thinking: …` 行合并为一个 Thinking 块（流式推理逐行写入，逐行渲染
+///   会产生「每个单词一个 Thinking 头」）；
+/// - `tool … args: …` 与后续 `{name} => …` 结果行合并成对话同款工具卡；结果行
+///   向后按名搜索（并行工具调用时结果行交错，不保证紧跟）；
+/// - 连续普通行合并为一个 markdown 文档渲染（跨行围栏/列表/标题/粗体才生效）。
+fn build_subagent_view_lines(
+    run: &SubagentRun,
+    tools_expanded: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let thinking_theme = Theme {
+        fg: MUTED,
+        title: MUTED,
+        ..CLI_THEME
+    };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut consumed = vec![false; run.lines.len()];
+    let mut i = 0;
+    while i < run.lines.len() {
+        if consumed[i] {
+            i += 1;
+            continue;
+        }
+        let line = &run.lines[i];
+        if let Some(text) = line.strip_prefix("thinking: ") {
+            // 连续 thinking 行合并。转录已按推理流缓冲聚合（行内空格原样保留，
+            // 事件边界可能切在词/数字中间），因此这里纯拼接：补空格会产生
+            // "118 42" / "node _modules" 这类错位。
+            let mut merged = String::from(text);
+            let mut end = i + 1;
+            while let Some(more) = run
+                .lines
+                .get(end)
+                .and_then(|l| l.strip_prefix("thinking: "))
+            {
+                merged.push_str(more);
+                end += 1;
+            }
+            if !out.is_empty() {
+                out.push(Line::default());
+            }
+            out.push(Line::styled(
+                "Thinking",
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+            ));
+            let mut rendered = crate::markdown::render(&merged, &thinking_theme);
+            for rendered_line in &mut rendered {
+                for span in &mut rendered_line.spans {
+                    span.style = span.style.fg(MUTED).add_modifier(Modifier::ITALIC);
+                }
+            }
+            out.extend(rendered);
+            i = end;
+        } else if let Some(rest) = line.strip_prefix("tool ") {
+            let Some(args_idx) = rest.find(" args: ") else {
+                // 非标准工具行：并入普通文本组
+                i = push_plain_block(run, &consumed, i, &mut out);
+                continue;
+            };
+            let name = &rest[..args_idx];
+            let arguments = rest[args_idx + " args: ".len()..].to_string();
+            let result_prefix = format!("{name} => ");
+            let mut result: Option<String> = None;
+            for (k, cand) in run.lines.iter().enumerate().skip(i + 1) {
+                if let Some(output) = cand.strip_prefix(&result_prefix) {
+                    consumed[k] = true;
+                    result = Some(output.to_string());
+                    break;
+                }
+            }
+            let (output, state) = match result {
+                Some(output) => (output, ToolCardState::Success),
+                None => (String::new(), ToolCardState::Pending),
+            };
+            let card = ToolCard {
+                id: format!("sv-{i}-{name}"),
+                name: name.to_string(),
+                arguments,
+                progress: String::new(),
+                output,
+                state,
+                start: 0,
+                end: 0,
+            };
+            out.extend(render_tool_card(&card, tools_expanded, width, true));
+            i += 1;
+        } else {
+            i = push_plain_block(run, &consumed, i, &mut out);
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::styled(
+            "（该子代理暂无转录行）",
+            Style::default().fg(MUTED),
+        ));
+    }
+    out
+}
+
+/// 从 `start` 起收集连续普通行（非 thinking / 非标准工具行），合并为一个
+/// markdown 文档渲染并追加到 `out`；返回下一个未处理索引。
+fn push_plain_block(
+    run: &SubagentRun,
+    consumed: &[bool],
+    start: usize,
+    out: &mut Vec<Line<'static>>,
+) -> usize {
+    let mut block = String::new();
+    let mut end = start;
+    while end < run.lines.len() && !consumed[end] {
+        let line = &run.lines[end];
+        if line.starts_with("thinking: ") || (line.starts_with("tool ") && line.contains(" args: "))
+        {
+            break;
+        }
+        if !block.is_empty() {
+            block.push('\n');
+        }
+        block.push_str(line);
+        end += 1;
+    }
+    if !block.is_empty() {
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(crate::markdown::render(&block, &CLI_THEME));
+    }
+    end
+}
+
+/// 后台任务面板：列表 ⇄ 详情。Subagent 详情优先展示 `SubagentArchive` 转录。
+fn draw_jobs_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut JobsPanelState,
+    jobs: &[BackgroundJob],
+    subagents: &SubagentArchive,
+) {
+    let Some(popup_area) = panel_geometry(area) else {
+        return;
+    };
+    frame.render_widget(Clear, popup_area);
+    if state.selected >= jobs.len() && !jobs.is_empty() {
+        state.selected = jobs.len() - 1;
+    }
+
+    let title = match state
+        .detail
+        .and_then(|id| jobs.iter().find(|job| job.id == id))
+    {
+        Some(job) => {
+            let kind = match job.kind {
+                JobKind::Shell => "Shell",
+                JobKind::Subagent => "Subagent",
+            };
+            let (badge, color) = job_badge(&job.status);
+            Line::from(vec![
+                Span::styled(
+                    " ⚡ 后台任务 ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("#{} · {kind} · {}", job.id, single_line(&job.name)),
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" · {badge}"), Style::default().fg(color)),
+            ])
+        }
+        None => Line::from(vec![Span::styled(
+            " ⚡ 后台任务 (Background Jobs) ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )]),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM))
+        .title(title);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let inner_width = inner.width as usize;
+    let content_height = inner.height.saturating_sub(1) as usize;
+    if content_height == 0 {
+        return;
+    }
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let mut footer_hint = " 操作: ↑/↓ 选择 · Enter 看日志 · k 终止 · r 清理 · Esc 关闭";
+    if let Some(detail_id) = state.detail {
+        let job = jobs.iter().find(|job| job.id == detail_id);
+        if let Some(job) = job {
+            footer_hint = " 操作: ↑/↓ · PgUp/PgDn 滚动 · End 回底 · Esc 返回列表";
+            // Subagent 任务优先展示其归档转录；无转录回退 registry lines。
+            let transcript = job.archive_run_id.and_then(|run_id| {
+                subagents
+                    .snapshot()
+                    .into_iter()
+                    .find(|run| run.id == run_id)
+            });
+            let mut shown = 0usize;
+            if let Some(run) = transcript {
+                let now = std::time::Instant::now();
+                for line in &run.lines {
+                    let elapsed = now.duration_since(run.started).as_secs_f64();
+                    body.push(Line::styled(
+                        clip_cells(&format!("{elapsed:>5.1}s  {line}"), inner_width),
+                        Style::default().fg(FG),
+                    ));
+                    shown += 1;
+                }
+            } else {
+                for line in &job.lines {
+                    body.push(Line::styled(
+                        clip_cells(line, inner_width),
+                        Style::default().fg(FG),
+                    ));
+                    shown += 1;
+                }
+            }
+            if shown == 0 {
+                body.push(Line::styled("（暂无输出）", Style::default().fg(MUTED)));
+            }
+            body.push(Line::default());
+            if state.follow_bottom {
+                body.push(Line::styled(" ↓ 跟随底部", Style::default().fg(DIM)));
+            }
+        } else {
+            state.detail = None;
+            state.detail_scroll = 0;
+            state.follow_bottom = true;
+        }
+    }
+    if state.detail.is_none() {
+        body.push(Line::styled(
+            clip_cells(
+                "   #  类型      状态          名称                    最新输出",
+                inner_width,
+            ),
+            Style::default().fg(DIM),
+        ));
+        for (index, job) in jobs.iter().enumerate() {
+            let kind = match job.kind {
+                JobKind::Shell => "Shell",
+                JobKind::Subagent => "Subagent",
+            };
+            let (badge, _) = job_badge(&job.status);
+            let last = job
+                .lines
+                .last()
+                .map(|line| single_line(line))
+                .unwrap_or_default();
+            let selected = index == state.selected;
+            let marker = if selected { "▶" } else { " " };
+            let text = clip_cells(
+                &format!(
+                    " {marker} {} [{kind}] {} {badge}  {last}",
+                    job.id,
+                    single_line(&job.name)
+                ),
+                inner_width,
+            );
+            let style = if selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FG)
+            };
+            body.push(Line::styled(text, style));
+        }
+        if jobs.is_empty() {
+            body.push(Line::default());
+            body.push(Line::styled(
+                "   暂无后台任务（/bg shell <cmd> 或 /bg run <prompt> 启动）".to_string(),
+                Style::default().fg(MUTED),
+            ));
+        }
+    }
+
+    let window = scroll_window(
+        &body,
+        content_height,
+        state.detail_scroll,
+        state.follow_bottom,
+    );
+    frame.render_widget(
+        Paragraph::new(window).style(Style::default().fg(FG)),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_cells(footer_hint, inner_width),
+            Style::default().fg(DIM),
+        )),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+}
+
+/// `/bg list` 纯文本输出（与面板列表行同格式）。
+fn jobs_list_text(registry: &BackgroundRegistry) -> String {
+    let jobs = registry.snapshot();
+    if jobs.is_empty() {
+        return "无后台任务（/bg shell <cmd> 或 /bg run <prompt> 启动）".into();
+    }
+    jobs.iter()
+        .map(|job| {
+            let kind = match job.kind {
+                JobKind::Shell => "Shell",
+                JobKind::Subagent => "Subagent",
+            };
+            let (badge, _) = job_badge(&job.status);
+            let last = job
+                .lines
+                .last()
+                .map(|line| single_line(line))
+                .unwrap_or_default();
+            format!("#{} [{kind}] {} {badge}  {last}", job.id, job.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn draw_composer(
     frame: &mut Frame,
     area: Rect,
@@ -4432,7 +5228,7 @@ fn handle_settings_key(
     Ok(false)
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct WrappedViewport {
     width: u16,
     padding: u16,
@@ -4545,9 +5341,37 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     let mut events = EventStream::new();
     let mut paste = PasteDetector::new();
     let mut tick = tokio::time::interval(Duration::from_millis(33));
+    if let Some(newer) = screen.new_version.as_deref() {
+        screen.message(
+            "Notice",
+            &format!("💡 检测到新版本 V{newer}，可运行 cyber update 进行更新"),
+            AMBER,
+        );
+    }
+    let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
+    if !mock {
+        tokio::spawn(async move {
+            if let Some(info) = cyber_core::update::check_for_updates(false).await {
+                if cyber_core::update::is_newer(cyber_core::update::CURRENT_VERSION, &info.version)
+                {
+                    let _ = update_tx.send(info.version);
+                }
+            }
+        });
+    }
     let result = async {
         loop {
             tokio::select! {
+                Some(new_ver) = update_rx.recv() => {
+                    if screen.new_version.as_deref() != Some(&new_ver) {
+                        screen.new_version = Some(new_ver.clone());
+                        screen.message(
+                            "Notice",
+                            &format!("💡 检测到新版本 V{new_ver}，可运行 cyber update 进行更新"),
+                            AMBER,
+                        );
+                    }
+                }
                 _ = tick.tick() => {
                     if !TERMINAL_ACTIVE.load(Ordering::SeqCst) {
                         color_eyre::eyre::bail!("A task panicked; the terminal was restored. See the diagnostic above.");
@@ -4563,6 +5387,14 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                         screen.needs_clear = false;
                     }
                     terminal.draw(|frame| screen.draw(frame))?;
+                    drain_background_completions(
+                        &mut screen,
+                        &mut runner,
+                        &permissions,
+                        &event_tx,
+                        &mut active,
+                        &mut cancel,
+                    )?;
                 }
                 event = agent_events.recv() => { if let Some(event) = event { screen.event(event); } }
                 request = requests.recv(), if screen.approval.is_none() => {
@@ -4583,8 +5415,16 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                     // The handle has been consumed, even when the task panicked.
                     // Remove it before propagating errors so cleanup cannot repoll it.
                     active.take();
-                    let (restored, outcome) = finished?;
+                    let (mut restored, outcome) = finished?;
                     while let Ok(event) = agent_events.try_recv() { screen.event(event); }
+                    // 回合中完成的后台子代理结果：flush 进会话并持久化。
+                    let pending_count = screen.pending_job_results.len();
+                    while let Some(summary) = screen.pending_job_results.pop_front() {
+                        restored.entries.push(ChatEntry::System(summary));
+                    }
+                    if pending_count > 0 {
+                        let _ = restored.save();
+                    }
                     screen.sync(&restored);
                     if let Some(error) = outcome.error {
                         let summary = if matches!(restored.entries.last(), Some(ChatEntry::TurnSummary { .. })) {
@@ -4648,6 +5488,9 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                         }
                                     } else if screen.approval.is_some() {
                                         screen.approval_scroll = screen.approval_scroll.saturating_sub(3);
+                                    } else if let Some(view) = screen.subagent_view.as_mut() {
+                                        view.follow_bottom = false;
+                                        view.scroll = view.scroll.saturating_add(3);
                                     } else {
                                         screen.scroll = screen.scroll.saturating_add(3).min(screen.max_scroll);
                                     }
@@ -4667,6 +5510,10 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                             .approval_scroll
                                             .saturating_add(3)
                                             .min(screen.approval_max_scroll);
+                                    } else if let Some(view) = screen.subagent_view.as_mut() {
+                                        if !view.follow_bottom {
+                                            view.scroll = view.scroll.saturating_sub(3);
+                                        }
                                     } else {
                                         screen.scroll = screen.scroll.saturating_sub(3);
                                     }
@@ -4704,7 +5551,181 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
             mcp.shutdown_all().await;
         }
     }
+    // 后台任务 detached 持有 registry clone：进程退出前显式终止运行中任务。
+    screen.background.kill_all();
     result
+}
+
+/// 把后台任务（子代理或命令）的完成状态格式化为：
+/// 1. `summary`（在界面上作为 System 消息展示，支持 Markdown 渲染）
+/// 2. `prompt`（作为提示词注入给模型，开启或引导思考轮次）
+fn format_job_completion(
+    job: &BackgroundJob,
+    subagents: &SubagentArchive,
+) -> Option<(String, String)> {
+    match job.kind {
+        JobKind::Subagent => {
+            let result = job.archive_run_id.and_then(|run_id| {
+                subagents
+                    .snapshot()
+                    .into_iter()
+                    .find(|run| run.id == run_id)
+                    .and_then(|run| run.result)
+            });
+            match &job.status {
+                JobStatus::Finished(_) => {
+                    const MAX_RESULT_CHARS: usize = 16_000;
+                    let body = match result {
+                        Some(text) if text.chars().count() > MAX_RESULT_CHARS => {
+                            let mut truncated = truncate_chars(&text, MAX_RESULT_CHARS);
+                            truncated.push_str(
+                                "\n\n（输出过长已截断，完整转录可在 Ctrl+G 子代理面板查看）",
+                            );
+                            truncated
+                        }
+                        Some(text) => text,
+                        None => "（子代理已完成，未产生文本输出）".into(),
+                    };
+                    let body = body.trim();
+                    let summary = if body.starts_with('#')
+                        || body.starts_with('|')
+                        || body.starts_with('-')
+                        || body.starts_with("```")
+                    {
+                        format!(
+                            "⚡ 后台子代理 #{}（{}）完成：\n\n{}",
+                            job.id, job.name, body
+                        )
+                    } else {
+                        format!("⚡ 后台子代理 #{}（{}）完成：{}", job.id, job.name, body)
+                    };
+                    let prompt = format!(
+                        "[后台子代理任务完成通知]\n子代理名称：{}\n任务ID：#{}\n状态：执行成功\n输出内容：\n{}\n\n请结合上述后台子代理的执行结果继续分析并回答。",
+                        job.name, job.id, body
+                    );
+                    Some((summary, prompt))
+                }
+                JobStatus::Failed(error) => {
+                    const MAX_ERROR_CHARS: usize = 4_000;
+                    let body = if error.chars().count() > MAX_ERROR_CHARS {
+                        truncate_chars(error, MAX_ERROR_CHARS)
+                    } else {
+                        error.clone()
+                    };
+                    let summary = format!(
+                        "⚡ 后台子代理 #{}（{}）失败：\n\n{}",
+                        job.id,
+                        job.name,
+                        body.trim()
+                    );
+                    let prompt = format!(
+                        "[后台子代理任务失败通知]\n子代理名称：{}\n任务ID：#{}\n状态：执行失败\n错误信息：\n{}\n\n子代理执行出错，请根据上述错误信息判断原因并决定下一步操作。",
+                        job.name, job.id, body.trim()
+                    );
+                    Some((summary, prompt))
+                }
+                JobStatus::Running | JobStatus::Killed => None,
+            }
+        }
+        JobKind::Shell => match &job.status {
+            JobStatus::Finished(code) => {
+                const MAX_SHELL_OUTPUT_CHARS: usize = 8_000;
+                let raw_output = job.lines.join("\n");
+                let body = if raw_output.chars().count() > MAX_SHELL_OUTPUT_CHARS {
+                    let mut truncated = truncate_chars(&raw_output, MAX_SHELL_OUTPUT_CHARS);
+                    truncated
+                        .push_str("\n\n（输出过长已截断，完整日志可在 Ctrl+B 后台任务面板查看）");
+                    truncated
+                } else if raw_output.trim().is_empty() {
+                    "（无输出）".to_string()
+                } else {
+                    raw_output
+                };
+                let body = body.trim();
+                let summary = format!(
+                    "⚡ 后台任务 #{}（{}）完成（退出码 {}）：\n\n```\n{}\n```",
+                    job.id, job.name, code, body
+                );
+                let prompt = format!(
+                    "[后台命令执行完成通知]\n执行命令：{}\n任务ID：#{}\n退出码：{}\n输出内容：\n```\n{}\n```\n\n请根据该后台命令的输出结果继续分析或执行下一步操作。",
+                    job.name, job.id, code, body
+                );
+                Some((summary, prompt))
+            }
+            JobStatus::Failed(error) => {
+                const MAX_SHELL_ERROR_CHARS: usize = 4_000;
+                let body = if error.chars().count() > MAX_SHELL_ERROR_CHARS {
+                    truncate_chars(error, MAX_SHELL_ERROR_CHARS)
+                } else {
+                    error.clone()
+                };
+                let summary = format!(
+                    "⚡ 后台任务 #{}（{}）失败：\n\n{}",
+                    job.id,
+                    job.name,
+                    body.trim()
+                );
+                let prompt = format!(
+                    "[后台命令执行失败通知]\n执行命令：{}\n任务ID：#{}\n错误信息：\n{}\n\n后台命令执行失败，请根据错误信息进行排查并决定下一步操作。",
+                    job.name, job.id, body.trim()
+                );
+                Some((summary, prompt))
+            }
+            JobStatus::Running | JobStatus::Killed => None,
+        },
+    }
+}
+
+/// 把已结束的后台任务（Shell 或 Subagent）结果注入当前会话。
+///
+/// - 若当前处于空闲状态（不在思考状态下）：注入 System 摘要，将提示词注入为一轮新任务并开启思考状态（`spawn_turn`）。
+/// - 若当前已在思考状态下（busy）：暂存 System 摘要待回合收尾时持久化，同时通过 `steering` 动态注入正在执行的思考流中，并入队保底。
+fn drain_background_completions(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    permissions: &Arc<PermissionBroker>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    active: &mut Option<ActiveTurn>,
+    cancel: &mut Option<oneshot::Sender<()>>,
+) -> color_eyre::Result<()> {
+    for job in screen.background.take_unreported_completions() {
+        let Some((summary, prompt)) = format_job_completion(&job, &screen.subagents) else {
+            continue;
+        };
+
+        if let Some(owner) = runner.as_mut() {
+            // 当前处于空闲状态（不在思考状态下）：
+            // 1. 注入会话记录
+            owner.entries.push(ChatEntry::System(summary.clone()));
+            owner.save()?;
+            screen.message("System", &summary, MUTED);
+
+            // 2. 注入提示词并开启思考状态！
+            spawn_turn(
+                screen,
+                runner,
+                prompt,
+                true,
+                permissions,
+                events,
+                active,
+                cancel,
+            );
+        } else {
+            // 当前已经在思考状态下（busy）：
+            // 1. 结果暂存，待当前回合收尾时持久化进会话
+            screen.pending_job_results.push_back(summary);
+            // 2. 将提示词注入正在运行的推理流中（steering），并加入队列保底
+            if let Some(tx) = &screen.active_steering_tx {
+                let _ = tx.send(prompt.clone());
+            }
+            screen.queued_prompts.push_back(QueuedPrompt {
+                text: prompt,
+                displayed: true,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4753,13 +5774,36 @@ fn handle_key(
         }
     }
     if screen.panel.is_some() && key.code == KeyCode::Esc {
-        if screen.panel == Some(Panel::Ctf) && screen.ctf_detail_view {
-            screen.ctf_detail_view = false;
-            screen.ctf_detail_scroll = 0;
-        } else {
-            screen.panel = None;
-            screen.ctf_detail_view = false;
-            screen.ctf_detail_scroll = 0;
+        match screen.panel {
+            Some(Panel::Ctf) if screen.ctf_detail_view => {
+                screen.ctf_detail_view = false;
+                screen.ctf_detail_scroll = 0;
+            }
+            Some(Panel::Subagents) => {
+                screen.panel = None;
+                screen.subagent_panel = None;
+            }
+            Some(Panel::Jobs) => {
+                let in_detail = screen
+                    .jobs_panel
+                    .as_ref()
+                    .is_some_and(|state| state.detail.is_some());
+                if in_detail {
+                    if let Some(state) = screen.jobs_panel.as_mut() {
+                        state.detail = None;
+                        state.detail_scroll = 0;
+                        state.follow_bottom = true;
+                    }
+                } else {
+                    screen.panel = None;
+                    screen.jobs_panel = None;
+                }
+            }
+            _ => {
+                screen.panel = None;
+                screen.ctf_detail_view = false;
+                screen.ctf_detail_scroll = 0;
+            }
         }
         return Ok(false);
     }
@@ -4808,6 +5852,32 @@ fn handle_key(
         }
         return Ok(false);
     }
+    if control && key.code == KeyCode::Char('g') {
+        if screen.panel == Some(Panel::Subagents) {
+            screen.panel = None;
+            screen.subagent_panel = None;
+        } else {
+            screen.panel = Some(Panel::Subagents);
+            screen.settings = None;
+            screen.ctf_detail_view = false;
+            screen.jobs_panel = None;
+            screen.subagent_panel = Some(SubagentPanelState::default());
+        }
+        return Ok(false);
+    }
+    if control && key.code == KeyCode::Char('b') {
+        if screen.panel == Some(Panel::Jobs) {
+            screen.panel = None;
+            screen.jobs_panel = None;
+        } else {
+            screen.panel = Some(Panel::Jobs);
+            screen.settings = None;
+            screen.ctf_detail_view = false;
+            screen.subagent_panel = None;
+            screen.jobs_panel = Some(JobsPanelState::default());
+        }
+        return Ok(false);
+    }
     if screen.panel == Some(Panel::Ctf) {
         let len = screen.ctf_challenges_count();
         match key.code {
@@ -4846,6 +5916,173 @@ fn handle_key(
             _ => {}
         }
         return Ok(false);
+    }
+    if screen.panel == Some(Panel::Subagents) {
+        if let Some(state) = screen.subagent_panel.as_mut() {
+            let runs = screen.subagents.snapshot();
+            if state.selected >= runs.len() && !runs.is_empty() {
+                state.selected = runs.len() - 1;
+            }
+            let len = runs.len();
+            match key.code {
+                KeyCode::Up if len > 0 => state.selected = state.selected.saturating_sub(1),
+                KeyCode::Down if len > 0 => {
+                    state.selected = (state.selected + 1).min(len - 1);
+                }
+                KeyCode::Home => state.selected = 0,
+                KeyCode::End if len > 0 => state.selected = len - 1,
+                KeyCode::PageUp => state.selected = state.selected.saturating_sub(5),
+                KeyCode::PageDown if len > 0 => {
+                    state.selected = (state.selected + 5).min(len - 1);
+                }
+                KeyCode::Enter if len > 0 => {
+                    let run_id = runs[state.selected].id;
+                    screen.panel = None;
+                    screen.subagent_panel = None;
+                    screen.subagent_view = Some(SubagentViewState {
+                        run_id,
+                        follow_bottom: true,
+                        scroll: 0,
+                        tools_expanded: false,
+                        built: None,
+                        viewport: WrappedViewport {
+                            padding: 1,
+                            ..WrappedViewport::default()
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+        return Ok(false);
+    }
+    if screen.panel == Some(Panel::Jobs) {
+        if let Some(state) = screen.jobs_panel.as_mut() {
+            let jobs = screen.background.snapshot();
+            if state.selected >= jobs.len() && !jobs.is_empty() {
+                state.selected = jobs.len() - 1;
+            }
+            match state.detail {
+                Some(id) => {
+                    let still_exists = jobs.iter().any(|job| job.id == id);
+                    if !still_exists {
+                        state.detail = None;
+                        state.detail_scroll = 0;
+                        state.follow_bottom = true;
+                    } else {
+                        match key.code {
+                            KeyCode::Up => {
+                                state.follow_bottom = false;
+                                state.detail_scroll = state.detail_scroll.saturating_add(1);
+                            }
+                            KeyCode::Down => {
+                                if !state.follow_bottom {
+                                    state.detail_scroll = state.detail_scroll.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                state.follow_bottom = false;
+                                state.detail_scroll = state.detail_scroll.saturating_add(10);
+                            }
+                            KeyCode::PageDown => {
+                                if !state.follow_bottom {
+                                    state.detail_scroll = state.detail_scroll.saturating_sub(10);
+                                }
+                            }
+                            KeyCode::End => {
+                                state.detail_scroll = 0;
+                                state.follow_bottom = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None => {
+                    let len = jobs.len();
+                    match key.code {
+                        KeyCode::Up if len > 0 => state.selected = state.selected.saturating_sub(1),
+                        KeyCode::Down if len > 0 => {
+                            state.selected = (state.selected + 1).min(len - 1);
+                        }
+                        KeyCode::Home => state.selected = 0,
+                        KeyCode::End if len > 0 => state.selected = len - 1,
+                        KeyCode::PageUp => state.selected = state.selected.saturating_sub(5),
+                        KeyCode::PageDown if len > 0 => {
+                            state.selected = (state.selected + 5).min(len - 1);
+                        }
+                        KeyCode::Enter if len > 0 => {
+                            state.detail = Some(jobs[state.selected].id);
+                            state.detail_scroll = 0;
+                            state.follow_bottom = true;
+                        }
+                        // k 终止：仅 Running 生效；r 清理：仅已结束生效。
+                        KeyCode::Char('k') if len > 0 => {
+                            screen.background.kill(jobs[state.selected].id);
+                        }
+                        KeyCode::Char('r') if len > 0 => {
+                            let removed = screen.background.remove(jobs[state.selected].id);
+                            if removed && state.selected > 0 {
+                                state.selected -= 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        return Ok(false);
+    }
+    // 子代理覆盖视图：仅拦截滚动/退出键；字符与 Enter 放行到输入框
+    //（输入框仍绑定主对话）。busy 中同样可操作（不依赖 runner）。
+    if screen.subagent_view.is_some() && screen.panel.is_none() && screen.approval.is_none() {
+        let toggle_expanded = control && key.code == KeyCode::Char('o');
+        let mut close_view = false;
+        let mut intercepted = false;
+        if let Some(view) = screen.subagent_view.as_mut() {
+            match key.code {
+                KeyCode::Up => {
+                    view.follow_bottom = false;
+                    view.scroll = view.scroll.saturating_add(1);
+                    intercepted = true;
+                }
+                KeyCode::Down => {
+                    if !view.follow_bottom {
+                        view.scroll = view.scroll.saturating_sub(1);
+                    }
+                    intercepted = true;
+                }
+                KeyCode::PageUp => {
+                    view.follow_bottom = false;
+                    view.scroll = view.scroll.saturating_add(10);
+                    intercepted = true;
+                }
+                KeyCode::PageDown => {
+                    if !view.follow_bottom {
+                        view.scroll = view.scroll.saturating_sub(10);
+                    }
+                    intercepted = true;
+                }
+                KeyCode::End => {
+                    view.scroll = 0;
+                    view.follow_bottom = true;
+                    intercepted = true;
+                }
+                KeyCode::Esc => {
+                    close_view = true;
+                    intercepted = true;
+                }
+                _ => {}
+            }
+            if toggle_expanded {
+                view.tools_expanded = !view.tools_expanded;
+            }
+        }
+        if close_view {
+            screen.subagent_view = None;
+        }
+        if intercepted || toggle_expanded {
+            return Ok(false);
+        }
     }
     let is_ctrl_c = control && key.code == KeyCode::Char('c');
     let is_esc = key.code == KeyCode::Esc;
@@ -5241,6 +6478,39 @@ fn handle_key(
             return Ok(false);
         }
         if text.starts_with('/') {
+            // `/bg` 命令族 busy 时可用（shell/list/kill/tail 不触碰 runner；
+            // run 需要 provider 上下文，返回忙碌提示）。
+            let bg_args = text
+                .strip_prefix("/bg")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.eq_ignore_ascii_case("/bg") || text.to_ascii_lowercase().starts_with("/bg ") {
+                screen.input = composer();
+                screen.completions.clear();
+                match cli_commands::parse_bg(&bg_args) {
+                    Ok(cli_commands::CliJobs::Run { .. }) => {
+                        screen.message(
+                            "后台任务",
+                            "AI 正在运行，请先 /cancel 或等待完成后再启动后台子代理",
+                            MUTED,
+                        );
+                    }
+                    Ok(jobs) => {
+                        return apply_action(
+                            screen,
+                            CliAction::Jobs(jobs),
+                            runner,
+                            permissions,
+                            events,
+                            active,
+                            cancel,
+                        )
+                    }
+                    Err(error) => screen.message("Error", &error.to_string(), ERROR),
+                }
+                return Ok(false);
+            }
             return Ok(false);
         }
 
@@ -5333,6 +6603,19 @@ fn spawn_turn(
     let Some(mut owned) = runner.take() else {
         return false;
     };
+    // 回合期间 runner 被 take：快照 (cwd, env) 供 `/bg shell` busy 时启动后台任务。
+    let background_env = (
+        owned.cwd.clone(),
+        owned
+            .ctx
+            .config
+            .env
+            .vars
+            .iter()
+            .map(|value| (value.key.clone(), value.value.clone()))
+            .collect::<Vec<(String, String)>>(),
+    );
+    screen.background_env = Some(background_env);
     if !displayed {
         screen.message("You", &prompt, ACCENT);
         screen.prompt_history.push(prompt.clone());
@@ -5461,6 +6744,73 @@ fn apply_action(
             }
             screen.panel = Some(Panel::Settings);
         }
+        CliAction::Jobs(jobs) => match jobs {
+            cli_commands::CliJobs::Shell { command } => {
+                let Some((cwd, env)) = screen.background_env.clone() else {
+                    screen.message("后台任务", "后台任务不可用（缺少工作目录快照）", ERROR);
+                    return Ok(false);
+                };
+                match cyber_agent::background::spawn_shell_job(
+                    &screen.background,
+                    cwd,
+                    env,
+                    command.clone(),
+                ) {
+                    Ok(id) => screen.message(
+                        "后台任务",
+                        &format!("后台任务 #{id} 已启动：{command}"),
+                        ACCENT,
+                    ),
+                    Err(error) => screen.message("后台任务", &error, ERROR),
+                }
+            }
+            cli_commands::CliJobs::Run { prompt } => {
+                let Some(owner) = runner.as_ref() else {
+                    screen.message(
+                        "后台任务",
+                        "AI 正在运行，请先 /cancel 或等待完成后再启动后台子代理",
+                        MUTED,
+                    );
+                    return Ok(false);
+                };
+                let id = owner.start_background_subagent(prompt);
+                screen.message("后台任务", &format!("已启动后台子代理 #{id}"), ACCENT);
+            }
+            cli_commands::CliJobs::List => {
+                screen.message("后台任务", &jobs_list_text(&screen.background), MUTED);
+            }
+            cli_commands::CliJobs::Kill(id) => {
+                let text = if screen.background.kill(id) {
+                    format!("已请求终止 #{id}")
+                } else {
+                    "任务不存在或已结束".to_string()
+                };
+                screen.message("后台任务", &text, MUTED);
+            }
+            cli_commands::CliJobs::Tail(id) => {
+                let snapshot = screen.background.snapshot();
+                match snapshot.into_iter().find(|job| job.id == id) {
+                    Some(job) => {
+                        let tail = job
+                            .lines
+                            .iter()
+                            .rev()
+                            .take(20)
+                            .rev()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let text = if tail.is_empty() {
+                            format!("#{id} 暂无输出")
+                        } else {
+                            tail
+                        };
+                        screen.message(&format!("后台任务 #{id}"), &text, MUTED);
+                    }
+                    None => screen.message("后台任务", "任务不存在", MUTED),
+                }
+            }
+        },
     }
     Ok(false)
 }
@@ -7414,6 +8764,42 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert_eq!(buffer[(2, 1)].symbol(), "_");
     }
+    #[tokio::test]
+    async fn header_and_welcome_display_newer_version_in_amber() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.new_version = Some("0.9.9".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..30)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let clean_text = text.replace(' ', "");
+        // 顶栏黄色标出新版本
+        assert!(clean_text.contains("(新版本V0.9.9)"), "{text}");
+        // 欢迎页提示使用 cyber update
+        assert!(
+            clean_text.contains("检测到新版本V0.9.9，可运行cyberupdate进行更新"),
+            "{text}"
+        );
+
+        // 验证顶栏新版本文字以 AMBER (黄色) 标出
+        let found_amber = (0..5).any(|y| {
+            (0..120).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.symbol() == "(" && cell.fg == AMBER
+            })
+        });
+        assert!(found_amber, "顶栏新版本标记必须以 AMBER (黄色) 标出");
+    }
 
     #[tokio::test]
     async fn narrow_and_tiny_terminals_do_not_panic() {
@@ -8551,5 +9937,727 @@ mod tests {
             rendered_mem.contains("memory rule prompt 04"),
             "focused last memory rule must be visible: {rendered_mem}"
         );
+    }
+
+    // ── 子代理面板 / 后台任务面板 ───────────────────────────────────────────
+
+    fn ctrl_key(screen: &mut CliScreen, code: KeyCode) {
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            screen,
+            KeyEvent::new(code, KeyModifiers::CONTROL),
+            &mut None,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+    }
+
+    fn seed_subagent(screen: &mut CliScreen, name: &str, status: SubagentStatus) -> u64 {
+        let run_id = screen.subagents.start(name);
+        screen.subagents.append_line(
+            run_id,
+            format!("tool shell args: {{\"command\":\"nmap {name}\"}}"),
+        );
+        screen
+            .subagents
+            .append_line(run_id, "shell => PORT 80 http".to_string());
+        match status {
+            SubagentStatus::Running => {}
+            SubagentStatus::Completed => {
+                screen.subagents.finish(
+                    run_id,
+                    status,
+                    Some(format!("{name} 发现 2 个漏洞")),
+                    None,
+                );
+            }
+            other => {
+                screen
+                    .subagents
+                    .finish(run_id, other, None, Some("failed".into()));
+            }
+        }
+        run_id
+    }
+
+    #[tokio::test]
+    async fn subagent_panel_list_enter_view_esc_back() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = seed_subagent(&mut screen, "recon_ports", SubagentStatus::Running);
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        assert_eq!(screen.panel, Some(Panel::Subagents));
+        assert_eq!(screen.subagent_panel.as_ref().unwrap().selected, 0);
+        assert!(screen.subagent_view.is_none());
+
+        // Enter → 面板关闭，覆盖对话视图打开（跟随底部）
+        page_key(&mut screen, KeyCode::Enter);
+        assert_eq!(screen.panel, None);
+        assert!(screen.subagent_panel.is_none());
+        let view = screen.subagent_view.as_ref().unwrap();
+        assert_eq!(view.run_id, run_id);
+        assert!(view.follow_bottom);
+        assert_eq!(view.scroll, 0);
+
+        // Esc → 返回对话（视图关闭，面板不打开）
+        page_key(&mut screen, KeyCode::Esc);
+        assert!(screen.subagent_view.is_none());
+        assert_eq!(screen.panel, None);
+
+        // Ctrl+G 可重开列表
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        assert_eq!(screen.panel, Some(Panel::Subagents));
+        assert!(screen.subagent_view.is_none());
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn jobs_panel_state_machine_and_mutual_exclusion() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        // 真实后台任务：k 按下后 detached task 收到 kill 信号并转 Killed。
+        let long_cmd = if cfg!(windows) {
+            "ping 127.0.0.1 -n 60"
+        } else {
+            "sleep 60"
+        };
+        let job_id = cyber_agent::background::spawn_shell_job(
+            &screen.background,
+            std::env::temp_dir(),
+            Vec::new(),
+            long_cmd.into(),
+        )
+        .unwrap();
+
+        // 先开子代理面板，再开后台面板 → 互斥（子代理状态被清空）
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        assert_eq!(screen.panel, Some(Panel::Subagents));
+        ctrl_key(&mut screen, KeyCode::Char('b'));
+        assert_eq!(screen.panel, Some(Panel::Jobs));
+        assert!(screen.subagent_panel.is_none());
+
+        page_key(&mut screen, KeyCode::Enter);
+        assert_eq!(screen.jobs_panel.as_ref().unwrap().detail, Some(job_id));
+        page_key(&mut screen, KeyCode::Esc);
+        assert!(screen.jobs_panel.as_ref().unwrap().detail.is_none());
+
+        // k 终止 Running → detached task 收到信号后状态转 Killed
+        page_key(&mut screen, KeyCode::Char('k'));
+        for _ in 0..300 {
+            let status = screen
+                .background
+                .snapshot()
+                .into_iter()
+                .find(|job| job.id == job_id)
+                .map(|job| job.status)
+                .unwrap_or(JobStatus::Running);
+            if status.is_finished() {
+                assert!(
+                    matches!(status, JobStatus::Killed),
+                    "应为 Killed：{status:?}"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = screen
+            .background
+            .snapshot()
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .map(|job| job.status)
+            .unwrap_or(JobStatus::Running);
+        assert!(
+            matches!(status, JobStatus::Killed),
+            "k 后应转 Killed：{status:?}"
+        );
+
+        // r 清理已结束 → 列表清空且 selected clamp
+        page_key(&mut screen, KeyCode::Char('r'));
+        assert!(screen.background.snapshot().is_empty());
+        assert_eq!(screen.jobs_panel.as_ref().unwrap().selected, 0);
+
+        // 再按 Ctrl+B 关闭
+        ctrl_key(&mut screen, KeyCode::Char('b'));
+        assert_eq!(screen.panel, None);
+        assert!(screen.jobs_panel.is_none());
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_panel_renders_list_and_empty_states() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // 空态
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        let rendered = render(&mut screen, 80, 24).replace(' ', "");
+        assert!(rendered.contains("子代理(Subagents)"), "{rendered}");
+        assert!(rendered.contains("暂无子代理运行记录"), "{rendered}");
+
+        // 列表（徽标着色、列布局、提示行）
+        seed_subagent(&mut screen, "recon_ports", SubagentStatus::Running);
+        seed_subagent(&mut screen, "vuln_scan", SubagentStatus::Completed);
+        let rendered = render(&mut screen, 80, 24).replace(' ', "");
+        assert!(rendered.contains("recon_ports"), "{rendered}");
+        assert!(rendered.contains("⏱运行中"), "{rendered}");
+        assert!(rendered.contains("vuln_scan"), "{rendered}");
+        assert!(rendered.contains("✓完成"), "{rendered}");
+        assert!(rendered.contains("Enter覆盖对话查看"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_renders_like_conversation() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = seed_subagent(&mut screen, "recon_ports", SubagentStatus::Running);
+        screen
+            .subagents
+            .append_line(run_id, "thinking: 先枚举端口".into());
+        screen
+            .subagents
+            .append_line(run_id, "thinking: 再扫描服务".into());
+        screen.subagents.append_line(run_id, "结论：完成".into());
+        screen.message("You", "主对话消息", ACCENT);
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        assert!(screen.subagent_view.is_some());
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        // 转录以对话样式渲染：连续 thinking 行合并为单个 Thinking 块 + 工具卡 + markdown 正文
+        assert_eq!(rendered.matches("Thinking").count(), 1, "{rendered}");
+        assert!(rendered.contains("先枚举端口"), "{rendered}");
+        assert!(rendered.contains("再扫描服务"), "{rendered}");
+        assert!(rendered.contains("Shell"), "{rendered}");
+        assert!(rendered.contains("PORT80"), "{rendered}");
+        assert!(rendered.contains("结论：完成"), "{rendered}");
+        // 覆盖生效：主对话消息不渲染
+        assert!(!rendered.contains("主对话消息"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_merges_thinking_and_renders_markdown() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("thinking");
+        // 流式推理逐词成行 → 必须合并为一个 Thinking 块（一个头）
+        for word in ["Let", "me", "just", "count", "端口", "node_", "modules"] {
+            screen
+                .subagents
+                .append_line(run_id, format!("thinking: {word}"));
+        }
+        // 跨行 markdown：粗体 + 行内代码 + 列表（合并渲染才生效）
+        screen
+            .subagents
+            .append_line(run_id, "**加粗** 与 `代码`".into());
+        screen.subagents.append_line(run_id, "- 列表项".into());
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        let raw = render(&mut screen, 100, 30);
+        let rendered = raw.replace(' ', "");
+        assert_eq!(rendered.matches("Thinking").count(), 1, "{rendered}");
+        // 词片段应连接为同一行流式文本（而非一词一行）
+        assert!(rendered.contains("Letmejustcount端口"), "{rendered}");
+        // 事件边界切在词中间（node_ / modules）：拼接后不得插入空格
+        assert!(raw.contains("node_modules"), "{raw}");
+        assert!(!raw.contains("node_ modules"), "{raw}");
+        assert!(rendered.contains("加粗"), "{rendered}");
+        assert!(!rendered.contains("**"), "{rendered}");
+        assert!(rendered.contains("列表项"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_renders_markdown_tables() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("tables");
+        // 最终答案含 GFM 表格：应渲染为对齐列而非裸 | 管道
+        screen.subagents.append_line(run_id, "## 结果".into());
+        screen
+            .subagents
+            .append_line(run_id, "| 扩展名 | 文件数 |".into());
+        screen
+            .subagents
+            .append_line(run_id, "|--------|--------|".into());
+        screen.subagents.append_line(run_id, "| .rs | 116 |".into());
+        screen.subagents.append_line(run_id, "| .py | 23 |".into());
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        assert!(rendered.contains("├"), "{rendered}"); // 表头分隔线
+        assert!(rendered.contains("扩展名"), "{rendered}");
+        assert!(rendered.contains(".rs"), "{rendered}");
+        assert!(rendered.contains("116"), "{rendered}");
+        // 裸管道表行已被表格渲染消费（logo 自带 |，不能整体断言无 |）
+        assert!(!rendered.contains("|扩展名|"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_pairs_parallel_tools_and_shows_args() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("parallel");
+        // 并行调用：两个 tool 行相邻、结果行交错（不紧跟调用行）
+        screen.subagents.append_line(
+            run_id,
+            r#"tool shell args: {"command":"nmap -sV 10.0.0.5"}"#.into(),
+        );
+        screen
+            .subagents
+            .append_line(run_id, r#"tool read args: {"path":"notes.md"}"#.into());
+        screen
+            .subagents
+            .append_line(run_id, "shell => PORT 80 http".into());
+        screen.subagents.append_line(run_id, "read => hello".into());
+        screen
+            .subagents
+            .finish(run_id, SubagentStatus::Completed, None, None);
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        // 参数（标题/正文）与结果（卡片正文）都展示；结果行被卡片消费不再裸显
+        assert!(rendered.contains("nmap-sV10.0.0.5"), "{rendered}");
+        assert!(rendered.contains("notes.md"), "{rendered}");
+        assert!(rendered.contains("PORT80"), "{rendered}");
+        assert!(rendered.contains("hello"), "{rendered}");
+        assert!(!rendered.contains("=>"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_shows_args_for_pending_tools() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("pending");
+        // 运行中被查看：工具无结果行 → Pending 卡，参数必须可见
+        screen.subagents.append_line(
+            run_id,
+            r#"tool shell args: {"command":"nmap -sV 10.0.0.5"}"#.into(),
+        );
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        assert!(rendered.contains("◇Shell"), "{rendered}");
+        assert!(rendered.contains("nmap-sV10.0.0.5"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_keeps_updating_at_transcript_cap() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("cap");
+        for i in 0..500 {
+            screen
+                .subagents
+                .append_line(run_id, format!("cap line {i:03}"));
+        }
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        let rendered = render(&mut screen, 80, 30).replace(' ', "");
+        assert!(rendered.contains("capline499"), "{rendered}");
+
+        // 触发上限丢最旧（行数恒 500）：视图必须仍重建并显示新行
+        screen.subagents.append_line(run_id, "cap line 500".into());
+        let rendered = render(&mut screen, 80, 30).replace(' ', "");
+        assert!(rendered.contains("capline500"), "{rendered}");
+        assert!(!rendered.contains("capline000"), "{rendered}");
+        drop(runner);
+    }
+
+    #[test]
+    fn subagent_lines_fingerprint_detects_any_content_change() {
+        let base = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            subagent_lines_fingerprint(&base),
+            subagent_lines_fingerprint(&base.clone())
+        );
+        let appended = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_ne!(
+            subagent_lines_fingerprint(&base),
+            subagent_lines_fingerprint(&appended)
+        );
+        // 上限丢最旧：行数不变但内容变化
+        let dropped_front = vec!["b".to_string(), "c".to_string()];
+        assert_ne!(
+            subagent_lines_fingerprint(&base),
+            subagent_lines_fingerprint(&dropped_front)
+        );
+        let mutated = vec!["a".to_string(), "x".to_string()];
+        assert_ne!(
+            subagent_lines_fingerprint(&base),
+            subagent_lines_fingerprint(&mutated)
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_view_scroll_and_follow() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = seed_subagent(&mut screen, "bulk", SubagentStatus::Running);
+        for i in 0..60 {
+            screen
+                .subagents
+                .append_line(run_id, format!("token line {i:02}"));
+        }
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+
+        // ↑ 脱离跟随并上滚
+        page_key(&mut screen, KeyCode::Up);
+        let view = screen.subagent_view.as_ref().unwrap();
+        assert!(!view.follow_bottom);
+        assert_eq!(view.scroll, 1);
+
+        // End 回底恢复跟随
+        page_key(&mut screen, KeyCode::End);
+        let view = screen.subagent_view.as_ref().unwrap();
+        assert!(view.follow_bottom);
+        assert_eq!(view.scroll, 0);
+
+        // 新行到达：跟随底部自动显示最新行（旧行滚出视口）
+        screen.subagents.append_line(run_id, "NEWEST LINE".into());
+        let rendered = render(&mut screen, 80, 30).replace(' ', "");
+        assert!(rendered.contains("NEWESTLINE"), "{rendered}");
+        assert!(!rendered.contains("tokenline00"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_keys_do_not_break_composer() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        seed_subagent(&mut screen, "recon_ports", SubagentStatus::Running);
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+
+        screen.insert_text("hi");
+        page_key(&mut screen, KeyCode::Char('x'));
+        assert!(
+            screen.input.lines()[0].contains("hix"),
+            "{}",
+            screen.input.lines().join("\n")
+        );
+        assert!(screen.subagent_view.is_some());
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn jobs_panel_renders_list_detail_and_empty_states() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        ctrl_key(&mut screen, KeyCode::Char('b'));
+        let rendered = render(&mut screen, 80, 24).replace(' ', "");
+        assert!(rendered.contains("后台任务(BackgroundJobs)"), "{rendered}");
+        assert!(rendered.contains("暂无后台任务"), "{rendered}");
+
+        let (shell_id, _kill_rx) = screen
+            .background
+            .start(JobKind::Shell, "cargo build".into());
+        screen
+            .background
+            .append_line(shell_id, "Finished release".into());
+        screen
+            .background
+            .set_status(shell_id, JobStatus::Finished(0));
+        let rendered = render(&mut screen, 80, 24).replace(' ', "");
+        assert!(rendered.contains("cargobuild"), "{rendered}");
+        assert!(rendered.contains("✓完成(0)"), "{rendered}");
+        assert!(rendered.contains("k终止"), "{rendered}");
+        assert!(rendered.contains("r清理"), "{rendered}");
+
+        // 详情（跟随底部 + 输出行）
+        page_key(&mut screen, KeyCode::Enter);
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        assert!(rendered.contains("Finishedrelease"), "{rendered}");
+        assert!(rendered.contains("跟随底部"), "{rendered}");
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn bg_shell_command_busy_usable_and_job_visible() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+        // 模拟 busy：runner 被 take（spawn_turn 会快照 background_env）
+        let owned = runner.take().unwrap();
+        screen.busy = true;
+        screen.background_env = Some((owned.cwd.clone(), Vec::<(String, String)>::new()));
+
+        screen.insert_text("/bg shell echo cli_bg_test");
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        let jobs = screen.background.snapshot();
+        assert_eq!(jobs.len(), 1, "busy 时 /bg shell 应可用");
+        assert!(jobs[0].name.contains("echo cli_bg_test"));
+        // 等待任务结束并检查输出
+        for _ in 0..200 {
+            let status = screen
+                .background
+                .snapshot()
+                .into_iter()
+                .find(|job| job.id == jobs[0].id)
+                .map(|job| job.status)
+                .unwrap_or(JobStatus::Running);
+            if status.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let job = screen
+            .background
+            .snapshot()
+            .into_iter()
+            .find(|job| job.id == jobs[0].id)
+            .unwrap();
+        assert!(
+            job.lines.iter().any(|line| line.contains("cli_bg_test")),
+            "输出应含 cli_bg_test：{:?}",
+            job.lines
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_run_busy_returns_busy_message() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = true;
+        let mut runner = None;
+        screen.insert_text("/bg run scan the target");
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(
+            history(&screen).contains("AI 正在运行"),
+            "busy 时 /bg run 应返回忙碌提示：{}",
+            history(&screen)
+        );
+        assert!(screen.background.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bg_run_completes_and_injects_system_entry_once() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+        screen.insert_text("/bg run background probe task");
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(
+            screen.background.snapshot().len(),
+            1,
+            "/bg run 应启动后台子代理"
+        );
+        // 等待后台子代理完成（mock provider tool-loop）
+        for _ in 0..500 {
+            let finished = screen
+                .background
+                .snapshot()
+                .iter()
+                .all(|job| job.status.is_finished());
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (broker, _requests) = PermissionBroker::interactive();
+        let permissions = Arc::new(broker);
+        let (events, _rx) = mpsc::unbounded_channel();
+        let mut active: Option<ActiveTurn> = None;
+        let mut cancel: Option<oneshot::Sender<()>> = None;
+        drain_background_completions(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        // 完成后应自动开启思考状态！
+        assert!(screen.busy);
+        assert!(active.is_some());
+        // 等待自动开启的回合完成
+        let (restored, _) = active.take().unwrap().await.unwrap();
+        runner = Some(restored);
+        screen.busy = false;
+        let owner = runner.as_ref().unwrap();
+        assert!(
+            owner.entries.iter().any(
+                |entry| matches!(entry, ChatEntry::System(text) if text.contains("后台子代理 #")
+                    && text.contains("完成"))
+            ),
+            "注入消息应含 后台子代理 #：{:?}",
+            owner.entries
+        );
+        // 再次 drain 不重复注入（reported 标记）
+        let before = owner.entries.len();
+        drain_background_completions(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        let after = runner.as_ref().unwrap().entries.len();
+        assert_eq!(before, after, "reported 标记应阻止重复注入");
+        assert!(!screen.busy);
+        assert!(active.is_none());
+    }
+
+    #[tokio::test]
+    async fn background_subagent_result_renders_markdown_tables_and_formatting() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+
+        let (job_id, _kill_rx) = screen
+            .background
+            .start(JobKind::Subagent, "loc-analysis".into());
+        let run_id = screen.subagents.start("loc-analysis");
+        screen.background.link_archive(job_id, run_id);
+
+        let table_markdown = "已执行脚本，结果如下：\n\n## 统计结果\n\n| 扩展名 | 文件数 |\n|--------|--------|\n| .rs | 116 |\n| .py | 17 |";
+        screen.subagents.finish(
+            run_id,
+            SubagentStatus::Completed,
+            Some(table_markdown.into()),
+            None,
+        );
+        screen.background.set_status(job_id, JobStatus::Finished(0));
+
+        let (broker, _requests) = PermissionBroker::interactive();
+        let permissions = Arc::new(broker);
+        let (events, _rx) = mpsc::unbounded_channel();
+        let mut active: Option<ActiveTurn> = None;
+        let mut cancel: Option<oneshot::Sender<()>> = None;
+        drain_background_completions(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        // 渲染对话主界面
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        // 断言：System 注入结果按 Markdown 渲染，包含表头分隔线与对齐列，而不是裸管道
+        assert!(rendered.contains("System"), "{rendered}");
+        assert!(rendered.contains("后台子代理#"), "{rendered}");
+        assert!(rendered.contains("统计结果"), "{rendered}");
+        assert!(rendered.contains("├"), "表格应渲染分隔线：{rendered}");
+        assert!(rendered.contains(".rs"), "{rendered}");
+        assert!(rendered.contains("116"), "{rendered}");
+        assert!(
+            !rendered.contains("|扩展名|"),
+            "表格不应残留裸管道：{rendered}"
+        );
+        if let Some(act) = active {
+            let _ = act.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn background_shell_job_completion_injects_prompt_and_starts_turn() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+
+        let (job_id, _kill_rx) = screen
+            .background
+            .start(JobKind::Shell, "ping 127.0.0.1".into());
+        screen
+            .background
+            .append_line(job_id, "64 bytes from 127.0.0.1: icmp_seq=1 ttl=64".into());
+        screen
+            .background
+            .append_line(job_id, "64 bytes from 127.0.0.1: icmp_seq=2 ttl=64".into());
+        screen.background.set_status(job_id, JobStatus::Finished(0));
+
+        let (broker, _requests) = PermissionBroker::interactive();
+        let permissions = Arc::new(broker);
+        let (events, _rx) = mpsc::unbounded_channel();
+        let mut active: Option<ActiveTurn> = None;
+        let mut cancel: Option<oneshot::Sender<()>> = None;
+
+        // 空闲状态下 drain
+        drain_background_completions(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        // 必须自动开启思考状态！
+        assert!(screen.busy);
+        assert!(active.is_some());
+
+        // 渲染对话界面：应展示后台命令完成通知与代码块
+        let rendered = render(&mut screen, 100, 30).replace(' ', "");
+        assert!(rendered.contains("后台任务#"), "{rendered}");
+        assert!(rendered.contains("ping127.0.0.1"), "{rendered}");
+        assert!(rendered.contains("icmp_seq=1"), "{rendered}");
+
+        // 等待回合执行完成，验证 prompt 注入生效
+        let (restored, outcome) = active.take().unwrap().await.unwrap();
+        runner = Some(restored);
+        screen.busy = false;
+        assert!(outcome.error.is_none());
+        let owner = runner.as_ref().unwrap();
+        assert!(owner.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::User(prompt) if prompt.contains("[后台命令执行完成通知]")
+                && prompt.contains("ping 127.0.0.1")
+        )));
     }
 }

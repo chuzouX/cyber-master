@@ -18,3 +18,4 @@ html2text = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+parking_lot = "0.12"

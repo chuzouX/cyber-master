@@ -14,6 +14,7 @@ pub mod paths;
 pub mod project;
 pub mod providers;
 pub mod todo;
+pub mod update;
 
 pub use config::{Config, EnvConfig, EnvVar, MemoryConfig, MemoryRule, ThinkingIntensity};
 pub use ctf::{current_time_str, CtfCategory, CtfChallenge, CtfStatus};
@@ -30,3 +31,4 @@ pub use providers::{
     PROVIDER_KINDS, PROVIDER_PRESETS,
 };
 pub use todo::{TodoItem, TodoStatus};
+pub use update::{check_for_updates, is_newer, ReleaseInfo};

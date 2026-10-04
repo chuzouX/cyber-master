@@ -39,8 +39,8 @@ use tracing::info;
 
 use cyber_agent::{
     context_remaining_percent, fetch_models, run_compact_stream, run_stream_with_permissions,
-    run_writeup_stream, AgentEvent, ApprovalChoice, Message, PermissionBroker, PermissionDecision,
-    PermissionMode, PermissionRequest, ToolRegistry, Usage,
+    run_writeup_stream, AgentEvent, ApprovalChoice, BackgroundRegistry, Message, PermissionBroker,
+    PermissionDecision, PermissionMode, PermissionRequest, SubagentArchive, ToolRegistry, Usage,
 };
 use cyber_core::{
     current_time_str, save_config, save_providers, Config, CtfCategory, CtfChallenge, CtfStatus,
@@ -147,6 +147,10 @@ pub struct AppRegistries {
     pub ctf_challenges: Option<Arc<Mutex<Vec<CtfChallenge>>>>,
     /// Todo 任务清单共享状态（工具与 App / CLI 共享）。
     pub todos: Arc<Mutex<Vec<cyber_core::TodoItem>>>,
+    /// 子代理转录注册表（CLI 子代理面板数据源；会话生命周期）。
+    pub subagents: Arc<SubagentArchive>,
+    /// 后台任务注册表（CLI 后台面板 + bg 工具族共享；会话生命周期）。
+    pub background: Arc<BackgroundRegistry>,
 }
 
 impl std::fmt::Debug for AppRegistries {
@@ -164,6 +168,8 @@ impl std::fmt::Debug for AppRegistries {
                     .map(|c| c.lock().map(|g| g.len()).unwrap_or(0)),
             )
             .field("todos", &self.todos.lock().map(|g| g.len()).unwrap_or(0))
+            .field("subagents", &self.subagents.snapshot().len())
+            .field("background", &self.background.snapshot().len())
             .finish()
     }
 }
@@ -182,6 +188,8 @@ impl AppRegistries {
             mcp: None,
             ctf_challenges: None,
             todos,
+            subagents: Arc::new(SubagentArchive::default()),
+            background: Arc::new(BackgroundRegistry::default()),
         }
     }
 }
@@ -1676,6 +1684,8 @@ impl App {
                 memory,
                 permissions,
                 Some(s_rx),
+                None,
+                Some(Arc::new(cyber_agent::BackgroundRegistry::default())),
             )
             .await;
         });
@@ -2639,6 +2649,11 @@ impl App {
             }
             SlashCommand::Todo(args) => {
                 self.handle_todo_slash(&args);
+            }
+            SlashCommand::Bg(_) => {
+                self.chat.entries.push(ChatEntry::System(
+                    "后台任务（/bg）仅在 CLI 模式可用（cyber --cli）".into(),
+                ));
             }
             SlashCommand::Settings => {
                 self.handle_action(Action::OpenSettings);

@@ -453,12 +453,13 @@ dependencies = [
 
 [[package]]
 name = "cyber-agent"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "cyber-core",
  "futures",
  "html2text",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
@@ -469,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-app"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "clap",
  "color-eyre",
@@ -491,10 +492,11 @@ dependencies = [
 
 [[package]]
 name = "cyber-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "dirs",
  "fs2",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -505,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cyber-agent",
  "cyber-core",
@@ -521,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-skills"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cyber-agent",
  "cyber-core",
@@ -535,15 +537,15 @@ dependencies = [
 
 [[package]]
 name = "cyber-storage"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "cyber-tools"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "cyber-tui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "color-eyre",
@@ -566,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-workflow"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "darling"

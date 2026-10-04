@@ -38,12 +38,14 @@ use tokio::sync::mpsc;
                  工具调用（Shell/文件/搜索等）、Todo 任务拆解与子 Agent 并行委派\n  \
                  cyber tui               全屏多面板模式：包含 CTF 题目协作、系统设置与多视图切换\n  \
                  cyber run \"<prompt>\"    Headless 非交互模式：单次执行任务（支持流式文本或结构化 JSON）\n  \
-                 cyber setup             交互式向导：配置模型服务商、API 凭据与默认模型",
+                 cyber setup             交互式向导：配置模型服务商、API 凭据与默认模型\n  \
+                 cyber update            检查并升级 Cyber Master 到最新版本",
     after_help = "常用示例:\n  \
                   cyber                         # 启动默认交互式 Coding CLI\n  \
                   cyber --mock                  # 以离线模拟模式启动（免配置 API 密钥快速体验）\n  \
                   cyber tui                     # 启动全屏 TUI 面板（CTF 题目/设置/多视图）\n  \
                   cyber setup                   # 运行或重新配置模型服务商向导\n  \
+                  cyber update                  # 检查是否有新版本及升级指南\n  \
                   cyber run \"总结当前目录结构\" # 单次执行任务并流式输出结果到终端\n  \
                   cyber run \"检查代码\" --format json --allow-tool list_dir,read_file\n  \
                   cyber run \"继续分析\" --session <id>  # 续接指定历史会话\n\n\
@@ -100,6 +102,17 @@ enum Command {
                       cyber run \"离线测试\" --mock --allow-tool list_dir"
     )]
     Run(RunArgs),
+    /// 检查并升级 Cyber Master 到最新版本
+    #[command(
+        about = "检查并升级 Cyber Master 到最新版本",
+        long_about = "检查 GitHub 仓库的最新发布版本。如发现新版本，可显示更新日志并提供升级命令；\n\
+                     支持传入 `--check` 仅检查新版本信息，或 `--apply` 自动在当前源码仓库下拉取编译。",
+        after_help = "示例:\n  \
+                      cyber update          # 检查更新并提示升级指南\n  \
+                      cyber update --check  # 仅检查是否有新版本并输出版本号\n  \
+                      cyber update --apply  # 检查并在当前 git 仓库下自动执行 git pull && cargo build --release"
+    )]
+    Update(UpdateArgs),
 }
 
 /// `cyber run` 参数。
@@ -146,6 +159,17 @@ struct RunArgs {
     #[arg(long = "allow-tool", value_name = "TOOL")]
     allow_tools: Vec<String>,
 }
+/// `cyber update` 参数。
+#[derive(clap::Args, Debug, Clone)]
+struct UpdateArgs {
+    /// 仅检查更新，不执行升级操作
+    #[arg(short = 'c', long)]
+    check: bool,
+
+    /// 自动在当前 git 源码仓库执行拉取与编译升级 (git pull && cargo build --release)
+    #[arg(short = 'a', long)]
+    apply: bool,
+}
 /// 输出格式。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 enum OutputFormat {
@@ -181,6 +205,7 @@ async fn main() -> color_eyre::Result<()> {
             setup::ensure_configured(&cwd, mock, true)?;
             run_tui(&cwd, mock, cli.log_level.as_deref()).await
         }
+        Some(Command::Update(args)) => run_update(args, &cwd).await,
         None => {
             require_terminal(interactive)?;
             setup::ensure_configured(&cwd, mock, true)?;
@@ -450,6 +475,94 @@ fn log_filter(log_level: Option<&str>) -> tracing_subscriber::EnvFilter {
     )
 }
 
+async fn run_update(args: UpdateArgs, cwd: &Path) -> color_eyre::Result<()> {
+    use std::io::Write;
+    println!("Cyber Master 版本更新检查");
+    println!("───────────────────────────────────────────────");
+    println!("当前安装版本: v{}", cyber_core::update::CURRENT_VERSION);
+    print!("正在连接 GitHub 检查最新版本... ");
+    let _ = std::io::stdout().flush();
+
+    let release = cyber_core::update::check_for_updates(true).await;
+    match release {
+        Some(info)
+            if cyber_core::update::is_newer(cyber_core::update::CURRENT_VERSION, &info.version) =>
+        {
+            println!("✨ 发现新版本！");
+            println!();
+            println!("  最新版本: v{}", info.version);
+            println!("  发布地址: {}", info.html_url);
+            if let Some(notes) = &info.release_notes {
+                let clean_notes = notes.trim();
+                if !clean_notes.is_empty() {
+                    println!();
+                    println!("发布说明:");
+                    let count = clean_notes.lines().count();
+                    for line in clean_notes.lines().take(15) {
+                        println!("  {line}");
+                    }
+                    if count > 15 {
+                        println!("  ... (更多更新说明请查看发布页面)");
+                    }
+                }
+            }
+            println!();
+            if args.check {
+                return Ok(());
+            }
+
+            let is_git_repo = cwd.join(".git").exists();
+            if args.apply && is_git_repo {
+                println!("正在自动拉取并构建最新代码...");
+                let status = std::process::Command::new("git")
+                    .arg("pull")
+                    .current_dir(cwd)
+                    .status()?;
+                if !status.success() {
+                    eprintln!("git pull 失败，请检查网络或本地修改。");
+                    return Ok(());
+                }
+                println!("正在编译最新版本 (cargo build --release)...");
+                let build_status = std::process::Command::new("cargo")
+                    .args(["build", "--release"])
+                    .current_dir(cwd)
+                    .status()?;
+                if build_status.success() {
+                    println!("🎉 更新构建成功！新版本可执行文件位于 target/release/cyber");
+                } else {
+                    eprintln!("cargo build 失败，请根据编译错误排查。");
+                }
+            } else {
+                println!("推荐升级方式:");
+                if is_git_repo {
+                    println!("  1. 在当前源码仓库中直接更新编译:");
+                    println!("     git pull && cargo build --release");
+                    println!("     或者直接运行: cyber update --apply");
+                } else {
+                    println!("  1. 通过 Cargo 全局安装最新版本:");
+                    println!(
+                        "     cargo install --git https://github.com/chuzouX/cyber-master --locked"
+                    );
+                }
+                println!("  2. 或前往 GitHub Releases 页面下载预编译二进制:");
+                println!("     {}", info.html_url);
+            }
+        }
+        Some(_info) => {
+            println!("已是最新！");
+            println!(
+                "当前版本 (v{}) 已经是最新的发布版本。",
+                cyber_core::update::CURRENT_VERSION
+            );
+        }
+        None => {
+            println!("检查失败。");
+            println!("未能从 GitHub 获取到最新版本信息，可能是网络不可达或超时。");
+            println!("您可以手动访问项目主页确认：https://github.com/chuzouX/cyber-master");
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +609,16 @@ mod tests {
             .starts_with("\\\\?\\"));
         let file = tempfile::NamedTempFile::new().unwrap();
         assert!(resolve_cwd(file.path().to_owned()).is_err());
+    }
+    #[test]
+    fn update_command_parses_flags() {
+        let cli = Cli::try_parse_from(["cyber", "update"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Update(ref a)) if !a.check && !a.apply));
+
+        let cli = Cli::try_parse_from(["cyber", "update", "--check"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Update(ref a)) if a.check && !a.apply));
+
+        let cli = Cli::try_parse_from(["cyber", "update", "-a"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Update(ref a)) if !a.check && a.apply));
     }
 }

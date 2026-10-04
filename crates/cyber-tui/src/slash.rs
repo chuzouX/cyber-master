@@ -127,6 +127,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "结构化任务清单：list 查看 / add 添加 / done 完成 / clear 清空 / close 收起 / open 展开",
     },
     CommandSpec {
+        name: "/bg",
+        usage: "/bg <run <prompt>|shell <cmd>|list|kill <id>|tail <id>>",
+        desc: "后台任务：运行子代理/脚本、查看状态、终止",
+    },
+    CommandSpec {
         name: "/settings",
         usage: "/settings",
         desc: "打开设置中心面板",
@@ -174,6 +179,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
         "/todo" => vec!["list", "add", "done", "clear", "close", "open"],
+        "/bg" => vec!["run", "shell", "list", "kill", "tail"],
         _ => Vec::new(),
     }
 }
@@ -228,6 +234,8 @@ pub enum SlashCommand {
     Memory(String),
     /// `/todo [list|add <title>|done <id>|clear]` — 结构化任务清单管理。
     Todo(String),
+    /// `/bg <run <prompt>|shell <cmd>|list|kill <id>|tail <id>>` — 后台任务管理。
+    Bg(String),
     /// `/settings` — 打开设置中心面板。
     Settings,
     /// `/quit` — 退出。
@@ -265,6 +273,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/sessions" | "/session" => SlashCommand::Sessions(args.to_string()),
         "/memory" => SlashCommand::Memory(args.to_string()),
         "/todo" => SlashCommand::Todo(args.to_string()),
+        "/bg" => SlashCommand::Bg(args.to_string()),
         "/settings" => SlashCommand::Settings,
         "/quit" => SlashCommand::Quit,
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
@@ -293,6 +302,7 @@ pub const HELP_TEXT: &str = "\
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
   /memory <sub>      记忆管理：list | add | project | edit | delete | rule
   /todo <sub>        任务管理：list | add <title> | done <id> | clear | close | open
+  /bg <sub>          后台任务：run <prompt> | shell <cmd> | list | kill <id> | tail <id>
   /settings          打开设置中心面板
   /quit              退出 Cyber Master";
 

@@ -141,6 +141,8 @@ pub async fn run_setup(cwd: &Path) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         bail!("`cyber setup` requires an interactive terminal (stdin and stderr).");
     }
+    let _term_guard = SetupTerminalGuard::enter();
+
     let paths = Paths::detect()?;
     cyber_core::init::ensure_global_init(&paths)?;
 
@@ -162,15 +164,14 @@ pub async fn run_setup(cwd: &Path) -> Result<()> {
             .map(|p| p.model.as_str())
             .unwrap_or("未设置");
 
-        eprintln!("\n╭──────────────────────────────────────────────────────────────╮");
-        eprintln!("│                    Cyber Master Setup 向导                   │");
-        eprintln!("│      AI 驱动安全终端体系：Provider · MCP · Custom Tools      │");
-        eprintln!("╰──────────────────────────────────────────────────────────────╯");
-        eprintln!("当前核心状态:");
-        eprintln!("  * 默认 Provider : \x1b[1;36m{current_prov}\x1b[0m ({current_model})");
-        eprintln!("  * 已配置 MCP   : {} 个", mcp_servers.servers.len());
-        eprintln!("  * 已加载自定义工具: {} 个", tools.len());
-
+        eprint!("\r\n╭──────────────────────────────────────────────────────────────╮\r\n");
+        eprint!("│                    Cyber Master Setup 向导                   │\r\n");
+        eprint!("│      AI 驱动安全终端体系：Provider · MCP · Custom Tools      │\r\n");
+        eprint!("╰──────────────────────────────────────────────────────────────╯\r\n");
+        eprint!("当前核心状态:\r\n");
+        eprint!("  * 默认 Provider : \x1b[1;36m{current_prov}\x1b[0m ({current_model})\r\n");
+        eprint!("  * 已配置 MCP   : {} 个\r\n", mcp_servers.servers.len());
+        eprint!("  * 已加载自定义工具: {} 个\r\n", tools.len());
         let main_items = vec![
             "1. 模型服务商配置 (Provider: 切换默认 / 热门预设添加 / 编辑 / 连通性测试)".to_string(),
             "2. MCP 服务器配置 (MCP: 热门模板预设 / 自定义 stdio 与 SSE / 连接测试)".to_string(),
@@ -2109,9 +2110,28 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// 全局向导终端保护：禁用 win32-input-mode 与 bracketed paste，退出时确保恢复。
+struct SetupTerminalGuard;
+
+impl SetupTerminalGuard {
+    fn enter() -> Self {
+        eprint!("\x1b[?9001l\x1b[?2004l");
+        let _ = io::stderr().flush();
+        Self
+    }
+}
+
+impl Drop for SetupTerminalGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        eprint!("\x1b[?25h\x1b[?9001l\x1b[?2004l\r\n");
+        let _ = io::stderr().flush();
+    }
+}
+
 /// 消费并清空终端事件队列中的残留事件（如按键释放与 VT 转义字符）。
 pub fn drain_events() {
-    while event::poll(std::time::Duration::from_millis(5)).unwrap_or(false) {
+    while event::poll(std::time::Duration::from_millis(20)).unwrap_or(false) {
         let _ = event::read();
     }
 }
@@ -2122,20 +2142,21 @@ pub fn select_menu(title: &str, items: &[String], default: usize) -> Result<Opti
         return Ok(None);
     }
     let mut selected = if default < items.len() { default } else { 0 };
-    eprintln!("\n\x1b[1;36m{title}\x1b[0m");
-    eprintln!("\x1b[90m(使用 ↑/↓ 移动光标，Enter 确认，Esc 返回/取消)\x1b[0m");
+    eprint!("\r\n\x1b[1;36m{title}\x1b[0m\r\n");
+    eprint!("\x1b[90m(使用 ↑/↓ 移动光标，Enter 确认，Esc 返回/取消)\x1b[0m\r\n");
 
     for (i, item) in items.iter().enumerate() {
         if i == selected {
-            eprintln!("  \x1b[1;32m> {}\x1b[0m", item);
+            eprint!("\r\x1b[2K  \x1b[1;32m> {}\x1b[0m\r\n", item);
         } else {
-            eprintln!("    \x1b[90m{}\x1b[0m", item);
+            eprint!("\r\x1b[2K    \x1b[90m{}\x1b[0m\r\n", item);
         }
     }
     io::stderr().flush()?;
 
     let total_lines = items.len();
     let _raw = RawModeGuard::new()?;
+    drain_events();
 
     loop {
         let Event::Key(key) = event::read()? else {
@@ -2146,15 +2167,15 @@ pub fn select_menu(title: &str, items: &[String], default: usize) -> Result<Opti
         }
         match key.code {
             KeyCode::Esc => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 bail!("操作已取消");
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2174,20 +2195,20 @@ pub fn select_menu(title: &str, items: &[String], default: usize) -> Result<Opti
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = items.len() - 1,
             KeyCode::Enter => {
-                drop(_raw);
                 drain_events();
-                eprintln!("\x1b[32m  ✓ 已选择: {}\x1b[0m", items[selected]);
+                drop(_raw);
+                eprint!("\r\x1b[32m  ✓ 已选择: {}\x1b[0m\r\n", items[selected]);
                 return Ok(Some(selected));
             }
             _ => continue,
         }
 
-        eprint!("\x1b[{}A\r", total_lines);
+        eprint!("\r\x1b[{}A", total_lines);
         for (i, item) in items.iter().enumerate() {
             if i == selected {
-                eprintln!("\x1b[2K  \x1b[1;32m> {}\x1b[0m", item);
+                eprint!("\r\x1b[2K  \x1b[1;32m> {}\x1b[0m\r\n", item);
             } else {
-                eprintln!("\x1b[2K    \x1b[90m{}\x1b[0m", item);
+                eprint!("\r\x1b[2K    \x1b[90m{}\x1b[0m\r\n", item);
             }
         }
         io::stderr().flush()?;
@@ -2202,8 +2223,8 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
     let mut selected_cursor = 0;
     let mut checked: Vec<bool> = items.iter().map(|(_, c)| *c).collect();
 
-    eprintln!("\n\x1b[1;36m{title}\x1b[0m");
-    eprintln!("\x1b[90m(使用 ↑/↓ 移动光标，Space 切换勾选，Enter 确认，Esc 返回/取消)\x1b[0m");
+    eprint!("\r\n\x1b[1;36m{title}\x1b[0m\r\n");
+    eprint!("\x1b[90m(使用 ↑/↓ 移动光标，Space 切换勾选，Enter 确认，Esc 返回/取消)\x1b[0m\r\n");
 
     for (i, (item, _)) in items.iter().enumerate() {
         let mark = if checked[i] {
@@ -2212,15 +2233,16 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
             "\x1b[90m[ ]\x1b[0m"
         };
         if i == selected_cursor {
-            eprintln!("  > {} \x1b[1;37m{}\x1b[0m", mark, item);
+            eprint!("\r\x1b[2K  > {} \x1b[1;37m{}\x1b[0m\r\n", mark, item);
         } else {
-            eprintln!("    {} \x1b[90m{}\x1b[0m", mark, item);
+            eprint!("\r\x1b[2K    {} \x1b[90m{}\x1b[0m\r\n", mark, item);
         }
     }
     io::stderr().flush()?;
 
     let total_lines = items.len();
     let _raw = RawModeGuard::new()?;
+    drain_events();
 
     loop {
         let Event::Key(key) = event::read()? else {
@@ -2231,15 +2253,15 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
         }
         match key.code {
             KeyCode::Esc => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 bail!("操作已取消");
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2264,20 +2286,20 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
                 checked.fill(!all_checked);
             }
             KeyCode::Enter => {
-                drop(_raw);
                 drain_events();
+                drop(_raw);
                 let chosen: Vec<usize> = checked
                     .iter()
                     .enumerate()
                     .filter_map(|(i, &c)| if c { Some(i) } else { None })
                     .collect();
-                eprintln!("\x1b[32m  ✓ 已选定 {} 项\x1b[0m", chosen.len());
+                eprint!("\r\x1b[32m  ✓ 已选定 {} 项\x1b[0m\r\n", chosen.len());
                 return Ok(Some(chosen));
             }
             _ => continue,
         }
 
-        eprint!("\x1b[{}A\r", total_lines);
+        eprint!("\r\x1b[{}A", total_lines);
         for (i, (item, _)) in items.iter().enumerate() {
             let mark = if checked[i] {
                 "\x1b[32m[x]\x1b[0m"
@@ -2285,9 +2307,9 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
                 "\x1b[90m[ ]\x1b[0m"
             };
             if i == selected_cursor {
-                eprintln!("\x1b[2K  > {} \x1b[1;37m{}\x1b[0m", mark, item);
+                eprint!("\r\x1b[2K  > {} \x1b[1;37m{}\x1b[0m\r\n", mark, item);
             } else {
-                eprintln!("\x1b[2K    {} \x1b[90m{}\x1b[0m", mark, item);
+                eprint!("\r\x1b[2K    {} \x1b[90m{}\x1b[0m\r\n", mark, item);
             }
         }
         io::stderr().flush()?;
@@ -2296,27 +2318,28 @@ pub fn multi_select_menu(title: &str, items: &[(String, bool)]) -> Result<Option
 
 /// 交互式文本输入（带默认值回退与 Esc 取消）。
 pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
-    drain_events();
-
     let (prefix, clean_label) = match label.rfind('\n') {
         Some(idx) => (&label[..=idx], &label[idx + 1..]),
         None => ("", label),
     };
     if !prefix.is_empty() {
-        eprint!("{prefix}");
+        for line in prefix.lines() {
+            eprint!("\r{line}\r\n");
+        }
     }
 
     if default.is_empty() {
-        eprint!("{clean_label}: ");
+        eprint!("\r{clean_label}: ");
     } else {
         eprint!(
-            "{clean_label} \x1b[90m[{}]\x1b[0m: ",
+            "\r{clean_label} \x1b[90m[{}]\x1b[0m: ",
             default.escape_default()
         );
     }
     io::stderr().flush()?;
 
     let _raw = RawModeGuard::new()?;
+    drain_events();
     let mut input = String::new();
 
     loop {
@@ -2328,21 +2351,21 @@ pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
         }
         match key.code {
             KeyCode::Esc => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 bail!("操作已取消");
             }
             KeyCode::Enter => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 if input == ":cancel" {
                     return Ok(None);
                 }
@@ -2377,20 +2400,21 @@ pub fn prompt_text(label: &str, default: &str) -> Result<Option<String>> {
 
 /// 交互式密码/敏感词掩码输入（实时打印星号 `*`）。
 pub fn prompt_password(label: &str) -> Result<Option<String>> {
-    drain_events();
-
     let (prefix, clean_label) = match label.rfind('\n') {
         Some(idx) => (&label[..=idx], &label[idx + 1..]),
         None => ("", label),
     };
     if !prefix.is_empty() {
-        eprint!("{prefix}");
+        for line in prefix.lines() {
+            eprint!("\r{line}\r\n");
+        }
     }
 
-    eprint!("{clean_label}: ");
+    eprint!("\r{clean_label}: ");
     io::stderr().flush()?;
 
     let _raw = RawModeGuard::new()?;
+    drain_events();
     let mut input = String::new();
 
     loop {
@@ -2402,21 +2426,21 @@ pub fn prompt_password(label: &str) -> Result<Option<String>> {
         }
         match key.code {
             KeyCode::Esc => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 return Ok(None);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 bail!("操作已取消");
             }
             KeyCode::Enter => {
-                drop(_raw);
                 drain_events();
-                eprintln!();
+                drop(_raw);
+                eprint!("\r\n");
                 if input == ":cancel" {
                     return Ok(None);
                 }

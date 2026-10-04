@@ -2,7 +2,7 @@
 
 本页区分默认 `cyber` coding CLI 与 `cyber tui` 原 Chat 面板。CLI 依据 [cli_commands.rs](../crates/cyber-tui/src/cli_commands.rs) 的目录、补全和执行 handler，以及 [cli.rs](../crates/cyber-tui/src/cli.rs) / [headless.rs](../crates/cyber-tui/src/headless.rs) 的 UI 和任务处理核对；原 TUI 依据 [slash.rs](../crates/cyber-tui/src/slash.rs) / [app.rs](../crates/cyber-tui/src/app.rs)。目录、补全或帮助列出某参数，不等于所有参数组合均已实现。
 
-CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort` 共 20 项：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/quit`、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
+CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort`、`/bg` 共 22 项：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/bg`、`/quit`、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
 
 ## CLI 输入与交互
 
@@ -10,7 +10,7 @@ CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort`
 - `Up/Down` 选择候选，`Tab` 接受补全；`Enter` 在有未接受候选时先补全，再按 Enter 执行。接受补全后仍可继续输入参数。`Esc` 关闭候选并保留原输入，不清空命令。
 - 主命令及实现支持的子命令大小写不敏感；provider/题目等名称按实际数据匹配。按空白切分参数，不解析 shell 引号，不支持一行执行多个命令。
 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。支持鼠标滚轮滑动浏览历史对话；在输入区按方向键上/下键可翻看/切换历史已发送的对话内容，scrolled 状态下上/下键逐行滚动视图。按 F2 或使用 `/mode [auto|manual|unlimited]` 切换三种审批模式（手动审批/自动审批/无限制）。自动审批（Auto）模式下常见只读与环境查看命令（如 `cat`、`grep`、`rg`、`git`、`cargo`、`pwd` 等）直接放行，高风险操作弹出确认。经会话授权（Session）的工具在后续使用相同命令主干或常见安全命令且无破坏性重定向时自动放行，无需因参数微调而重复确认。
-- 生成中命令受 UI 状态限制，须先取消再进行配置/会话操作；不能据静态目录推断任何任务状态下均可执行。
+- 生成中命令受 UI 状态限制，须先取消再进行配置/会话操作；不能据静态目录推断任何任务状态下均可执行。例外：`/bg shell|list|kill|tail` 与 `Ctrl+G`/`Ctrl+B` 面板在 AI 回合运行中同样可用（数据来自后台注册表，不触碰回合持有的 runner）；`/bg run` 需要空闲（busy 时返回忙碌提示）。
 
 ## CLI 已实现行为
 
@@ -49,6 +49,9 @@ CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort`
 | `/memory rule` / `/memory rule add` | 打开 enabled/scope/prompt 规则表单。 |
 | `/memory rule list` | 列出规则编号、enabled、scope、prompt。 |
 | `/memory rule edit index` / `/memory rule delete index` | 表单编辑或直接删除规则，编号从 1 开始。 |
+| `/bg shell <cmd>` | 后台启动脚本（denylist 护栏先行），立即返回 job id，不阻塞 AI 回合；busy 时同样可用。 |
+| `/bg run <prompt>` | 后台启动子代理（复用当前 provider/工具/记忆上下文，无外层超时），仅空闲时可用；完成后结果以 System 消息注入当前会话。 |
+| `/bg list` / `/bg kill <id>` / `/bg tail <id>` | 纯文本查看全部任务 / 请求终止运行中任务 / 查看某任务日志最后 20 行。 |
 
 Provider 表单包含 name/kind/endpoint/apikey/model/maxtokens/temperature/context_length；API key 和可能包含凭据的 endpoint 均掩码显示，取消不保存。保存使用私有文件权限和同目录原子发布，不生成公开凭据备份；不宣称 CLI 表单支持原 TUI 的联网「拉取模型」按钮。
 

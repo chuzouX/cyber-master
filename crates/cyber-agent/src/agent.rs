@@ -46,6 +46,8 @@ pub(crate) struct SubagentRuntime {
     memory: String,
     tx: UnboundedSender<(u64, AgentEvent)>,
     gen: u64,
+    archive: Option<Arc<crate::subagent::SubagentArchive>>,
+    background: Option<Arc<crate::background::BackgroundRegistry>>,
 }
 
 impl SubagentRuntime {
@@ -62,6 +64,8 @@ impl SubagentRuntime {
         memory: String,
         tx: UnboundedSender<(u64, AgentEvent)>,
         gen: u64,
+        archive: Option<Arc<crate::subagent::SubagentArchive>>,
+        background: Option<Arc<crate::background::BackgroundRegistry>>,
     ) -> Self {
         Self {
             config,
@@ -75,6 +79,8 @@ impl SubagentRuntime {
             memory,
             tx,
             gen,
+            archive,
+            background,
         }
     }
 
@@ -90,6 +96,14 @@ impl SubagentRuntime {
         &self.registry
     }
 
+    pub(crate) fn archive(&self) -> Option<&Arc<crate::subagent::SubagentArchive>> {
+        self.archive.as_ref()
+    }
+
+    pub(crate) fn background(&self) -> Option<&Arc<crate::background::BackgroundRegistry>> {
+        self.background.as_ref()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_task(
         &self,
@@ -100,6 +114,7 @@ impl SubagentRuntime {
         model: Option<String>,
         tool_names: Vec<String>,
         task_progress: Option<UnboundedSender<String>>,
+        transcript: Option<Arc<std::sync::Mutex<crate::subagent::SubagentRun>>>,
     ) -> Result<String> {
         let provider_name =
             provider_name.unwrap_or_else(|| self.config.agent.default_provider.clone());
@@ -146,6 +161,9 @@ impl SubagentRuntime {
         system.push_str(
             "\n\nComplete only this task. Return an evidence-based result. You must not delegate or create subagents.",
         );
+        system.push_str(
+            "\n\nCollect data with single aggregate commands (e.g., PowerShell pipelines, rg --count, one-shot statistics). Do not explore the tree directory by directory; keep every tool output short and precise so the context stays within budget.",
+        );
         let user_message = if context.is_empty() {
             task
         } else {
@@ -167,8 +185,15 @@ impl SubagentRuntime {
             .iter()
             .map(|value| (value.key.clone(), value.value.clone()))
             .collect();
-        let ctx = ToolCtx::new(self.cwd.clone(), rules, scope, env);
-        let sink = EventSink::child_with_progress(&self.tx, self.gen, task_progress.as_ref());
+        let ctx = ToolCtx::new(self.cwd.clone(), rules, scope, env)
+            .with_subagent_archive(self.archive().cloned())
+            .with_background(self.background().cloned());
+        let sink = EventSink::child_with_transcript(
+            &self.tx,
+            self.gen,
+            task_progress.as_ref(),
+            transcript.as_ref(),
+        );
         let output = run_agent_loop(
             provider.as_ref(),
             system,
@@ -183,15 +208,37 @@ impl SubagentRuntime {
                 .or(Some(DEFAULT_CONTEXT_LENGTH)),
             &sink,
             None,
+            Some(SUBAGENT_TOOL_OUTPUT_BUDGET),
         )
         .await?;
-        if output.final_text.trim().is_empty() {
-            return Err(AgentError::Provider(
-                "subagent returned an empty final response".into(),
+        sink.flush_transcript();
+        finalize_subagent_output(output)
+    }
+}
+
+/// 子代理最终结果守卫：每个结束的子代理都必须带非空、有意义的结果内容。
+///
+/// - 非空 final → 原样返回。
+/// - 空 final 但有工具轨迹 → 合成摘要（截 1500 字符），完成的工作不丢失。
+/// - 二者皆空 → 显式错误（内容非空）。
+fn finalize_subagent_output(output: AgentRunOutput) -> Result<String> {
+    const MAX_SUMMARY_CHARS: usize = 1500;
+    if output.final_text.trim().is_empty() {
+        if !output.tool_trail.is_empty() {
+            let summary = format!(
+                "subagent completed tool work without a final summary. Tool activity:\n{}",
+                output.tool_trail.join("\n")
+            );
+            return Ok(crate::background::truncate_chars(
+                &summary,
+                MAX_SUMMARY_CHARS,
             ));
         }
-        Ok(output.final_text)
+        return Err(AgentError::Provider(
+            "subagent produced no output and executed no tools".into(),
+        ));
     }
+    Ok(output.final_text)
 }
 
 /// 连续相同工具调用检测器：记录每轮工具调用指纹，连续 `threshold` 轮相同则判定死循环。
@@ -321,6 +368,8 @@ pub async fn run_stream(
         intensity,
         &memory,
         None,
+        None,
+        None,
     )
     .await;
     if let Err(e) = res {
@@ -349,6 +398,8 @@ pub async fn run_stream_with_permissions(
     memory: String,
     permissions: Arc<crate::permission::PermissionBroker>,
     steering: Option<SteeringReceiver>,
+    subagent_archive: Option<Arc<crate::subagent::SubagentArchive>>,
+    background: Option<Arc<crate::background::BackgroundRegistry>>,
 ) {
     let _ = tx.send((gen, AgentEvent::Started));
     let registry = Arc::new(ToolRegistry::with_permissions(registry, permissions));
@@ -367,6 +418,8 @@ pub async fn run_stream_with_permissions(
         intensity,
         &memory,
         steering,
+        subagent_archive,
+        background,
     )
     .await;
     if let Err(e) = res {
@@ -391,6 +444,8 @@ async fn run_inner(
     intensity: ThinkingIntensity,
     memory: &str,
     steering: Option<SteeringReceiver>,
+    subagent_archive: Option<Arc<crate::subagent::SubagentArchive>>,
+    background: Option<Arc<crate::background::BackgroundRegistry>>,
 ) -> Result<()> {
     let name = &config.agent.default_provider;
     let cfg = providers.providers.get(name).ok_or_else(|| {
@@ -430,8 +485,13 @@ async fn run_inner(
         memory.to_string(),
         tx.clone(),
         gen,
+        subagent_archive.clone(),
+        background.clone(),
     ));
-    let ctx = ToolCtx::new(cwd, rules, scope, env).with_subagent_runtime(runtime);
+    let ctx = ToolCtx::new(cwd, rules, scope, env)
+        .with_subagent_runtime(runtime.clone())
+        .with_subagent_archive(runtime.archive().cloned())
+        .with_background(runtime.background().cloned());
     let mut tools = if config.agent.auto_tool_call && !registry.is_empty() {
         registry.schemas()
     } else {
@@ -456,6 +516,7 @@ async fn run_inner(
             .or(Some(DEFAULT_CONTEXT_LENGTH)),
         &sink,
         steering,
+        None,
     )
     .await?;
     Ok(())
@@ -463,6 +524,8 @@ async fn run_inner(
 
 struct AgentRunOutput {
     final_text: String,
+    /// 每次工具执行的一行摘要（`工具名: 结果前 200 字符`），供空 final 时合成兜底结果。
+    tool_trail: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -476,6 +539,8 @@ struct EventSink<'a> {
     gen: u64,
     mode: EventMode,
     task_progress: Option<&'a UnboundedSender<String>>,
+    /// Child 模式的转录写句柄（子代理面板数据源）。
+    transcript: Option<crate::subagent::TranscriptWriter>,
 }
 
 impl<'a> EventSink<'a> {
@@ -485,6 +550,7 @@ impl<'a> EventSink<'a> {
             gen,
             mode: EventMode::Parent,
             task_progress: None,
+            transcript: None,
         }
     }
 
@@ -495,19 +561,31 @@ impl<'a> EventSink<'a> {
             gen,
             mode: EventMode::Child,
             task_progress: None,
+            transcript: None,
         }
     }
 
-    fn child_with_progress(
+    /// Child 模式 + 转录：除进度转发外把子代理事件写入 `SubagentRun.lines`。
+    fn child_with_transcript(
         tx: &'a UnboundedSender<(u64, AgentEvent)>,
         gen: u64,
         task_progress: Option<&'a UnboundedSender<String>>,
+        transcript: Option<&Arc<std::sync::Mutex<crate::subagent::SubagentRun>>>,
     ) -> Self {
         Self {
             tx,
             gen,
             mode: EventMode::Child,
             task_progress,
+            transcript: transcript
+                .map(|run| crate::subagent::TranscriptWriter::new(Arc::clone(run))),
+        }
+    }
+
+    /// 定稿时 flush token 缓冲中剩余的最后一行（无换行结尾的 final 文本）。
+    fn flush_transcript(&self) {
+        if let Some(transcript) = &self.transcript {
+            transcript.flush();
         }
     }
 
@@ -524,6 +602,28 @@ impl<'a> EventSink<'a> {
                         } else {
                             let _ = tp.send(format!("tool {name} completed\n"));
                         }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(transcript) = &self.transcript {
+                match &event {
+                    // 推理流按缓冲聚合（事件边界可能切在词/数字中间，逐行会丢空格）
+                    AgentEvent::Reasoning(text) => transcript.reasoning(text),
+                    AgentEvent::Token(text) => transcript.token(text),
+                    AgentEvent::ToolCall {
+                        name, arguments, ..
+                    } => {
+                        transcript.line(format!(
+                            "tool {name} args: {}",
+                            crate::background::truncate_chars(arguments, 200)
+                        ));
+                    }
+                    AgentEvent::ToolResult { name, output, .. } => {
+                        transcript.line(format!(
+                            "{name} => {}",
+                            crate::background::truncate_chars(output, 300)
+                        ));
                     }
                     _ => {}
                 }
@@ -559,6 +659,10 @@ fn skill_summaries(schemas: &[crate::tool::ToolSchema]) -> Vec<SkillSummary> {
         .collect()
 }
 
+/// 子代理工具结果进入消息历史的最大字符数：单条 shell 递归输出无法再撑爆
+/// 上下文窗口（主 agent 不截断，传 None）。
+const SUBAGENT_TOOL_OUTPUT_BUDGET: usize = 6_000;
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     provider: &dyn Provider,
@@ -572,10 +676,12 @@ async fn run_agent_loop(
     effective_ctx_len: Option<u32>,
     sink: &EventSink<'_>,
     mut steering: Option<SteeringReceiver>,
+    tool_output_budget: Option<usize>,
 ) -> Result<AgentRunOutput> {
     emit_context_update(sink, &messages, effective_ctx_len);
     let mut detector = LoopDetector::new(3);
     let mut loop_detected = false;
+    let mut tool_trail: Vec<String> = Vec::new();
     for step in 0..max_steps {
         debug!(step, gen = sink.gen, "agent loop 迭代");
         drain_steering(&mut steering, &mut messages, sink);
@@ -610,7 +716,10 @@ async fn run_agent_loop(
             }
             emit_context_update(sink, &messages, effective_ctx_len);
             sink.send(AgentEvent::Done);
-            return Ok(AgentRunOutput { final_text });
+            return Ok(AgentRunOutput {
+                final_text,
+                tool_trail,
+            });
         }
 
         let calls = accumulation.calls;
@@ -706,13 +815,30 @@ async fn run_agent_loop(
                     is_error: true,
                 }
             };
+            tool_trail.push(format!(
+                "{}: {}",
+                call.name,
+                crate::background::truncate_chars(&out.content, 200)
+            ));
             sink.send(AgentEvent::ToolResult {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 output: out.content.clone(),
                 is_error: out.is_error,
             });
-            messages.push(Message::tool(call.id.clone(), out.content));
+            // 子代理（budget=Some）工具结果进入消息历史前截断：控制上下文增长。
+            let history_content = match tool_output_budget {
+                Some(budget) if out.content.chars().count() > budget => {
+                    let total = out.content.chars().count();
+                    let mut content = crate::background::truncate_chars(&out.content, budget);
+                    content.push_str(&format!(
+                        "\n\n（工具输出共 {total} 字符，已截断至前 {budget} 字符；如需完整内容请用更聚焦的命令重查。）"
+                    ));
+                    content
+                }
+                _ => out.content,
+            };
+            messages.push(Message::tool(call.id.clone(), history_content));
         }
         drain_steering(&mut steering, &mut messages, sink);
 
@@ -753,7 +879,10 @@ async fn run_agent_loop(
     }
     emit_context_update(sink, &messages, effective_ctx_len);
     sink.send(AgentEvent::Done);
-    Ok(AgentRunOutput { final_text })
+    Ok(AgentRunOutput {
+        final_text,
+        tool_trail,
+    })
 }
 
 /// 发送上下文使用情况更新事件（TUI 据此显示剩余百分比）。
@@ -1307,11 +1436,245 @@ mod tests {
             Some(DEFAULT_CONTEXT_LENGTH),
             &sink,
             None,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(output.final_text, "done");
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn finalize_subagent_output_passes_through_nonempty_final() {
+        let output = AgentRunOutput {
+            final_text: "  结论：发现 2 个漏洞  ".into(),
+            tool_trail: vec!["shell: nmap 输出".into()],
+        };
+        let result = finalize_subagent_output(output).unwrap();
+        assert_eq!(result, "  结论：发现 2 个漏洞  ");
+    }
+
+    #[test]
+    fn finalize_subagent_output_synthesizes_summary_from_tool_trail() {
+        let output = AgentRunOutput {
+            final_text: String::new(),
+            tool_trail: vec!["counting: TOOL-OUT-42".into()],
+        };
+        let result = finalize_subagent_output(output).unwrap();
+        assert!(result.contains("Tool activity"), "应合成摘要：{result}");
+        assert!(result.contains("TOOL-OUT-42"), "应含工具轨迹：{result}");
+        assert!(result.contains("counting"));
+    }
+
+    #[test]
+    fn finalize_subagent_output_errors_when_no_text_and_no_tools() {
+        let output = AgentRunOutput {
+            final_text: "   \n".into(),
+            tool_trail: Vec::new(),
+        };
+        let error = finalize_subagent_output(output).unwrap_err();
+        assert!(
+            matches!(&error, AgentError::Provider(m) if m == "subagent produced no output and executed no tools"),
+            "应为显式错误：{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_loop_collects_tool_trail_when_final_is_empty() {
+        use futures::{stream, Stream};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ScriptProvider {
+            calls: AtomicUsize,
+        }
+
+        impl Provider for ScriptProvider {
+            fn stream(
+                &self,
+                _req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::ToolCallDelta(ToolCallDelta {
+                            index: 0,
+                            id: Some("trail-call".into()),
+                            name: Some("counting".into()),
+                            arguments_fragment: "{}".into(),
+                        }),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    // 第二轮：空 final（模拟模型未产出最终回答）
+                    Box::pin(stream::iter(vec![StreamEvent::Done]))
+                }
+            }
+        }
+
+        struct CountingTool(Arc<AtomicUsize>);
+
+        impl crate::Tool for CountingTool {
+            fn schema(&self) -> crate::ToolSchema {
+                crate::ToolSchema {
+                    name: "counting".into(),
+                    description: "counting tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: Vec::new(),
+                }
+            }
+
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(ToolOutput {
+                        content: "TOOL-OUT-42".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool(Arc::new(AtomicUsize::new(0)))));
+        let registry = Arc::new(registry);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::child(&tx, 1);
+        let allowed = std::collections::HashSet::from(["counting".to_string()]);
+        let output = run_agent_loop(
+            &ScriptProvider {
+                calls: AtomicUsize::new(0),
+            },
+            String::new(),
+            vec![Message::user("run the tool only")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            registry.schemas(),
+            Some(&allowed),
+            registry,
+            2,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.final_text.trim().is_empty());
+        assert_eq!(output.tool_trail.len(), 1);
+        assert_eq!(output.tool_trail[0], "counting: TOOL-OUT-42");
+        // 合成兜底结果非空且含工具产出
+        let fallback = finalize_subagent_output(output).unwrap();
+        assert!(fallback.contains("Tool activity"));
+        assert!(fallback.contains("TOOL-OUT-42"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_loop_truncates_tool_output_for_subagent_budget() {
+        use crate::Role;
+        use futures::{stream, Stream};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CaptureProvider {
+            calls: AtomicUsize,
+            seen: parking_lot::Mutex<Vec<Vec<Message>>>,
+        }
+
+        impl Provider for CaptureProvider {
+            fn stream(
+                &self,
+                req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                self.seen.lock().push(req.messages);
+                if call == 0 {
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::ToolCallDelta(ToolCallDelta {
+                            index: 0,
+                            id: Some("dump-call".into()),
+                            name: Some("counting".into()),
+                            arguments_fragment: "{}".into(),
+                        }),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    Box::pin(stream::iter(vec![StreamEvent::Done]))
+                }
+            }
+        }
+
+        struct BigOutputTool;
+
+        impl crate::Tool for BigOutputTool {
+            fn schema(&self) -> crate::ToolSchema {
+                crate::ToolSchema {
+                    name: "counting".into(),
+                    description: "dumps a lot of lines".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: Vec::new(),
+                }
+            }
+
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async move {
+                    Ok(ToolOutput {
+                        content: "BIG-".repeat(2000),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BigOutputTool));
+        let registry = Arc::new(registry);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::child(&tx, 1);
+        let allowed = std::collections::HashSet::from(["counting".to_string()]);
+        let provider = CaptureProvider {
+            calls: AtomicUsize::new(0),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        };
+        let output = run_agent_loop(
+            &provider,
+            String::new(),
+            vec![Message::user("run it")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            registry.schemas(),
+            Some(&allowed),
+            registry,
+            2,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap();
+        assert!(output.final_text.trim().is_empty());
+        // 第二轮请求里的工具结果必须被截断（100 + 提示）
+        let second = provider.seen.lock()[1].clone();
+        let tool_content = second
+            .iter()
+            .find_map(|m| match m.role {
+                Role::Tool => Some(m.content.as_str()),
+                _ => None,
+            })
+            .expect("第二轮应含工具结果消息");
+        assert!(tool_content.chars().count() <= 200, "{tool_content}");
+        assert!(
+            tool_content.contains("已截断至前 100 字符"),
+            "{tool_content}"
+        );
     }
 
     #[tokio::test]
@@ -1370,6 +1733,7 @@ mod tests {
             Some(DEFAULT_CONTEXT_LENGTH),
             &sink,
             Some(steer_rx),
+            None,
         )
         .await
         .unwrap();

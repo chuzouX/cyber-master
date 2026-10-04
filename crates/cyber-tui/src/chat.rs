@@ -1063,7 +1063,17 @@ pub fn render_entries(
                 push_thinking_lines(&mut lines, theme, content, is_expanded);
             }
             ChatEntry::System(content) => {
-                push_role_lines(&mut lines, "[system]", theme.muted, content, theme);
+                if content.contains('\n') || content.contains("##") || content.contains('|') {
+                    lines.push(Line::from(Span::styled(
+                        "[system]",
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.extend(crate::markdown::render(content, theme));
+                } else {
+                    push_role_lines(&mut lines, "[system]", theme.muted, content, theme);
+                }
             }
             ChatEntry::TurnSummary {
                 elapsed_ms,

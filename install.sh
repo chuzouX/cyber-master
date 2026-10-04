@@ -114,13 +114,13 @@ if [ -z "$VERSION" ]; then
   fi
 fi
 
-# ─── 下载源：GitHub 主源 + 常用镜像回退（可用 CYBER_DOWNLOAD_MIRROR 指定镜像前缀）──
+# ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────
 github_base="https://github.com/$REPO/releases/download/$VERSION"
+candidates=""
 if [ -n "${CYBER_DOWNLOAD_MIRROR:-}" ]; then
-  download_base_list="${CYBER_DOWNLOAD_MIRROR%/}/$github_base $github_base"
-else
-  download_base_list="$github_base https://ghproxy.net/$github_base https://gh-proxy.com/$github_base https://ghfast.top/$github_base"
+  candidates="自定义镜像|${CYBER_DOWNLOAD_MIRROR%/}/$github_base"
 fi
+candidates="$candidates GitHub官方源|$github_base gh-proxy.com镜像|https://gh-proxy.com/$github_base ghfast.top镜像|https://ghfast.top/$github_base ghproxy.net镜像|https://ghproxy.net/$github_base"
 
 echo "→ 安装 cyber $VERSION ($target) 到 $INSTALL_DIR"
 
@@ -130,16 +130,55 @@ trap 'rm -rf "$tmpdir"' 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# ─── 下载（主源失败自动回退镜像）──────────────────────────────────────────
+# ─── 测速各下载源并选择最优节点 ────────────────────────────────────────────
+echo "→ 测速各下载源并选择最优节点…"
+speedtest_results=""
+for item in $candidates; do
+  [ -z "$item" ] && continue
+  name="${item%%|*}"
+  base="${item#*|}"
+  sha_url="$base/$archive.sha256"
+  time_sec=$(curl -fsSL --connect-timeout 4 --max-time 6 -w "%{time_total}" -o "$tmpdir/speedtest.sha256" "$sha_url" 2>/dev/null || true)
+  if [ -n "$time_sec" ] && [ -s "$tmpdir/speedtest.sha256" ]; then
+    hash_val=$(awk 'NR == 1 { print $1 }' "$tmpdir/speedtest.sha256" 2>/dev/null || true)
+    case "$hash_val" in
+      [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*)
+        if [ "${#hash_val}" -ge 64 ]; then
+          printf "   [✓] %-18s : %.2fs\n" "$name" "$time_sec"
+          speedtest_results="${speedtest_results}${time_sec} ${base} ${name}\n"
+          continue
+        fi
+        ;;
+    esac
+  fi
+  printf "   [✗] %-18s : 超时/不可达\n" "$name"
+done
+
+download_base_list=""
+if [ -n "$speedtest_results" ]; then
+  download_base_list=$(printf "$speedtest_results" | sort -n | awk '{ print $2 }')
+  fastest_sec=$(printf "$speedtest_results" | sort -n | head -n1 | awk '{ print $1 }')
+  fastest_name=$(printf "$speedtest_results" | sort -n | head -n1 | awk '{ print $3 }')
+  printf "→ 选用最优源: %s (%.2fs)\n" "$fastest_name" "$fastest_sec"
+else
+  echo "   所有源测速未响应，回退至默认源重试…"
+  for item in $candidates; do
+    [ -z "$item" ] && continue
+    base="${item#*|}"
+    download_base_list="$download_base_list $base"
+  done
+fi
+
+# ─── 下载（最优源失败自动回退备用镜像）────────────────────────────────────
 downloaded=0
 for base in $download_base_list; do
   echo "→ 下载 $base/$archive"
-  if curl -fsSL --connect-timeout 15 --max-time 30 -o "$tmpdir/$archive" "$base/$archive" \
-     && curl -fsSL --connect-timeout 15 --max-time 30 -o "$tmpdir/$archive.sha256" "$base/$archive.sha256"; then
+  if curl -fsSL --connect-timeout 15 --max-time 300 -o "$tmpdir/$archive" "$base/$archive" \
+     && curl -fsSL --connect-timeout 15 --max-time 60 -o "$tmpdir/$archive.sha256" "$base/$archive.sha256"; then
     downloaded=1
     break
   fi
-  echo "  该源失败，尝试下一源…" >&2
+  echo "   该源下载失败，尝试备用源…" >&2
 done
 [ "$downloaded" -eq 1 ] \
   || { echo "所有下载源均失败。请检查网络/代理（需放行 release-assets.githubusercontent.com），或用 CYBER_DOWNLOAD_MIRROR 指定镜像前缀。" >&2; exit 1; }

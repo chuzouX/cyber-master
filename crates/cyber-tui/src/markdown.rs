@@ -60,7 +60,10 @@ pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut in_math = false;
     let mut math_lines: Vec<String> = Vec::new();
 
-    for raw in text.lines() {
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < raw_lines.len() {
+        let raw = raw_lines[i];
         if in_code {
             if is_fence_line(raw) {
                 flush_code_block(&mut out, &md, &code_lines);
@@ -69,6 +72,7 @@ pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             } else {
                 code_lines.push(raw.to_string());
             }
+            i += 1;
             continue;
         }
         // 块级数学：独占一行的 $$ 起止（单行 $$x^2$$ 由行内解析处理）
@@ -80,19 +84,29 @@ pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
             } else {
                 math_lines.push(raw.to_string());
             }
+            i += 1;
             continue;
         }
         if raw.trim() == "$$" {
             in_math = true;
             math_lines.clear();
+            i += 1;
             continue;
         }
         if is_fence_line(raw) {
             in_code = true;
             code_lines.clear();
+            i += 1;
+            continue;
+        }
+        // 表格块：表头行 + 分隔行（如 | a | b | / |---|---|）+ 连续数据行
+        if let Some(table) = parse_table(&raw_lines[i..]) {
+            out.extend(render_table(&table, &md));
+            i += table.line_count;
             continue;
         }
         out.push(render_block_line(raw, &md));
+        i += 1;
     }
     // 未闭合代码块 / 数学块（流式中常见）：把已累积的行渲染出来
     if in_code {
@@ -176,6 +190,206 @@ fn render_block_line(raw: &str, md: &MdColors) -> Line<'static> {
     }
     let mut spans = vec![Span::raw(indent)];
     spans.extend(parse_rich(trimmed, md));
+    Line::from(spans)
+}
+
+// ── 表格块 ──────────────────────────────────────────────────────────────────
+
+/// 列对齐方式（由分隔行 `:---` / `---:` / `:---:` 决定）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// 解析出的表格块：表头 + 对齐 + 数据行。
+struct TableBlock {
+    header: Vec<String>,
+    aligns: Vec<TableAlign>,
+    rows: Vec<Vec<String>>,
+    line_count: usize,
+}
+
+/// 把一行 `| a | b |` 切成去首尾竖线的单元格；支持 `\|` 转义。非表格行返回 None。
+fn split_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 2 {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next == '|' {
+                    current.push('|');
+                    chars.next();
+                    continue;
+                }
+            }
+            current.push(c);
+        } else if c == '|' {
+            cells.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    cells.push(current.trim().to_string());
+    Some(cells)
+}
+
+/// 在 `lines[0]` 处尝试解析表格：表头行 + 分隔行 + 连续数据行。
+fn parse_table(lines: &[&str]) -> Option<TableBlock> {
+    let header = split_table_row(lines.first()?)?;
+    if header.is_empty() {
+        return None;
+    }
+    let delimiter = split_table_row(lines.get(1)?)?;
+    if delimiter.len() != header.len() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(delimiter.len());
+    for cell in &delimiter {
+        // GFM 分隔单元格：仅 - 与 : 构成，且至少一个 -
+        if cell.is_empty() || !cell.chars().all(|c| c == '-' || c == ':') || !cell.contains('-') {
+            return None;
+        }
+        aligns.push(match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => TableAlign::Center,
+            (true, false) => TableAlign::Left,
+            (false, true) => TableAlign::Right,
+            (false, false) => TableAlign::Left,
+        });
+    }
+    let mut rows = Vec::new();
+    let mut line_count = 2;
+    for line in &lines[2..] {
+        match split_table_row(line) {
+            Some(mut row) => {
+                if row.len() < header.len() {
+                    row.resize(header.len(), String::new());
+                } else if row.len() > header.len() {
+                    row.truncate(header.len());
+                }
+                rows.push(row);
+                line_count += 1;
+            }
+            None => break,
+        }
+    }
+    Some(TableBlock {
+        header,
+        aligns,
+        rows,
+        line_count,
+    })
+}
+
+/// 已预解析样式的表格单元格，包含渲染后的 spans 及其视觉总宽度。
+struct RenderedCell {
+    spans: Vec<Span<'static>>,
+    width: usize,
+}
+
+impl RenderedCell {
+    fn new(text: &str, md: &MdColors) -> Self {
+        use unicode_width::UnicodeWidthStr;
+        let spans = parse_rich(text, md);
+        let width = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        Self { spans, width }
+    }
+}
+
+/// 渲染表格：表头（主题 header 色 + 粗体）、分隔线、数据行（按视觉列宽对齐）。
+fn render_table(table: &TableBlock, md: &MdColors) -> Vec<Line<'static>> {
+    let cols = table.header.len();
+    let header_cells: Vec<RenderedCell> = table
+        .header
+        .iter()
+        .map(|c| RenderedCell::new(c, md))
+        .collect();
+    let row_cells: Vec<Vec<RenderedCell>> = table
+        .rows
+        .iter()
+        .map(|row| row.iter().map(|c| RenderedCell::new(c, md)).collect())
+        .collect();
+
+    // 列宽必须根据渲染后的视觉宽度（而非含 ** / ` 等标记的原始字符串长度）计算，
+    // 否则行内格式标签被消费后会导致右侧边框无法对齐。
+    let mut widths = vec![0usize; cols];
+    for (col, cell) in header_cells.iter().enumerate() {
+        widths[col] = widths[col].max(cell.width);
+    }
+    for row in &row_cells {
+        for (col, cell) in row.iter().enumerate() {
+            widths[col] = widths[col].max(cell.width);
+        }
+    }
+
+    let mut out = Vec::with_capacity(2 + row_cells.len());
+    out.push(render_table_row(
+        header_cells,
+        &table.aligns,
+        &widths,
+        true,
+        md,
+    ));
+    let mut separator = String::from("├");
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            separator.push('┼');
+        }
+        separator.push_str(&"─".repeat(width + 2));
+    }
+    separator.push('┤');
+    out.push(Line::styled(separator, Style::default().fg(md.quote)));
+    for row in row_cells {
+        out.push(render_table_row(row, &table.aligns, &widths, false, md));
+    }
+    out
+}
+
+/// 渲染一行表格单元格：`│ a │ b │`，单元格按视觉宽度与对齐补空格。
+fn render_table_row(
+    cells: Vec<RenderedCell>,
+    aligns: &[TableAlign],
+    widths: &[usize],
+    header: bool,
+    md: &MdColors,
+) -> Line<'static> {
+    let bar = Style::default().fg(md.quote);
+    let mut spans = vec![Span::styled("│ ", bar)];
+    for (col, mut cell) in cells.into_iter().enumerate() {
+        if col > 0 {
+            spans.push(Span::styled(" │ ", bar));
+        }
+        let pad = widths[col].saturating_sub(cell.width);
+        let (left, right) = match aligns.get(col).copied().unwrap_or(TableAlign::Left) {
+            TableAlign::Left => (0, pad),
+            TableAlign::Right => (pad, 0),
+            TableAlign::Center => (pad / 2, pad - pad / 2),
+        };
+        if left > 0 {
+            spans.push(Span::raw(" ".repeat(left)));
+        }
+        if header {
+            for span in &mut cell.spans {
+                span.style = span.style.fg(md.header).add_modifier(Modifier::BOLD);
+            }
+        }
+        spans.extend(cell.spans);
+        if right > 0 {
+            spans.push(Span::raw(" ".repeat(right)));
+        }
+    }
+    spans.push(Span::styled(" │", bar));
     Line::from(spans)
 }
 
@@ -695,6 +909,93 @@ mod tests {
         assert!(
             spans.iter().any(|s| &*s.content == "a * b"),
             "数学内容应原样含 *"
+        );
+    }
+
+    // ── 表格 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn table_renders_header_separator_and_rows() {
+        let text = "| name | count |\n|------|-------|\n| a | 1 |\n| b | 2 |";
+        let lines = render(text, &theme());
+        assert_eq!(lines.len(), 4, "表头 + 分隔线 + 2 数据行");
+        let joined: String = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("├"), "应有表头分隔线：{joined}");
+        assert!(joined.contains("name"), "{joined}");
+        assert!(joined.contains("count"), "{joined}");
+        assert!(!joined.contains('|'), "不应残留裸管道：{joined}");
+    }
+
+    #[test]
+    fn table_aligns_columns_by_cell_width() {
+        let text = "| a | long |\n|---|---|\n| xxx | y |";
+        let lines = render(text, &theme());
+        let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // 列宽由最宽单元格（xxx=3）决定，"a" 应补 2 空格对齐
+        assert!(header.contains("a  "), "短单元格应补空格对齐：{header}");
+    }
+
+    #[test]
+    fn table_with_alignment_markers_renders() {
+        let text = "| a | b | c |\n|:--|--:|:-:|\n| 1 | 2 | 3 |";
+        let lines = render(text, &theme());
+        assert_eq!(lines.len(), 3, "带对齐标记的表格应正常渲染");
+    }
+
+    #[test]
+    fn single_pipe_line_is_not_table() {
+        let lines = render("| 这不是表格", &theme());
+        assert_eq!(lines.len(), 1, "单独 | 行应保持纯文本");
+    }
+
+    #[test]
+    fn table_header_without_delimiter_is_not_table() {
+        let lines = render("| a | b |\n| c | d |", &theme());
+        assert_eq!(lines.len(), 2, "无分隔行的相邻 | 行应各自按段落渲染");
+    }
+
+    #[test]
+    fn table_inline_formatting_renders() {
+        let lines = render("| a | b |\n|---|---|\n| **x** | `y` |", &theme());
+        assert_eq!(lines.len(), 3, "单元格行内格式不破坏表格");
+    }
+
+    #[test]
+    fn table_inline_markdown_calculates_visual_width_for_alignment() {
+        use unicode_width::UnicodeWidthStr;
+        let text = "| 范围 | 文件数 | 行数 |\n|---|---:|---:|\n| 全部文本/代码 | 4,244 | 420,460 |\n| **纯项目源码**（再排除 `.cyber/` 技能文档） | 302 | **126,659** |";
+        let lines = render(text, &theme());
+        assert_eq!(lines.len(), 4, "表头 + 分隔线 + 2 数据行");
+        let line_widths: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum()
+            })
+            .collect();
+        // 每一行（表头、分隔线、数据行）的终端渲染视觉总宽度必须严格完全一致！
+        assert_eq!(
+            line_widths[0], line_widths[1],
+            "表头与分隔线宽度必须一致: {line_widths:?}"
+        );
+        assert_eq!(
+            line_widths[1], line_widths[2],
+            "数据行1与分隔线宽度必须一致: {line_widths:?}"
+        );
+        assert_eq!(
+            line_widths[2], line_widths[3],
+            "数据行2与数据行1宽度必须一致: {line_widths:?}"
         );
     }
 }

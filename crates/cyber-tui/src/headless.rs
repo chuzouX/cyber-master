@@ -609,6 +609,25 @@ impl SessionRunner {
         Ok(directory)
     }
 
+    /// 启动后台子代理（`/bg run`）：复用当前 runner 的 provider/工具/记忆上下文。
+    /// 立即返回 job id；任务 detached 运行，完成后由 CLI 注入当前会话。
+    pub(crate) fn start_background_subagent(&self, prompt: String) -> u64 {
+        cyber_agent::background::spawn_background_subagent(
+            self.ctx.config.clone(),
+            self.ctx.providers.clone(),
+            self.ctx.project.clone(),
+            self.mock,
+            self.cwd.clone(),
+            self.registry.clone(),
+            self.ctf_enabled,
+            self.ctx.config.agent.thinking_intensity,
+            self.memory_prompt().unwrap_or_default(),
+            prompt,
+            Some(Arc::clone(&self.registries.subagents)),
+            Arc::clone(&self.registries.background),
+        )
+    }
+
     fn memory_prompt(&self) -> color_eyre::Result<String> {
         let mut memory = String::new();
         for (scope, path) in [
@@ -1237,6 +1256,8 @@ impl SessionRunner {
             memory,
             permissions.clone(),
             steering,
+            Some(Arc::clone(&self.registries.subagents)),
+            Some(Arc::clone(&self.registries.background)),
         ));
         let mut turn = TurnHistory::new(prompt);
         let mut pending: Option<PermissionRequest> = None;

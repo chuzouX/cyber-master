@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.2] - 2026-10-04
+
+### Added
+- **子代理面板美化 + opencode 式覆盖对话视图**：
+  - `Ctrl+G` 纯列表面板支持按 Enter 直接进入子代理运行视图，无缝覆盖主对话区域并保持底部输入框可用（边看边聊）。
+  - 顶栏替换为子代理运行态信息（#id · 名称 · 状态徽标 · 运行时长），转录行以对话样式实时流式呈现（Thinking 块、折叠式工具卡、Markdown 正文）。
+  - 完善键盘滚动（`↑`/`↓`/`PgUp`/`PgDn`）、`End` 恢复贴底追踪、`Ctrl+O` 展开/折叠内部工具卡、`Esc` 退出视图回到对话。
+- **后台任务与子代理结果自动回灌并开启思考**：
+  - 后台 Shell 命令与子代理任务完成时，将完整结果作为 Markdown 注入会话记录（放宽至 16,000 字符并解除 400 字符限制）。
+  - 若主模型处于空闲状态，自动注入通知提示词并进入思考状态（`spawn_turn`）；若处于忙碌状态，通过 `steering` 动态注入正在执行的推理流。
+- **GFM 表格渲染与 Markdown 增强**：
+  - `markdown.rs` 新增完整的 GFM 表格块解析与盒线对齐渲染（表头高亮、`├─┼─┤` 细边框、基于 Spans 实际视觉宽度的中英混排精确对齐、`\|` 转义管道符支持）。
+  - `self.message` 与 `ChatEntry::System` 全面支持 Markdown 解析与格式化展示。
+- **子代理防撑爆与推理排版加固**：
+  - 子代理工具输出进入消息历史时增加 6000 字符预算截断，系统提示新增单步聚合命令引导，杜绝长目录遍历撑爆上下文。
+  - `TranscriptWriter` 引入推理流聚合缓冲，修复逐词事件断行丢失空格导致词/数字撕裂（如 "118 42"、"node _modules"）的问题。
+- **子代理结果永不空值**：每个结束的子代理（completed/error/timed_out）都携带非空、有意义的结果内容。
+- **后台模式**：AI 工具级 `bg_shell` / `bg_status` / `bg_kill`；命令级 `/bg run` / `/bg shell` / `/bg list` / `/bg kill` / `/bg tail`；`Ctrl+B` 后台任务管理面板。
+
+### Changed
+- `ToolCtx` / `SubagentRuntime` / `run_stream_with_permissions` 贯通携带 `SubagentArchive` 与 `BackgroundRegistry`。
+- 固化 `scripts/count-loc.ps1` 代码行数统计脚本（含构建产物 / 仅源码双口径）。
+---
+
 ## [0.4.1] - 2026-10-04
 
 ### Added

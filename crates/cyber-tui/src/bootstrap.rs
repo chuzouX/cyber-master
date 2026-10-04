@@ -129,6 +129,8 @@ pub async fn build_registries(
             mcp,
             ctf_challenges: Some(ctf_challenges),
             todos,
+            subagents: Arc::new(cyber_agent::SubagentArchive::default()),
+            background: Arc::new(cyber_agent::BackgroundRegistry::default()),
         },
         errors,
     )

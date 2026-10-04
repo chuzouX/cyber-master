@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod anthropic;
+pub mod background;
 pub mod compact;
 pub mod error;
 pub mod mock;
@@ -17,6 +18,7 @@ pub mod prompt;
 pub mod provider;
 pub mod responses;
 pub mod sse;
+pub mod subagent;
 pub mod tool;
 pub mod tools;
 pub mod types;
@@ -25,6 +27,7 @@ pub use agent::{
     run_compact_stream, run_stream, run_stream_with_permissions, run_writeup_stream,
     steering_channel, SteeringReceiver, SteeringSender,
 };
+pub use background::{BackgroundJob, BackgroundRegistry, JobKind, JobStatus};
 pub use compact::{
     auto_compact_threshold, compact_messages, compact_prompt, context_remaining_percent,
     estimate_messages_tokens, estimate_tokens, AUTOCOMPACT_BUFFER_TOKENS,
@@ -38,6 +41,7 @@ pub use permission::{
     AUTO_APPROVE_CONFIDENCE_THRESHOLD,
 };
 pub use provider::{provider_factory, Provider, StreamRequest};
+pub use subagent::{SubagentArchive, SubagentRun, SubagentStatus};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{
     builtin_tool_names, CtfChallengeTool, CustomTool, DelegateTasksTool, SaveMemoryTool,

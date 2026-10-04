@@ -124,7 +124,7 @@ fn sanitize_pathext(pathext: &str) -> String {
 /// Unix 用 `sh -c`。用 `#[cfg]` 守卫而非 `cfg!()` 运行时检查，
 /// 因为 `std::os::windows::process::CommandExt` 和 `raw_arg` 是编译时 Windows 专有 API。
 #[cfg(target_os = "windows")]
-fn build_shell_command(command: &str) -> tokio::process::Command {
+pub(crate) fn build_shell_command(command: &str) -> tokio::process::Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut std_cmd = std::process::Command::new("cmd");
@@ -137,7 +137,7 @@ fn build_shell_command(command: &str) -> tokio::process::Command {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn build_shell_command(command: &str) -> tokio::process::Command {
+pub(crate) fn build_shell_command(command: &str) -> tokio::process::Command {
     let mut c = tokio::process::Command::new("sh");
     c.arg("-c").arg(command);
     c
@@ -191,7 +191,7 @@ impl Tool for ShellTool {
             let mut cmd = build_shell_command(command);
             // 强制子进程不缓冲 stdout/stderr：stdout 是 pipe（非 TTY）时，Python 等
             // 运行时默认块缓冲（4-8KB），导致 print() 输出攒满缓冲区或进程退出才到达
-            // 我们的 BufReader::lines() → 流式读取看不到实时输出。
+            // 我们的 BufReader 流式读取 → 看不到实时输出。
             // Claude Code 用 PTY 分配伪终端让子进程以为连着终端而行缓冲；本项目用 pipe，
             // 通过环境变量达到同等效果（PYTHONUNBUFFERED 对 Python 等价于 python -u）。
             // 放在用户 env 注入前，用户可在 Settings → Env 中覆盖。
@@ -215,8 +215,11 @@ impl Tool for ShellTool {
                 .map_err(|e| AgentError::Provider(format!("执行命令失败: {e}")))?;
             let stdout = child.stdout.take().expect("stdout 已 piped");
             let stderr = child.stderr.take().expect("stderr 已 piped");
-            let mut stdout_lines = BufReader::new(stdout).lines();
-            let mut stderr_lines = BufReader::new(stderr).lines();
+            // 字节级按 \n 切分 + lossy UTF-8：`BufReader::lines()` 严格要求合法 UTF-8，
+            // 中文 Windows 的程序（如 `ping`）输出 GBK 时读一行即报 `InvalidData`，
+            // 之后所有输出都被丢弃。
+            let mut stdout_lines = BufReader::new(stdout).split(b'\n');
+            let mut stderr_lines = BufReader::new(stderr).split(b'\n');
 
             let mut out_buf = String::new();
             let mut stdout_done = false;
@@ -234,12 +237,20 @@ impl Tool for ShellTool {
                 loop {
                     tokio::select! {
                         biased;
-                        line = stdout_lines.next_line(), if !stdout_done => match line {
-                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
+                        line = stdout_lines.next_segment(), if !stdout_done => match line {
+                            Ok(Some(segment)) => {
+                                let text = String::from_utf8_lossy(&segment);
+                                let text = text.strip_suffix('\r').unwrap_or(&text);
+                                push_output_line(&mut out_buf, text, &progress, &mut truncated);
+                            }
                             Ok(None) | Err(_) => stdout_done = true,
                         },
-                        line = stderr_lines.next_line(), if !stderr_done => match line {
-                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
+                        line = stderr_lines.next_segment(), if !stderr_done => match line {
+                            Ok(Some(segment)) => {
+                                let text = String::from_utf8_lossy(&segment);
+                                let text = text.strip_suffix('\r').unwrap_or(&text);
+                                push_output_line(&mut out_buf, &format!("[stderr] {text}"), &progress, &mut truncated);
+                            }
                             Ok(None) | Err(_) => stderr_done = true,
                         },
                         status = child.wait(), if exit_status.is_none() => {
@@ -260,12 +271,20 @@ impl Tool for ShellTool {
                                 loop {
                                     tokio::select! {
                                         biased;
-                                        line = stdout_lines.next_line(), if !stdout_done => match line {
-                                            Ok(Some(l)) => push_output_line(&mut out_buf, &l, &progress, &mut truncated),
+                                        line = stdout_lines.next_segment(), if !stdout_done => match line {
+                                            Ok(Some(segment)) => {
+                                                let text = String::from_utf8_lossy(&segment);
+                                                let text = text.strip_suffix('\r').unwrap_or(&text);
+                                                push_output_line(&mut out_buf, text, &progress, &mut truncated);
+                                            }
                                             Ok(None) | Err(_) => stdout_done = true,
                                         },
-                                        line = stderr_lines.next_line(), if !stderr_done => match line {
-                                            Ok(Some(l)) => push_output_line(&mut out_buf, &format!("[stderr] {l}"), &progress, &mut truncated),
+                                        line = stderr_lines.next_segment(), if !stderr_done => match line {
+                                            Ok(Some(segment)) => {
+                                                let text = String::from_utf8_lossy(&segment);
+                                                let text = text.strip_suffix('\r').unwrap_or(&text);
+                                                push_output_line(&mut out_buf, &format!("[stderr] {text}"), &progress, &mut truncated);
+                                            }
                                             Ok(None) | Err(_) => stderr_done = true,
                                         },
                                     }

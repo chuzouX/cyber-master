@@ -31,6 +31,7 @@ pub(crate) enum CliAction {
     Mode(cyber_agent::PermissionMode),
     TodoVisibility(bool),
     Settings,
+    Jobs(CliJobs),
 }
 
 pub struct CommandForm {
@@ -72,6 +73,15 @@ pub enum CliTask {
     Writeup { challenge: Box<CtfChallenge> },
     McpConnect { config: McpServersConfig },
 }
+/// `/bg` 命令族（用户级后台任务入口）。
+/// `Shell` 在 busy 时同样可用（数据来自 CliScreen 快照，不触碰 runner）。
+pub enum CliJobs {
+    Run { prompt: String },
+    Shell { command: String },
+    List,
+    Kill(u64),
+    Tail(u64),
+}
 pub struct CompletionItem {
     pub value: String,
     pub description: String,
@@ -112,6 +122,43 @@ fn split(value: &str) -> (&str, &str) {
         .split_once(char::is_whitespace)
         .unwrap_or((value.trim(), ""));
     (a, b.trim())
+}
+
+/// 解析 `/bg` 参数为 `CliJobs`（不依赖 runner；busy 时也可用）。
+pub(crate) fn parse_bg(args: &str) -> Result<CliJobs> {
+    let (sub, rest) = split(args);
+    match sub.to_ascii_lowercase().as_str() {
+        "shell" => {
+            if rest.is_empty() {
+                bail!("用法: /bg shell <command>");
+            }
+            Ok(CliJobs::Shell {
+                command: rest.to_string(),
+            })
+        }
+        "run" => {
+            if rest.is_empty() {
+                bail!("用法: /bg run <prompt>");
+            }
+            Ok(CliJobs::Run {
+                prompt: rest.to_string(),
+            })
+        }
+        "list" | "" => Ok(CliJobs::List),
+        "kill" => {
+            let id = rest
+                .parse::<u64>()
+                .map_err(|_| eyre!("用法: /bg kill <id>"))?;
+            Ok(CliJobs::Kill(id))
+        }
+        "tail" => {
+            let id = rest
+                .parse::<u64>()
+                .map_err(|_| eyre!("用法: /bg tail <id>"))?;
+            Ok(CliJobs::Tail(id))
+        }
+        _ => bail!("用法: /bg <run <prompt>|shell <cmd>|list|kill <id>|tail <id>>"),
+    }
 }
 
 /// Private, same-directory publication. Never make public credential backups.
@@ -554,6 +601,41 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         })?;
         return Ok(CliAction::Mode(mode));
     }
+    if name.eq_ignore_ascii_case("/update") {
+        let release = cyber_core::update::cached_latest_version();
+        return Ok(match release {
+            Some(info)
+                if cyber_core::update::is_newer(
+                    cyber_core::update::CURRENT_VERSION,
+                    &info.version,
+                ) =>
+            {
+                output(
+                    "更新检查",
+                    format!(
+                        "✨ 发现新版本 V{}（当前 V{}）！\n\n发布页面：{}\n可在终端退出后运行 `cyber update` 进行升级。",
+                        info.version,
+                        cyber_core::update::CURRENT_VERSION,
+                        info.html_url
+                    ),
+                )
+            }
+            Some(_) => output(
+                "更新检查",
+                format!(
+                    "✅ 当前已是最新版本 V{}\n（如需强行联网检查，请在终端退出后运行 `cyber update`）",
+                    cyber_core::update::CURRENT_VERSION
+                ),
+            ),
+            None => output(
+                "更新检查",
+                format!(
+                    "当前版本 V{}\n未检测到本地版本缓存。请在终端执行 `cyber update` 联网检查最新版本。\n发布地址：https://github.com/chuzouX/cyber-master",
+                    cyber_core::update::CURRENT_VERSION
+                ),
+            ),
+        });
+    }
     let parsed = if name.eq_ignore_ascii_case("/effort") {
         let args = match args.to_ascii_lowercase().as_str() {
             "medium" => "middle",
@@ -734,6 +816,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         SlashCommand::Sessions(args) => sessions(runner, &args)?,
         SlashCommand::Memory(args) => memory(runner, &args)?,
         SlashCommand::Todo(args) => todo_cmd(runner, &args)?,
+        SlashCommand::Bg(args) => CliAction::Jobs(parse_bg(&args)?),
         SlashCommand::Settings => CliAction::Settings,
         SlashCommand::Mode(_) => {
             bail!("/mode is not available in CLI");
@@ -1535,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 23);
+        assert_eq!(commands().len(), 24);
         assert!(commands().iter().any(|c| c.name == "/settings"));
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
@@ -2628,6 +2711,19 @@ rules = [
             panic!("expected web status output");
         };
         assert!(status_text.contains("enabled"));
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+    #[tokio::test]
+    async fn slash_update_checks_version_and_outputs_result() {
+        let mut runner = test_runner().await;
+        let action = execute(&mut runner, "/update").unwrap();
+        match action {
+            CliAction::Output { title, text } => {
+                assert_eq!(title, "更新检查");
+                assert!(text.contains("版本"));
+            }
+            _ => panic!("expected Output"),
+        }
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 }

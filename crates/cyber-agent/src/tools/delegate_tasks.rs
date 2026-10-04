@@ -20,6 +20,10 @@ pub struct DelegateTasksTool;
 #[serde(deny_unknown_fields)]
 struct DelegateTasksInput {
     tasks: Vec<DelegateTask>,
+    /// `true`：任务后台执行（不阻塞工具调用），立即返回 job ids；
+    /// 完成后由 CLI 注入当前会话。默认 false（同步等待全部结果）。
+    #[serde(default)]
+    background: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,12 +75,18 @@ impl DelegateTaskResult {
         }
     }
 
-    fn timed_out(name: String, timeout_secs: u64) -> Self {
+    fn timed_out(name: String, timeout_secs: u64, partial: Option<String>) -> Self {
+        let error = match partial {
+            Some(tail) => {
+                format!("Timed out after {timeout_secs} seconds. Partial transcript:\n{tail}")
+            }
+            None => format!("Timed out after {timeout_secs} seconds"),
+        };
         Self {
             name,
             status: "timed_out",
             output: None,
-            error: Some(format!("Timed out after {timeout_secs} seconds")),
+            error: Some(error),
         }
     }
 }
@@ -113,6 +123,11 @@ impl Tool for DelegateTasksTool {
                                 }
                             }
                         }
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Run tasks in the background and return job ids immediately; results are injected into the session when finished. Use only when you must keep working and do not need the results now."
                     }
                 }
             }),
@@ -153,10 +168,16 @@ impl Tool for DelegateTasksTool {
                 )));
             }
 
+            if input.background {
+                return run_background(input.tasks, &runtime, ctx).await;
+            }
+
             let total = input.tasks.len();
             let timeout_secs = limits.effective_timeout_secs();
+            let archive = ctx.subagent_archive().cloned();
             let mut immediate = Vec::new();
             let mut pending = Vec::new();
+            let mut run_ids = std::collections::BTreeMap::new();
             for (index, mut task) in input.tasks.into_iter().enumerate() {
                 task.tools = deduplicate(task.tools);
                 if let Some(error) = validate_task(&runtime, &task) {
@@ -167,7 +188,14 @@ impl Tool for DelegateTasksTool {
                 let child_progress = progress.clone();
                 let display_name = task.name.clone();
                 let task_num = index + 1;
-                pending.push((index, display_name.clone(), async move {
+                let run_id = archive.as_ref().map(|a| a.start(&display_name));
+                let transcript =
+                    run_id.and_then(|rid| archive.as_ref().and_then(|a| a.run_handle(rid)));
+                run_ids.insert(index, run_id);
+                let transcript_for_timeout = transcript.clone();
+                let archive_for_finish = archive.clone();
+                let run_id_for_finish = run_id;
+                pending.push((index, display_name.clone(), transcript, async move {
                     if let Some(tx) = child_progress.as_ref() {
                         let _ = tx.send(format!("[{task_num}/{total}] {display_name} started\n"));
                     }
@@ -191,9 +219,28 @@ impl Tool for DelegateTasksTool {
                             task.model,
                             task.tools,
                             Some(task_tx),
+                            transcript_for_timeout,
                         )
                         .await;
                     let _ = forwarder_handle.await;
+                    // 单任务结束后立即定稿自己的归档条目——不等整批结束，
+                    // 面板才能在本任务完成的那一刻显示「✓ 完成」而非「运行中」。
+                    if let (Some(archive), Some(run_id)) = (&archive_for_finish, run_id_for_finish)
+                    {
+                        let (status, output, error) = match &res {
+                            Ok(output) => (
+                                crate::subagent::SubagentStatus::Completed,
+                                Some(output.clone()),
+                                None,
+                            ),
+                            Err(error) => (
+                                crate::subagent::SubagentStatus::Error,
+                                None,
+                                Some(error.to_string()),
+                            ),
+                        };
+                        archive.finish(run_id, status, output, error);
+                    }
                     res
                 }));
             }
@@ -215,6 +262,20 @@ impl Tool for DelegateTasksTool {
                         result.status
                     ));
                 }
+                // completed/error 已由各任务 future 内定稿；只有超时（future 被丢弃）
+                // 需要在这里补定稿。
+                if result.status == "timed_out" {
+                    if let (Some(archive), Some(run_id)) =
+                        (archive.as_ref(), run_ids.get(&index).copied().flatten())
+                    {
+                        archive.finish(
+                            run_id,
+                            crate::subagent::SubagentStatus::TimedOut,
+                            None,
+                            result.error.clone(),
+                        );
+                    }
+                }
                 results.push((index, result));
             }
             results.sort_by_key(|(index, _)| *index);
@@ -226,6 +287,64 @@ impl Tool for DelegateTasksTool {
             })
         })
     }
+}
+
+/// `background=true` 路径：校验后逐个 detached 运行（无外层超时，靠 kill 信号终止），
+/// 立即返回 job ids；结果由 CLI 注入会话、面板可查。
+async fn run_background(
+    tasks: Vec<DelegateTask>,
+    runtime: &Arc<crate::agent::SubagentRuntime>,
+    ctx: &ToolCtx,
+) -> Result<ToolOutput> {
+    let mut tasks = tasks;
+    let mut validation_errors = Vec::new();
+    for task in &mut tasks {
+        task.tools = deduplicate(std::mem::take(&mut task.tools));
+        if let Some(error) = validate_task(runtime, task) {
+            validation_errors.push(format!("{}: {error}", task.name));
+        }
+    }
+    if !validation_errors.is_empty() {
+        return Err(AgentError::Provider(validation_errors.join("; ")));
+    }
+    let background = ctx.background().cloned().ok_or_else(|| {
+        AgentError::Provider("background jobs are unavailable in this session".into())
+    })?;
+    let archive = ctx.subagent_archive().cloned();
+
+    let mut job_ids = Vec::new();
+    for task in tasks {
+        let child_runtime = Arc::clone(runtime);
+        let background = Arc::clone(&background);
+        let archive = archive.clone();
+        let (job_id, kill_rx) =
+            background.start(crate::background::JobKind::Subagent, task.name.clone());
+        let run_id = archive.as_ref().map(|a| a.start(&task.name));
+        if let Some(run_id) = run_id {
+            background.link_archive(job_id, run_id);
+        }
+        let transcript = run_id.and_then(|rid| archive.as_ref().and_then(|a| a.run_handle(rid)));
+        job_ids.push(job_id);
+        tokio::spawn(crate::background::run_detached_subagent(
+            child_runtime,
+            task.system_prompt,
+            task.task,
+            task.context,
+            task.provider,
+            task.model,
+            task.tools,
+            transcript,
+            archive,
+            background,
+            job_id,
+            run_id,
+            kill_rx,
+        ));
+    }
+    Ok(ToolOutput {
+        content: serde_json::to_string(&json!({ "background_jobs": job_ids }))?,
+        is_error: false,
+    })
 }
 
 fn deduplicate(tools: Vec<String>) -> Vec<String> {
@@ -285,28 +404,54 @@ fn validate_task(runtime: &crate::agent::SubagentRuntime, task: &DelegateTask) -
     None
 }
 
+/// 子代理转录句柄（`SubagentArchive` 运行条目；超时分支据此取部分产出）。
+type TranscriptHandle = Option<Arc<std::sync::Mutex<crate::subagent::SubagentRun>>>;
+
 async fn run_ordered_bounded<F>(
-    tasks: Vec<(usize, String, F)>,
+    tasks: Vec<(usize, String, TranscriptHandle, F)>,
     max_parallel: usize,
     timeout: Duration,
 ) -> Vec<(usize, DelegateTaskResult)>
 where
     F: Future<Output = Result<String>> + Send,
 {
-    let mut results: Vec<_> =
-        stream::iter(tasks.into_iter().map(|(index, name, future)| async move {
+    let mut results: Vec<_> = stream::iter(tasks.into_iter().map(
+        |(index, name, transcript, future)| async move {
             let result = match tokio::time::timeout(timeout, future).await {
                 Ok(Ok(output)) => DelegateTaskResult::completed(name, output),
                 Ok(Err(error)) => DelegateTaskResult::error(name, error.to_string()),
-                Err(_) => DelegateTaskResult::timed_out(name, timeout.as_secs()),
+                Err(_) => DelegateTaskResult::timed_out(
+                    name,
+                    timeout.as_secs(),
+                    transcript_tail(transcript),
+                ),
             };
             (index, result)
-        }))
-        .buffer_unordered(max_parallel.max(1))
-        .collect()
-        .await;
+        },
+    ))
+    .buffer_unordered(max_parallel.max(1))
+    .collect()
+    .await;
     results.sort_by_key(|(index, _)| *index);
     results
+}
+
+/// 超时子代理的部分产出：取转录最后 3 行（空转录返回 None，退化为现有文案）。
+fn transcript_tail(transcript: TranscriptHandle) -> Option<String> {
+    let lines = transcript.and_then(|run| run.lock().ok().map(|run| run.lines.clone()))?;
+    let tail = lines
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +482,8 @@ mod tests {
             String::new(),
             tx,
             1,
+            None,
+            None,
         ));
         ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new())
             .with_subagent_runtime(runtime)
@@ -496,7 +643,7 @@ mod tests {
                 let active = Arc::clone(&active);
                 let peak = Arc::clone(&peak);
                 let barrier = Arc::clone(&barrier);
-                (index, format!("task-{index}"), async move {
+                (index, format!("task-{index}"), None, async move {
                     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(current, Ordering::SeqCst);
                     barrier.wait().await;
@@ -513,11 +660,164 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delegate_tasks_background_returns_job_ids_and_completes_independently() {
+        let tool = DelegateTasksTool;
+        let archive = Arc::new(crate::subagent::SubagentArchive::default());
+        let background = Arc::new(crate::background::BackgroundRegistry::default());
+        let ctx = context(Config::default())
+            .with_subagent_archive(Some(Arc::clone(&archive)))
+            .with_background(Some(Arc::clone(&background)));
+        let output = tool
+            .run(
+                json!({
+                    "background": true,
+                    "tasks": [task("bg-one", "do the background thing")]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        let ids = value["background_jobs"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+        let job_id = ids[0].as_u64().unwrap();
+        // 任务独立完成（不阻塞工具返回；mock echo 模式逐字符流式）
+        for _ in 0..500 {
+            let status = background
+                .snapshot()
+                .into_iter()
+                .find(|job| job.id == job_id)
+                .map(|job| job.status)
+                .unwrap_or(crate::background::JobStatus::Running);
+            if status.is_finished() {
+                assert!(matches!(status, crate::background::JobStatus::Finished(_)));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let job = background
+            .snapshot()
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .unwrap();
+        assert!(
+            job.status.is_finished(),
+            "后台子代理应独立完成，实际：{:?}",
+            job.status
+        );
+        let runs = archive.snapshot();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, crate::subagent::SubagentStatus::Completed);
+        assert!(runs[0].result.is_some());
+        assert!(!runs[0].lines.is_empty(), "archive 应含转录行");
+    }
+
+    /// 把 wake 转成 `Notify::notify_one`，供测试内手动驱动 future。
+    struct WakeNotify(Arc<tokio::sync::Notify>);
+    impl std::task::Wake for WakeNotify {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.notify_one();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_tasks_marks_each_run_finished_as_its_task_ends() {
+        use std::task::Poll;
+
+        // 回归：任务 A 已完成而任务 B 仍在跑时，A 的归档条目应已「完成」，
+        // 而不是等整批 delegate_tasks 结束后才定稿（面板显示错为运行中）。
+        let tool = DelegateTasksTool;
+        let archive = Arc::new(crate::subagent::SubagentArchive::default());
+        let ctx = context(Config::default()).with_subagent_archive(Some(Arc::clone(&archive)));
+        let slow_text = "x".repeat(120); // mock echo 逐字符 20ms ≈ 2.4s
+        let fut = tool.run(
+            json!({
+                "tasks": [
+                    {"name": "fast", "system_prompt": "s", "task": "hi", "tools": []},
+                    {"name": "slow", "system_prompt": "s", "task": slow_text, "tools": []}
+                ]
+            }),
+            &ctx,
+        );
+        tokio::pin!(fut);
+        // 手动驱动：内部子任务由外层 future 的 poll 推进，wake 经 Notify 转回。
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waker = std::task::Waker::from(Arc::new(WakeNotify(Arc::clone(&notify))));
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "首个 poll 应进入等待"
+        );
+        // 在整批工具调用尚未返回时轮询：fast 应已定稿 Completed。
+        let mut fast_completed = false;
+        for _ in 0..200 {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(_) => break, // 整批已结束（异常快）
+            }
+            let runs = archive.snapshot();
+            if runs.iter().any(|run| {
+                run.name == "fast" && run.status == crate::subagent::SubagentStatus::Completed
+            }) {
+                fast_completed = true;
+                break;
+            }
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+            }
+        }
+        assert!(
+            fast_completed,
+            "fast 子代理结束后应立即定稿 Completed，实际：{:?}",
+            archive.snapshot()
+        );
+        let output = fut.await.unwrap();
+        assert!(!output.is_error);
+        let runs = archive.snapshot();
+        assert!(runs.len() == 2);
+        assert!(runs
+            .iter()
+            .all(|run| run.status != crate::subagent::SubagentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn delegate_tasks_background_rejects_invalid_task_before_spawning() {
+        let tool = DelegateTasksTool;
+        let archive = Arc::new(crate::subagent::SubagentArchive::default());
+        let background = Arc::new(crate::background::BackgroundRegistry::default());
+        let ctx = context(Config::default())
+            .with_subagent_archive(Some(Arc::clone(&archive)))
+            .with_background(Some(Arc::clone(&background)));
+        let result = tool
+            .run(
+                json!({
+                    "background": true,
+                    "tasks": [{
+                        "name": "bad",
+                        "system_prompt": "",
+                        "task": "x",
+                        "tools": []
+                    }]
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_err(), "校验失败应返回错误而非静默启动");
+        assert!(background.snapshot().is_empty());
+        assert!(archive.snapshot().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn delegate_tasks_times_out_one_task_without_blocking_another() {
         let tasks = (0..2)
             .map(|index| {
-                (index, format!("task-{index}"), async move {
+                (index, format!("task-{index}"), None, async move {
                     if index == 0 {
                         std::future::pending::<()>().await;
                     }
@@ -528,5 +828,32 @@ mod tests {
         let results = run_ordered_bounded(tasks, 2, Duration::from_secs(5)).await;
         assert_eq!(results[0].1.status, "timed_out");
         assert_eq!(results[1].1.status, "completed");
+        assert_eq!(
+            results[0].1.error.as_deref(),
+            Some("Timed out after 5 seconds")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_result_carries_partial_transcript_tail() {
+        let archive = crate::subagent::SubagentArchive::default();
+        let run_id = archive.start("slow");
+        archive.append_line(run_id, "tool shell args: {\"command\":\"nmap\"}".into());
+        archive.append_line(run_id, "shell => PORT 80 http".into());
+        archive.append_line(run_id, "shell => PORT 443 https".into());
+        let transcript = archive.run_handle(run_id);
+        let tasks = vec![(0usize, "slow".to_string(), transcript, async {
+            std::future::pending::<()>().await;
+            Ok::<String, crate::error::AgentError>(String::new())
+        })];
+        let results = run_ordered_bounded(tasks, 1, Duration::from_secs(5)).await;
+        assert_eq!(results[0].1.status, "timed_out");
+        let error = results[0].1.error.as_deref().unwrap();
+        assert!(
+            error.starts_with("Timed out after 5 seconds. Partial transcript:"),
+            "超时应携带转录尾部：{error}"
+        );
+        assert!(error.contains("shell => PORT 80 http"));
+        assert!(error.contains("shell => PORT 443 https"));
     }
 }

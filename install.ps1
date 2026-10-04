@@ -1,4 +1,4 @@
-# Cyber Master 一键安装脚本（Windows / PowerShell）
+﻿# Cyber Master 一键安装脚本（Windows / PowerShell）
 #
 # 用法（PowerShell 5.1+ / PowerShell 7+）：
 #   irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
@@ -68,18 +68,19 @@ if (-not $Version) {
     }
 }
 
-# ─── 下载源：GitHub 主源 + 常用镜像回退（默认自动尝试，可用 $env:CYBER_DOWNLOAD_MIRROR 指定镜像前缀）──
+# ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────
 $GithubBase = "https://github.com/$Repo/releases/download/$Version"
-$Sources = @($GithubBase)
+$CandidateList = @()
 if ($env:CYBER_DOWNLOAD_MIRROR) {
-    $Sources = @("$($env:CYBER_DOWNLOAD_MIRROR.TrimEnd('/'))/$GithubBase") + $Sources
-} else {
-    $Sources += @(
-        "https://ghproxy.net/$GithubBase",
-        "https://gh-proxy.com/$GithubBase",
-        "https://ghfast.top/$GithubBase"
-    )
+    $prefix = $env:CYBER_DOWNLOAD_MIRROR.TrimEnd('/')
+    $CandidateList += @{ Name = "自定义镜像 ($prefix)"; Base = "$prefix/$GithubBase" }
 }
+$CandidateList += @(
+    @{ Name = "GitHub 官方源";  Base = $GithubBase },
+    @{ Name = "gh-proxy.com 镜像"; Base = "https://gh-proxy.com/$GithubBase" },
+    @{ Name = "ghfast.top 镜像";  Base = "https://ghfast.top/$GithubBase" },
+    @{ Name = "ghproxy.net 镜像"; Base = "https://ghproxy.net/$GithubBase" }
+)
 
 Write-Host "→ 安装 cyber $Version ($Target) 到 $InstallDir" -ForegroundColor Cyan
 
@@ -91,18 +92,59 @@ $extractPath = Join-Path $tmpDir 'extract'
 $destBinary = Join-Path $InstallDir 'cyber.exe'
 try {
     New-Item -ItemType Directory -Path $tmpDir | Out-Null
+
+    Write-Host "→ 测速各下载源并选择最优节点…" -ForegroundColor Cyan
+    $TestedSources = @()
+    $speedtestSha = Join-Path $tmpDir "speedtest.sha256"
+
+    foreach ($item in $CandidateList) {
+        $base = $item.Base
+        $name = $item.Name
+        $shaUrl = "$base/$Archive.sha256"
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            Invoke-WebRequest -Uri $shaUrl -OutFile $speedtestSha -UseBasicParsing -TimeoutSec 4
+            $sw.Stop()
+            $ms = [int]$sw.ElapsedMilliseconds
+            $content = (Get-Content -LiteralPath $speedtestSha -TotalCount 1).Trim()
+            if ($content -match '^[0-9a-fA-F]{64}') {
+                Write-Host ("   [✓] {0,-18} : {1}ms" -f $name, $ms) -ForegroundColor Green
+                $TestedSources += [PSCustomObject]@{
+                    Name = $name
+                    Base = $base
+                    Latency = $ms
+                }
+            } else {
+                Write-Host ("   [✗] {0,-18} : 返回内容无效" -f $name) -ForegroundColor DarkGray
+            }
+        } catch {
+            $sw.Stop()
+            Write-Host ("   [✗] {0,-18} : 超时/不可达" -f $name) -ForegroundColor DarkGray
+        }
+    }
+
+    if ($TestedSources.Count -gt 0) {
+        $SortedSources = $TestedSources | Sort-Object -Property Latency
+        $Fastest = $SortedSources[0]
+        Write-Host ("→ 选用最优源: {0} ({1}ms)" -f $Fastest.Name, $Fastest.Latency) -ForegroundColor Cyan
+        $Sources = @($SortedSources | ForEach-Object { $_.Base })
+    } else {
+        Write-Host "   所有源测速未响应，回退至默认源重试…" -ForegroundColor Yellow
+        $Sources = @($CandidateList | ForEach-Object { $_.Base })
+    }
+
     $downloaded = $false
     foreach ($base in $Sources) {
         $zipUrl = "$base/$Archive"
         $shaUrl = "$zipUrl.sha256"
         try {
             Write-Host "→ 下载 $zipUrl"
-            Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing -TimeoutSec 60
+            Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing -TimeoutSec 120
             Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing -TimeoutSec 60
             $downloaded = $true
             break
         } catch {
-            Write-Host "   该源失败（$($_.Exception.Message.Split([char]10)[0])），尝试下一源…" -ForegroundColor DarkGray
+            Write-Host "   该源下载失败（$($_.Exception.Message.Split([char]10)[0])），尝试备用源…" -ForegroundColor DarkGray
         }
     }
     if (-not $downloaded) {

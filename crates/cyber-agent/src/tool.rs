@@ -63,6 +63,8 @@ pub struct ToolCtx {
     /// 用户在 Settings → Env 配置的环境变量，注入 shell 子进程。
     pub env: Vec<(String, String)>,
     pub(crate) subagent_runtime: Option<Arc<crate::agent::SubagentRuntime>>,
+    pub(crate) subagent_archive: Option<Arc<crate::subagent::SubagentArchive>>,
+    pub(crate) background: Option<Arc<crate::background::BackgroundRegistry>>,
 }
 
 impl ToolCtx {
@@ -78,6 +80,8 @@ impl ToolCtx {
             scope,
             env,
             subagent_runtime: None,
+            subagent_archive: None,
+            background: None,
         }
     }
 
@@ -91,6 +95,30 @@ impl ToolCtx {
 
     pub(crate) fn subagent_runtime(&self) -> Option<&Arc<crate::agent::SubagentRuntime>> {
         self.subagent_runtime.as_ref()
+    }
+
+    pub(crate) fn with_subagent_archive(
+        mut self,
+        archive: Option<Arc<crate::subagent::SubagentArchive>>,
+    ) -> Self {
+        self.subagent_archive = archive;
+        self
+    }
+
+    pub(crate) fn subagent_archive(&self) -> Option<&Arc<crate::subagent::SubagentArchive>> {
+        self.subagent_archive.as_ref()
+    }
+
+    pub(crate) fn with_background(
+        mut self,
+        background: Option<Arc<crate::background::BackgroundRegistry>>,
+    ) -> Self {
+        self.background = background;
+        self
+    }
+
+    pub(crate) fn background(&self) -> Option<&Arc<crate::background::BackgroundRegistry>> {
+        self.background.as_ref()
     }
 }
 
@@ -519,13 +547,14 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 9);
+        assert_eq!(registry.all_schemas().len(), 12);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
+        assert!(registry.get("bg_shell").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 9);
-        assert_eq!(registry.schemas().len(), 9);
+        assert_eq!(registry.all_schemas().len(), 12);
+        assert_eq!(registry.schemas().len(), 12);
     }
 
     #[test]
