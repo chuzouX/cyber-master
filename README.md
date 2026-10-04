@@ -78,6 +78,24 @@
 
 ### 一行安装（预编译 Release）
 
+#### 🚀 国内极速安装（CNB 云原生源，推荐，免代理）
+
+> 托管于腾讯云原生构建（CNB.cool），国内直连，告别 GitHub 连接超时与慢速下载。
+
+Linux / macOS：
+
+```bash
+curl -fsSL https://cnb.cool/chuzouX/cyber-master/-/git/raw/main/install.sh | sh
+```
+
+Windows（PowerShell 5.1+）：
+
+```powershell
+irm https://cnb.cool/chuzouX/cyber-master/-/git/raw/main/install.ps1 | iex
+```
+
+#### 🌐 GitHub 官方源（海外 / 代理）
+
 Linux / macOS：
 
 ```bash
@@ -90,10 +108,11 @@ Windows（PowerShell 5.1+）：
 irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
 ```
 
+> 💡 **智能多源竞速下载**：安装脚本内置多源测速机制，自动在 **CNB 极速源**、GitHub 官方源及多家代理镜像（`gh-proxy.com` / `ghfast.top` / `ghproxy.net`）中并发测速，自动选用延迟最低、速度最快的源下载对应二进制产物，并强制执行 SHA256 完整性安全校验。
+
 支持 Linux（glibc）与 macOS 的 x86_64 / aarch64，以及 Windows x86_64；其他系统或架构会拒绝安装。默认下载最新 Release，必须成功下载并通过对应 `.sha256` 校验，否则中止。SHA256 用于检查文件完整性，不替代对发布来源的信任。
 
-Unix 默认安装到 `~/.local/bin/cyber`，Windows 默认安装到 `%USERPROFILE%\.local\bin\cyber.exe`。可用 `CYBER_VERSION` 指定 tag，`CYBER_INSTALL_DIR` 指定安装目录，`CYBER_REPO` 指定仓库；Windows 使用同名 `$env:` 环境变量。GitHub 资产下载失败时自动按序回退 `ghproxy.net` / `gh-proxy.com` / `ghfast.top` 镜像，也可用 `CYBER_DOWNLOAD_MIRROR` 指定镜像前缀（SHA256 校验始终强制生效）。
-
+Unix 默认安装到 `~/.local/bin/cyber`，Windows 默认安装到 `%USERPROFILE%\.local\bin\cyber.exe`。可用 `CYBER_VERSION` 指定 tag，`CYBER_INSTALL_DIR` 指定安装目录，`CYBER_REPO` 指定仓库；`install.sh` 支持 `--cnb` 参数强制优先选用 CNB 源；Windows 可设置 `$env:CYBER_USE_CNB=1`。网络受限时自动按序回退 CNB 及各大镜像（SHA256 校验始终强制生效）。
 安装器保留已有 shell 配置，幂等添加用户 PATH：Bash 写入 `.bashrc` 和生效的登录 profile，Zsh 写入 `${ZDOTDIR:-$HOME}/.zshrc`，Fish 写入用户配置目录的 `fish/conf.d/cyber-path.fish`，POSIX shell 写入 `.profile`。未知 shell 只给出手动配置提示。**Unix 安装后需重新打开终端**（POSIX shell 需重新登录）；也可立即用完整二进制路径启动。Windows 持久更新用户 PATH，并独立同步当前 PowerShell 会话；其他已打开的终端需重开。
 
 ### 从源码构建（需 Rust 1.75+）

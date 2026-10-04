@@ -36,7 +36,7 @@ if (-not $Version)    { $Version    = $env:CYBER_VERSION }
 if (-not $InstallDir) { $InstallDir = $env:CYBER_INSTALL_DIR }
 if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE '.local\bin' }
 if ($env:CYBER_REPO)  { $Repo       = $env:CYBER_REPO }
-
+$CnbRepo = if ($env:CYBER_CNB_REPO) { $env:CYBER_CNB_REPO } else { $Repo }
 # ─── 平台检测（PowerShell 只支持 Windows 二进制；WSL 用户请用 install.sh）──
 $architecture = if ($env:PROCESSOR_ARCHITEW6432) {
     $env:PROCESSOR_ARCHITEW6432
@@ -54,34 +54,49 @@ $Archive = "cyber-$Target.zip"
 # ─── 解析版本（未指定时取 latest）──────────────────────────────────────────
 if (-not $Version) {
     Write-Host "→ 查询最新版本…" -ForegroundColor Cyan
-    try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-                                     -Headers @{ 'User-Agent' = 'cyber-installer' }
-        $Version = $release.tag_name
-    } catch {
-        Write-Error "无法获取最新版本：$_`n请设置 `$env:CYBER_VERSION 显式指定版本 tag。"
-        exit 1
+    if ($env:CYBER_USE_CNB) {
+        try {
+            $cnbReleases = Invoke-RestMethod -Uri "https://api.cnb.cool/$CnbRepo/-/releases" -Headers @{ 'Accept' = 'application/json' } -TimeoutSec 5
+            if ($cnbReleases -and $cnbReleases.Count -gt 0) {
+                $Version = $cnbReleases[0].tag_name
+            }
+        } catch {}
     }
     if (-not $Version) {
-        Write-Error "latest release 返回空 tag_name"
+        try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+                                         -Headers @{ 'User-Agent' = 'cyber-installer' } -TimeoutSec 5
+            $Version = $release.tag_name
+        } catch {
+            try {
+                $cnbReleases = Invoke-RestMethod -Uri "https://api.cnb.cool/$CnbRepo/-/releases" -Headers @{ 'Accept' = 'application/json' } -TimeoutSec 5
+                if ($cnbReleases -and $cnbReleases.Count -gt 0) {
+                    $Version = $cnbReleases[0].tag_name
+                }
+            } catch {}
+        }
+    }
+    if (-not $Version) {
+        Write-Error "无法获取最新版本。请设置 `$env:CYBER_VERSION 显式指定版本 tag。"
         exit 1
     }
 }
 
 # ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────
 $GithubBase = "https://github.com/$Repo/releases/download/$Version"
+$CnbBase    = "https://cnb.cool/$CnbRepo/-/releases/download/$Version"
 $CandidateList = @()
 if ($env:CYBER_DOWNLOAD_MIRROR) {
     $prefix = $env:CYBER_DOWNLOAD_MIRROR.TrimEnd('/')
     $CandidateList += @{ Name = "自定义镜像 ($prefix)"; Base = "$prefix/$GithubBase" }
 }
 $CandidateList += @(
-    @{ Name = "GitHub 官方源";  Base = $GithubBase },
-    @{ Name = "gh-proxy.com 镜像"; Base = "https://gh-proxy.com/$GithubBase" },
-    @{ Name = "ghfast.top 镜像";  Base = "https://ghfast.top/$GithubBase" },
-    @{ Name = "ghproxy.net 镜像"; Base = "https://ghproxy.net/$GithubBase" }
+    @{ Name = "CNB 镜像源 (国内极速)"; Base = $CnbBase },
+    @{ Name = "GitHub 官方源";       Base = $GithubBase },
+    @{ Name = "gh-proxy.com 镜像";   Base = "https://gh-proxy.com/$GithubBase" },
+    @{ Name = "ghfast.top 镜像";     Base = "https://ghfast.top/$GithubBase" },
+    @{ Name = "ghproxy.net 镜像";    Base = "https://ghproxy.net/$GithubBase" }
 )
-
 Write-Host "→ 安装 cyber $Version ($Target) 到 $InstallDir" -ForegroundColor Cyan
 
 # ─── 下载、强制 SHA256 校验及安装；所有失败路径均清理临时目录 ─────────────

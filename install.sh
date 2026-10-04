@@ -20,9 +20,10 @@
 set -eu
 
 REPO="${CYBER_REPO:-chuzouX/cyber-master}"
+CNB_REPO="${CYBER_CNB_REPO:-$REPO}"
 VERSION="${CYBER_VERSION:-}"
 INSTALL_DIR="${CYBER_INSTALL_DIR:-$HOME/.local/bin}"
-
+USE_CNB="${CYBER_USE_CNB:-0}"
 # ─── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +33,8 @@ while [ $# -gt 0 ]; do
     --install-dir)
       [ $# -ge 2 ] && [ -n "$2" ] || { echo "--install-dir 需要非空路径" >&2; exit 1; }
       INSTALL_DIR="$2"; shift 2 ;;
+    --cnb)
+      USE_CNB=1; shift ;;
     --help|-h)
       cat <<EOF
 Cyber Master installer
@@ -41,6 +44,7 @@ Usage: sh install.sh [OPTIONS]
 Options:
   --version <tag>        指定版本（如 v0.1.0），默认 latest
   --install-dir <path>   安装目录，默认 ~/.local/bin
+  --cnb                  优先使用 CNB 国内极速源
   -h, --help             显示此帮助
 
 Environment:
@@ -48,6 +52,8 @@ Environment:
   CYBER_INSTALL_DIR      等价于 --install-dir
   CYBER_REPO             GitHub owner/name，默认 chuzouX/cyber-master
   CYBER_DOWNLOAD_MIRROR  下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
+  CYBER_CNB_REPO         CNB 镜像仓库（默认同 CYBER_REPO）
+  CYBER_USE_CNB          设为 1 时优先使用 CNB 源
 EOF
       exit 0 ;;
     *)
@@ -106,8 +112,18 @@ fi
 # ─── 解析版本（未指定时取 latest）──────────────────────────────────────────
 if [ -z "$VERSION" ]; then
   echo "→ 查询最新版本…"
-  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-            | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+  if [ "$USE_CNB" = "1" ]; then
+    VERSION=$(curl -fsSL --connect-timeout 4 --max-time 6 "https://api.cnb.cool/$CNB_REPO/-/releases" 2>/dev/null \
+              | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  fi
+  if [ -z "$VERSION" ]; then
+    VERSION=$(curl -fsSL --connect-timeout 4 --max-time 6 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+              | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  fi
+  if [ -z "$VERSION" ]; then
+    VERSION=$(curl -fsSL --connect-timeout 4 --max-time 6 "https://api.cnb.cool/$CNB_REPO/-/releases" 2>/dev/null \
+              | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  fi
   if [ -z "$VERSION" ]; then
     echo "无法获取最新版本。请用 --version <tag> 显式指定，或检查网络。" >&2
     exit 1
@@ -116,12 +132,16 @@ fi
 
 # ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────
 github_base="https://github.com/$REPO/releases/download/$VERSION"
+cnb_base="https://cnb.cool/$CNB_REPO/-/releases/download/$VERSION"
 candidates=""
 if [ -n "${CYBER_DOWNLOAD_MIRROR:-}" ]; then
   candidates="自定义镜像|${CYBER_DOWNLOAD_MIRROR%/}/$github_base"
 fi
-candidates="$candidates GitHub官方源|$github_base gh-proxy.com镜像|https://gh-proxy.com/$github_base ghfast.top镜像|https://ghfast.top/$github_base ghproxy.net镜像|https://ghproxy.net/$github_base"
-
+if [ "$USE_CNB" = "1" ]; then
+  candidates="$candidates CNB源(国内极速)|$cnb_base GitHub官方源|$github_base gh-proxy.com镜像|https://gh-proxy.com/$github_base ghfast.top镜像|https://ghfast.top/$github_base ghproxy.net镜像|https://ghproxy.net/$github_base"
+else
+  candidates="$candidates CNB源(国内极速)|$cnb_base GitHub官方源|$github_base gh-proxy.com镜像|https://gh-proxy.com/$github_base ghfast.top镜像|https://ghfast.top/$github_base ghproxy.net镜像|https://ghproxy.net/$github_base"
+fi
 echo "→ 安装 cyber $VERSION ($target) 到 $INSTALL_DIR"
 
 # ─── 创建临时目录 ─────────────────────────────────────────────────────────
