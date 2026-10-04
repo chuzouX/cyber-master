@@ -27,7 +27,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
     Frame,
 };
@@ -246,6 +247,7 @@ fn render_history(
     // 用 Padding 让内容不贴边
     let padded = Block::default().padding(Padding::new(1, 1, 0, 0));
     let inner = padded.inner(area);
+    state.last_history_area.set(inner);
     frame.render_widget(padded, area);
 
     // 空会话引导：直接渲染（量小，无需缓存/滚动）
@@ -284,6 +286,7 @@ fn render_history(
         );
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         state.set_scroll_metrics(0, inner.height as usize);
+        state.last_history_area.set(inner);
         return;
     }
 
@@ -293,16 +296,60 @@ fn render_history(
     let visible = inner.height as usize;
     let max_scroll = total.saturating_sub(visible);
     state.set_scroll_metrics(total, visible);
+    state.last_history_area.set(inner);
     let offset = state.resolved_scroll_offset(max_scroll);
     let end = (offset + visible).min(total);
     // 仅 clone 可见窗口（O(visible)），无 Wrap 无 scroll → ratatui 渲染 O(visible)
     let window: Vec<Line<'static>> = if offset < end {
-        wrapped[offset..end].to_vec()
+        let raw = wrapped[offset..end].to_vec();
+        drop(wrapped);
+        if let Some(sel) = state.selection.as_ref() {
+            if !sel.is_empty() {
+                let wc = state.wrapped.borrow();
+                let sel_style = crate::selection::default_selection_style();
+                raw.into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let row_idx = offset + i;
+                        let line_idx = wc.ends.partition_point(|&e| e <= row_idx);
+                        if let Some(&(char_start, char_end)) = wc.row_ranges.get(row_idx) {
+                            crate::selection::apply_selection_to_row_full(
+                                &row,
+                                char_start,
+                                char_end,
+                                line_idx,
+                                sel,
+                                sel_style,
+                                0,
+                                wc.source.get(line_idx),
+                            )
+                        } else {
+                            row
+                        }
+                    })
+                    .collect()
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
     } else {
+        drop(wrapped);
         Vec::new()
     };
-    drop(wrapped); // 释放 RefCell 借用
     frame.render_widget(Paragraph::new(window), inner);
+    if max_scroll > 0 {
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .track_style(Style::default().fg(theme.muted))
+            .thumb_style(Style::default().fg(theme.accent));
+        frame.render_stateful_widget(scrollbar, inner, &mut scrollbar_state);
+    }
 }
 
 /// 渲染输入框。
@@ -1165,5 +1212,85 @@ mod tests {
             !content2.contains("todo close"),
             "收起后不应包含 close 提示: {content2}"
         );
+    }
+    #[test]
+    fn chat_scrollbar_renders_when_overflowing_and_updates_on_click() {
+        let theme = Theme::resolve("cyberpunk");
+        let mut state = ChatState::new();
+        for i in 0..40 {
+            state
+                .entries
+                .push(ChatEntry::User(format!("user question line {i:02}")));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                    &[],
+                )
+            })
+            .unwrap();
+
+        let inner = state.last_history_area.get();
+        assert!(inner.height > 0);
+        assert!(state.max_scroll() > 0);
+
+        let buffer = terminal.backend().buffer();
+        let scrollbar_col = inner.right().saturating_sub(1);
+        let mut has_track = false;
+        let mut has_thumb = false;
+        for row in inner.top()..inner.bottom() {
+            let sym = buffer[(scrollbar_col, row)].symbol();
+            if sym == "│" {
+                has_track = true;
+            } else if sym == "█" {
+                has_thumb = true;
+            }
+        }
+        assert!(has_track || has_thumb);
+        assert!(has_thumb, "初始底部态应有滑块");
+
+        // 初始底部态：最底端应为滑块
+        let bottom_sym = buffer[(scrollbar_col, inner.bottom() - 1)].symbol();
+        assert_eq!(bottom_sym, "█", "底部态滑块应在最底端");
+
+        // 点击顶部
+        state.apply_scrollbar_click(inner.top());
+        assert_eq!(state.scroll_y, 0);
+
+        // 重新渲染验证滑块在顶部
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                    &[],
+                )
+            })
+            .unwrap();
+        let buffer_top = terminal.backend().buffer();
+        let top_sym = buffer_top[(scrollbar_col, inner.top())].symbol();
+        assert_eq!(top_sym, "█", "点击顶部后滑块应在最顶端");
+
+        // 点击底部恢复
+        state.apply_scrollbar_click(inner.bottom() - 1);
+        assert_eq!(state.scroll_y, crate::chat::SCROLL_FOLLOW);
     }
 }

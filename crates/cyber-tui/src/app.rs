@@ -885,11 +885,7 @@ impl App {
                 }
             }
             // Chat 模式：鼠标滚轮滚动历史区（鼠标捕获在 config.ui.mouse 时启用）
-            Event::Mouse(m) if self.mode == Mode::Chat => match m.kind {
-                MouseEventKind::ScrollUp => self.chat.scroll_history(-3),
-                MouseEventKind::ScrollDown => self.chat.scroll_history(3),
-                _ => {}
-            },
+            Event::Mouse(m) if self.mode == Mode::Chat => self.handle_mouse_event(m),
             // 粘贴（bracketed paste）：整块插入当前活跃的 textarea，不触发提交。
             // 未启用 bracketed paste 的终端不会产生此事件，回退为逐字符 KeyEvent。
             Event::Paste(text) => {
@@ -903,6 +899,19 @@ impl App {
                 self.handle_paste(text);
             }
             _ => {}
+        }
+    }
+    /// Chat 模式下处理鼠标滚轮与点击/拖拽滑动条事件。
+    fn handle_mouse_event(&mut self, m: crossterm::event::MouseEvent) {
+        if self.mode != Mode::Chat {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp => self.chat.scroll_history(-3),
+            MouseEventKind::ScrollDown => self.chat.scroll_history(3),
+            _ => {
+                self.chat.handle_mouse(m);
+            }
         }
     }
 
@@ -1115,6 +1124,20 @@ impl App {
                 KeyCode::Esc => self.cancel_active_turn(),
                 _ => {}
             }
+            return;
+        }
+        if k.code == crossterm::event::KeyCode::Esc && self.chat.has_selection() {
+            self.chat.clear_selection();
+            return;
+        }
+        if k.modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+            && (k.code == crossterm::event::KeyCode::Char('c')
+                || k.code == crossterm::event::KeyCode::Char('C'))
+            && self.chat.has_selection()
+        {
+            self.chat.copy_selection_to_clipboard();
+            self.chat.clear_selection();
             return;
         }
         if k.code == crossterm::event::KeyCode::F(2)
@@ -5360,7 +5383,7 @@ fn parse_sgr(codes: &str, base: Style, theme: &Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton};
     use cyber_core::{Config, ProvidersConfig};
     #[test]
     fn strip_tool_call_tags_removes_function_calls_block() {
@@ -6774,5 +6797,59 @@ mod tests {
         app.chat.input.insert_str("some text");
         app.handle_chat_key(k);
         assert!(!app.chat.is_following_bottom());
+    }
+    #[test]
+    fn chat_mouse_click_and_drag_scrollbar() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        let area = Rect::new(1, 2, 78, 20);
+        app.chat.last_history_area.set(area);
+        app.chat.set_scroll_metrics(60, 20);
+        assert_eq!(app.chat.max_scroll(), 40);
+        assert!(app.chat.is_following_bottom());
+
+        // 1. MouseDown on scrollbar top (column 78, row 2)
+        let down_event = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.right() - 1,
+            row: area.top(),
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(down_event);
+        assert!(app.chat.is_dragging_scrollbar);
+        assert_eq!(app.chat.scroll_y, 0);
+        assert!(!app.chat.is_following_bottom());
+
+        // 2. MouseDrag to mid-point (row 2 + 10 = 12)
+        let drag_event = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.right() - 1,
+            row: area.top() + 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(drag_event);
+        assert!(app.chat.is_dragging_scrollbar);
+        assert_eq!(app.chat.scroll_y, 21);
+        assert!(!app.chat.is_following_bottom());
+
+        // 3. MouseDrag to bottom (row 21)
+        let drag_bottom = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.right() - 1,
+            row: area.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(drag_bottom);
+        assert_eq!(app.chat.scroll_y, crate::chat::SCROLL_FOLLOW);
+        assert!(app.chat.is_following_bottom());
+
+        // 4. MouseUp
+        let up_event = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.right() - 1,
+            row: area.bottom() - 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(up_event);
+        assert!(!app.chat.is_dragging_scrollbar);
     }
 }

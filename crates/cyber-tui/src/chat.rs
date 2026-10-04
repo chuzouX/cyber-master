@@ -14,9 +14,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::selection::{ContentCoord, TextSelection};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use cyber_agent::{AttachedImage, Message, ToolCall};
 use ratatui::{
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
@@ -220,7 +222,7 @@ pub fn turn_summary_text(elapsed_ms: u64, finished_at: u64, status: &str) -> Str
 
 /// `scroll_y` 的哨兵值：表示"跟随底部"（auto-follow），流式新内容自动滚到底。
 /// 用 `usize::MAX` 避免额外 `Option` 字段，且任何真实偏移都远小于此值。
-const SCROLL_FOLLOW: usize = usize::MAX;
+pub const SCROLL_FOLLOW: usize = usize::MAX;
 
 /// 工具结果回显折叠阈值：输出行数超过此值时默认折叠为最后 N 行，
 /// 提示 Ctrl+O 展开（参考 Claude Code 的折叠行为）。
@@ -348,7 +350,7 @@ pub struct ChatState {
     /// `Wrap` 重算（O(N)）与全量 clone —— 滚动跟手性的关键。
     /// key = (entries.len, streaming_buffer.len, width)；theme 切换经 `invalidate_cache`
     /// 置 `valid=false` 强制重建。render 以 `&self` 经 `RefCell` 内部可变更新。
-    wrapped: RefCell<WrappedCache>,
+    pub(crate) wrapped: RefCell<WrappedCache>,
     /// 斜杠命令补全菜单状态。
     pub slash_menu: SlashMenu,
     /// 输入历史（↑/↓ 在空输入框时呼出）。
@@ -367,13 +369,22 @@ pub struct ChatState {
     pub attached_images: Vec<AttachedImage>,
     /// 下一个分配的图片序列号（从 1 起始单调自增）。
     pub next_image_id: usize,
+    /// 上一帧渲染的历史区 inner 坐标范围，供鼠标事件判断是否点击滚动条。
+    pub last_history_area: Cell<Rect>,
+    /// 是否正在用鼠标拖拽滚动条。
+    pub is_dragging_scrollbar: bool,
+    /// 当前文本选区。
+    pub selection: Option<TextSelection>,
 }
 
 /// `wrapped` 预折行缓存的载体。
 #[derive(Default)]
-struct WrappedCache {
+pub(crate) struct WrappedCache {
     /// 已折行的单行 `Line`（entries + tail）。
-    lines: Vec<Line<'static>>,
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) source: Vec<Line<'static>>,
+    pub(crate) ends: Vec<usize>,
+    pub(crate) row_ranges: Vec<(usize, usize)>,
     /// 缓存键：(entries.len, streaming_buffer.len, thinking_buffer.len, streaming_tool_output.len, width)。
     key: (usize, usize, usize, usize, u16),
     /// 是否有效（theme 切换等 entries.len 不变但样式需刷新时置 false）。
@@ -407,6 +418,9 @@ impl ChatState {
             todo_closed: false,
             attached_images: Vec::new(),
             next_image_id: 1,
+            last_history_area: Cell::new(Rect::default()),
+            is_dragging_scrollbar: false,
+            selection: None,
         }
     }
 
@@ -463,6 +477,251 @@ impl ChatState {
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_y = SCROLL_FOLLOW;
     }
+    /// 返回历史区最大滚动偏移量。
+    pub fn max_scroll(&self) -> usize {
+        self.last_total_lines
+            .get()
+            .saturating_sub(self.last_visible_height.get())
+    }
+
+    /// 鼠标点击/拖拽滑动条时，根据点击的行坐标重新计算 `scroll_y`。
+    pub fn apply_scrollbar_click(&mut self, row: u16) {
+        let area = self.last_history_area.get();
+        if area.height == 0 {
+            return;
+        }
+        let max_scroll = self.max_scroll();
+        if max_scroll == 0 {
+            return;
+        }
+        let track_h = area.height.saturating_sub(1).max(1) as f64;
+        let rel_y = (row.saturating_sub(area.y) as f64).clamp(0.0, track_h);
+        let progress = rel_y / track_h;
+        let target_pos = (progress * max_scroll as f64).round() as usize;
+        self.scroll_y = if target_pos >= max_scroll {
+            SCROLL_FOLLOW
+        } else {
+            target_pos
+        };
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn copy_selection_to_clipboard(&mut self) -> bool {
+        if let Some(sel) = self.selection.as_ref() {
+            if !sel.is_empty() {
+                let wc = self.wrapped.borrow();
+                let text = crate::selection::extract_text(&wc.source, sel);
+                if !text.is_empty() {
+                    return crate::selection::set_clipboard_text(&text);
+                }
+            }
+        }
+        false
+    }
+
+    pub fn coord_from_viewport(
+        &self,
+        viewport_row: usize,
+        visual_col: u16,
+    ) -> Option<ContentCoord> {
+        let wc = self.wrapped.borrow();
+        if viewport_row >= wc.lines.len() || wc.source.is_empty() {
+            return None;
+        }
+        let line_idx = wc.ends.partition_point(|&end| end <= viewport_row);
+        if line_idx >= wc.source.len() {
+            return None;
+        }
+        let (start_char, end_char) = wc.row_ranges.get(viewport_row).copied()?;
+        if start_char >= end_char {
+            return Some(ContentCoord::new(line_idx, start_char));
+        }
+
+        let line = &wc.source[line_idx];
+        let mut cur_col = 0;
+        let mut current_idx = 0;
+        let target_col = visual_col as usize;
+
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                if current_idx >= start_char && current_idx < end_char {
+                    let w = if ch == '\t' {
+                        1
+                    } else {
+                        UnicodeWidthChar::width(ch).unwrap_or(0)
+                    };
+                    if cur_col + w > target_col {
+                        return Some(ContentCoord::new(line_idx, current_idx));
+                    }
+                    cur_col += w;
+                }
+                current_idx += 1;
+                if current_idx >= end_char {
+                    break;
+                }
+            }
+            if current_idx >= end_char {
+                break;
+            }
+        }
+
+        Some(ContentCoord::new(line_idx, end_char))
+    }
+
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        let area = self.last_history_area.get();
+        if area.height == 0 || area.width == 0 {
+            return false;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if mouse.row >= area.top()
+                    && mouse.row < area.bottom()
+                    && mouse.column >= area.right().saturating_sub(2)
+                    && mouse.column < area.right()
+                {
+                    self.is_dragging_scrollbar = true;
+                    self.apply_scrollbar_click(mouse.row);
+                    return true;
+                }
+
+                let in_history = mouse.row >= area.top()
+                    && mouse.row < area.bottom()
+                    && mouse.column >= area.left()
+                    && mouse.column < area.right();
+
+                let is_shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
+                if in_history {
+                    let total = self.last_total_lines.get();
+                    let visible = self.last_visible_height.get();
+                    let max_scroll = total.saturating_sub(visible);
+                    let offset = self.resolved_scroll_offset(max_scroll);
+                    let rel_row = (mouse.row - area.y) as usize;
+                    let rel_col = mouse.column.saturating_sub(area.x);
+                    let viewport_row = (offset + rel_row).min(total.saturating_sub(1));
+
+                    if let Some(coord) = self.coord_from_viewport(viewport_row, rel_col) {
+                        if is_shift {
+                            if let Some(mut sel) = self.selection.take() {
+                                sel.cursor = coord;
+                                sel.selecting = false;
+                                let wc = self.wrapped.borrow();
+                                let text = crate::selection::extract_text(&wc.source, &sel);
+                                if !text.is_empty() {
+                                    crate::selection::set_clipboard_text(&text);
+                                }
+                                self.selection = Some(sel);
+                            } else {
+                                self.selection = Some(TextSelection::new(coord));
+                            }
+                        } else {
+                            self.selection = Some(TextSelection::new(coord));
+                        }
+                        return true;
+                    }
+                } else {
+                    self.clear_selection();
+                    return true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.is_dragging_scrollbar {
+                    self.apply_scrollbar_click(mouse.row);
+                    return true;
+                }
+
+                if let Some(mut sel) = self.selection.take() {
+                    if sel.selecting {
+                        let total = self.last_total_lines.get();
+                        let visible = self.last_visible_height.get();
+                        let max_scroll = total.saturating_sub(visible);
+
+                        if mouse.row < area.y {
+                            let delta = (area.y.saturating_sub(mouse.row)) as usize;
+                            let speed = delta.clamp(1, 10);
+                            let cur_offset = self.resolved_scroll_offset(max_scroll);
+                            let new_offset = cur_offset.saturating_sub(speed);
+                            self.scroll_y = new_offset;
+                            if let Some(coord) = self.coord_from_viewport(new_offset, 0) {
+                                sel.cursor = coord;
+                            }
+                        } else if mouse.row >= area.y + area.height {
+                            let delta =
+                                (mouse.row.saturating_sub(area.y + area.height) + 1) as usize;
+                            let speed = delta.clamp(1, 10);
+                            let cur_offset = self.resolved_scroll_offset(max_scroll);
+                            let new_offset = (cur_offset + speed).min(max_scroll);
+                            self.scroll_y = if new_offset >= max_scroll {
+                                SCROLL_FOLLOW
+                            } else {
+                                new_offset
+                            };
+                            let bottom_row = (new_offset + visible)
+                                .saturating_sub(1)
+                                .min(total.saturating_sub(1));
+                            if let Some(coord) = self.coord_from_viewport(bottom_row, u16::MAX) {
+                                sel.cursor = coord;
+                            }
+                        } else {
+                            let cur_offset = self.resolved_scroll_offset(max_scroll);
+                            let rel_row = (mouse.row - area.y) as usize;
+                            let rel_col = if mouse.column < area.x {
+                                0
+                            } else if mouse.column >= area.right() {
+                                u16::MAX
+                            } else {
+                                mouse.column - area.x
+                            };
+                            let viewport_row = (cur_offset + rel_row).min(total.saturating_sub(1));
+                            if let Some(coord) = self.coord_from_viewport(viewport_row, rel_col) {
+                                sel.cursor = coord;
+                            }
+                        }
+                        self.selection = Some(sel);
+                        return true;
+                    }
+                    self.selection = Some(sel);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.is_dragging_scrollbar {
+                    self.is_dragging_scrollbar = false;
+                    return true;
+                }
+
+                if let Some(mut sel) = self.selection.take() {
+                    sel.selecting = false;
+                    if sel.is_empty() {
+                        self.selection = None;
+                    } else {
+                        let wc = self.wrapped.borrow();
+                        let text = crate::selection::extract_text(&wc.source, &sel);
+                        if !text.is_empty() {
+                            crate::selection::set_clipboard_text(&text);
+                        }
+                        self.selection = Some(sel);
+                    }
+                    return true;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.has_selection() => {
+                self.copy_selection_to_clipboard();
+                return true;
+            }
+            _ => {}
+        }
+
+        false
+    }
 
     /// 是否正在跟随底部（未上滚）。render 据此决定是否显示"已滚动"指示。
     pub fn is_following_bottom(&self) -> bool {
@@ -513,7 +772,11 @@ impl ChatState {
             );
             if !wc.valid || wc.key != key {
                 let unwrapped = self.build_render_lines(theme, width);
-                wc.lines = wrap_lines(&unwrapped, width as usize);
+                let (wrapped, ends, ranges) = wrap_lines_with_ranges(&unwrapped, width as usize);
+                wc.lines = wrapped;
+                wc.ends = ends;
+                wc.row_ranges = ranges;
+                wc.source = unwrapped;
                 wc.key = key;
                 wc.valid = true;
             }
@@ -1329,17 +1592,26 @@ fn push_thinking_lines_streaming(lines: &mut Vec<Line<'static>>, theme: &Theme, 
 /// 替代 `Paragraph::line_count` + `Wrap` 的每帧 O(N) 重算：折行结果缓存于
 /// `WrappedCache`，render 直接切片可见窗口。样式按 span 边界保留（相邻同 style 字符
 /// 合并为一个 span）。`width == 0` 时不折行（避免除零，回退原样）。
-fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+fn wrap_lines_with_ranges(
+    lines: &[Line<'static>],
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<(usize, usize)>) {
     if width == 0 {
-        return lines.to_vec();
+        let ends: Vec<usize> = (1..=lines.len()).collect();
+        let ranges: Vec<(usize, usize)> = lines
+            .iter()
+            .map(|l| (0, l.spans.iter().map(|s| s.content.chars().count()).sum()))
+            .collect();
+        return (lines.to_vec(), ends, ranges);
     }
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut ends: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut row_ranges: Vec<(usize, usize)> = Vec::new();
+
     for line in lines {
-        // 展平为 (char, 显示宽度, style)，按字符贪婪填行
         let mut cells: Vec<(char, usize, Style)> = Vec::new();
         for span in &line.spans {
             for ch in span.content.chars() {
-                // tab 按 1 列计（与历史区行为一致，避免对齐抖动）
                 let w = if ch == '\t' {
                     1
                 } else {
@@ -1350,24 +1622,29 @@ fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
         }
         if cells.is_empty() {
             out.push(Line::from(""));
+            row_ranges.push((0, 0));
+            ends.push(out.len());
             continue;
         }
         let mut row_spans: Vec<Span<'static>> = Vec::new();
         let mut row_w: usize = 0;
         let mut cur_str = String::new();
         let mut cur_style: Option<Style> = None;
+        let mut start_char = 0;
+        let mut current_char = 0;
+
         for (ch, w, st) in cells {
-            // 当前行非空且加入 ch 会超宽 → 先收尾当前 span 与行
             if !cur_str.is_empty() && row_w + w > width {
                 row_spans.push(Span::styled(
                     std::mem::take(&mut cur_str),
                     cur_style.unwrap_or_default(),
                 ));
                 out.push(Line::from(std::mem::take(&mut row_spans)));
+                row_ranges.push((start_char, current_char));
+                start_char = current_char;
                 row_w = 0;
                 cur_style = None;
             }
-            // style 边界：切出新 span
             if cur_style != Some(st) {
                 if !cur_str.is_empty() {
                     row_spans.push(Span::styled(
@@ -1379,14 +1656,22 @@ fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
             }
             cur_str.push(ch);
             row_w += w;
+            current_char += 1;
         }
-        // 收尾最后一个 span 与行
         if !cur_str.is_empty() {
             row_spans.push(Span::styled(cur_str, cur_style.unwrap_or_default()));
         }
         out.push(Line::from(row_spans));
+        row_ranges.push((start_char, current_char));
+        ends.push(out.len());
     }
-    out
+
+    (out, ends, row_ranges)
+}
+
+#[allow(dead_code)]
+fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    wrap_lines_with_ranges(lines, width).0
 }
 
 /// 把一条 user/assistant/system 文本按行展开为带标签的 `Line`。
@@ -2889,5 +3174,80 @@ mod tests {
         assert_eq!(spans[0].content, "测试图片 ");
         assert_eq!(spans[1].content, "🖼️ [image:1]");
         assert_eq!(spans[2].content, " 内容");
+    }
+    #[test]
+    fn test_chat_state_apply_scrollbar_click() {
+        let mut state = ChatState::new();
+        state.last_history_area.set(Rect::new(1, 2, 78, 10));
+        state.set_scroll_metrics(50, 10);
+        assert_eq!(state.max_scroll(), 40);
+
+        // 点击顶部 (row = 2)
+        state.apply_scrollbar_click(2);
+        assert_eq!(state.scroll_y, 0);
+
+        // 点击中点 (row = 6)
+        state.apply_scrollbar_click(6);
+        assert_eq!(state.scroll_y, 18);
+
+        // 点击底部 (row = 11)
+        state.apply_scrollbar_click(11);
+        assert_eq!(state.scroll_y, SCROLL_FOLLOW);
+
+        // 超出底部
+        state.apply_scrollbar_click(20);
+        assert_eq!(state.scroll_y, SCROLL_FOLLOW);
+
+        // 超出顶部
+        state.apply_scrollbar_click(0);
+        assert_eq!(state.scroll_y, 0);
+    }
+
+    #[test]
+    fn test_chat_state_selection_and_mouse_interaction() {
+        let mut state = ChatState::new();
+        state
+            .entries
+            .push(ChatEntry::User("Hello, world from chat!".into()));
+        state
+            .entries
+            .push(ChatEntry::Assistant("Response from assistant line.".into()));
+
+        let theme = Theme::resolve("cyberpunk");
+        let _ = state.wrapped_lines(&theme, 80);
+        state.last_history_area.set(Rect::new(0, 0, 80, 20));
+        let total = state.wrapped.borrow().lines.len();
+        state.set_scroll_metrics(total, 20);
+
+        // 1. 点击建立选区
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.selection.is_some());
+
+        // 2. 拖拽
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 15,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        state.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 15,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(state.has_selection());
+
+        // 3. 复制选区
+        assert!(state.copy_selection_to_clipboard());
+
+        // 4. 清除选区
+        state.clear_selection();
+        assert!(!state.has_selection());
     }
 }

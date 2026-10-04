@@ -11,7 +11,8 @@ use std::time::Duration;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+        MouseEventKind,
     },
     execute,
     terminal::{
@@ -30,7 +31,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -41,6 +45,9 @@ use crate::cli_commands::{
     self, CliAction, CommandForm, CommandPicker, CompletionItem, PickerKind,
 };
 use crate::headless::{HeadlessOutcome, SessionRunner};
+#[allow(unused_imports)]
+use crate::selection::default_selection_style;
+use crate::selection::{ContentCoord, TextSelection};
 use crate::theme::Theme;
 
 const CY_LOGO: [&str; 5] = [
@@ -533,6 +540,10 @@ struct CliScreen {
     pub next_image_id: usize,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub last_paste_instant: Option<std::time::Instant>,
+    pub history_area: Rect,
+    #[allow(dead_code)]
+    pub selection: Option<TextSelection>,
+    pub is_dragging_scrollbar: bool,
 }
 
 struct FormState {
@@ -785,6 +796,9 @@ impl CliScreen {
             next_image_id: 1,
             last_ctrl_c: None,
             last_paste_instant: None,
+            history_area: Rect::default(),
+            is_dragging_scrollbar: false,
+            selection: None,
         };
         if let Some(info) = cyber_core::update::cached_latest_version() {
             if cyber_core::update::is_newer(cyber_core::update::CURRENT_VERSION, &info.version) {
@@ -1733,6 +1747,291 @@ impl CliScreen {
         self.approval_input.insert_str(choice.label());
     }
 
+    pub(crate) fn apply_scrollbar_click(&mut self, row: u16) {
+        if self.approval.is_some()
+            || self.panel.is_some()
+            || self.form.is_some()
+            || self.settings.is_some()
+        {
+            return;
+        }
+        let area = self.history_area;
+        if area.height == 0 {
+            return;
+        }
+        let track_h = area.height.saturating_sub(1).max(1) as f64;
+        let rel_y = (row.saturating_sub(area.y) as f64).clamp(0.0, track_h);
+        let progress = rel_y / track_h;
+
+        if let Some(view) = self.subagent_view.as_mut() {
+            if view.max_scroll > 0 {
+                let target_pos = (progress * view.max_scroll as f64).round() as usize;
+                view.scroll = view.max_scroll.saturating_sub(target_pos);
+                view.follow_bottom = view.scroll == 0;
+            }
+        } else if self.max_scroll > 0 {
+            let target_pos = (progress * self.max_scroll as f64).round() as usize;
+            self.scroll = self.max_scroll.saturating_sub(target_pos);
+            self.auto_scroll = self.scroll == 0;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn has_selection(&self) -> bool {
+        self.selection.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    #[allow(dead_code)]
+    pub fn copy_selection_to_clipboard(&mut self) -> bool {
+        if let Some(sel) = self.selection.as_ref() {
+            if !sel.is_empty() {
+                let lines: &[Line<'static>] = if let Some(view) = self.subagent_view.as_ref() {
+                    &view.viewport.source
+                } else {
+                    &self.messages
+                };
+                let text = crate::selection::extract_text(lines, sel);
+                if !text.is_empty() {
+                    let ok = crate::selection::set_clipboard_text(&text);
+                    self.status = "✔ 已选中文本并复制到剪贴板".into();
+                    return ok;
+                }
+            }
+        }
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        if self.panel.is_some()
+            || self.settings.is_some()
+            || self.approval.is_some()
+            || self.form.is_some()
+            || self.picker.is_some()
+        {
+            return false;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if mouse.row >= self.history_area.top()
+                    && mouse.row < self.history_area.bottom()
+                    && mouse.column >= self.history_area.right().saturating_sub(2)
+                    && mouse.column < self.history_area.right()
+                {
+                    self.is_dragging_scrollbar = true;
+                    self.apply_scrollbar_click(mouse.row);
+                    return true;
+                }
+
+                let in_history = mouse.row >= self.history_area.top()
+                    && mouse.row < self.history_area.bottom()
+                    && mouse.column >= self.history_area.left()
+                    && mouse.column < self.history_area.right();
+
+                let is_shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
+                if in_history {
+                    let coord_opt = if let Some(view) = self.subagent_view.as_ref() {
+                        let start = view.max_scroll
+                            - if view.follow_bottom {
+                                0
+                            } else {
+                                view.scroll.min(view.max_scroll)
+                            };
+                        let rel_row = (mouse.row - self.history_area.y) as usize;
+                        let rel_col = mouse.column.saturating_sub(self.history_area.x);
+                        let viewport_row =
+                            (start + rel_row).min(view.viewport.rows.len().saturating_sub(1));
+                        view.viewport.coord_from_viewport(viewport_row, rel_col)
+                    } else {
+                        let start = self.max_scroll - self.scroll;
+                        let rel_row = (mouse.row - self.history_area.y) as usize;
+                        let rel_col = mouse.column.saturating_sub(self.history_area.x);
+                        let viewport_row =
+                            (start + rel_row).min(self.history_view.rows.len().saturating_sub(1));
+                        self.history_view.coord_from_viewport(viewport_row, rel_col)
+                    };
+
+                    if let Some(coord) = coord_opt {
+                        if is_shift {
+                            if let Some(mut sel) = self.selection.take() {
+                                sel.cursor = coord;
+                                sel.selecting = false;
+                                let lines: &[Line<'static>] =
+                                    if let Some(view) = self.subagent_view.as_ref() {
+                                        &view.viewport.source
+                                    } else {
+                                        &self.messages
+                                    };
+                                let text = crate::selection::extract_text(lines, &sel);
+                                if !text.is_empty() {
+                                    crate::selection::set_clipboard_text(&text);
+                                    self.status = "✔ 已扩展选区并复制到剪贴板".into();
+                                }
+                                self.selection = Some(sel);
+                            } else {
+                                self.selection = Some(TextSelection::new(coord));
+                                self.auto_scroll = false;
+                            }
+                        } else {
+                            self.selection = Some(TextSelection::new(coord));
+                            self.auto_scroll = false;
+                        }
+                        return true;
+                    }
+                } else {
+                    self.clear_selection();
+                    return true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.is_dragging_scrollbar {
+                    self.apply_scrollbar_click(mouse.row);
+                    return true;
+                }
+
+                if let Some(mut sel) = self.selection.take() {
+                    if sel.selecting {
+                        if mouse.row < self.history_area.y {
+                            let delta = (self.history_area.y.saturating_sub(mouse.row)) as usize;
+                            let speed = delta.clamp(1, 10);
+                            if let Some(view) = self.subagent_view.as_mut() {
+                                view.follow_bottom = false;
+                                view.scroll = (view.scroll + speed).min(view.max_scroll);
+                                let start = view.max_scroll - view.scroll;
+                                if let Some(coord) = view.viewport.coord_from_viewport(start, 0) {
+                                    sel.cursor = coord;
+                                }
+                            } else {
+                                self.auto_scroll = false;
+                                self.scroll =
+                                    self.scroll.saturating_add(speed).min(self.max_scroll);
+                                let viewport_row = self.max_scroll - self.scroll;
+                                if let Some(coord) =
+                                    self.history_view.coord_from_viewport(viewport_row, 0)
+                                {
+                                    sel.cursor = coord;
+                                }
+                            }
+                        } else if mouse.row >= self.history_area.y + self.history_area.height {
+                            let delta = (mouse
+                                .row
+                                .saturating_sub(self.history_area.y + self.history_area.height)
+                                + 1) as usize;
+                            let speed = delta.clamp(1, 10);
+                            if let Some(view) = self.subagent_view.as_mut() {
+                                view.scroll = view.scroll.saturating_sub(speed);
+                                if view.scroll == 0 {
+                                    view.follow_bottom = true;
+                                }
+                                let start = view.max_scroll
+                                    - if view.follow_bottom { 0 } else { view.scroll };
+                                let bottom_row = (start + self.history_area.height as usize)
+                                    .saturating_sub(1)
+                                    .min(view.viewport.rows.len().saturating_sub(1));
+                                if let Some(coord) =
+                                    view.viewport.coord_from_viewport(bottom_row, u16::MAX)
+                                {
+                                    sel.cursor = coord;
+                                }
+                            } else {
+                                self.scroll = self.scroll.saturating_sub(speed);
+                                if self.scroll == 0 {
+                                    self.auto_scroll = true;
+                                }
+                                let start = self.max_scroll - self.scroll;
+                                let bottom_row = (start + self.history_area.height as usize)
+                                    .saturating_sub(1)
+                                    .min(self.history_view.rows.len().saturating_sub(1));
+                                if let Some(coord) =
+                                    self.history_view.coord_from_viewport(bottom_row, u16::MAX)
+                                {
+                                    sel.cursor = coord;
+                                }
+                            }
+                        } else {
+                            let rel_row = (mouse.row - self.history_area.y) as usize;
+                            let rel_col = if mouse.column < self.history_area.x {
+                                0
+                            } else if mouse.column >= self.history_area.right() {
+                                u16::MAX
+                            } else {
+                                mouse.column - self.history_area.x
+                            };
+                            if let Some(view) = self.subagent_view.as_ref() {
+                                let start = view.max_scroll
+                                    - if view.follow_bottom {
+                                        0
+                                    } else {
+                                        view.scroll.min(view.max_scroll)
+                                    };
+                                let viewport_row = (start + rel_row)
+                                    .min(view.viewport.rows.len().saturating_sub(1));
+                                if let Some(coord) =
+                                    view.viewport.coord_from_viewport(viewport_row, rel_col)
+                                {
+                                    sel.cursor = coord;
+                                }
+                            } else {
+                                let start = self.max_scroll - self.scroll;
+                                let viewport_row = (start + rel_row)
+                                    .min(self.history_view.rows.len().saturating_sub(1));
+                                if let Some(coord) =
+                                    self.history_view.coord_from_viewport(viewport_row, rel_col)
+                                {
+                                    sel.cursor = coord;
+                                }
+                            }
+                        }
+                        self.selection = Some(sel);
+                        return true;
+                    }
+                    self.selection = Some(sel);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.is_dragging_scrollbar {
+                    self.is_dragging_scrollbar = false;
+                    return true;
+                }
+
+                if let Some(mut sel) = self.selection.take() {
+                    sel.selecting = false;
+                    if sel.is_empty() {
+                        self.selection = None;
+                    } else {
+                        let lines: &[Line<'static>] =
+                            if let Some(view) = self.subagent_view.as_ref() {
+                                &view.viewport.source
+                            } else {
+                                &self.messages
+                            };
+                        let text = crate::selection::extract_text(lines, &sel);
+                        if !text.is_empty() {
+                            crate::selection::set_clipboard_text(&text);
+                            self.status = "✔ 已选中文本并复制到剪贴板".into();
+                        }
+                        self.selection = Some(sel);
+                    }
+                    return true;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.has_selection() => {
+                self.copy_selection_to_clipboard();
+                return true;
+            }
+            _ => {}
+        }
+
+        false
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let win_title = crate::history::terminal_window_title(
             self.busy,
@@ -1911,6 +2210,7 @@ impl CliScreen {
             Constraint::Length(1),
         ])
         .split(area);
+        self.history_area = sections[1];
         // 子代理覆盖视图：panel/approval 打开时隐藏但不丢状态；run 从快照消失
         // 时防御性退出（归档条目会话级不回删，属纯防御）。
         let mut view_run: Option<SubagentRun> = None;
@@ -1989,17 +2289,40 @@ impl CliScreen {
             if view.scroll == 0 {
                 view.follow_bottom = true;
             }
-            let window = scroll_window(
-                &view.viewport.rows,
-                sections[1].height as usize,
-                view.scroll,
-                view.follow_bottom,
+            let start = view.max_scroll
+                - if view.follow_bottom {
+                    0
+                } else {
+                    view.scroll.min(view.max_scroll)
+                };
+            let window = view.viewport.window_with_selection(
+                start,
+                sections[1].height,
+                self.selection.as_ref(),
+                default_selection_style(),
             );
             frame.render_widget(Paragraph::new(window), sections[1]);
+            if view.max_scroll > 0 {
+                let mut scrollbar_state = ScrollbarState::new(view.max_scroll)
+                    .position(view.max_scroll.saturating_sub(view.scroll));
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█")
+                    .track_style(Style::default().fg(Color::DarkGray))
+                    .thumb_style(Style::default().fg(ACCENT));
+                frame.render_stateful_widget(scrollbar, sections[1], &mut scrollbar_state);
+            }
         } else {
             let start = self.max_scroll - self.scroll;
             frame.render_widget(
-                Paragraph::new(self.history_view.window(start, sections[1].height)),
+                Paragraph::new(self.history_view.window_with_selection(
+                    start,
+                    sections[1].height,
+                    self.selection.as_ref(),
+                    default_selection_style(),
+                )),
                 sections[1],
             );
             if self.messages.is_empty() && !self.busy && sections[1].height >= 4 {
@@ -2039,6 +2362,18 @@ impl CliScreen {
                     );
                 }
                 frame.render_widget(Paragraph::new(welcome), sections[1]);
+            }
+            if self.max_scroll > 0 {
+                let mut scrollbar_state = ScrollbarState::new(self.max_scroll)
+                    .position(self.max_scroll.saturating_sub(self.scroll));
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█")
+                    .track_style(Style::default().fg(Color::DarkGray))
+                    .thumb_style(Style::default().fg(ACCENT));
+                frame.render_stateful_widget(scrollbar, sections[1], &mut scrollbar_state);
             }
         }
         if self.approval.is_none()
@@ -5908,6 +6243,7 @@ struct WrappedViewport {
     source: Vec<Line<'static>>,
     ends: Vec<usize>,
     rows: Vec<Line<'static>>,
+    row_ranges: Vec<(usize, usize)>,
 }
 
 impl WrappedViewport {
@@ -5927,7 +6263,9 @@ impl WrappedViewport {
         self.width = width;
         self.source.truncate(unchanged);
         self.ends.truncate(unchanged);
-        self.rows.truncate(self.ends.last().copied().unwrap_or(0));
+        let valid_rows = self.ends.last().copied().unwrap_or(0);
+        self.rows.truncate(valid_rows);
+        self.row_ranges.truncate(valid_rows);
         let full_width = usize::from(width).max(1);
         let padding = usize::from(self.padding).min(full_width.saturating_sub(1) / 2);
         let width = full_width.saturating_sub(padding * 2).max(1);
@@ -5937,6 +6275,8 @@ impl WrappedViewport {
                 row.spans.push(Span::raw(" ".repeat(padding)));
             }
             let mut used = 0;
+            let mut current_char = 0;
+            let mut start_char = 0;
             for span in &line.spans {
                 let mut text = String::new();
                 for ch in span.content.chars() {
@@ -5954,6 +6294,8 @@ impl WrappedViewport {
                             ));
                         }
                         self.rows.push(row);
+                        self.row_ranges.push((start_char, current_char));
+                        start_char = current_char;
                         row = Line::default().style(line.style);
                         if padding > 0 {
                             row.spans.push(Span::raw(" ".repeat(padding)));
@@ -5966,6 +6308,7 @@ impl WrappedViewport {
                         text.push(ch);
                     }
                     used += columns;
+                    current_char += 1;
                 }
                 if !text.is_empty() {
                     row.spans.push(Span::styled(text, span.style));
@@ -5977,9 +6320,63 @@ impl WrappedViewport {
                 ));
             }
             self.rows.push(row);
+            self.row_ranges.push((start_char, current_char));
             self.source.push(line.clone());
             self.ends.push(self.rows.len());
         }
+    }
+
+    #[allow(dead_code)]
+    fn coord_from_viewport(&self, viewport_row: usize, visual_col: u16) -> Option<ContentCoord> {
+        use unicode_width::UnicodeWidthChar;
+
+        if viewport_row >= self.rows.len() || self.source.is_empty() {
+            return None;
+        }
+        let line_idx = self.ends.partition_point(|&end| end <= viewport_row);
+        if line_idx >= self.source.len() {
+            return None;
+        }
+        let (start_char, end_char) = self.row_ranges.get(viewport_row).copied()?;
+        if start_char >= end_char {
+            return Some(ContentCoord::new(line_idx, start_char));
+        }
+
+        let padding = usize::from(self.padding);
+        let col = usize::from(visual_col);
+        if col <= padding {
+            return Some(ContentCoord::new(line_idx, start_char));
+        }
+        let target_col = col - padding;
+
+        let line = &self.source[line_idx];
+        let mut cur_col = 0;
+        let mut current_idx = 0;
+
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                if current_idx >= start_char && current_idx < end_char {
+                    let w = if ch == '\t' {
+                        4
+                    } else {
+                        ch.width().unwrap_or(0)
+                    };
+                    if cur_col + w > target_col {
+                        return Some(ContentCoord::new(line_idx, current_idx));
+                    }
+                    cur_col += w;
+                }
+                current_idx += 1;
+                if current_idx >= end_char {
+                    break;
+                }
+            }
+            if current_idx >= end_char {
+                break;
+            }
+        }
+
+        Some(ContentCoord::new(line_idx, end_char))
     }
 
     fn window(&self, start: usize, height: u16) -> Vec<Line<'static>> {
@@ -5989,6 +6386,44 @@ impl WrappedViewport {
             .take(height as usize)
             .cloned()
             .collect()
+    }
+
+    #[allow(dead_code)]
+    fn window_with_selection(
+        &self,
+        start: usize,
+        height: u16,
+        sel: Option<&TextSelection>,
+        sel_style: Style,
+    ) -> Vec<Line<'static>> {
+        let count = height as usize;
+        let mut result = Vec::with_capacity(count);
+
+        for row_idx in start..(start + count).min(self.rows.len()) {
+            let row = &self.rows[row_idx];
+            if let Some(selection) = sel {
+                if !selection.is_empty() {
+                    let line_idx = self.ends.partition_point(|&end| end <= row_idx);
+                    if let Some(&(char_start, char_end)) = self.row_ranges.get(row_idx) {
+                        let highlighted = crate::selection::apply_selection_to_row_full(
+                            row,
+                            char_start,
+                            char_end,
+                            line_idx,
+                            selection,
+                            sel_style,
+                            usize::from(self.padding),
+                            self.source.get(line_idx),
+                        );
+                        result.push(highlighted);
+                        continue;
+                    }
+                }
+            }
+            result.push(row.clone());
+        }
+
+        result
     }
 }
 
@@ -6245,7 +6680,9 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                         }
                                     }
                                 }
-                                _ => {}
+                                _ => {
+                                    screen.handle_mouse(mouse);
+                                }
                             }
                         }
                         Some(Ok(_)) => {}
@@ -6474,9 +6911,18 @@ fn handle_key(
     if key.code != KeyCode::Char('d') || !key.modifiers.is_empty() {
         screen.delete_pending = None;
     }
+    if key.code == KeyCode::Esc && screen.has_selection() {
+        screen.clear_selection();
+        return Ok(false);
+    }
 
     let is_ctrl_c = control && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C'));
     if is_ctrl_c {
+        if screen.has_selection() {
+            screen.copy_selection_to_clipboard();
+            screen.clear_selection();
+            return Ok(false);
+        }
         if screen.approval.is_some() {
             screen.reply(PermissionDecision::Deny);
         }
@@ -9438,8 +9884,13 @@ mod tests {
 
         // 起始行完全静止，没有被顶上去
         assert_eq!(start_0, start_1);
-        // 且可见内容完全一致
-        assert_eq!(rendered_0, rendered_1);
+        // 且正文文本完全一致（忽略最右侧随总行数动态调整的滚动条滑块）
+        let clean = |s: &str| -> Vec<String> {
+            s.lines()
+                .map(|l| l.trim_end_matches(['│', '█', ' ']).to_string())
+                .collect()
+        };
+        assert_eq!(clean(&rendered_0), clean(&rendered_1));
         assert!(!screen.auto_scroll);
 
         // 用户按多次 Down 回到底部
@@ -11644,10 +12095,12 @@ mod tests {
         let content_0: Vec<_> = rendered_0
             .lines()
             .filter(|l| l.contains("token line"))
+            .map(|l| l.trim_end_matches(['│', '█', ' ']))
             .collect();
         let content_1: Vec<_> = rendered_1
             .lines()
             .filter(|l| l.contains("token line"))
+            .map(|l| l.trim_end_matches(['│', '█', ' ']))
             .collect();
         assert_eq!(content_0, content_1);
 
@@ -12032,5 +12485,444 @@ mod tests {
             screen.subagents.snapshot()[1].status,
             SubagentStatus::Killed
         );
+    }
+    #[tokio::test]
+    async fn test_scrollbar_rendering_and_mouse_drag_scrolling() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        for i in 0..50 {
+            screen
+                .messages
+                .push(Line::raw(format!("line message {i:02}")));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        assert!(screen.max_scroll > 0);
+        assert_eq!(screen.scroll, 0);
+        assert!(screen.auto_scroll);
+        let area = screen.history_area;
+        assert!(area.height > 0);
+
+        let buffer = terminal.backend().buffer();
+        let scrollbar_col = area.right().saturating_sub(1);
+        let mut has_track = false;
+        let mut has_thumb = false;
+        for row in area.top()..area.bottom() {
+            let sym = buffer[(scrollbar_col, row)].symbol();
+            if sym == "│" {
+                has_track = true;
+            } else if sym == "█" {
+                has_thumb = true;
+            }
+        }
+        assert!(has_track || has_thumb);
+        assert!(has_thumb, "初始底部态应有滑块");
+
+        let bottom_sym = buffer[(scrollbar_col, area.bottom() - 1)].symbol();
+        assert_eq!(bottom_sym, "█", "底部态滑块应在最底端");
+
+        // 1. 模拟鼠标点击滑动条顶部
+        screen.apply_scrollbar_click(area.top());
+        assert_eq!(screen.scroll, screen.max_scroll);
+        assert!(!screen.auto_scroll);
+
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+        let buffer_top = terminal.backend().buffer();
+        let top_sym = buffer_top[(scrollbar_col, area.top())].symbol();
+        assert_eq!(top_sym, "█", "点击顶部后滑块应在最顶端");
+
+        // 2. 模拟鼠标拖拽至中点
+        let mid_row = area.top() + area.height / 2;
+        screen.apply_scrollbar_click(mid_row);
+        let half_max = screen.max_scroll / 2;
+        let diff = (screen.scroll as isize - half_max as isize).abs();
+        assert!(
+            diff <= 3,
+            "拖拽至中点 scroll ({}) 应该接近 50% ({})",
+            screen.scroll,
+            half_max
+        );
+        assert!(!screen.auto_scroll);
+
+        // 3. 模拟拖拽回底部
+        screen.apply_scrollbar_click(area.bottom() - 1);
+        assert_eq!(screen.scroll, 0);
+        assert!(screen.auto_scroll);
+
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn test_subagent_view_scrollbar_rendering_and_mouse_click() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("agent-scrollbar-test");
+        for i in 0..50 {
+            screen
+                .subagents
+                .append_line(run_id, format!("agent token {i:02}"));
+        }
+        screen.subagent_view = Some(SubagentViewState {
+            run_id,
+            follow_bottom: true,
+            scroll: 0,
+            tools_expanded: false,
+            built: None,
+            viewport: WrappedViewport {
+                padding: 1,
+                ..WrappedViewport::default()
+            },
+            max_scroll: 0,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let area = screen.history_area;
+        let view = screen.subagent_view.as_ref().unwrap();
+        assert!(view.max_scroll > 0);
+        assert_eq!(view.scroll, 0);
+        assert!(view.follow_bottom);
+
+        let buffer = terminal.backend().buffer();
+        let scrollbar_col = area.right().saturating_sub(1);
+        let bottom_sym = buffer[(scrollbar_col, area.bottom() - 1)].symbol();
+        assert_eq!(bottom_sym, "█", "子代理视图底部态滑块应在最底端");
+
+        // 点击顶部
+        screen.apply_scrollbar_click(area.top());
+        let view = screen.subagent_view.as_ref().unwrap();
+        assert_eq!(view.scroll, view.max_scroll);
+        assert!(!view.follow_bottom);
+
+        // 点击底部恢复
+        screen.apply_scrollbar_click(area.bottom() - 1);
+        let view = screen.subagent_view.as_ref().unwrap();
+        assert_eq!(view.scroll, 0);
+        assert!(view.follow_bottom);
+
+        drop(runner);
+    }
+
+    #[test]
+    fn test_wrapped_viewport_coord_and_text_extraction() {
+        let mut vp = WrappedViewport {
+            padding: 1,
+            ..WrappedViewport::default()
+        };
+        let lines = vec![
+            Line::from("Hello, world!"),
+            Line::from("\tTabbed line"),
+            Line::from("你好，世界！Cyber Master"),
+        ];
+        vp.update(&lines, 20);
+
+        let c0 = vp.coord_from_viewport(0, 0).unwrap();
+        assert_eq!(c0, ContentCoord::new(0, 0));
+
+        let c1 = vp.coord_from_viewport(0, 1).unwrap();
+        assert_eq!(c1, ContentCoord::new(0, 0));
+
+        let c2 = vp.coord_from_viewport(0, 2).unwrap();
+        assert_eq!(c2, ContentCoord::new(0, 1));
+
+        let c_tab1 = vp.coord_from_viewport(1, 1).unwrap();
+        assert_eq!(c_tab1, ContentCoord::new(1, 0));
+        let c_tab2 = vp.coord_from_viewport(1, 4).unwrap();
+        assert_eq!(c_tab2, ContentCoord::new(1, 0));
+        let c_tab3 = vp.coord_from_viewport(1, 5).unwrap();
+        assert_eq!(c_tab3, ContentCoord::new(1, 1));
+
+        let c_cjk0 = vp.coord_from_viewport(2, 1).unwrap();
+        assert_eq!(c_cjk0, ContentCoord::new(2, 0));
+        let c_cjk1 = vp.coord_from_viewport(2, 2).unwrap();
+        assert_eq!(c_cjk1, ContentCoord::new(2, 0));
+        let c_cjk2 = vp.coord_from_viewport(2, 3).unwrap();
+        assert_eq!(c_cjk2, ContentCoord::new(2, 1));
+
+        let sel = TextSelection {
+            anchor: ContentCoord::new(0, 7),
+            cursor: ContentCoord::new(2, 2),
+            selecting: false,
+        };
+        let extracted = crate::selection::extract_text(&vp.source, &sel);
+        assert_eq!(extracted, "world!\n\tTabbed line\n你好");
+    }
+
+    #[tokio::test]
+    async fn test_selection_invariance_on_scroll_stream_and_resize() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        for i in 0..10 {
+            screen.message(
+                "Assistant",
+                &format!("Message content number {i:02} for testing invariance."),
+                ACCENT,
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let anchor = ContentCoord::new(2, 8);
+        let cursor = ContentCoord::new(2, 25);
+        screen.selection = Some(TextSelection {
+            anchor,
+            cursor,
+            selecting: false,
+        });
+
+        let text_initial =
+            crate::selection::extract_text(&screen.messages, screen.selection.as_ref().unwrap());
+        assert_eq!(text_initial, "content number 00");
+
+        // 1. 模拟滚轮上滚滚动 5 行
+        screen.scroll = 5;
+        screen.auto_scroll = false;
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, anchor);
+        assert_eq!(sel.cursor, cursor);
+        let text_after_scroll = crate::selection::extract_text(&screen.messages, sel);
+        assert_eq!(text_after_scroll, "content number 00");
+
+        // 2. 模拟大模型流式追加 50 条新消息
+        for i in 10..60 {
+            screen.message(
+                "Assistant",
+                &format!("Streaming new token and chunk {i:02}"),
+                ACCENT,
+            );
+        }
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let sel_after_stream = screen.selection.as_ref().unwrap();
+        assert_eq!(sel_after_stream.anchor, anchor);
+        assert_eq!(sel_after_stream.cursor, cursor);
+        let text_after_stream = crate::selection::extract_text(&screen.messages, sel_after_stream);
+        assert_eq!(text_after_stream, "content number 00");
+
+        // 3. 模拟窗口缩放 (80 -> 40 列宽) 触发重新折行
+        terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let sel_after_resize = screen.selection.as_ref().unwrap();
+        assert_eq!(sel_after_resize.anchor, anchor);
+        assert_eq!(sel_after_resize.cursor, cursor);
+        let text_after_resize = crate::selection::extract_text(&screen.messages, sel_after_resize);
+        assert_eq!(text_after_resize, "content number 00");
+
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn test_mouse_edge_drag_dynamic_acceleration() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        for i in 0..100 {
+            screen.message("Assistant", &format!("Line {i:03} content text"), ACCENT);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let area = screen.history_area;
+        assert!(screen.max_scroll >= 20);
+
+        let mid_row = area.y + area.height / 2;
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 5,
+            row: mid_row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(screen.selection.is_some());
+        let sel = screen.selection.as_ref().unwrap();
+        assert!(sel.selecting);
+        let init_anchor = sel.anchor;
+
+        // 1. 向上拖拽超出顶边界 1 行 (row = area.y - 1)
+        let old_scroll = screen.scroll;
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 5,
+            row: area.y.saturating_sub(1),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(screen.scroll, old_scroll + 1);
+
+        // 2. 向上拖拽超出顶边界 5 行 (row = area.y - 5)
+        let old_scroll_5 = screen.scroll;
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 5,
+            row: area.y.saturating_sub(5),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(screen.scroll, old_scroll_5 + 5);
+
+        let current_sel = screen.selection.as_ref().unwrap();
+        assert_eq!(current_sel.anchor, init_anchor);
+        assert!(current_sel.cursor.line_idx <= init_anchor.line_idx);
+
+        // 3. 向下拖拽超出底边界 3 行
+        let old_scroll_down = screen.scroll;
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 5,
+            row: area.y + area.height + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(screen.scroll, old_scroll_down.saturating_sub(3));
+
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn test_mouse_shift_click_cross_screen_expansion() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        for i in 0..120 {
+            screen.message("Assistant", &format!("Numbered message row {i:03}"), ACCENT);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let area = screen.history_area;
+
+        screen.scroll = screen.max_scroll;
+        screen.auto_scroll = false;
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let anchor_coord = ContentCoord::new(2, 0);
+        screen.selection = Some(TextSelection::new(anchor_coord));
+
+        // 模拟滚轮向下滚动多屏直达底部，让 anchor 彻底滚出视口几屏之远
+        screen.scroll = 0;
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        // 按住 Shift 在当前视口靠后位置发送 Down(MouseButton::Left)
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.right() - 5,
+            row: area.bottom() - 2,
+            modifiers: KeyModifiers::SHIFT,
+        });
+
+        let sel = screen.selection.as_ref().unwrap();
+        assert_eq!(sel.anchor, anchor_coord);
+        assert!(sel.cursor.line_idx > 40);
+
+        let multi_page_text = crate::selection::extract_text(&screen.messages, sel);
+        assert!(multi_page_text.contains("Numbered message row 000"));
+        assert!(multi_page_text.contains("Numbered message row 040"));
+        assert_eq!(screen.status, "✔ 已扩展选区并复制到剪贴板");
+
+        drop(runner);
+    }
+
+    #[tokio::test]
+    async fn test_mouse_click_clear_drag_selection_and_key_shortcuts() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        screen.message(
+            "Assistant",
+            "Quick brown fox jumps over the lazy dog.",
+            ACCENT,
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+
+        let area = screen.history_area;
+
+        // 1. 单击同一坐标：选区应当自动清除
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 3,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(screen.selection.is_some());
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x + 3,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(screen.selection.is_none());
+
+        // 2. 拖拽不同坐标：生成非空选区并复制
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 15,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        screen.handle_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x + 15,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(screen.has_selection());
+        assert_eq!(screen.status, "✔ 已选中文本并复制到剪贴板");
+
+        // 3. 有选区时按 Ctrl+C：复制并清除选区，不退出程序
+        let mut runner_opt = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let res = handle_key(
+            &mut screen,
+            ctrl_c,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        );
+        assert!(!res.unwrap());
+        assert!(!screen.has_selection());
+
+        // 4. 有选区时按 Esc：直接清除选区
+        screen.selection = Some(TextSelection {
+            anchor: ContentCoord::new(0, 0),
+            cursor: ContentCoord::new(0, 5),
+            selecting: false,
+        });
+        assert!(screen.has_selection());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let res_esc = handle_key(
+            &mut screen,
+            esc,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        );
+        assert!(!res_esc.unwrap());
+        assert!(!screen.has_selection());
     }
 }
