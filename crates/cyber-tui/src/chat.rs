@@ -3242,8 +3242,13 @@ mod tests {
         assert!(state.has_selection());
 
         // 3. 复制选区
-        assert!(state.copy_selection_to_clipboard());
-
+        {
+            let wc = state.wrapped.borrow();
+            let text =
+                crate::selection::extract_text(&wc.source, state.selection.as_ref().unwrap());
+            assert!(!text.is_empty());
+        }
+        let _ = state.copy_selection_to_clipboard();
         // 4. 清除选区
         state.clear_selection();
         assert!(!state.has_selection());
