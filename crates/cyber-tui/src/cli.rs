@@ -79,7 +79,7 @@ struct TerminalSession;
 
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn restore_terminal() {
+pub fn restore_terminal() {
     if !TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
         return;
     }
@@ -194,10 +194,10 @@ impl SettingsTab {
 
     pub fn max_row(self, state: &CliSettingsState) -> usize {
         match self {
-            Self::AgentModel => 6, // 0..=6 (7 rows)
-            Self::UiWorkflow => 6, // 0..=6 (7 rows)
-            Self::Subagents => 4,  // 0..=4 (5 rows)
-            Self::ToolsMcp => 1,   // 0..=1 (2 editable toggles)
+            Self::AgentModel => 11, // 0..=11 (12 rows)
+            Self::UiWorkflow => 6,  // 0..=6 (7 rows)
+            Self::Subagents => 4,   // 0..=4 (5 rows)
+            Self::ToolsMcp => 1,    // 0..=1 (2 editable toggles)
             Self::Providers => state.providers_draft.providers.len().saturating_sub(1),
             Self::EnvMemory => {
                 let env_count = state.config_draft.env.vars.len();
@@ -213,6 +213,7 @@ impl SettingsTab {
 pub struct McpServerSummary {
     pub name: String,
     pub connected: bool,
+    pub tool_count: usize,
     pub detail: String,
 }
 
@@ -277,11 +278,13 @@ impl CliSettingsState {
                 .servers
                 .into_iter()
                 .map(|s| {
-                    let connected = runner
-                        .registries
-                        .mcp
-                        .as_ref()
-                        .is_some_and(|m| m.server_names().contains(&s.name.as_str()));
+                    let (connected, tool_count) = match runner.registries.mcp.as_ref() {
+                        Some(m) => match m.tool_count(&s.name) {
+                            Some(c) => (true, c),
+                            None => (false, 0),
+                        },
+                        None => (false, 0),
+                    };
                     let detail = match &s.transport {
                         cyber_mcp::McpTransport::Stdio => {
                             format!("stdio: {}", s.command.as_deref().unwrap_or(""))
@@ -293,6 +296,7 @@ impl CliSettingsState {
                     McpServerSummary {
                         name: s.name,
                         connected,
+                        tool_count,
                         detail,
                     }
                 })
@@ -345,6 +349,9 @@ impl CliSettingsState {
                 self.config_draft.agent.max_steps = default.agent.max_steps;
                 self.config_draft.agent.thinking_intensity = default.agent.thinking_intensity;
                 self.config_draft.tools.web_search = default.tools.web_search;
+                self.config_draft.agent.vision = default.agent.vision;
+                self.config_draft.agent.retry_attempts = default.agent.retry_attempts;
+                self.config_draft.agent.retry_delay_secs = default.agent.retry_delay_secs;
             }
             SettingsTab::UiWorkflow => {
                 self.config_draft.ui = default.ui;
@@ -430,6 +437,7 @@ struct SubagentViewState {
     /// 只用 len 会导致运行后期视图停止更新。
     built: Option<(u16, bool, u64)>,
     viewport: WrappedViewport,
+    max_scroll: usize,
 }
 
 /// 后台任务面板交互状态（结构同子代理面板）。
@@ -467,6 +475,7 @@ struct CliScreen {
     status: String,
     scroll: usize,
     max_scroll: usize,
+    pub auto_scroll: bool,
     history_view: WrappedViewport,
     approval_scroll: usize,
     approval_max_scroll: usize,
@@ -520,6 +529,10 @@ struct CliScreen {
     subagent_view: Option<SubagentViewState>,
     /// 检测到的新版本（若有新版本则为 Some(ver)，在顶栏黄色标出）
     pub new_version: Option<String>,
+    pub attached_images: Vec<cyber_agent::AttachedImage>,
+    pub next_image_id: usize,
+    pub last_ctrl_c: Option<std::time::Instant>,
+    pub last_paste_instant: Option<std::time::Instant>,
 }
 
 struct FormState {
@@ -586,6 +599,58 @@ impl CliScreen {
         }
     }
 
+    fn attach_image(
+        &mut self,
+        path: impl Into<std::path::PathBuf>,
+        display_name: impl Into<String>,
+    ) -> usize {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.attached_images
+            .push(cyber_agent::AttachedImage::new(id, path, display_name));
+        self.input.insert_str(format!("[image:{id}]"));
+        self.completion_closed = false;
+        self.completion_accepted = false;
+        id
+    }
+
+    fn expand_attached_placeholders(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut last_end = 0;
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        let mut referenced_ids = std::collections::HashSet::new();
+
+        while i < len {
+            if bytes[i] == b'[' {
+                let rest = &text[i + 1..];
+                if rest.to_ascii_lowercase().starts_with("image:") {
+                    let prefix_len = 1 + "image:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Ok(id) = spec.parse::<usize>() {
+                            if let Some(att) = self.attached_images.iter().find(|a| a.id == id) {
+                                out.push_str(&text[last_end..i]);
+                                out.push_str(&format!("[image: {}]", att.path.display()));
+                                referenced_ids.insert(id);
+                                last_end = end;
+                                i = end;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.push_str(&text[last_end..]);
+        self.attached_images
+            .retain(|a| referenced_ids.contains(&a.id));
+        out
+    }
+
     fn update_completions(&mut self, runner: Option<&SessionRunner>) {
         let input = &self.input.lines()[0];
         self.completions = if input.starts_with('/') {
@@ -640,6 +705,7 @@ impl CliScreen {
             status: String::new(),
             scroll: 0,
             max_scroll: 0,
+            auto_scroll: true,
             history_view: WrappedViewport {
                 padding: 1,
                 ..WrappedViewport::default()
@@ -715,6 +781,10 @@ impl CliScreen {
             jobs_panel: None,
             subagent_view: None,
             new_version: None,
+            attached_images: Vec::new(),
+            next_image_id: 1,
+            last_ctrl_c: None,
+            last_paste_instant: None,
         };
         if let Some(info) = cyber_core::update::cached_latest_version() {
             if cyber_core::update::is_newer(cyber_core::update::CURRENT_VERSION, &info.version) {
@@ -854,11 +924,15 @@ impl CliScreen {
             self.assistant_label_shown = false;
             let style = Style::default().fg(FG).bg(USER_BG);
             self.messages.push(Line::styled("", style));
-            self.messages.extend(
-                clean(text)
-                    .lines()
-                    .map(|line| Line::styled(line.to_owned(), style)),
-            );
+            for line in clean(text).lines() {
+                if line.contains("[image:") {
+                    let mut spans = Vec::new();
+                    Self::render_cli_text_with_image_badges(&mut spans, line, style);
+                    self.messages.push(Line::from(spans).style(style));
+                } else {
+                    self.messages.push(Line::styled(line.to_owned(), style));
+                }
+            }
             self.messages.push(Line::styled("", style));
             return;
         }
@@ -878,6 +952,178 @@ impl CliScreen {
                 Style::default().fg(if label == "You" { CLI_THEME.fg } else { color }),
             )
         }));
+    }
+
+    fn render_cli_text_with_image_badges(
+        spans: &mut Vec<Span<'static>>,
+        text: &str,
+        default_style: Style,
+    ) {
+        let mut last_end = 0;
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            if bytes[i] == b'[' {
+                let rest = &text[i + 1..];
+                if rest.to_ascii_lowercase().starts_with("image:") {
+                    let prefix_len = 1 + "image:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Ok(id) = spec.parse::<usize>() {
+                            if i > last_end {
+                                spans.push(Span::styled(
+                                    text[last_end..i].to_string(),
+                                    default_style,
+                                ));
+                            }
+                            spans.push(Span::styled(
+                                format!("🖼️ [image:{id}]"),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(Color::Rgb(112, 48, 160))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            last_end = end;
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if last_end < text.len() {
+            spans.push(Span::styled(text[last_end..].to_string(), default_style));
+        }
+    }
+
+    fn handle_text_image_paste(&mut self, text: &str) -> bool {
+        let trimmed = text.trim();
+        let unquoted = trimmed
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| {
+                trimmed
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+            })
+            .or_else(|| trimmed.strip_prefix('“').and_then(|s| s.strip_suffix('”')))
+            .unwrap_or(trimmed)
+            .trim();
+
+        if unquoted.is_empty() || unquoted.contains('\n') {
+            return false;
+        }
+
+        let is_url = unquoted.starts_with("http://") || unquoted.starts_with("https://");
+        let p = std::path::Path::new(unquoted);
+        if is_url && cyber_agent::vision::is_image_extension(p) {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image.png");
+            let id = self.attach_image(unquoted, name);
+            self.status = format!("🖼️ 已记录图片，生成标识符 [image:{id}]");
+            return true;
+        }
+        if cyber_agent::vision::is_image_extension(p) {
+            let full = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::path::Path::new(&self.cwd).join(p)
+            };
+            if full.exists() && full.is_file() {
+                let name = full
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image.png");
+                let id = self.attach_image(&full, name);
+                self.status = format!("🖼️ 已记录图片，生成标识符 [image:{id}]");
+                return true;
+            }
+        }
+        false
+    }
+
+    fn handle_clipboard_image_only(&mut self) -> bool {
+        if self
+            .last_paste_instant
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+        {
+            return false;
+        }
+        let mut cb_res = arboard::Clipboard::new();
+        for _ in 0..5 {
+            if cb_res.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cb_res = arboard::Clipboard::new();
+        }
+        if let Ok(mut cb) = cb_res {
+            if let Ok(img) = cb.get_image() {
+                let width = img.width as u32;
+                let height = img.height as u32;
+                let png_bytes = crate::chat::encode_rgba_to_png(width, height, &img.bytes);
+
+                let cache_dir = cyber_core::Paths::detect()
+                    .map(|p| p.cyber_home)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join("cache")
+                    .join("images");
+                let _ = std::fs::create_dir_all(&cache_dir);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let id = self.next_image_id;
+                let file_name = format!("clip_{}_{}.png", timestamp, id);
+                let file_path = cache_dir.join(&file_name);
+
+                if let Ok(()) = std::fs::write(&file_path, png_bytes) {
+                    self.attach_image(&file_path, file_name);
+                    self.status = format!("🖼️ 已粘贴图片，生成标识符 [image:{id}]");
+                    self.last_paste_instant = Some(std::time::Instant::now());
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn handle_clipboard_image_or_text(&mut self) -> bool {
+        if self
+            .last_paste_instant
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+        {
+            return false;
+        }
+        if self.handle_clipboard_image_only() {
+            return true;
+        }
+        let mut cb_res = arboard::Clipboard::new();
+        for _ in 0..5 {
+            if cb_res.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cb_res = arboard::Clipboard::new();
+        }
+        if let Ok(mut cb) = cb_res {
+            if let Ok(text) = cb.get_text() {
+                self.last_paste_instant = Some(std::time::Instant::now());
+                if self.handle_text_image_paste(&text) {
+                    return true;
+                }
+                self.insert_text(&text);
+                return true;
+            }
+        }
+        false
     }
 
     fn tool_width(&self) -> u16 {
@@ -1133,6 +1379,7 @@ impl CliScreen {
             .unwrap_or(0)
     }
 
+    #[allow(dead_code)]
     fn footer(&self) -> String {
         let todo_sum = self.todo_summary();
         if !self.has_run {
@@ -1193,6 +1440,176 @@ impl CliScreen {
             footer.push_str(&format!(" · {}", clean(&self.status)));
         }
         footer
+    }
+
+    fn footer_status_style(&self) -> Style {
+        let s = self.status.as_str();
+        if s.contains("Cancelling")
+            || s.contains("失败")
+            || s.contains("Error")
+            || s.contains("Cannot")
+        {
+            Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
+        } else if s == "Working"
+            || s == "Thinking"
+            || s == "Responding"
+            || s.starts_with("Tool")
+            || s.starts_with("Running")
+            || s.starts_with("Compacting")
+            || s.contains("重试")
+        {
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            // 操作反馈提示（如 Model selected, CTF mode updated, Vision engine enabled 等）：
+            // 采用鲜明的高亮电光青色 (RGB 80, 240, 220) 配合粗体，形成极高对比度，清晰醒目！
+            Style::default()
+                .fg(Color::Rgb(80, 240, 220))
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    fn footer_line(&self) -> Line<'static> {
+        let todo_sum = self.todo_summary();
+        let status_style = self.footer_status_style();
+
+        if !self.has_run {
+            if self.approval.is_some() {
+                return Line::from(vec![Span::styled(
+                    "  permission required · 1/2/3 select · Enter confirm · Esc deny",
+                    Style::default().fg(DIM),
+                )]);
+            } else if !todo_sum.is_empty() {
+                let mut spans = vec![Span::styled(
+                    format!("  {todo_sum}"),
+                    Style::default().fg(DIM),
+                )];
+                if !self.status.is_empty() {
+                    spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
+                    spans.push(Span::styled(clean(&self.status), status_style));
+                }
+                if !self.auto_scroll && self.scroll > 0 {
+                    spans.push(Span::styled(
+                        " · [↑自动滚动已暂停 · 按 End 恢复]",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                return Line::from(spans);
+            } else if !self.status.is_empty() {
+                let mut spans = vec![
+                    Span::styled("  ", Style::default().fg(DIM)),
+                    Span::styled(clean(&self.status), status_style),
+                ];
+                if !self.auto_scroll && self.scroll > 0 {
+                    spans.push(Span::styled(
+                        " · [↑自动滚动已暂停 · 按 End 恢复]",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                return Line::from(spans);
+            } else if !self.auto_scroll && self.scroll > 0 {
+                return Line::from(vec![
+                    Span::styled("  ", Style::default().fg(DIM)),
+                    Span::styled(
+                        "[↑自动滚动已暂停 · 按 End 恢复]",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+            } else {
+                return Line::default();
+            }
+        }
+
+        let context = self
+            .context_length
+            .filter(|length| *length > 0)
+            .map(|length| {
+                let length = u128::from(length);
+                format!(
+                    "{}%",
+                    (length.saturating_sub(self.used_tokens as u128) * 100) / length
+                )
+            })
+            .unwrap_or_else(|| "--".into());
+        let cache_total = self.cache_hit_tokens.saturating_add(self.cache_miss_tokens);
+        let cache = if cache_total > 0 {
+            format!(
+                "{:.1}%",
+                self.cache_hit_tokens as f64 / cache_total as f64 * 100.0
+            )
+        } else {
+            "--".into()
+        };
+        let (input, output) = if self.usage_reported {
+            (
+                token_count(self.prompt_tokens),
+                token_count(self.completion_tokens),
+            )
+        } else {
+            ("--".into(), "--".into())
+        };
+        let mode_label = self.permission_mode.label();
+
+        let mut spans = vec![Span::styled(
+            format!(
+                "  {} · {} │ ctx {context} │ cache {cache} │ ↑{input} ↓{output} │ 模式: {mode_label} (F2)",
+                clean(&self.provider),
+                clean(&self.model)
+            ),
+            Style::default().fg(DIM),
+        )];
+
+        if !todo_sum.is_empty() {
+            spans.push(Span::styled(
+                format!(" │ {todo_sum}"),
+                Style::default().fg(DIM),
+            ));
+        }
+
+        if self.approval.is_some() {
+            spans.push(Span::styled(
+                " · permission required · 1/2/3 select · Enter confirm · Esc deny",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" · {} · Ctrl+C to cancel", clean(&self.status)),
+                status_style,
+            ));
+        } else if !self.status.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(DIM)));
+            spans.push(Span::styled(clean(&self.status), status_style));
+        }
+
+        if !self.auto_scroll && self.scroll > 0 {
+            spans.push(Span::styled(
+                " · [↑自动滚动已暂停 · 按 End 恢复]",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        Line::from(spans)
+    }
+    fn append_ctf_mode_badge(&self, line: Line<'static>, width: usize) -> Line<'static> {
+        let badge_text = "CTF model";
+        let badge_style = Style::default()
+            .fg(Color::Rgb(254, 188, 56))
+            .add_modifier(Modifier::BOLD);
+        let line_w = line.width();
+        let badge_w = 9;
+        let mut spans = line.spans;
+        if width > line_w + badge_w + 3 {
+            let pad = width - line_w - badge_w - 3;
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(badge_text, badge_style));
+            spans.push(Span::raw("   "));
+        } else if width > line_w + badge_w {
+            let pad = width.saturating_sub(line_w + badge_w);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(badge_text, badge_style));
+        } else {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(badge_text, badge_style));
+        }
+        Line::from(spans)
     }
 
     fn event(&mut self, event: AgentEvent) {
@@ -1276,6 +1693,27 @@ impl CliScreen {
                 self.busy = false;
                 self.thinking_started = None;
                 self.message("Error", &error, ERROR);
+            }
+            AgentEvent::Retry {
+                attempt,
+                max_retries,
+                delay_secs,
+                error,
+            } => {
+                self.has_run = true;
+                if let Some(start) = self.response_start {
+                    let rollback_to =
+                        start.saturating_sub(if self.assistant_label_shown { 2 } else { 0 });
+                    self.messages.truncate(rollback_to);
+                    self.stream.clear();
+                    self.response_start = None;
+                    self.assistant_label_shown = false;
+                }
+                self.thinking_started = None;
+                self.status = format!(
+                    "连接中断，正在重试 ({attempt}/{max_retries}) · {delay_secs}s 后重试: {}",
+                    clean(&error)
+                );
             }
             _ => {}
         }
@@ -1498,12 +1936,30 @@ impl CliScreen {
         // 对话自身的 history_view/scroll 照常更新（视图期间不渲染，但返回时
         // 保证对话内容最新）。
         self.history_view.update(&self.messages, sections[1].width);
-        self.max_scroll = self
+        let new_max_scroll = self
             .history_view
             .rows
             .len()
             .saturating_sub(sections[1].height as usize);
+
+        if new_max_scroll > self.max_scroll {
+            let delta = new_max_scroll - self.max_scroll;
+            if self.auto_scroll {
+                // 处于自动滚动跟随态：保持紧贴最新底部
+                self.scroll = 0;
+            } else {
+                // 处于上滚阅读态（自动滚动已暂停）：
+                // 视口起始行 start = max_scroll - scroll 必须保持完全静止！
+                // 由于 max_scroll 增加了 delta，将 self.scroll 同步增加 delta，
+                // 使得 start_new = (max_scroll + delta) - (scroll + delta) = max_scroll - scroll = start_old
+                self.scroll = (self.scroll + delta).min(new_max_scroll);
+            }
+        }
+        self.max_scroll = new_max_scroll;
         self.scroll = self.scroll.min(self.max_scroll);
+        if self.scroll == 0 {
+            self.auto_scroll = true;
+        }
         if let (Some(view), Some(run)) = (self.subagent_view.as_mut(), view_run.as_ref()) {
             let key = (
                 sections[1].width,
@@ -1514,6 +1970,24 @@ impl CliScreen {
                 let lines = build_subagent_view_lines(run, view.tools_expanded, sections[1].width);
                 view.viewport.update(&lines, sections[1].width);
                 view.built = Some(key);
+            }
+            let new_max = view
+                .viewport
+                .rows
+                .len()
+                .saturating_sub(sections[1].height as usize);
+            if new_max > view.max_scroll {
+                let delta = new_max - view.max_scroll;
+                if view.follow_bottom {
+                    view.scroll = 0;
+                } else {
+                    view.scroll = (view.scroll + delta).min(new_max);
+                }
+            }
+            view.max_scroll = new_max;
+            view.scroll = view.scroll.min(view.max_scroll);
+            if view.scroll == 0 {
+                view.follow_bottom = true;
             }
             let window = scroll_window(
                 &view.viewport.rows,
@@ -1660,14 +2134,14 @@ impl CliScreen {
             secret,
             self.busy,
         );
-        let mut footer: Vec<Line<'static>> = vec![Line::from(self.footer())];
+        let mut footer: Vec<Line<'static>> = vec![self.footer_line()];
         if self.approval.is_some() {
             footer = vec![Line::from(
                 "  permission required · 1/2/3 select · Enter confirm · Esc deny",
             )];
         } else if let Some(run) = view_run.as_ref() {
             let (badge, badge_color) = subagent_badge(run.status);
-            footer = vec![Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" #{} {} · ", run.id, single_line(&run.name)),
                     Style::default().fg(DIM),
@@ -1680,12 +2154,22 @@ impl CliScreen {
                     ),
                     Style::default().fg(DIM),
                 ),
-            ])];
+            ];
+            if let Some(view) = &self.subagent_view {
+                if !view.follow_bottom && view.scroll > 0 {
+                    spans.push(Span::styled(
+                        "· [↑自动滚动已暂停 · 按 End 恢复]",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            footer = vec![Line::from(spans)];
         }
-        frame.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(DIM)),
-            sections[4],
-        );
+        if self.ctf_enabled {
+            let last_line = footer.pop().unwrap_or_default();
+            footer.push(self.append_ctf_mode_badge(last_line, sections[4].width as usize));
+        }
+        frame.render_widget(Paragraph::new(footer), sections[4]);
         if let Some(request) = &self.approval {
             if self.approval_nonce != request.nonce {
                 self.approval_nonce.clone_from(&request.nonce);
@@ -3703,6 +4187,59 @@ fn draw_tab_agent_model(
             "启用/禁用 web_fetch 外部网络查询工具".into(),
             area.width,
         ),
+        render_setting_row(
+            settings.selected_row == 7,
+            "自适应识图引擎 (Vision Engine)",
+            if settings.config_draft.agent.vision.enabled {
+                "[ ● 开启 ]".into()
+            } else {
+                "[ ○ 关闭 ]".into()
+            },
+            "遇图像输入时自适应探测模型能力或图生文解析".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 8,
+            "识图专用服务商 (Vision Provider)",
+            format!(
+                "◄ [ {} ] ►",
+                if settings.config_draft.agent.vision.provider.is_empty() {
+                    "自动选择"
+                } else {
+                    &settings.config_draft.agent.vision.provider
+                }
+            ),
+            "◄/► 切换用于图生文分析的专属服务商".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 9,
+            "识图专用模型 (Vision Model)",
+            if settings.config_draft.agent.vision.model.is_empty() {
+                "跟随服务商默认模型".into()
+            } else {
+                settings.config_draft.agent.vision.model.clone()
+            },
+            "图生文降级专用视觉模型（/vision model 细调）".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 10,
+            "异常重试次数 (Retry Attempts)",
+            format!("◄ [ {} 次 ] ►", settings.config_draft.agent.retry_attempts),
+            "◄/► 调整 (范围: 0-20 次，0 为不重试)".into(),
+            area.width,
+        ),
+        render_setting_row(
+            settings.selected_row == 11,
+            "重试时间间隔 (Retry Interval)",
+            format!(
+                "◄ [ {} 秒 ] ►",
+                settings.config_draft.agent.retry_delay_secs
+            ),
+            "◄/► 调整 (范围: 1-60 秒)".into(),
+            area.width,
+        ),
     ];
 
     render_scrollable_content(
@@ -3909,7 +4446,14 @@ fn draw_tab_tools_mcp(
     } else {
         for s in settings.mcp_servers.iter().take(3) {
             let status_badge = if s.connected {
-                Span::styled(" [ ● 已连接 ] ", Style::default().fg(SUCCESS))
+                if s.tool_count == 0 {
+                    Span::styled(" [ ● 已连接 (0 工具) ] ", Style::default().fg(ACCENT))
+                } else {
+                    Span::styled(
+                        format!(" [ ● 已连接 ({} 工具) ] ", s.tool_count),
+                        Style::default().fg(SUCCESS),
+                    )
+                }
             } else {
                 Span::styled(" [ ○ 未连接 ] ", Style::default().fg(DIM))
             };
@@ -3923,6 +4467,12 @@ fn draw_tab_tools_mcp(
                 Span::raw(" "),
                 Span::styled(&s.detail, Style::default().fg(DIM)),
             ]));
+            if s.connected && s.tool_count == 0 {
+                lines.push(Line::styled(
+                    "      提示: 0 个工具。若该服务为 SSE 端点，请将 transport 改为 sse",
+                    Style::default().fg(ACCENT),
+                ));
+            }
         }
     }
 
@@ -3967,12 +4517,12 @@ fn draw_tab_providers(frame: &mut Frame, area: Rect, settings: &CliSettingsState
 
     let header_text = if total_provs > 1 {
         format!(
-            "  已配置服务商列表 [{}/{} 项 · ↑/↓ 切换焦点] (按 Enter 设为默认 · A 添加 · E 编辑 · D 删除):",
+            "  已配置服务商列表 [{}/{} 项 · ↑/↓ 切换焦点] (按 Enter 设为默认 · A 预设/协议添加 · T 连通测活 · M 模型 · E 编辑 · D 删除):",
             (settings.selected_row + 1).min(total_provs),
             total_provs
         )
     } else {
-        "  已配置服务商列表 (按 Enter 设为默认 · A 添加 · E 编辑 · D 删除):".to_string()
+        "  已配置服务商列表 (按 Enter 设为默认 · A 预设/协议添加 · T 连通测活 · M 模型 · E 编辑 · D 删除):".to_string()
     };
 
     let mut lines = vec![
@@ -4501,7 +5051,7 @@ fn draw_settings_panel(
         SettingsTab::UiWorkflow => "💡 提示: 若需使用终端原生划词复制功能，可在此处将鼠标捕获关闭。主题与鼠标即时生效。",
         SettingsTab::Subagents => "💡 提示: 子任务并发数受本地 CPU 与服务商 API 频率限制，推荐配置为 2~6 个并发。",
         SettingsTab::ToolsMcp => "💡 提示: MCP 服务器配置存储于 mcp.json，可输入 /mcp 查看详细状态或通过配置文件增删。",
-        SettingsTab::Providers => "💡 提示: 按 Enter 即可快速将高亮服务商切换为全局默认 Provider；按 A 键可打开表单添加服务商。",
+        SettingsTab::Providers => "💡 提示: 按 Enter 即可快速将高亮服务商切换为全局默认 Provider；按 A 键可打开预设/自定义向导添加服务商，T 键测试连通性，M 键浏览模型。",
         SettingsTab::EnvMemory => "💡 提示: 标记为脱敏保护的环境变量在终端界面和日志中均会自动遮蔽，保障凭据安全。",
         SettingsTab::StorageSystem => "💡 提示: 日志级别调整后将在后台日志中实时生效；如需排查详细工具执行流，建议调至 debug 级别。",
     };
@@ -4511,11 +5061,29 @@ fn draw_settings_panel(
     );
 
     let buttons = match settings.tab {
-        SettingsTab::Providers => Line::from(vec![
+        SettingsTab::Providers if chunks[4].width < 100 => Line::from(vec![
             Span::styled(
                 " [ A 添加 ] ",
                 Style::default().fg(CODE).add_modifier(Modifier::BOLD),
             ),
+            Span::raw(" "),
+            Span::styled(" [ T 测活 ] ", Style::default().fg(ACCENT)),
+            Span::raw(" "),
+            Span::styled(" [ E 编辑 ] ", Style::default().fg(CODE)),
+            Span::raw(" "),
+            Span::styled(" [ D 删除 ] ", Style::default().fg(ERROR)),
+            Span::raw(" "),
+            Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
+        ]),
+        SettingsTab::Providers => Line::from(vec![
+            Span::styled(
+                " [ A 预设/自定义添加 ] ",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ T 连通测速 ] ", Style::default().fg(ACCENT)),
+            Span::raw(" "),
+            Span::styled(" [ M 查看模型 ] ", Style::default().fg(CODE)),
             Span::raw(" "),
             Span::styled(" [ E 编辑 ] ", Style::default().fg(CODE)),
             Span::raw(" "),
@@ -4559,7 +5127,7 @@ fn draw_settings_panel(
     frame.render_widget(Paragraph::new(buttons), chunks[4]);
 
     let nav_hint = match settings.tab {
-        SettingsTab::Providers => "操作: ↑/↓ 选择服务商 · Enter 设为默认 · A/E/D 管理 · Tab 切换分类 · 1-7 直达分类 · Esc 关闭",
+        SettingsTab::Providers => "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭",
         SettingsTab::EnvMemory => "操作: ↑/↓ 选择项目 · A/D 增删 · Space 切换脱敏/启用 · Tab 切换分类 · 1-7 直达 · Esc 关闭",
         _ => "操作: ↑/↓ 选择项目 · ←/→ 微调数值 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭",
     };
@@ -4863,6 +5431,67 @@ fn handle_settings_key(
                     settings.dirty = true;
                 }
             }
+            7 => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                ) {
+                    settings.config_draft.agent.vision.enabled =
+                        !settings.config_draft.agent.vision.enabled;
+                    settings.dirty = true;
+                }
+            }
+            8 => {
+                let mut names = vec!["".to_string()];
+                names.extend(settings.providers_draft.sorted_names());
+                let cur_idx = names
+                    .iter()
+                    .position(|n| n == &settings.config_draft.agent.vision.provider)
+                    .unwrap_or(0);
+                let next_idx = match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => (cur_idx + names.len() - 1) % names.len(),
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        (cur_idx + 1) % names.len()
+                    }
+                    _ => cur_idx,
+                };
+                if next_idx != cur_idx {
+                    settings.config_draft.agent.vision.provider = names[next_idx].clone();
+                    settings.dirty = true;
+                }
+            }
+            9 => {}
+            10 => {
+                let step = if shift { 5 } else { 1 };
+                let cur = settings.config_draft.agent.retry_attempts;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.retry_attempts = cur.saturating_sub(step);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.retry_attempts = (cur + step).min(20);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            11 => {
+                let step = if shift { 5 } else { 1 };
+                let cur = settings.config_draft.agent.retry_delay_secs;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        settings.config_draft.agent.retry_delay_secs =
+                            cur.saturating_sub(step).max(1);
+                        settings.dirty = true;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        settings.config_draft.agent.retry_delay_secs = (cur + step).min(60);
+                        settings.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         },
         SettingsTab::UiWorkflow => match settings.selected_row {
@@ -5068,11 +5697,55 @@ fn handle_settings_key(
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         if let Some(r) = runner.as_mut() {
-                            if let Ok(CliAction::Form(form)) =
-                                cli_commands::execute(r, "/provider add")
+                            if let Ok(CliAction::Picker(p)) =
+                                cli_commands::execute(r, "/provider wizard")
                             {
-                                screen.form = Some(FormState::new(form));
-                                screen.panel = None;
+                                screen.picker = Some(p);
+                                screen.picker_selected = 0;
+                            }
+                        }
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        if let Some(cfg) = settings.providers_draft.providers.get(name).cloned() {
+                            let target_name = name.clone();
+                            screen.status = format!("正在测试服务商 [{name}] 连通性与网络延迟...");
+                            let start = std::time::Instant::now();
+                            let res = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current()
+                                    .block_on(cyber_agent::fetch_models(&cfg))
+                            });
+                            let rtt = start.elapsed().as_millis();
+                            match res {
+                                Ok(models) => {
+                                    screen.message(
+                                        "Ping",
+                                        &format!(
+                                            "🟢 [{target_name}] 连通正常 (延迟: {rtt}ms，发现 {} 款可用模型)",
+                                            models.len()
+                                        ),
+                                        SUCCESS,
+                                    );
+                                    screen.status =
+                                        format!("服务商 [{target_name}] 连通正常 ({rtt}ms)");
+                                }
+                                Err(e) => {
+                                    screen.message(
+                                        "Ping",
+                                        &format!("🔴 [{target_name}] 连通失败 ({rtt}ms): {e}"),
+                                        ERROR,
+                                    );
+                                    screen.status = format!("服务商 [{target_name}] 连通失败");
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        if let Some(r) = runner.as_mut() {
+                            if let Ok(CliAction::Picker(p)) =
+                                cli_commands::execute(r, &format!("/model {name}"))
+                            {
+                                screen.picker = Some(p);
+                                screen.picker_selected = 0;
                             }
                         }
                     }
@@ -5104,9 +5777,9 @@ fn handle_settings_key(
                 }
             } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
                 if let Some(r) = runner.as_mut() {
-                    if let Ok(CliAction::Form(form)) = cli_commands::execute(r, "/provider add") {
-                        screen.form = Some(FormState::new(form));
-                        screen.panel = None;
+                    if let Ok(CliAction::Picker(p)) = cli_commands::execute(r, "/provider wizard") {
+                        screen.picker = Some(p);
+                        screen.picker_selected = 0;
                     }
                 }
             }
@@ -5360,8 +6033,20 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
         });
     }
     let result = async {
+        #[cfg(windows)]
+        let mut was_ctrl_v_down = false;
         loop {
             tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    if let Some(cancel_tx) = cancel.take() {
+                        let _ = cancel_tx.send(());
+                        screen.queued_prompts.clear();
+                        screen.status = "Cancelling (再按一次 Ctrl+C 强制退出)".into();
+                    } else {
+                        break;
+                    }
+                }
                 Some(new_ver) = update_rx.recv() => {
                     if screen.new_version.as_deref() != Some(&new_ver) {
                         screen.new_version = Some(new_ver.clone());
@@ -5375,6 +6060,15 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                 _ = tick.tick() => {
                     if !TERMINAL_ACTIVE.load(Ordering::SeqCst) {
                         color_eyre::eyre::bail!("A task panicked; the terminal was restored. See the diagnostic above.");
+                    }
+                    #[cfg(windows)]
+                    if crate::win_paste::check_ctrl_v_rising_edge(&mut was_ctrl_v_down)
+                        && crate::win_paste::is_terminal_foreground()
+                        && screen.approval.is_none()
+                        && screen.form.is_none()
+                        && screen.handle_clipboard_image_only()
+                    {
+                        screen.update_completions(runner.as_ref());
                     }
                     if let Some(text) = paste.flush_if_stale() {
                         screen.insert_text(&text);
@@ -5471,7 +6165,29 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                             if handle_key(&mut screen, key, &mut runner, &permissions, &event_tx, &mut active, &mut cancel)? { break; }
                         }
                         Some(Ok(Event::Paste(text))) => {
-                            if let Some(text) = paste.flush() { screen.insert_text(&text); }
+                            if let Some(buffered) = paste.flush() {
+                                screen.insert_text(&buffered);
+                            }
+                            if screen
+                                .last_paste_instant
+                                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+                            {
+                                continue;
+                            }
+                            screen.last_paste_instant = Some(std::time::Instant::now());
+                            if text.trim().is_empty() {
+                                if screen.handle_clipboard_image_only() {
+                                    screen.completion_closed = false;
+                                    screen.completion_accepted = false;
+                                    screen.update_completions(runner.as_ref());
+                                    continue;
+                                }
+                            } else if screen.handle_text_image_paste(&text) {
+                                screen.completion_closed = false;
+                                screen.completion_accepted = false;
+                                screen.update_completions(runner.as_ref());
+                                continue;
+                            }
                             screen.insert_text(&text);
                             screen.completion_closed = false;
                             screen.completion_accepted = false;
@@ -5490,8 +6206,13 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                         screen.approval_scroll = screen.approval_scroll.saturating_sub(3);
                                     } else if let Some(view) = screen.subagent_view.as_mut() {
                                         view.follow_bottom = false;
-                                        view.scroll = view.scroll.saturating_add(3);
+                                        view.scroll = if view.max_scroll > 0 {
+                                            view.scroll.saturating_add(3).min(view.max_scroll)
+                                        } else {
+                                            view.scroll.saturating_add(3)
+                                        };
                                     } else {
+                                        screen.auto_scroll = false;
                                         screen.scroll = screen.scroll.saturating_add(3).min(screen.max_scroll);
                                     }
                                 }
@@ -5513,9 +6234,15 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                     } else if let Some(view) = screen.subagent_view.as_mut() {
                                         if !view.follow_bottom {
                                             view.scroll = view.scroll.saturating_sub(3);
+                                            if view.scroll == 0 {
+                                                view.follow_bottom = true;
+                                            }
                                         }
                                     } else {
                                         screen.scroll = screen.scroll.saturating_sub(3);
+                                        if screen.scroll == 0 {
+                                            screen.auto_scroll = true;
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -5553,7 +6280,12 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     }
     // 后台任务 detached 持有 registry clone：进程退出前显式终止运行中任务。
     screen.background.kill_all();
-    result
+    restore_terminal();
+    if let Err(e) = result {
+        eprintln!("[error] {e}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 /// 把后台任务（子代理或命令）的完成状态格式化为：
@@ -5742,6 +6474,55 @@ fn handle_key(
     if key.code != KeyCode::Char('d') || !key.modifiers.is_empty() {
         screen.delete_pending = None;
     }
+
+    let is_ctrl_c = control && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C'));
+    if is_ctrl_c {
+        if screen.approval.is_some() {
+            screen.reply(PermissionDecision::Deny);
+        }
+        if let Some(cancel_tx) = cancel.take() {
+            let _ = cancel_tx.send(());
+            screen.queued_prompts.clear();
+            screen.status = "Cancelling (再按一次 Ctrl+C 强制退出)".into();
+            screen.last_ctrl_c = Some(std::time::Instant::now());
+            return Ok(false);
+        } else if screen.busy || screen.status.contains("Cancelling") {
+            return Ok(true);
+        } else if !screen.busy {
+            if screen.panel.is_some()
+                || screen.settings.is_some()
+                || screen.form.is_some()
+                || screen.picker.is_some()
+                || screen.subagent_view.is_some()
+            {
+                screen.panel = None;
+                screen.settings = None;
+                screen.form = None;
+                screen.picker = None;
+                screen.subagent_panel = None;
+                screen.jobs_panel = None;
+                screen.subagent_view = None;
+                screen.status = "已关闭面板 (再按一次 Ctrl+C 退出程序)".into();
+                screen.last_ctrl_c = Some(std::time::Instant::now());
+                return Ok(false);
+            }
+            if screen.input.is_empty() {
+                return Ok(true);
+            }
+            if screen
+                .last_ctrl_c
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(1500))
+            {
+                return Ok(true);
+            }
+            screen.last_ctrl_c = Some(std::time::Instant::now());
+            screen.input = composer();
+            screen.completions.clear();
+            screen.status = "已清空输入 (再按一次 Ctrl+C 退出程序)".into();
+            return Ok(false);
+        }
+        return Ok(true);
+    }
     if screen.approval.is_some() && key.code == KeyCode::Esc {
         screen.reply(PermissionDecision::Deny);
         return Ok(false);
@@ -5757,6 +6538,22 @@ fn handle_key(
     if control && key.code == KeyCode::Char('l') {
         screen.needs_clear = true;
         return Ok(false);
+    }
+    let is_v = key.code == KeyCode::Char('v') || key.code == KeyCode::Char('V');
+    if is_v
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT))
+    {
+        if screen
+            .last_paste_instant
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
+        {
+            return Ok(false);
+        }
+        if screen.handle_clipboard_image_or_text() {
+            screen.update_completions(runner.as_ref());
+            return Ok(false);
+        }
     }
     if screen.panel == Some(Panel::Settings) {
         return handle_settings_key(screen, runner, permissions, key);
@@ -5949,6 +6746,7 @@ fn handle_key(
                             padding: 1,
                             ..WrappedViewport::default()
                         },
+                        max_scroll: 0,
                     });
                 }
                 _ => {}
@@ -6042,24 +6840,43 @@ fn handle_key(
             match key.code {
                 KeyCode::Up => {
                     view.follow_bottom = false;
-                    view.scroll = view.scroll.saturating_add(1);
+                    view.scroll = if view.max_scroll > 0 {
+                        view.scroll.saturating_add(1).min(view.max_scroll)
+                    } else {
+                        view.scroll.saturating_add(1)
+                    };
                     intercepted = true;
                 }
                 KeyCode::Down => {
                     if !view.follow_bottom {
                         view.scroll = view.scroll.saturating_sub(1);
+                        if view.scroll == 0 {
+                            view.follow_bottom = true;
+                        }
                     }
                     intercepted = true;
                 }
                 KeyCode::PageUp => {
                     view.follow_bottom = false;
-                    view.scroll = view.scroll.saturating_add(10);
+                    view.scroll = if view.max_scroll > 0 {
+                        view.scroll.saturating_add(10).min(view.max_scroll)
+                    } else {
+                        view.scroll.saturating_add(10)
+                    };
                     intercepted = true;
                 }
                 KeyCode::PageDown => {
                     if !view.follow_bottom {
                         view.scroll = view.scroll.saturating_sub(10);
+                        if view.scroll == 0 {
+                            view.follow_bottom = true;
+                        }
                     }
+                    intercepted = true;
+                }
+                KeyCode::Home => {
+                    view.follow_bottom = false;
+                    view.scroll = view.max_scroll;
                     intercepted = true;
                 }
                 KeyCode::End => {
@@ -6084,9 +6901,8 @@ fn handle_key(
             return Ok(false);
         }
     }
-    let is_ctrl_c = control && key.code == KeyCode::Char('c');
     let is_esc = key.code == KeyCode::Esc;
-    if is_ctrl_c || is_esc {
+    if is_esc {
         if screen.approval.is_none() && (screen.form.is_some() || screen.picker.is_some()) {
             screen.form = None;
             screen.picker = None;
@@ -6096,20 +6912,7 @@ fn handle_key(
         screen.reply(PermissionDecision::Deny);
         if let Some(cancel) = cancel.take() {
             let _ = cancel.send(());
-            if is_ctrl_c {
-                screen.queued_prompts.clear();
-                screen.status = "Cancelling (按 Ctrl+C 强制退出)".into();
-            } else {
-                screen.status = "Cancelling".into();
-            }
-        } else if is_ctrl_c && (screen.busy || screen.status.contains("Cancelling")) {
-            return Ok(true);
-        } else if !screen.busy {
-            if screen.input.is_empty() && is_ctrl_c {
-                return Ok(true);
-            }
-            screen.input = composer();
-            screen.completions.clear();
+            screen.status = "Cancelling".into();
         }
         return Ok(false);
     }
@@ -6185,11 +6988,25 @@ fn handle_key(
         && screen.picker.is_none()
     {
         if key.code == KeyCode::Up {
+            screen.auto_scroll = false;
             screen.scroll = screen.scroll.saturating_add(1).min(screen.max_scroll);
             return Ok(false);
         }
         if key.code == KeyCode::Down {
             screen.scroll = screen.scroll.saturating_sub(1);
+            if screen.scroll == 0 {
+                screen.auto_scroll = true;
+            }
+            return Ok(false);
+        }
+        if key.code == KeyCode::Home {
+            screen.auto_scroll = false;
+            screen.scroll = screen.max_scroll;
+            return Ok(false);
+        }
+        if key.code == KeyCode::End {
+            screen.scroll = 0;
+            screen.auto_scroll = true;
             return Ok(false);
         }
     } else if screen.approval.is_none()
@@ -6237,6 +7054,7 @@ fn handle_key(
         if screen.approval.is_some() {
             screen.approval_scroll = screen.approval_scroll.saturating_sub(10);
         } else {
+            screen.auto_scroll = false;
             screen.scroll = screen.scroll.saturating_add(10).min(screen.max_scroll);
         }
         return Ok(false);
@@ -6249,6 +7067,9 @@ fn handle_key(
                 .min(screen.approval_max_scroll);
         } else {
             screen.scroll = screen.scroll.saturating_sub(10);
+            if screen.scroll == 0 {
+                screen.auto_scroll = true;
+            }
         }
         return Ok(false);
     }
@@ -6511,6 +7332,23 @@ fn handle_key(
                 }
                 return Ok(false);
             }
+
+            let lower = text.to_ascii_lowercase();
+            if lower == "/subagents stop" || lower.starts_with("/subagents stop ") {
+                screen.input = composer();
+                screen.completions.clear();
+                let target = lower.strip_prefix("/subagents stop").unwrap_or("").trim();
+                let message = match cli_commands::stop_subagents(
+                    &screen.background,
+                    &screen.subagents,
+                    target,
+                ) {
+                    Ok(msg) => msg,
+                    Err(err) => err.to_string(),
+                };
+                screen.message("Subagents", &message, ACCENT);
+                return Ok(false);
+            }
             return Ok(false);
         }
 
@@ -6523,6 +7361,7 @@ fn handle_key(
             screen.history_index = None;
             screen.saved_draft.clear();
             screen.scroll = 0;
+            screen.auto_scroll = true;
             screen.status = "已立即打断并读取新指示…".into();
             screen.reply(PermissionDecision::Deny);
             if let Some(tx) = cancel.take() {
@@ -6542,6 +7381,7 @@ fn handle_key(
             screen.history_index = None;
             screen.saved_draft.clear();
             screen.scroll = 0;
+            screen.auto_scroll = true;
             screen.status = "已追加指示（下一步自动读取）".into();
             if let Some(tx) = &screen.active_steering_tx {
                 let _ = tx.send(text.to_owned());
@@ -6557,6 +7397,22 @@ fn handle_key(
     screen.input = composer();
     screen.completions.clear();
     if text.starts_with('/') {
+        if text.eq_ignore_ascii_case("/paste")
+            || text.eq_ignore_ascii_case("/image")
+            || text.eq_ignore_ascii_case("/image paste")
+        {
+            if screen.handle_clipboard_image_or_text() {
+                screen.update_completions(runner.as_ref());
+                return Ok(false);
+            } else {
+                screen.message(
+                    "Error",
+                    "剪贴板中未检测到图片。\n提示：\n1. Windows Terminal 会拦截 Ctrl+V，请按 Alt+V 粘贴图片！\n2. 或使用 /image <路径|URL> 指定图片路径。",
+                    ERROR,
+                );
+                return Ok(false);
+            }
+        }
         if let Some(owner) = runner.as_mut() {
             match cli_commands::execute(owner, text) {
                 Ok(action) => {
@@ -6616,12 +7472,14 @@ fn spawn_turn(
             .collect::<Vec<(String, String)>>(),
     );
     screen.background_env = Some(background_env);
+    let expanded = screen.expand_attached_placeholders(&prompt);
     if !displayed {
         screen.message("You", &prompt, ACCENT);
         screen.prompt_history.push(prompt.clone());
         screen.history_index = None;
         screen.saved_draft.clear();
         screen.scroll = 0;
+        screen.auto_scroll = true;
     }
     screen.has_run = true;
     screen.busy = true;
@@ -6637,7 +7495,7 @@ fn spawn_turn(
     let intensity = screen.effort;
     *active = Some(tokio::spawn(async move {
         let outcome = owned
-            .run_turn_ui(prompt, intensity, permissions, events, rx, Some(s_rx))
+            .run_turn_ui(expanded, intensity, permissions, events, rx, Some(s_rx))
             .await;
         (owned, outcome)
     }));
@@ -6741,6 +7599,19 @@ fn apply_action(
                     &Config::default(),
                     &ProvidersConfig::default(),
                 ));
+            }
+            screen.panel = Some(Panel::Settings);
+        }
+        CliAction::SettingsTab(tab) => {
+            if let Some(owner) = runner.as_ref() {
+                let mut settings = CliSettingsState::from_runner(owner);
+                settings.tab = tab;
+                screen.settings = Some(settings);
+            } else {
+                let mut settings =
+                    CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
+                settings.tab = tab;
+                screen.settings = Some(settings);
             }
             screen.panel = Some(Panel::Settings);
         }
@@ -7978,6 +8849,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_screen_retry_clears_stream_and_highlights_status() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.event(AgentEvent::Token("半截流式内容".into()));
+        assert!(
+            !screen.messages.is_empty(),
+            "Token 应在 messages 中有未定稿片段"
+        );
+        assert!(screen.response_start.is_some());
+
+        screen.event(AgentEvent::Retry {
+            attempt: 1,
+            max_retries: 5,
+            delay_secs: 3,
+            error: "stream: connection reset".into(),
+        });
+
+        assert!(
+            screen.messages.is_empty(),
+            "Retry 事件应当清空未定稿的流式片段"
+        );
+        assert!(screen.response_start.is_none());
+        assert!(screen.stream.is_empty());
+        assert!(screen.status.contains("正在重试"));
+        assert!(screen.status.contains("1/5"));
+        assert_eq!(screen.footer_status_style().fg, Some(AMBER));
+    }
+
+    #[tokio::test]
     async fn major_component_snapshots_preserve_palette_and_narrow_layouts() {
         let mut owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
@@ -8390,6 +9290,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctf_mode_renders_persistent_badge_on_footer() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // CTF 未开启时：无 CTF model 标记
+        screen.ctf_enabled = false;
+        let text_disabled = render(&mut screen, 120, 24);
+        assert!(!text_disabled.contains("CTF model"));
+
+        // CTF 开启时：输入框底部常亮展示 CTF model
+        screen.ctf_enabled = true;
+        let text_enabled = render(&mut screen, 120, 24);
+        assert!(text_enabled.contains("CTF model"));
+
+        // 验证位于底部 footer 行且靠右
+        let last_line = text_enabled.lines().last().unwrap();
+        assert!(last_line.contains("CTF model"));
+
+        let _ = std::fs::remove_dir_all(&runner.cwd);
+    }
+
+    #[tokio::test]
     async fn long_approval_keeps_controls_visible_and_scrolls_only_arguments() {
         let runner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&runner);
@@ -8481,6 +9403,106 @@ mod tests {
         assert_eq!(screen.max_scroll, 0);
         page_key(&mut screen, KeyCode::PageUp);
         assert_eq!(screen.scroll, 0);
+        let _ = std::fs::remove_dir_all(&runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_auto_scroll_locks_content_when_scrolled_up_and_resumes_at_bottom() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        for i in 0..30 {
+            screen.messages.push(Line::raw(format!("msg line {i:02}")));
+        }
+        render(&mut screen, 80, 20);
+        assert!(screen.auto_scroll);
+        // 用户上滚进入浏览历史状态（触发 auto_scroll = false）
+        screen.scroll = 5;
+        screen.auto_scroll = false;
+        // 在浏览状态下按 Up 键继续上滚 1 行
+        page_key(&mut screen, KeyCode::Up);
+        assert_eq!(screen.scroll, 6);
+        assert!(!screen.auto_scroll);
+        // 按 Down 键下滚 1 行恢复到 5
+        page_key(&mut screen, KeyCode::Down);
+        assert_eq!(screen.scroll, 5);
+        assert!(!screen.auto_scroll);
+        let start_0 = screen.max_scroll - screen.scroll;
+        let rendered_0 = render(&mut screen, 80, 20);
+
+        // 模拟模型流式追加 10 行新内容并渲染
+        for i in 30..40 {
+            screen.messages.push(Line::raw(format!("msg line {i:02}")));
+        }
+        let rendered_1 = render(&mut screen, 80, 20);
+        let start_1 = screen.max_scroll - screen.scroll;
+
+        // 起始行完全静止，没有被顶上去
+        assert_eq!(start_0, start_1);
+        // 且可见内容完全一致
+        assert_eq!(rendered_0, rendered_1);
+        assert!(!screen.auto_scroll);
+
+        // 用户按多次 Down 回到底部
+        for _ in 0..15 {
+            page_key(&mut screen, KeyCode::Down);
+        }
+        assert_eq!(screen.scroll, 0);
+        assert!(screen.auto_scroll);
+
+        // 模拟再次流式追加 10 行
+        for i in 40..50 {
+            screen.messages.push(Line::raw(format!("msg line {i:02}")));
+        }
+        render(&mut screen, 80, 20);
+        // 处于自动跟随态
+        assert_eq!(screen.scroll, 0);
+        assert!(screen.auto_scroll);
+        let _ = std::fs::remove_dir_all(&runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_auto_scroll_end_key_resets_and_indicator_in_footer() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.has_run = true;
+        for i in 0..30 {
+            screen.messages.push(Line::raw(format!("msg line {i:02}")));
+        }
+        render(&mut screen, 80, 20);
+
+        // 初始跟随底部，footer 无暂停提示
+        let footer_init = screen.footer_line();
+        let has_pause_tag = footer_init
+            .spans
+            .iter()
+            .any(|s| s.content.contains("自动滚动已暂停"));
+        assert!(!has_pause_tag);
+
+        // 上滚后：出现暂停提示
+        page_key(&mut screen, KeyCode::PageUp);
+        assert!(!screen.auto_scroll);
+        assert!(screen.scroll > 0);
+        let footer_scrolled = screen.footer_line();
+        let pause_span = footer_scrolled
+            .spans
+            .iter()
+            .find(|s| s.content.contains("自动滚动已暂停"))
+            .expect("应显示暂停提示");
+        assert!(pause_span.content.contains("按 End 恢复"));
+        assert_eq!(pause_span.style.fg, Some(AMBER));
+        assert!(pause_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 按 End 键立即复位
+        page_key(&mut screen, KeyCode::End);
+        assert_eq!(screen.scroll, 0);
+        assert!(screen.auto_scroll);
+
+        // footer 提示消失
+        let footer_after_end = screen.footer_line();
+        assert!(!footer_after_end
+            .spans
+            .iter()
+            .any(|s| s.content.contains("自动滚动已暂停")));
         let _ = std::fs::remove_dir_all(&runner.cwd);
     }
 
@@ -8720,6 +9742,123 @@ mod tests {
         view.update(&lines, 4);
         assert_eq!(view.rows[0].spans[0].content.as_ptr(), prefix);
         assert_eq!(view.window(2, 1)[0].to_string(), "chan");
+    }
+
+    #[tokio::test]
+    async fn test_cli_image_pasting_and_placeholder_generation() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // 1. 测试直接粘贴带引号的文件路径（如 Windows 资源管理器复制）
+        let temp_dir = std::env::temp_dir();
+        let test_img = temp_dir.join("cli_test_paste.png");
+        std::fs::write(&test_img, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+        let quoted_path = format!("\"{}\"", test_img.display());
+        let handled = screen.handle_text_image_paste(&quoted_path);
+        assert!(handled, "应识别带双引号的文件路径为图片");
+        assert_eq!(screen.attached_images.len(), 1);
+        assert_eq!(screen.attached_images[0].id, 1);
+        assert_eq!(screen.input.lines().join(""), "[image:1]");
+
+        // 2. 测试粘贴图片 URL
+        let handled_url = screen.handle_text_image_paste("https://example.com/captcha.jpg");
+        assert!(handled_url, "应识别图片 URL");
+        assert_eq!(screen.attached_images.len(), 2);
+        assert_eq!(screen.attached_images[1].id, 2);
+        assert_eq!(screen.input.lines().join(""), "[image:1][image:2]");
+
+        // 3. 测试占位符展开
+        let expanded = screen.expand_attached_placeholders("请分析 [image:1] 以及 [image:2]");
+        assert!(expanded.contains("cli_test_paste.png"));
+        assert!(expanded.contains("https://example.com/captcha.jpg"));
+
+        // 4. 测试徽章渲染
+        let style = Style::default();
+        let mut spans = Vec::new();
+        CliScreen::render_cli_text_with_image_badges(&mut spans, "输入 [image:1] 占位", style);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "输入 ");
+        assert_eq!(spans[1].content, "🖼️ [image:1]");
+        assert_eq!(spans[2].content, " 占位");
+
+        let _ = std::fs::remove_file(test_img);
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_cli_paste_debouncing() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // 模拟已发生一次粘贴
+        screen.last_paste_instant = Some(std::time::Instant::now());
+        screen.insert_text("hello");
+        assert_eq!(screen.input.lines().join(""), "hello");
+
+        // 紧接着尝试调用剪贴板粘贴方法
+        assert!(
+            !screen.handle_clipboard_image_only(),
+            "防重保护应拦截高频调用"
+        );
+        assert!(
+            !screen.handle_clipboard_image_or_text(),
+            "防重保护应拦截高频调用"
+        );
+        assert_eq!(screen.input.lines().join(""), "hello", "内容不应被重复插入");
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_footer_status_highlighting() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.has_run = true;
+
+        // 1. 操作提示（如 Model selected）高亮为电光青色加粗
+        screen.status = "Model selected".into();
+        let line = screen.footer_line();
+        let status_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Model selected"))
+            .unwrap();
+        assert_eq!(status_span.style.fg, Some(Color::Rgb(80, 240, 220)));
+        assert!(status_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 2. CTF 模式更新同样高亮
+        screen.status = "CTF mode updated".into();
+        let line = screen.footer_line();
+        let ctf_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("CTF mode updated"))
+            .unwrap();
+        assert_eq!(ctf_span.style.fg, Some(Color::Rgb(80, 240, 220)));
+        assert!(ctf_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 3. 取消 / 错误提示为红色加粗
+        screen.status = "Cancelling".into();
+        let line = screen.footer_line();
+        let cancel_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Cancelling"))
+            .unwrap();
+        assert_eq!(cancel_span.style.fg, Some(ERROR));
+        assert!(cancel_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 4. 工作中提示为琥珀金加粗
+        screen.status = "Working".into();
+        let line = screen.footer_line();
+        let work_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Working"))
+            .unwrap();
+        assert_eq!(work_span.style.fg, Some(AMBER));
+        assert!(work_span.style.add_modifier.contains(Modifier::BOLD));
+        let _ = std::fs::remove_dir_all(runner.cwd);
     }
 
     async fn snapshot(width: u16, height: u16) -> (String, ratatui::buffer::Buffer) {
@@ -9597,6 +10736,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_agent_model_retry_configuration() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        // 打开设置面板
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+        assert_eq!(
+            SettingsTab::AgentModel.max_row(screen.settings.as_ref().unwrap()),
+            11
+        );
+
+        // 行 10: 异常重试次数（默认 5 次）
+        screen.settings.as_mut().unwrap().selected_row = 10;
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .retry_attempts,
+            5
+        );
+        // 按 3 次 Right 增加到 8 次
+        for _ in 0..3 {
+            settings_key_with_runner(
+                &mut screen,
+                &mut runner_opt,
+                KeyCode::Right,
+                KeyModifiers::NONE,
+            );
+        }
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .retry_attempts,
+            8
+        );
+
+        // 行 11: 重试时间间隔（默认 3 秒）
+        screen.settings.as_mut().unwrap().selected_row = 11;
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .retry_delay_secs,
+            3
+        );
+        // 按 2 次 Right 增加到 5 秒
+        for _ in 0..2 {
+            settings_key_with_runner(
+                &mut screen,
+                &mut runner_opt,
+                KeyCode::Right,
+                KeyModifiers::NONE,
+            );
+        }
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .retry_delay_secs,
+            5
+        );
+
+        // 保存设置 (Ctrl+S)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!(screen.panel, None, "保存后面板应关闭");
+        assert_eq!(
+            runner_opt.as_ref().unwrap().ctx.config.agent.retry_attempts,
+            8
+        );
+        assert_eq!(
+            runner_opt
+                .as_ref()
+                .unwrap()
+                .ctx
+                .config
+                .agent
+                .retry_delay_secs,
+            5
+        );
+    }
+
+    #[tokio::test]
     async fn settings_unsaved_discard_guard() {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
@@ -9745,7 +10994,10 @@ mod tests {
                     rendered.contains(ch),
                     "w={w}, h={h} should display active tab number {ch}"
                 );
-                assert!(rendered.contains("Esc"), "should display bottom buttons");
+                assert!(
+                    rendered.contains("Esc"),
+                    "tab={tab_idx}, w={w}, h={h} should display bottom buttons"
+                );
             }
         }
     }
@@ -10356,6 +11608,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_view_locks_content_when_scrolled_up() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = seed_subagent(&mut screen, "bulk", SubagentStatus::Running);
+        for i in 0..60 {
+            screen
+                .subagents
+                .append_line(run_id, format!("token line {i:02}"));
+        }
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        render(&mut screen, 80, 30);
+
+        // ↑ 上滚 5 行（脱离跟随态）
+        for _ in 0..5 {
+            page_key(&mut screen, KeyCode::Up);
+        }
+        let view_0 = screen.subagent_view.as_ref().unwrap();
+        assert!(!view_0.follow_bottom);
+        assert_eq!(view_0.scroll, 5);
+        let rendered_0 = render(&mut screen, 80, 30);
+
+        // 新行到达
+        for i in 60..70 {
+            screen
+                .subagents
+                .append_line(run_id, format!("token line {i:02}"));
+        }
+        let rendered_1 = render(&mut screen, 80, 30);
+        let view_1 = screen.subagent_view.as_ref().unwrap();
+        // 增量自动补偿给 scroll，确保内容保持静止
+        assert!(!view_1.follow_bottom);
+        assert_eq!(view_1.scroll, 15);
+        let content_0: Vec<_> = rendered_0
+            .lines()
+            .filter(|l| l.contains("token line"))
+            .collect();
+        let content_1: Vec<_> = rendered_1
+            .lines()
+            .filter(|l| l.contains("token line"))
+            .collect();
+        assert_eq!(content_0, content_1);
+
+        // 按 End 恢复跟随
+        page_key(&mut screen, KeyCode::End);
+        let view_end = screen.subagent_view.as_ref().unwrap();
+        assert!(view_end.follow_bottom);
+        assert_eq!(view_end.scroll, 0);
+        drop(runner);
+    }
+
+    #[tokio::test]
     async fn jobs_panel_renders_list_detail_and_empty_states() {
         let runner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&runner);
@@ -10659,5 +11963,74 @@ mod tests {
             ChatEntry::User(prompt) if prompt.contains("[后台命令执行完成通知]")
                 && prompt.contains("ping 127.0.0.1")
         )));
+    }
+    #[tokio::test]
+    async fn subagents_stop_slash_command_terminates_running_subagents() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+
+        // 1. 无运行中子代理时 stop
+        screen.insert_text("/subagents stop");
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(history(&screen).contains("当前没有运行中的子代理"));
+
+        // 2. 存在运行中的后台子代理时执行 /subagents stop
+        let (job_id, _kill_rx) = screen.background.start(JobKind::Subagent, "worker".into());
+        let run_id = screen.subagents.start("worker");
+        screen.background.link_archive(job_id, run_id);
+
+        screen.insert_text("/subagents stop");
+        let (broker, _requests) = PermissionBroker::interactive();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(history(&screen).contains("已终止 1 个运行中的子代理"));
+        assert_eq!(
+            screen.subagents.snapshot()[0].status,
+            SubagentStatus::Killed
+        );
+
+        // 3. busy 状态下执行 /subagents stop #id
+        screen.busy = true;
+        let (job_id2, _rx) = screen.background.start(JobKind::Subagent, "worker2".into());
+        let run_id2 = screen.subagents.start("worker2");
+        screen.background.link_archive(job_id2, run_id2);
+
+        screen.insert_text(&format!("/subagents stop #{run_id2}"));
+        let (broker, _requests) = PermissionBroker::interactive();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(history(&screen).contains(&format!("已终止子代理 #{run_id2}")));
+        assert_eq!(
+            screen.subagents.snapshot()[1].status,
+            SubagentStatus::Killed
+        );
     }
 }

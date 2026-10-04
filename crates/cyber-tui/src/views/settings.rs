@@ -113,6 +113,18 @@ fn get_max_steps(c: &Config) -> String {
 fn set_max_steps(c: &mut Config, v: String) {
     c.agent.max_steps = v.parse().unwrap_or(50);
 }
+fn get_retry_attempts(c: &Config) -> String {
+    c.agent.retry_attempts.to_string()
+}
+fn set_retry_attempts(c: &mut Config, v: String) {
+    c.agent.retry_attempts = v.parse().unwrap_or(5);
+}
+fn get_retry_delay_secs(c: &Config) -> String {
+    c.agent.retry_delay_secs.to_string()
+}
+fn set_retry_delay_secs(c: &mut Config, v: String) {
+    c.agent.retry_delay_secs = v.parse().unwrap_or(3);
+}
 
 fn get_max_parallel_nodes(c: &Config) -> String {
     c.workflow.max_parallel_nodes.to_string()
@@ -230,6 +242,30 @@ const AGENT_FIELDS: &[FieldDef] = &[
         live: LiveApply::None,
         get: get_max_steps,
         set: set_max_steps,
+    },
+    FieldDef {
+        label: "异常重试次数 retry_attempts",
+        kind: FieldKind::Number {
+            min: 0,
+            max: 20,
+            step: 1,
+        },
+        effect: "即时",
+        live: LiveApply::None,
+        get: get_retry_attempts,
+        set: set_retry_attempts,
+    },
+    FieldDef {
+        label: "重试时间间隔 retry_delay_secs",
+        kind: FieldKind::Number {
+            min: 1,
+            max: 60,
+            step: 1,
+        },
+        effect: "即时",
+        live: LiveApply::None,
+        get: get_retry_delay_secs,
+        set: set_retry_delay_secs,
     },
 ];
 
@@ -1240,7 +1276,6 @@ fn render_mcp_lines(
         );
         return;
     }
-    let connected_names: Vec<&str> = mcp_registry.map(|r| r.server_names()).unwrap_or_default();
     for (i, spec) in mcp_config.servers.iter().enumerate() {
         let selected = i == state.mcp_selected && !state.mcp_on_save;
         let pending_delete = state.mcp_pending_delete_idx == Some(i);
@@ -1271,13 +1306,17 @@ fn render_mcp_lines(
                 spec.url.as_deref().unwrap_or("(未设置 url)").to_string()
             }
         };
-        // 连接状态：已连接 / 连接失败 / 未启用（mock 模式）
-        let (status_text, status_color) = if mcp_registry.is_none() {
-            ("未启用", theme.muted)
-        } else if connected_names.contains(&spec.name.as_str()) {
-            ("已连接", theme.title)
+        // 连接状态：已连接 (N 工具) / 连接失败 / 未启用（mock 模式）
+        let (status_text, status_color, zero_tools) = if mcp_registry.is_none() {
+            ("未启用".to_string(), theme.muted, false)
+        } else if let Some(count) = mcp_registry.and_then(|r| r.tool_count(&spec.name)) {
+            if count == 0 {
+                ("已连接 (0 工具)".to_string(), theme.accent, true)
+            } else {
+                (format!("已连接 ({} 工具)", count), theme.title, false)
+            }
         } else {
-            ("连接失败", theme.accent)
+            ("连接失败".to_string(), theme.accent, false)
         };
         lines.push(
             Line::from(vec![
@@ -1301,6 +1340,12 @@ fn render_mcp_lines(
             ])
             .style(row_style),
         );
+        if zero_tools {
+            lines.push(
+                Line::from("    提示: 该服务已连接但未暴露工具。若为 SSE 端点，请尝试将 transport 改为 sse")
+                    .style(Style::default().fg(theme.accent)),
+            );
+        }
         // env / headers 摘要
         if !spec.env.is_empty() {
             let env_keys: Vec<&str> = spec.env.keys().map(|s| s.as_str()).collect();

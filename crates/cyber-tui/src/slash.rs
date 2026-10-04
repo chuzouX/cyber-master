@@ -43,18 +43,18 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/model",
-        usage: "/model [provider]",
-        desc: "打开面板选择 provider + model（带 provider 参数则直接切换）",
+        usage: "/model [name]",
+        desc: "直接 /model 打开模型面板切换模型；亦可带参数快速切换（别名：/models）",
     },
     CommandSpec {
         name: "/provider",
-        usage: "/provider <sub>",
-        desc: "管理服务商：list | add | edit <name> | use <name> | remove <name>",
+        usage: "/provider [sub]",
+        desc: "服务商管理面板（支持 /providers 直接打开管理看板，a 预设/协议添加，e 编辑，d 删除）",
     },
     CommandSpec {
         name: "/subagents",
-        usage: "/subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]",
-        desc: "查看或配置批量子 agent（启用状态变更需重启）",
+        usage: "/subagents [status|enable|disable|stop [id|all]|max_tasks N|max_parallel N|timeout N|max_steps N]",
+        desc: "查看、配置或终止批量子 agent",
     },
     CommandSpec {
         name: "/env",
@@ -65,6 +65,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/web",
         usage: "/web [status|on|off|enable|disable]",
         desc: "开启或禁用联网搜索与抓取功能（web_fetch）",
+    },
+    CommandSpec {
+        name: "/image",
+        usage: "/image <path> [prompt]",
+        desc: "传入本地图片或 URL（自动转为 [image:1] 占位符并提交给视觉模型分析）",
+    },
+    CommandSpec {
+        name: "/vision",
+        usage: "/vision [status|on|off|provider <name>|model <name>|test [model]]",
+        desc: "查看或配置自适应识图引擎（多模态能力探测与图生文降级）",
+    },
+    CommandSpec {
+        name: "/paste",
+        usage: "/paste",
+        desc: "粘贴系统剪贴板中的图片并生成 [image:1] 占位符（Windows 快捷键：Alt+V）",
     },
     CommandSpec {
         name: "/tools",
@@ -168,6 +183,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
             "status",
             "enable",
             "disable",
+            "stop",
             "max_tasks",
             "max_parallel",
             "timeout",
@@ -175,6 +191,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         ],
         "/env" => vec!["list", "set", "set-sensitive", "remove"],
         "/web" => vec!["status", "on", "off", "enable", "disable"],
+        "/vision" => vec!["status", "on", "off", "provider", "model", "test"],
         "/memory" => vec!["list", "add", "project", "edit", "delete", "rule"],
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
@@ -204,6 +221,8 @@ pub enum SlashCommand {
     Env(String),
     /// `/web [status|on|off|enable|disable]` — 开启/禁用联网搜索功能。
     Web(String),
+    /// `/vision [subcommand]` — 自适应识图引擎配置与能力探针。
+    Vision(String),
     /// `/tools` — 列出可用工具。
     Tools,
     /// `/skill <name|list>` — 查看 Skill 详细说明（list 列出全部）。
@@ -224,6 +243,8 @@ pub enum SlashCommand {
     MaxSteps(String),
     /// `/think [level]` — 查看或设置思考强度。空串 = 查看当前值。
     Think(String),
+    /// `/image <path> [prompt]` — 传入本地图片或 URL 进行视觉多模态分析。
+    Image(String),
     /// `/new` — 新建会话（保存当前 → 切到空会话）。
     New,
     /// `/sessions <list|read <id|关键词>|new>` — 会话管理。
@@ -256,11 +277,12 @@ pub fn parse(line: &str) -> SlashCommand {
         "/help" => SlashCommand::Help,
         "/clear" => SlashCommand::Clear,
         "/mode" => SlashCommand::Mode(args.to_string()),
-        "/model" => SlashCommand::Model(args.to_string()),
-        "/provider" => SlashCommand::Provider(args.to_string()),
+        "/model" | "/models" => SlashCommand::Model(args.to_string()),
+        "/provider" | "/providers" => SlashCommand::Provider(args.to_string()),
         "/subagents" => SlashCommand::Subagents(args.to_string()),
         "/env" => SlashCommand::Env(args.to_string()),
         "/web" => SlashCommand::Web(args.to_string()),
+        "/vision" => SlashCommand::Vision(args.to_string()),
         "/tools" => SlashCommand::Tools,
         "/skill" => SlashCommand::Skill(args.to_string()),
         "/mcp" => SlashCommand::Mcp(args.to_string()),
@@ -276,6 +298,8 @@ pub fn parse(line: &str) -> SlashCommand {
         "/bg" => SlashCommand::Bg(args.to_string()),
         "/settings" => SlashCommand::Settings,
         "/quit" => SlashCommand::Quit,
+        "/image" => SlashCommand::Image(args.to_string()),
+        "/paste" => SlashCommand::Image("paste".into()),
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
     }
 }
@@ -288,7 +312,7 @@ pub const HELP_TEXT: &str = "\
   /mode <name>       切换模式（chat / workflow / dashboard）
   /model [provider]  打开面板选择 provider + model（带 provider 参数则直接切换）
   /provider <sub>    管理服务商：list | add | edit <name> | use <name> | remove <name>
-  /subagents [sub]   子 agent：status | enable | disable | max_tasks N | max_parallel N | timeout N | max_steps N
+  /subagents [sub]   子 agent：status | enable | disable | stop [id|all] | max_tasks N | max_parallel N | timeout N | max_steps N
   /env [sub]         环境变量：list | set KEY VALUE | set-sensitive KEY VALUE | remove KEY
   /web [status|on|off] 联网搜索：查看状态或开启/禁用 web_fetch 功能
   /tools             列出可用工具
@@ -297,6 +321,8 @@ pub const HELP_TEXT: &str = "\
   /cancel            取消当前生成
   /compact [instr]   手动压缩上下文（可选自定义摘要指令）
   /max_steps <N>     查看或设置工具调用步数上限（1-1000）
+  /image <path> [prompt] 视觉分析：传入图片或 URL 提交给视觉多模态模型
+  /paste             粘贴剪贴板图片：生成 [image:1] 占位符（快捷键 Alt+V / Ctrl+V）
   /think [level]     查看或设置思考强度（low / middle / high / max / auto）
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
@@ -329,6 +355,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_image() {
+        assert_eq!(
+            parse("/image ./test.png"),
+            SlashCommand::Image("./test.png".into())
+        );
+        assert_eq!(
+            parse("/image ./test.png 请分析"),
+            SlashCommand::Image("./test.png 请分析".into())
+        );
+    }
+    #[test]
     fn parse_mode_with_arg() {
         assert_eq!(parse("/mode chat"), SlashCommand::Mode("chat".into()));
         assert_eq!(
@@ -349,8 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_vision_command() {
+        assert_eq!(parse("/vision"), SlashCommand::Vision(String::new()));
+        assert_eq!(parse("/vision on"), SlashCommand::Vision("on".into()));
+        assert_eq!(
+            parse("/vision test gpt-4o"),
+            SlashCommand::Vision("test gpt-4o".into())
+        );
+    }
+    #[test]
     fn parse_model_no_arg() {
         assert_eq!(parse("/model"), SlashCommand::Model(String::new()));
+        assert_eq!(parse("/models"), SlashCommand::Model(String::new()));
+        assert_eq!(
+            parse("/models gpt-4o"),
+            SlashCommand::Model("gpt-4o".into())
+        );
     }
 
     #[test]
@@ -490,8 +541,12 @@ mod tests {
     fn parse_provider_no_arg() {
         assert_eq!(parse("/provider"), SlashCommand::Provider(String::new()));
         assert_eq!(parse("/provider   "), SlashCommand::Provider(String::new()));
+        assert_eq!(parse("/providers"), SlashCommand::Provider(String::new()));
+        assert_eq!(
+            parse("/providers list"),
+            SlashCommand::Provider("list".into())
+        );
     }
-
     #[test]
     fn parse_provider_subcommands() {
         assert_eq!(
@@ -650,6 +705,7 @@ mod tests {
                 "status",
                 "enable",
                 "disable",
+                "stop",
                 "max_tasks",
                 "max_parallel",
                 "timeout",

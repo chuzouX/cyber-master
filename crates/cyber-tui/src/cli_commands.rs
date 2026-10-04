@@ -31,6 +31,7 @@ pub(crate) enum CliAction {
     Mode(cyber_agent::PermissionMode),
     TodoVisibility(bool),
     Settings,
+    SettingsTab(crate::cli::SettingsTab),
     Jobs(CliJobs),
 }
 
@@ -428,6 +429,104 @@ fn save_selection_renamed(
     Ok(())
 }
 
+pub(crate) fn stop_subagents(
+    background: &cyber_agent::BackgroundRegistry,
+    subagents: &cyber_agent::SubagentArchive,
+    target: &str,
+) -> Result<String> {
+    let target = target.trim();
+    if target.is_empty() || target.eq_ignore_ascii_case("all") {
+        let mut stopped = 0;
+        let mut seen_archive_ids = std::collections::HashSet::new();
+
+        // 1. 终止 BackgroundRegistry 中所有运行中的 Subagent 任务
+        for job in background.snapshot() {
+            if matches!(job.kind, cyber_agent::JobKind::Subagent)
+                && matches!(job.status, cyber_agent::JobStatus::Running)
+            {
+                if background.kill(job.id) {
+                    stopped += 1;
+                }
+                if let Some(run_id) = job.archive_run_id {
+                    seen_archive_ids.insert(run_id);
+                    subagents.finish(
+                        run_id,
+                        cyber_agent::SubagentStatus::Killed,
+                        None,
+                        Some("killed by user".into()),
+                    );
+                }
+            }
+        }
+
+        // 2. 终止 SubagentArchive 中处于 Running 状态的独立条目
+        for run in subagents.snapshot() {
+            if run.status == cyber_agent::SubagentStatus::Running
+                && !seen_archive_ids.contains(&run.id)
+            {
+                subagents.finish(
+                    run.id,
+                    cyber_agent::SubagentStatus::Killed,
+                    None,
+                    Some("killed by user".into()),
+                );
+                stopped += 1;
+            }
+        }
+
+        if stopped > 0 {
+            Ok(format!("已终止 {stopped} 个运行中的子代理"))
+        } else {
+            Ok("当前没有运行中的子代理".to_string())
+        }
+    } else {
+        let clean_id = target.trim_start_matches('#');
+        let target_id = clean_id
+            .parse::<u64>()
+            .map_err(|_| eyre!("用法: /subagents stop [id|all]"))?;
+
+        let mut found = false;
+        for job in background.snapshot() {
+            if matches!(job.kind, cyber_agent::JobKind::Subagent)
+                && matches!(job.status, cyber_agent::JobStatus::Running)
+                && (job.id == target_id || job.archive_run_id == Some(target_id))
+            {
+                background.kill(job.id);
+                if let Some(run_id) = job.archive_run_id {
+                    subagents.finish(
+                        run_id,
+                        cyber_agent::SubagentStatus::Killed,
+                        None,
+                        Some("killed by user".into()),
+                    );
+                }
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            for run in subagents.snapshot() {
+                if run.id == target_id && run.status == cyber_agent::SubagentStatus::Running {
+                    subagents.finish(
+                        target_id,
+                        cyber_agent::SubagentStatus::Killed,
+                        None,
+                        Some("killed by user".into()),
+                    );
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if found {
+            Ok(format!("已终止子代理 #{target_id}"))
+        } else {
+            Ok(format!("未找到运行中的子代理 #{target_id}"))
+        }
+    }
+}
 fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (command, value) = split(args);
     if command.is_empty() || command.eq_ignore_ascii_case("status") {
@@ -443,6 +542,15 @@ fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 config.effective_max_steps()
             ),
         ));
+    }
+
+    if command.eq_ignore_ascii_case("stop") {
+        let message = stop_subagents(
+            &runner.registries.background,
+            &runner.registries.subagents,
+            value,
+        )?;
+        return Ok(output("Subagents", message));
     }
 
     let mut config = runner.ctx.config.clone();
@@ -493,7 +601,7 @@ fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
         }
         _ => {
             bail!(
-                "Usage: /subagents [status|enable|disable|max_tasks N|max_parallel N|timeout N|max_steps N]"
+                "Usage: /subagents [status|enable|disable|stop [id|all]|max_tasks N|max_parallel N|timeout N|max_steps N]"
             );
         }
     };
@@ -589,6 +697,147 @@ fn web(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     Ok(refresh(message, false))
 }
 
+fn vision(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let mut parts = args.trim().splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").to_lowercase();
+    let rest = parts.next().unwrap_or("").trim();
+
+    match sub.as_str() {
+        "" | "status" => {
+            let status_str = if runner.ctx.config.agent.vision.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let provider = if runner.ctx.config.agent.vision.provider.is_empty() {
+                "auto"
+            } else {
+                &runner.ctx.config.agent.vision.provider
+            };
+            let model = if runner.ctx.config.agent.vision.model.is_empty() {
+                "auto"
+            } else {
+                &runner.ctx.config.agent.vision.model
+            };
+            let out = format!(
+                "Vision Engine: {status_str}\nProvider: {provider}\nModel: {model}\nDetail: {}\nPrompt: {}",
+                runner.ctx.config.agent.vision.detail,
+                runner.ctx.config.agent.vision.prompt
+            );
+            Ok(output("Vision Engine", out))
+        }
+        "on" | "enable" | "1" | "true" => {
+            let mut config = runner.ctx.config.clone();
+            config.agent.vision.enabled = true;
+            cyber_core::save_config(&config, &runner.ctx.paths.config_file)?;
+            runner.ctx.config = config;
+            Ok(refresh("Vision engine enabled", false))
+        }
+        "off" | "disable" | "0" | "false" => {
+            let mut config = runner.ctx.config.clone();
+            config.agent.vision.enabled = false;
+            cyber_core::save_config(&config, &runner.ctx.paths.config_file)?;
+            runner.ctx.config = config;
+            Ok(refresh("Vision engine disabled", false))
+        }
+        "provider" => {
+            if rest.is_empty() {
+                bail!("Usage: /vision provider <name>");
+            }
+            let mut config = runner.ctx.config.clone();
+            config.agent.vision.provider = rest.to_string();
+            cyber_core::save_config(&config, &runner.ctx.paths.config_file)?;
+            runner.ctx.config = config;
+            Ok(refresh(&format!("Vision provider set to {rest}"), false))
+        }
+        "model" => {
+            if rest.is_empty() {
+                let mut items = Vec::new();
+                for name in runner.ctx.providers.sorted_names() {
+                    let provider = &runner.ctx.providers.providers[&name];
+                    let mut models: Vec<_> = provider.models.keys().cloned().collect();
+                    models.push(provider.model.clone());
+                    models.sort();
+                    models.dedup();
+                    for model in models.into_iter().filter(|m| !m.is_empty()) {
+                        let cap =
+                            cyber_core::get_model_vision_capability(provider, &name, &model, None);
+                        let badge = cap.badge_text();
+                        let label = if badge.is_empty() {
+                            model.clone()
+                        } else {
+                            format!("{model} {badge}")
+                        };
+                        items.push(PickerItem {
+                            label,
+                            detail: name.clone(),
+                            command: format!("/vision model {name} {model}"),
+                        });
+                    }
+                }
+                Ok(CliAction::Picker(CommandPicker {
+                    title: "Vision Models".into(),
+                    items,
+                    kind: PickerKind::Models,
+                }))
+            } else {
+                let (p1, p2) = split(rest);
+                let mut config = runner.ctx.config.clone();
+                let message = if !p2.is_empty() {
+                    config.agent.vision.provider = p1.to_string();
+                    config.agent.vision.model = p2.to_string();
+                    format!("Vision provider set to {p1}, model set to {p2}")
+                } else {
+                    config.agent.vision.model = rest.to_string();
+                    format!("Vision model set to {rest}")
+                };
+                cyber_core::save_config(&config, &runner.ctx.paths.config_file)?;
+                runner.ctx.config = config;
+                Ok(refresh(&message, false))
+            }
+        }
+        "test" => {
+            let default_provider = runner.ctx.config.agent.default_provider.clone();
+            let provider_cfg = runner
+                .ctx
+                .providers
+                .providers
+                .get(&default_provider)
+                .cloned()
+                .ok_or_else(|| eyre!("Default provider not configured"))?;
+            let model = if !rest.is_empty() {
+                rest.to_string()
+            } else {
+                provider_cfg.model.clone()
+            };
+
+            let cap = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    cyber_agent::probe_model_vision(&provider_cfg, &model).await
+                })
+            })?;
+
+            let _ = cyber_core::save_model_vision_capability(
+                &default_provider,
+                &model,
+                cap,
+                runner.ctx.providers.providers.get_mut(&default_provider),
+            );
+            let _ =
+                cyber_core::save_providers(&runner.ctx.providers, &runner.ctx.paths.providers_file);
+
+            let out = format!(
+                "Probe Test Result:\nProvider: {default_provider}\nModel: {model}\nPayload: 1x1 RGBA PNG Data URI\nCapability: {:?}",
+                cap
+            );
+            Ok(output("Vision Probe", out))
+        }
+        _ => {
+            bail!("Usage: /vision [status|on|off|provider <name>|model <name>|test [model]]");
+        }
+    }
+}
+
 pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
     let (name, args) = split(line);
     if name.eq_ignore_ascii_case("/mode") || name.eq_ignore_ascii_case("/approval") {
@@ -674,19 +923,45 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         SlashCommand::Model(args) => {
             if args.is_empty() {
                 let mut items = Vec::new();
+                let current_default = &runner.ctx.config.agent.default_provider;
+                let current_prov_cfg = runner.ctx.providers.providers.get(current_default);
+                let current_model = current_prov_cfg.map(|p| p.model.as_str()).unwrap_or("");
+
                 for name in runner.ctx.providers.sorted_names() {
                     let provider = &runner.ctx.providers.providers[&name];
+                    let is_default_prov = &name == current_default;
                     let mut models: Vec<_> = provider.models.keys().cloned().collect();
-                    models.push(provider.model.clone());
+                    if !provider.model.is_empty() && !models.contains(&provider.model) {
+                        models.push(provider.model.clone());
+                    }
                     models.sort();
                     models.dedup();
                     for model in models.into_iter().filter(|m| !m.is_empty()) {
+                        let is_active = is_default_prov && model == current_model;
+                        let cap =
+                            cyber_core::get_model_vision_capability(provider, &name, &model, None);
+                        let badge = cap.badge_text();
+                        let active_badge = if is_active { " ● [当前生效]" } else { "" };
+                        let label = if badge.is_empty() {
+                            format!("{model}{active_badge}")
+                        } else {
+                            format!("{model} {badge}{active_badge}")
+                        };
                         items.push(PickerItem {
-                            label: model.clone(),
-                            detail: name.clone(),
+                            label,
+                            detail: if is_default_prov {
+                                format!("{name} ★默认服务商")
+                            } else {
+                                name.clone()
+                            },
                             command: format!("/model {name} {model}"),
                         });
                     }
+                }
+                if let Some(pos) = items.iter().position(|i| i.label.contains("● [当前生效]"))
+                {
+                    let active_item = items.remove(pos);
+                    items.insert(0, active_item);
                 }
                 CliAction::Picker(CommandPicker {
                     title: "Models".into(),
@@ -694,15 +969,54 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                     kind: PickerKind::Models,
                 })
             } else {
-                let (provider, model) = split(&args);
-                runner.select_model_persisted(provider, (!model.is_empty()).then_some(model))?;
-                refresh("Model selected", false)
+                let (first, second) = split(&args);
+                if !second.is_empty() {
+                    runner.select_model_persisted(first, Some(second))?;
+                    refresh("Model selected", false)
+                } else if runner.ctx.providers.providers.contains_key(first) {
+                    runner.select_model_persisted(first, None)?;
+                    refresh("Model selected", false)
+                } else {
+                    let target = first.to_ascii_lowercase();
+                    let mut matched = Vec::new();
+                    for name in runner.ctx.providers.sorted_names() {
+                        let p = &runner.ctx.providers.providers[&name];
+                        if p.model.to_ascii_lowercase() == target
+                            || p.models.keys().any(|m| m.to_ascii_lowercase() == target)
+                        {
+                            matched.push((name, first.to_string()));
+                        }
+                    }
+
+                    if matched.len() == 1 {
+                        let (prov, mdl) = &matched[0];
+                        runner.select_model_persisted(prov, Some(mdl))?;
+                        refresh("Model selected", false)
+                    } else if matched.is_empty() {
+                        bail!("Unknown provider");
+                    } else {
+                        let items = matched
+                            .into_iter()
+                            .map(|(prov, mdl)| PickerItem {
+                                label: mdl.clone(),
+                                detail: prov.clone(),
+                                command: format!("/model {prov} {mdl}"),
+                            })
+                            .collect();
+                        CliAction::Picker(CommandPicker {
+                            title: format!("Select Provider for '{first}'"),
+                            items,
+                            kind: PickerKind::Models,
+                        })
+                    }
+                }
             }
         }
         SlashCommand::Provider(args) => provider(runner, &args)?,
         SlashCommand::Subagents(args) => subagents(runner, &args)?,
         SlashCommand::Env(args) => env(runner, &args)?,
         SlashCommand::Web(args) => web(runner, &args)?,
+        SlashCommand::Vision(args) => vision(runner, &args)?,
         SlashCommand::Tools => output(
             "Tools",
             runner
@@ -746,27 +1060,27 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                     CliAction::Task(CliTask::McpConnect { config })
                 }
                 "" | "list" | "status" => {
-                    let connected = runner
-                        .registries
-                        .mcp
-                        .as_ref()
-                        .map(|m| m.server_names())
-                        .unwrap_or_default();
                     output(
                         "MCP",
                         config
                             .servers
                             .iter()
                             .map(|s| {
+                                let status_str = match runner
+                                    .registries
+                                    .mcp
+                                    .as_ref()
+                                    .and_then(|m| m.tool_count(&s.name))
+                                {
+                                    Some(0) => "connected (0 tools - hint: if SSE server, set transport = \"sse\")".to_string(),
+                                    Some(n) => format!("connected ({n} tools)"),
+                                    None => "not connected (explicit approval required)".to_string(),
+                                };
                                 format!(
                                     "{}  {:?}  {}",
                                     s.name,
                                     s.transport,
-                                    if connected.contains(&s.name.as_str()) {
-                                        "connected"
-                                    } else {
-                                        "not connected (explicit approval required)"
-                                    }
+                                    status_str,
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -819,6 +1133,64 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         SlashCommand::Memory(args) => memory(runner, &args)?,
         SlashCommand::Todo(args) => todo_cmd(runner, &args)?,
         SlashCommand::Bg(args) => CliAction::Jobs(parse_bg(&args)?),
+        SlashCommand::Image(args) => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("paste") {
+                let mut cb_res = arboard::Clipboard::new();
+                for _ in 0..5 {
+                    if cb_res.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    cb_res = arboard::Clipboard::new();
+                }
+                if let Ok(mut cb) = cb_res {
+                    if let Ok(img) = cb.get_image() {
+                        let width = img.width as u32;
+                        let height = img.height as u32;
+                        let png_bytes = crate::chat::encode_rgba_to_png(width, height, &img.bytes);
+                        let cache_dir = cyber_core::Paths::detect()
+                            .map(|p| p.cyber_home)
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join("cache")
+                            .join("images");
+                        let _ = std::fs::create_dir_all(&cache_dir);
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let file_name = format!("clip_{}_{}.png", timestamp, 1);
+                        let file_path = cache_dir.join(&file_name);
+                        if let Ok(()) = std::fs::write(&file_path, png_bytes) {
+                            let prompt =
+                                format!("[image: {}] 请详细分析此图片", file_path.display());
+                            runner.entries.push(crate::chat::ChatEntry::User(prompt));
+                            return Ok(output(
+                                "Image",
+                                format!("已从系统剪贴板捕获图片并转存为 {file_name}，生成标识符 [image:1]。"),
+                            ));
+                        }
+                    }
+                }
+                output(
+                    "Image",
+                    "剪贴板中未检测到图片。\n提示：\n1. 请在截图后直接按 Alt+V（Windows推荐）或 Ctrl+V；\n2. 或使用 /image <path> [prompt] 指定本地图片/URL路径。",
+                )
+            } else {
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let path_str = parts.next().unwrap_or("").trim();
+                let prompt_str = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+                let prompt = match prompt_str {
+                    Some(p) => format!("[image: {path_str}] {p}"),
+                    None => format!("[image: {path_str}] 请详细分析此图片"),
+                };
+                runner.entries.push(crate::chat::ChatEntry::User(prompt));
+                output(
+                    "Image",
+                    format!("已加载图片附件: {path_str}，标识符 [image:1] 已附加至会话。"),
+                )
+            }
+        }
         SlashCommand::Settings => CliAction::Settings,
         SlashCommand::Mode(_) => {
             bail!("/mode is not available in CLI");
@@ -832,7 +1204,10 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
 fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (sub, rest) = split(args);
     match sub.to_ascii_lowercase().as_str() {
-        "" | "list" => Ok(output(
+        "" | "panel" | "dashboard" => {
+            Ok(CliAction::SettingsTab(crate::cli::SettingsTab::Providers))
+        }
+        "list" => Ok(output(
             "Providers",
             runner
                 .ctx
@@ -841,7 +1216,6 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 .iter()
                 .map(|n| {
                     let p = &runner.ctx.providers.providers[n];
-                    // Endpoints can contain credentials. Do not display them.
                     format!(
                         "{}{}  {}  {}",
                         n,
@@ -857,6 +1231,158 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )),
+        "wizard" | "preset" | "presets" => {
+            let mut items = Vec::new();
+            for preset in cyber_core::PROVIDER_PRESETS {
+                items.push(PickerItem {
+                    label: format!("{} ({})", preset.name, preset.default_model),
+                    detail: preset.base_url.to_string(),
+                    command: format!("/provider add-preset {}", preset.id),
+                });
+            }
+            items.push(PickerItem {
+                label: "🛠️ 自定义服务商接入 (自行选择协议类型)...".into(),
+                detail: "支持 openai-compatible, anthropic, ollama, openai".into(),
+                command: "/provider add-custom".into(),
+            });
+            Ok(CliAction::Picker(CommandPicker {
+                title: "Add Provider from Preset or Custom".into(),
+                items,
+                kind: PickerKind::Models,
+            }))
+        }
+        "add-custom" => {
+            let items = vec![
+                PickerItem {
+                    label: "openai-compatible (通用兼容协议 - vLLM/OneAPI/中转/FastChat)".into(),
+                    detail: "http://localhost:8000/v1 · Bearer 鉴权".into(),
+                    command: "/provider add-with-kind openai-compatible".into(),
+                },
+                PickerItem {
+                    label: "anthropic (Anthropic Claude 原生 Messages API 协议)".into(),
+                    detail: "https://api.anthropic.com/v1 · x-api-key 鉴权".into(),
+                    command: "/provider add-with-kind anthropic".into(),
+                },
+                PickerItem {
+                    label: "ollama (Ollama 本地/局域网私有化运行实例)".into(),
+                    detail: "http://127.0.0.1:11434 · 默认免密".into(),
+                    command: "/provider add-with-kind ollama".into(),
+                },
+                PickerItem {
+                    label: "openai (OpenAI 官方接口标准规范)".into(),
+                    detail: "https://api.openai.com/v1 · Bearer 鉴权".into(),
+                    command: "/provider add-with-kind openai".into(),
+                },
+            ];
+            Ok(CliAction::Picker(CommandPicker {
+                title: "Select Protocol Kind".into(),
+                items,
+                kind: PickerKind::Models,
+            }))
+        }
+        "add-preset" => {
+            let preset_id = rest.trim();
+            let preset = cyber_core::PROVIDER_PRESETS
+                .iter()
+                .find(|p| p.id.eq_ignore_ascii_case(preset_id))
+                .ok_or_else(|| eyre!("Unknown preset '{preset_id}'"))?;
+            let p = ProviderConfig {
+                kind: preset.kind.to_string(),
+                base_url: preset.base_url.to_string(),
+                model: preset.default_model.to_string(),
+                api_key: if preset.id == "ollama" {
+                    String::new()
+                } else {
+                    format!("${{{}}}", preset.env_var_suggestion)
+                },
+                ..Default::default()
+            };
+            let values = [
+                ("name", preset.id.to_string(), false),
+                ("kind", p.kind.clone(), false),
+                ("endpoint", p.base_url.clone(), true),
+                ("apikey", p.api_key.clone(), true),
+                ("model", p.model.clone(), false),
+                ("maxtokens", p.max_tokens.to_string(), false),
+                ("temperature", p.temperature.to_string(), false),
+                (
+                    "context_length",
+                    p.effective_context_length()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    false,
+                ),
+            ];
+            Ok(CliAction::Form(CommandForm {
+                title: format!("Add Provider ({})", preset.name),
+                fields: values
+                    .into_iter()
+                    .map(|(name, value, secret)| FormField {
+                        name: name.into(),
+                        value,
+                        secret,
+                    })
+                    .collect(),
+                kind: FormKind::Provider {
+                    original_name: None,
+                    original: Box::new(p),
+                },
+            }))
+        }
+        "add-with-kind" => {
+            let kind = rest.trim().to_ascii_lowercase();
+            if !cyber_core::PROVIDER_KINDS.contains(&kind.as_str()) {
+                bail!("Invalid provider kind '{kind}'");
+            }
+            let (default_endpoint, default_model, default_key) = match kind.as_str() {
+                "anthropic" => (
+                    "https://api.anthropic.com/v1",
+                    "claude-3-5-sonnet-20241022",
+                    "${ANTHROPIC_API_KEY}",
+                ),
+                "ollama" => ("http://127.0.0.1:11434", "llama3.3", ""),
+                "openai" => ("https://api.openai.com/v1", "gpt-4o", "${OPENAI_API_KEY}"),
+                _ => ("http://localhost:8000/v1", "", ""),
+            };
+            let p = ProviderConfig {
+                kind: kind.clone(),
+                base_url: default_endpoint.to_string(),
+                model: default_model.to_string(),
+                api_key: default_key.to_string(),
+                ..Default::default()
+            };
+            let values = [
+                ("name", String::new(), false),
+                ("kind", kind, false),
+                ("endpoint", p.base_url.clone(), true),
+                ("apikey", p.api_key.clone(), true),
+                ("model", p.model.clone(), false),
+                ("maxtokens", p.max_tokens.to_string(), false),
+                ("temperature", p.temperature.to_string(), false),
+                (
+                    "context_length",
+                    p.effective_context_length()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    false,
+                ),
+            ];
+            Ok(CliAction::Form(CommandForm {
+                title: "Add Custom Provider".into(),
+                fields: values
+                    .into_iter()
+                    .map(|(name, value, secret)| FormField {
+                        name: name.into(),
+                        value,
+                        secret,
+                    })
+                    .collect(),
+                kind: FormKind::Provider {
+                    original_name: None,
+                    original: Box::new(p),
+                },
+            }))
+        }
         "add" | "edit" => {
             let edit = sub.eq_ignore_ascii_case("edit");
             let p = if edit {
@@ -1620,7 +2146,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 24);
+        assert_eq!(commands().len(), 27);
         assert!(commands().iter().any(|c| c.name == "/settings"));
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
@@ -2107,6 +2633,112 @@ notes = "model named notes"
         execute(&mut runner, &format!("/sessions {id}")).unwrap();
         execute(&mut runner, &format!("/sessions delete {id}")).unwrap();
         assert!(runner.index.get(&id).is_none());
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+    #[tokio::test]
+    async fn enhanced_model_and_provider_preset_wizard_operations() {
+        let mut runner = test_runner().await;
+
+        // 1. /model 无参数返回模型列表，且当前生效模型置顶
+        if let CliAction::Picker(p) = execute(&mut runner, "/model").unwrap() {
+            assert!(matches!(p.kind, PickerKind::Models));
+            assert!(p.items[0].label.contains("● [当前生效]"));
+        } else {
+            panic!("expected model picker");
+        }
+
+        // 2. /model <model_name> 自动跨服务商匹配模型
+        let res = execute(&mut runner, "/model qwen2.5:32b").unwrap();
+        assert!(matches!(res, CliAction::Refresh { .. }));
+        assert_eq!(runner.ctx.config.agent.default_provider, "ollama");
+
+        // 3. /provider 与 /providers 打开服务商管理看板
+        let action1 = execute(&mut runner, "/provider").unwrap();
+        assert!(matches!(
+            action1,
+            CliAction::SettingsTab(crate::cli::SettingsTab::Providers)
+        ));
+        let action2 = execute(&mut runner, "/providers").unwrap();
+        assert!(matches!(
+            action2,
+            CliAction::SettingsTab(crate::cli::SettingsTab::Providers)
+        ));
+
+        // 4. /provider wizard 弹出预设模板与自定义向导
+        if let CliAction::Picker(p) = execute(&mut runner, "/provider wizard").unwrap() {
+            assert!(p
+                .items
+                .iter()
+                .any(|i| i.command == "/provider add-preset deepseek"));
+            assert!(p.items.iter().any(|i| i.command == "/provider add-custom"));
+        } else {
+            panic!("expected wizard picker");
+        }
+
+        // 5. /provider add-custom 弹出协议规范选择器
+        if let CliAction::Picker(p) = execute(&mut runner, "/provider add-custom").unwrap() {
+            assert!(p
+                .items
+                .iter()
+                .any(|i| i.command == "/provider add-with-kind openai-compatible"));
+            assert!(p
+                .items
+                .iter()
+                .any(|i| i.command == "/provider add-with-kind anthropic"));
+            assert!(p
+                .items
+                .iter()
+                .any(|i| i.command == "/provider add-with-kind ollama"));
+        } else {
+            panic!("expected protocol kind picker");
+        }
+
+        // 6. /provider add-preset deepseek 打开预填官方节点的表单
+        if let CliAction::Form(f) = execute(&mut runner, "/provider add-preset deepseek").unwrap() {
+            assert_eq!(
+                f.fields
+                    .iter()
+                    .find(|field| field.name == "endpoint")
+                    .unwrap()
+                    .value,
+                "https://api.deepseek.com"
+            );
+            assert_eq!(
+                f.fields
+                    .iter()
+                    .find(|field| field.name == "model")
+                    .unwrap()
+                    .value,
+                "deepseek-chat"
+            );
+        } else {
+            panic!("expected preset form");
+        }
+
+        // 7. /provider add-with-kind anthropic 打开预填 Anthropic 协议的表单
+        if let CliAction::Form(f) =
+            execute(&mut runner, "/provider add-with-kind anthropic").unwrap()
+        {
+            assert_eq!(
+                f.fields
+                    .iter()
+                    .find(|field| field.name == "kind")
+                    .unwrap()
+                    .value,
+                "anthropic"
+            );
+            assert_eq!(
+                f.fields
+                    .iter()
+                    .find(|field| field.name == "endpoint")
+                    .unwrap()
+                    .value,
+                "https://api.anthropic.com/v1"
+            );
+        } else {
+            panic!("expected kind form");
+        }
+
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 
@@ -2653,6 +3285,37 @@ rules = [
         assert!(!runner.ctx.config.agent.subagents.enabled);
         assert!(execute(&mut runner, "/subagents max_tasks 0").is_err());
 
+        // /subagents stop 命令验证：空闲、单任务按 ID 停止、批量停止与非法参数
+        let action = execute(&mut runner, "/subagents stop").unwrap();
+        assert!(
+            matches!(action, CliAction::Output { ref text, .. } if text.contains("当前没有运行中的子代理"))
+        );
+        assert!(execute(&mut runner, "/subagents stop invalid").is_err());
+
+        let (job_id, _kill_rx) = runner
+            .registries
+            .background
+            .start(cyber_agent::JobKind::Subagent, "worker".into());
+        let run_id = runner.registries.subagents.start("worker");
+        runner.registries.background.link_archive(job_id, run_id);
+
+        let action = execute(&mut runner, &format!("/subagents stop {run_id}")).unwrap();
+        assert!(
+            matches!(action, CliAction::Output { ref text, .. } if text.contains(&format!("已终止子代理 #{run_id}")))
+        );
+        assert_eq!(
+            runner.registries.subagents.snapshot()[0].status,
+            cyber_agent::SubagentStatus::Killed
+        );
+
+        let (_job_id2, _rx) = runner
+            .registries
+            .background
+            .start(cyber_agent::JobKind::Subagent, "worker2".into());
+        let action_all = execute(&mut runner, "/subagents stop all").unwrap();
+        assert!(
+            matches!(action_all, CliAction::Output { ref text, .. } if text.contains("已终止 1 个运行中的子代理"))
+        );
         execute(&mut runner, "/env set PUBLIC visible value").unwrap();
         execute(&mut runner, "/env set-sensitive TOKEN private value").unwrap();
         let listed = execute(&mut runner, "/env list").unwrap();
@@ -2726,6 +3389,54 @@ rules = [
             }
             _ => panic!("expected Output"),
         }
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn slash_vision_config_and_status() {
+        let mut runner = test_runner().await;
+        assert!(runner.ctx.config.agent.vision.enabled);
+        let status = execute(&mut runner, "/vision status").unwrap();
+        let CliAction::Output { text, .. } = status else {
+            panic!("expected vision status output");
+        };
+        assert!(text.contains("enabled"));
+
+        execute(&mut runner, "/vision off").unwrap();
+        assert!(!runner.ctx.config.agent.vision.enabled);
+        execute(&mut runner, "/vision on").unwrap();
+        assert!(runner.ctx.config.agent.vision.enabled);
+
+        execute(&mut runner, "/vision provider custom-prov").unwrap();
+        assert_eq!(runner.ctx.config.agent.vision.provider, "custom-prov");
+        execute(&mut runner, "/vision model custom-model").unwrap();
+        assert_eq!(runner.ctx.config.agent.vision.model, "custom-model");
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn slash_vision_model_picker_and_set() {
+        let mut runner = test_runner().await;
+        // 1. 无参数时弹出 picker
+        let action = execute(&mut runner, "/vision model").unwrap();
+        match action {
+            CliAction::Picker(p) => {
+                assert_eq!(p.title, "Vision Models");
+                assert!(!p.items.is_empty());
+                assert!(p
+                    .items
+                    .iter()
+                    .all(|i| i.command.starts_with("/vision model ")));
+            }
+            _ => panic!("expected Picker for /vision model"),
+        }
+
+        // 2. 带参数时直接设置
+        execute(&mut runner, "/vision model openai gpt-4o").unwrap();
+        assert_eq!(runner.ctx.config.agent.vision.provider, "openai");
+        assert_eq!(runner.ctx.config.agent.vision.model, "gpt-4o");
+
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 }

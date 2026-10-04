@@ -182,6 +182,19 @@ enum OutputFormat {
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+
+    // 全局双击 Ctrl+C 紧急强杀看门狗：任何时刻连续收到两次系统级 Ctrl+C 均立即强退，防止任何死锁/挂起
+    tokio::spawn(async {
+        let mut count = 0;
+        while let Ok(()) = tokio::signal::ctrl_c().await {
+            count += 1;
+            if count >= 2 {
+                cyber_tui::restore_terminal();
+                std::process::exit(130);
+            }
+        }
+    });
+
     let cli = Cli::parse();
 
     let cwd = resolve_cwd(match cli.cwd {
@@ -197,20 +210,44 @@ async fn main() -> color_eyre::Result<()> {
         Some(Command::Run(args)) => {
             // headless：日志写 stderr（不污染 stdout 的结果输出）
             init_tracing(cli.log_level.as_deref());
-            run_headless_command(&cwd, args, mock).await
+            let res = run_headless_command(&cwd, args, mock).await;
+            match res {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         }
-        Some(Command::Setup) => setup::run_setup(&cwd).await,
+        Some(Command::Setup) => {
+            let res = setup::run_setup(&cwd).await;
+            cyber_tui::restore_terminal();
+            match res {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Command::Tui) => {
             require_terminal(interactive)?;
             setup::ensure_configured(&cwd, mock, true)?;
-            run_tui(&cwd, mock, cli.log_level.as_deref()).await
+            let res = run_tui(&cwd, mock, cli.log_level.as_deref()).await;
+            cyber_tui::restore_terminal();
+            std::process::exit(if res.is_ok() { 0 } else { 1 });
         }
-        Some(Command::Update(args)) => run_update(args, &cwd).await,
+        Some(Command::Update(args)) => {
+            let res = run_update(args, &cwd).await;
+            std::process::exit(if res.is_ok() { 0 } else { 1 });
+        }
         None => {
             require_terminal(interactive)?;
             setup::ensure_configured(&cwd, mock, true)?;
             init_cli_tracing(cli.log_level.as_deref())?;
-            run_cli(&cwd, mock).await
+            let res = run_cli(&cwd, mock).await;
+            cyber_tui::restore_terminal();
+            std::process::exit(if res.is_ok() { 0 } else { 1 });
         }
     }
 }
