@@ -38,8 +38,9 @@ desktop.ini
 # Logs
 *.log
 
-# Trae IDE internal docs (optional — comment out to keep)
-# /.trae/
+# Trae IDE internal docs
+/.trae/
+.trae/
 
 /assets/
 
