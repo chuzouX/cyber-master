@@ -268,9 +268,11 @@ kind = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-chat"
-max_tokens = 4096
+max_tokens = 384000
 temperature = 0.7
 ```
+
+`max_tokens` 是输出上限的声明值：实际发送前会按该模型声明的 `context_length` 自动钳制（未声明时钳制到 128000），因此无需为长思考/推理模型手动保守设置。若某模型的 `context_length` 偏小，可在 `[providers.X.models.Y]` 中调大。
 
 支持 `kind`：`openai` / `anthropic` / `ollama` / `openai-compatible`
 
@@ -348,7 +350,6 @@ provider · model │ [1/3] tasks │ ctx 剩余% │ cache 命中率 │ ↑inp
 | `Alt+Enter` / `Shift+Enter` | 换行 |
 | `PgUp` / `PgDown` | 滚动对话历史 |
 | `Ctrl+C` | 任务中取消；当前空闲且空输入时也可退出 |
-| `Ctrl+D`（空输入） | 退出 |
 
 执行前审批仍须输入当前请求的 nonce（`once <请求码>` 或 `session <请求码>`）后显式提交；paste 不得自动提交或确认授权，预输入内容也不得误批准。这是工具权限流程，不是可切换的 mode；底栏精简不改变下述权限策略或 headless 行为。
 

@@ -6,6 +6,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Provider 表单「高级设置」分组**：新增/编辑服务商时可直接填写
+  `chat_endpoint`（自定义对话端点，留空默认 `{base_url}/chat/completions`）与
+  `models_endpoint`（自定义模型列表端点，留空默认 `{base_url}/models`）。
+  CLI 表单（`/provider add|edit|add-preset|add-with-kind`）与 TUI 表单（`cyber tui` / Settings Providers 段）均已覆盖。
+- **TUI Provider 表单跟随光标滚屏**：字段数量增长后字段区不再被底部裁剪，光标移到任意字段都会自动滚入视口。
+
+### Fixed
+- **设置中心弹层背景错误**：从设置中心打开的「编辑环境变量 / 编辑记忆规则」表单与「Models」模型选择弹层，
+  下层背景此前会回落到对话界面（logo 头部 + 对话区 + 输入框），现已保持设置中心面板（边框标题 + 页签栏 + 当前页内容），
+  弹层居中覆盖其上；按键路由与 `Esc` / 保存后返回设置面板的语义完全不变。
+- **清空高级端点覆盖值后残留**：将 `chat_endpoint` / `models_endpoint` 置空保存时，会同步从 `providers.toml` 删除对应键，避免合并写入保留陈旧值并在下次启动被重新读回。
+
+### Removed
+- **CLI 空输入 `Ctrl+D` 退出快捷键**：`Ctrl+D` 不再退出进程。无面板时交回输入框自身语义（Emacs 风格「删除光标处字符」）；
+  设置中心与 CTF 面板内显式忽略该按键，避免落入单字母 `d` 的删除动作（provider / 环境变量 / 记忆规则 / 题目）。
+  shortcuts 面板与文档同步删除该条目，退出仍可用空输入 `Ctrl+C` 或 `/quit`。
+
+---
+
+## [0.5.1] - 2026-10-05
+
+### Added
+- **CNB 镜像源更新回退与一键升级安装支持**：
+  - 在 GitHub Releases API 不可用或受限时，自动回退至 CNB 镜像源检测最新版本。
+  - `/update` 支持提示用户确认并直接拉取安装脚本执行原地更新。
+  - `/version` 增加 CNB 镜像发布地址展示，并在更新提示中附带国内云原生一键安装命令。
+- **终端文本选区交互优化**：
+  - Chat 与 CLI 视口支持 `Shift + 单击` 连续扩展文本选区。
+  - 鼠标释放时保持高亮选区以便 `Ctrl+C` 复制到剪贴板。
+
+### Fixed
+- **无头 CI 环境剪贴板容错**：解决 Linux 无显示服务（Headless）环境下剪贴板断言导致的集成测试失败。
+- **CNB Release 目标提交绑定**：修复自动化镜像工作流中 Release Tag 未绑定准确 commit 的问题。
+
+### Changed
+- **发布预检流程精简**：优化本地发布检查脚本 (`check-release`) 为 7 步并保持与 CI 工作流对齐。
+
+---
+
 ## [0.5.0] - 2026-10-05
 
 ### Added

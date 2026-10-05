@@ -18,7 +18,7 @@ CLI 与 headless 在 `cyber-tui` 内共用独立于 `App` 的 `SessionRunner`、
 
 - **视觉与 Header**：参考 [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi) 的真实 palette 与终端层次，不拷源码、不仿造未实现 agents/LSP。使用暖金、灰白、cyan/紫色，彩色 ASCII `Cy` + `Cyber Master V<版本>` + model/effort + cwd；不沿用原面板的模式导航标题栏。
 - **主区与底部**：可滚动对话区，底部固定输入区与实际状态栏 `provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output`；未知值显示 `--`。不再使用行末 `\` 续行的行式交互，不显示审批模式或 agent 面板入口。
-- **快捷键与补全**：空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。两行圆角输入区上方显示金色无框候选；`/` 与二级参数建议、Tab 接受、Up/Down 选择，Enter 先接受未接受的候选再执行，Esc 关闭候选保留输入。普通 Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，Ctrl+O 展开工具；任务中 Ctrl+C cancel，空输入 Ctrl+D quit。当前实现空闲且空输入的 Ctrl+C 也会退出，不能将其描述为任何状态都只取消。
+- **快捷键与补全**：空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。两行圆角输入区上方显示金色无框候选；`/` 与二级参数建议、Tab 接受、Up/Down 选择，Enter 先接受未接受的候选再执行，Esc 关闭候选保留输入。普通 Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，Ctrl+O 展开工具；任务中 Ctrl+C cancel。当前实现空闲且空输入的 Ctrl+C 也会退出，不能将其描述为任何状态都只取消。
 - **状态数据**：`ctx` 是当前上下文估算 token 相对有效容量的剩余百分比，容量未知为 `--`；`cache` 是上报命中 token /（命中 + 未命中 token），分母为零为 `--`；input/output 只累计实际 Usage，未上报为 `--`。Usage 仅在本进程当前会话累计，新建/切换会话重置，重开不恢复；切换 provider/model 不重置累计，重新计算上下文容量与估算。
 - **命令目录**：`cli_commands.rs::commands` 复用 TUI 目录，过滤 `/mode` 后支持 16 个主命令，加 `/effort` 共 17 项。执行、表单、picker、任务与二级补全已接入，实际语法及原 TUI 差异见 [TUI_COMMANDS.md](./TUI_COMMANDS.md)；目录覆盖不等于所有多子命令/参数/任务状态组合均已端到端验收。
 - **Provider 与会话**：Provider add/edit 表单 API key 掩码、取消不保存、私有文件原子持久化，use/remove 与默认项回退已实现；model picker 使用已配置模型，不宣称 CLI 自动联网拉取。session picker/list/read/new/delete 与 ID 切换、JSON 保存已实现，跨会话读取只展示，不注入模型历史。
@@ -651,11 +651,22 @@ P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`�
 | 2 | base_url | 文本（自动 trim + 去尾 `/`） |
 | 3 | api_key | 文本 |
 | 4 | model | 文本（可手填或经「拉取模型」按钮 picker 选中回填） |
-| 5 | max_tokens | 文本（parse 为 u32，失败校验报错） |
-| 6 | temperature | 文本（parse 为 f32，失败校验报错） |
-| 7 | 拉取模型 | 按钮（Enter 触发异步 fetch） |
-| 8 | 保存 | 按钮（Enter 触发校验 + 持久化） |
-| 9 | 取消 | 按钮（Enter / Esc 丢弃表单返回 `prev_mode`） |
+| 5 | alias | 文本（显示别名，留空用 model id） |
+| 6 | context_length | Enum（←/→/空格 在 `CONTEXT_LENGTH_PRESETS` = 默认(留空)/128K/256K/512K/1M/自定义 间循环；选「自定义」后 Enter 进 textarea 手输数字） |
+| 7 | max_tokens | 文本（parse 为 u32，失败校验报错） |
+| 8 | temperature | 文本（parse 为 f32，失败校验报错） |
+| 9-11 | input_per_m / output_per_m / cache_hit_per_m | 文本（每百万 token 价格，可留空） |
+| 12 | currency | Enum（←/→ 循环 usd/cny） |
+| 13 | notes | 文本（自由备注） |
+| 14 | chat_endpoint | 文本（高级设置：自定义流式对话端点，留空默认 `{base_url}/chat/completions`） |
+| 15 | models_endpoint | 文本（高级设置：自定义模型列表端点，留空默认 `{base_url}/models`） |
+| 16 | 拉取模型 | 按钮（Enter 触发异步 fetch） |
+| 17 | 保存 | 按钮（Enter 触发校验 + 持久化） |
+| 18 | 取消 | 按钮（Enter / Esc 丢弃表单返回 `prev_mode`） |
+
+字段 5-13 属于「模型专属微调参数」（对当前选中 model 独立生效），14-15 归入「高级设置 高级选项」分组，渲染时以分隔线与分组标题区分。
+
+**高级端点覆盖**：`chat_endpoint` / `models_endpoint` 为空串时序列化为 `None`（`skip_serializing_if`），生效端点回退到按 kind 推导的默认值（见 `ProviderConfig::chat_endpoint()`）。显式清空已有覆盖值时必须从原始 `providers.toml` 删除对应键，否则 `merge_table` 合并会保留陈旧值并在下次启动重新读回（`provider_configuration_bytes` 中与 `context_length` 同处处理）。
 
 **拉取模型（async fetch）**：「拉取模型」按钮 bump `fetch_id`（防 stale）+ 置 `fetching` 态，spawn `cyber_agent::fetch_models` 任务。按 kind 试 `{base}/models` 与 `{base}/v1/models`（anthropic 先 v1，其余先 /models），headers 按 kind（anthropic→`x-api-key`+`anthropic-version`；openai/compatible→`Authorization: Bearer`；ollama→无 auth）。结果经 `mpsc::UnboundedSender<FetchResult>` 回传主循环第 4 路 `select!` 分支 → `deliver_fetch`（`fetch_id` 不匹配则丢弃）。成功弹出 picker（↑/↓ 选模型 → Enter 回填 model 字段）；失败显示错误文案。
 
@@ -665,6 +676,8 @@ P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`�
 - **Chat 入口**（`/provider add|edit`）：Save 立即 `save_providers` 写盘（Chat 无 Settings 的保存触发点）。
 
 **校验**：name 非空 + 不与现有重名（编辑自身除外）+ base_url 非空 + max_tokens/temperature 可 parse。失败保留表单 + toast 提示，不退出。
+
+**max_tokens 默认与钳制**：新建 / 缺省 provider 的默认 `max_tokens` 为 `cyber_core::DEFAULT_MAX_TOKENS`（384_000）。真正发给端点的值是 `ProviderConfig::effective_max_tokens()`：per-model `max_tokens` 优先、回退 provider 级，再按该模型声明的 `context_length` 钳制；未声明 `context_length` 时钳制到 `DEFAULT_OUTPUT_TOKEN_CAP`（128_000）。因此配置里写 384000 是安全的上限声明，实际发送值不会超出模型窗口——想用满更大预算需把该模型的 `context_length` 提到相应数值。截断续写的回合处理见 `cyber_agent::agent`（`MAX_EMPTY_TRUNCATION_ROUNDS` / `TRUNCATION_CONTINUE_NUDGE` / `AgentEvent::Notice`）。
 
 **删除确认**：Settings Providers 段 `d` 双击（首次置 `pending_delete_idx` + 行内 `[待删除!]` 标记，任一其他键清除；二次 `d` 执行删除）。删除/重命名触及 `default_provider` 时自动回退到排序后首个剩余 / 同步改名，并 toast。
 

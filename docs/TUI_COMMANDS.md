@@ -19,7 +19,7 @@ CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort`
 | `/help` | 显示实际 CLI 目录；空输入 `?` 打开 shortcuts。 |
 | `/clear` | 清空并保存当前会话历史、重置 Usage，不删除全部会话。 |
 | `/cancel` | 取消当前 agent、compact、writeup 或连接任务；隔离旧事件并保存实际结果。任务中 Ctrl+C 同样 cancel；当前空闲且空输入时 Ctrl+C 会退出。 |
-| `/quit` / 空输入 Ctrl+D | 保存会话并退出。 |
+| `/quit` | 保存会话并退出（无 Ctrl+D 快捷键）。 |
 | `/model [provider [model]]` | 无参数打开已配置 provider/model picker；带参数选择并持久化，不自动联网发现模型。 |
 | `/provider [list\|add\|edit name\|use name\|remove name]` | list 隐藏 endpoint/凭据；add/edit 打开表单，use 持久化选择，remove 直接删除并处理默认项回退，无二次删除确认。 |
 | `/subagents [status\|enable\|disable\|max_tasks N\|max_parallel N\|timeout N\|max_steps N]` | 查询或持久化 `[agent.subagents]`；数量、并发、超时和步数在后续 turn 生效，enable/disable 需重启以重建工具目录。所有数值必须为正整数。 |
@@ -106,6 +106,8 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 | `/provider remove <name>` | 删除并写 providers 文件，删除默认项时内存默认值回退到排序后首个剩余项。此 slash 路径直接删除，没有 Settings 面板的双击确认。 |
 
 子命令大小写不敏感，provider 名称按实际配置精确匹配。`/model provider` 是当前运行切换；需保存默认配置时使用 `/provider use provider`。
+
+表单字段按顺序为 `name`、`kind`、`endpoint`、`apikey`、`model`、`maxtokens`、`temperature`、`context_length`，以及「高级设置 高级选项」分组下的 `chat_endpoint`（自定义对话端点，留空默认 `{base_url}/chat/completions`）与 `models_endpoint`（自定义模型列表端点，留空默认 `{base_url}/models`）。两个端点字段留空即回退默认并删除已有覆盖值。
 
 ## 原 TUI CTF 子命令
 

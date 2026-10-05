@@ -37,7 +37,7 @@
 已实现独立 coding CLI 布局，保留原 `cyber tui` 面板；正常日志写文件，退出、取消或异常会恢复终端。
 
 - [x] 行式 CLI 替换为全屏简洁 coding 界面；视觉参考 [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)，不拷源码、不仿造未实现 agents/LSP。真实 palette 为暖金/灰白/cyan/紫色，彩色 ASCII `Cy` + 版本/model/effort/cwd，两行圆角输入与金色无框候选，实际状态栏 `provider · model │ ctx 剩余% │ cache 命中率 │ ↑input ↓output`，未知为 `--`；移除旧审批模式提示与 agent 面板入口。
-- [x] 空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，任务中 Ctrl+C cancel，空输入 Ctrl+D quit；当前空闲且空输入的 Ctrl+C 也可退出，不宣称它在所有状态都只取消。
+- [x] 空输入 `?` 打开实际 shortcuts，`/help` 显示命令目录；空输入 `Left` 不打开面板。Enter 提交，Alt/Shift+Enter 换行，PgUp/PgDown 滚动，任务中 Ctrl+C cancel；当前空闲且空输入的 Ctrl+C 也可退出，不宣称它在所有状态都只取消。
 - [x] `/effort low|medium|high|xhigh|auto` 切换现有 agent 思考档位；medium→Middle、xhigh→Max，保留 middle/max aliases 与 `/think`，只沿用系统提示词注入，不新增 provider API `reasoning_effort`。
 - [x] 执行前审批支持三大模式：手动审批（每次调用工具弹出确认）、自动审批（低风险只读工具直接放行，高风险命令/写操作弹出确认）、无限制（完全不弹出确认，直接持续执行）。支持 F2 / Ctrl+P 快捷键及 `/mode [auto|manual|unlimited]` 即时切换。审批弹框采用按钮小卡片，支持 1/2/3 直达、方向键/Tab 选择和 Enter 确认。
 - [x] headless 文本/JSON、会话续接、默认拒绝工具和显式 `--allow-tool` 授权回归通过；布局覆盖小尺寸与超过 65535 行历史。
