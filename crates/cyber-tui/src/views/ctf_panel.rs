@@ -16,6 +16,8 @@ use unicode_width::UnicodeWidthChar;
 
 use cyber_core::CtfChallenge;
 
+use super::clip_cells_ellipsis;
+
 use crate::theme::Theme;
 
 /// CTF 面板默认宽度（字符）。
@@ -241,19 +243,25 @@ fn render_detail(
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    let w = content_area.width as usize;
+    let w = (content_area.width as usize).saturating_sub(1);
 
     // 标题行
+    let cat_text = format!("[{}]", c.category);
+    use unicode_width::UnicodeWidthStr;
+    let cat_w = UnicodeWidthStr::width(cat_text.as_str()) + 1;
+    let name_budget = w.saturating_sub(cat_w);
+    let name_clipped = clip_cells_ellipsis(&c.name, name_budget);
+
     lines.push(Line::from(vec![
         Span::styled(
-            format!("[{}]", c.category),
+            cat_text,
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
-            c.name.clone(),
+            name_clipped,
             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
     ]));

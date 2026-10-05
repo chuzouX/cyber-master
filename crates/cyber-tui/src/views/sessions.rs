@@ -15,6 +15,8 @@ use crate::app::SessionsPanelState;
 use crate::history::SessionIndex;
 use crate::theme::Theme;
 
+use super::{clip_cells_ellipsis, clipped_spans};
+
 /// 面板中 id 的最大显示宽度（超出截断，加 `…`）。
 const ID_DISPLAY_LEN: usize = 10;
 
@@ -36,6 +38,8 @@ pub fn render(
     } else {
         " 会话管理 / Sessions ".to_string()
     };
+    // 标题绘制在顶边框上：限制宽度避免覆盖右上角边框。
+    let title_text = clip_cells_ellipsis(&title_text, (area.width as usize).saturating_sub(3));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -57,6 +61,8 @@ pub fn render(
     let hint_area = chunks[1];
 
     let mut lines: Vec<Line> = Vec::new();
+    // 内容行必须严格小于 inner 宽度，否则会覆写右侧边框。
+    let max_row_w = (inner.width as usize).saturating_sub(1);
 
     if state.list.is_empty() {
         lines.push(
@@ -67,15 +73,18 @@ pub fn render(
     } else {
         // 表头
         lines.push(
-            Line::from(vec![
-                Span::styled(
-                    "标题",
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  · 消息  · id"),
-            ])
+            Line::from(clipped_spans(
+                vec![
+                    Span::styled(
+                        "标题",
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  · 消息  · id"),
+                ],
+                max_row_w,
+            ))
             .style(Style::default().fg(theme.muted)),
         );
         lines.push(Line::from(""));
@@ -94,26 +103,34 @@ pub fn render(
             let title_color = if pending { theme.accent } else { theme.title };
             let id_short = truncate_id(&meta.id, ID_DISPLAY_LEN);
 
+            // 标题（+ ★当前）优先，其余列随后；整体裁剪防越界。
+            let title_cells = format!("{}{}", meta.title, star);
+            let suffix_cells = format!("  · {} 条  · [{}]", meta.message_count, id_short);
+            use unicode_width::UnicodeWidthStr;
+            let title_budget = max_row_w
+                .saturating_sub(UnicodeWidthStr::width(marker))
+                .saturating_sub(UnicodeWidthStr::width(suffix_cells.as_str()))
+                .saturating_sub(UnicodeWidthStr::width(delete_tag));
             lines.push(
-                Line::from(vec![
-                    Span::raw(marker),
-                    Span::styled(
-                        format!("{}{}", meta.title, star),
-                        Style::default()
-                            .fg(title_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  · {} 条  · [{}]", meta.message_count, id_short),
-                        Style::default().fg(theme.muted),
-                    ),
-                    Span::styled(
-                        delete_tag.to_string(),
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
+                Line::from(clipped_spans(
+                    vec![
+                        Span::raw(marker),
+                        Span::styled(
+                            clip_cells_ellipsis(&title_cells, title_budget),
+                            Style::default()
+                                .fg(title_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(suffix_cells, Style::default().fg(theme.muted)),
+                        Span::styled(
+                            delete_tag.to_string(),
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ],
+                    max_row_w,
+                ))
                 .style(row_style),
             );
         }
@@ -151,7 +168,7 @@ pub fn render(
         Style::default().fg(theme.muted)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(hint)).style(hint_style),
+        Paragraph::new(Line::from(clip_cells_ellipsis(&hint, max_row_w))).style(hint_style),
         hint_area,
     );
 }
@@ -232,6 +249,42 @@ mod tests {
         terminal
             .draw(|f| render(f, f.area(), &Theme::resolve("cyberpunk"), &state, &idx))
             .unwrap();
+    }
+
+    #[test]
+    fn sessions_borders_survive_long_titles_and_narrow_width() {
+        let long_title = "这是一个极其冗长的会话标题：排查所有服务商预设、模型别名、后台任务与子代理转录的边框渲染问题并逐个修复";
+        let state = SessionsPanelState {
+            selected: 0,
+            pending_delete: Some(0),
+            list: vec![
+                meta("0c1b2a3d-4e5f-6789-abcd-ef0123456789", long_title, 987),
+                meta("short", long_title, 1),
+            ],
+        };
+        let idx = SessionIndex {
+            current: "0c1b2a3d-4e5f-6789-abcd-ef0123456789".into(),
+            sessions: state.list.clone(),
+        };
+        for (w, h) in [(70u16, 20u16), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| render(f, f.area(), &Theme::resolve("cyberpunk"), &state, &idx))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut bad = Vec::new();
+            for y in 1..h - 1 {
+                let right = buffer[(w - 1, y)].symbol();
+                if right != "│" {
+                    bad.push(format!("右边界 y={y} 被覆写: {right:?}"));
+                }
+                let left = buffer[(0, y)].symbol();
+                if left != "│" {
+                    bad.push(format!("左边界 y={y} 被覆写: {left:?}"));
+                }
+            }
+            assert!(bad.is_empty(), "w={w} 会话面板边框损坏: {bad:#?}");
+        }
     }
 
     #[test]

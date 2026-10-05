@@ -305,6 +305,58 @@ impl RenderedCell {
             .sum();
         Self { spans, width }
     }
+    fn clip_to_width(&mut self, max_width: usize) {
+        use unicode_width::UnicodeWidthChar;
+        if self.width <= max_width {
+            return;
+        }
+        if max_width == 0 {
+            self.spans.clear();
+            self.width = 0;
+            return;
+        }
+        if max_width == 1 {
+            let last_style = self.spans.last().map(|s| s.style).unwrap_or_default();
+            self.spans = vec![Span::styled("…", last_style)];
+            self.width = 1;
+            return;
+        }
+
+        let target = max_width.saturating_sub(1);
+        let mut used = 0;
+        let mut new_spans = Vec::new();
+        let mut last_style = Style::default();
+        let mut finished = false;
+
+        for span in &self.spans {
+            last_style = span.style;
+            if finished {
+                break;
+            }
+            let mut span_chars = String::new();
+            for ch in span.content.chars() {
+                let char_w = if ch == '\t' {
+                    4
+                } else {
+                    UnicodeWidthChar::width(ch).unwrap_or(0)
+                };
+                if used + char_w <= target {
+                    used += char_w;
+                    span_chars.push(ch);
+                } else {
+                    finished = true;
+                    break;
+                }
+            }
+            if !span_chars.is_empty() {
+                new_spans.push(Span::styled(span_chars, span.style));
+            }
+        }
+
+        new_spans.push(Span::styled("…", last_style));
+        self.spans = new_spans;
+        self.width = used + 1;
+    }
 }
 
 /// 渲染表格：表头（主题 header 色 + 粗体）、分隔线、数据行（按视觉列宽对齐）。
@@ -333,6 +385,28 @@ fn render_table(table: &TableBlock, md: &MdColors) -> Vec<Line<'static>> {
         }
     }
 
+    // 约束列宽和总宽度，防止长表格在视口折行时被破坏打散
+    const MAX_TABLE_WIDTH: usize = 80;
+    const MAX_COL_WIDTH: usize = 40;
+    const MIN_COL_WIDTH: usize = 3;
+
+    for w in &mut widths {
+        *w = (*w).clamp(1, MAX_COL_WIDTH);
+    }
+
+    let border_overhead = 1 + 3 * cols;
+    let content_budget = MAX_TABLE_WIDTH
+        .saturating_sub(border_overhead)
+        .max(cols * MIN_COL_WIDTH);
+    while widths.iter().sum::<usize>() > content_budget {
+        let max_val = widths.iter().copied().max().unwrap_or(0);
+        if max_val <= MIN_COL_WIDTH {
+            break;
+        }
+        if let Some(w) = widths.iter_mut().find(|w| **w == max_val) {
+            *w = w.saturating_sub(1);
+        }
+    }
     let mut out = Vec::with_capacity(2 + row_cells.len());
     out.push(render_table_row(
         header_cells,
@@ -370,6 +444,7 @@ fn render_table_row(
         if col > 0 {
             spans.push(Span::styled(" │ ", bar));
         }
+        cell.clip_to_width(widths[col]);
         let pad = widths[col].saturating_sub(cell.width);
         let (left, right) = match aligns.get(col).copied().unwrap_or(TableAlign::Left) {
             TableAlign::Left => (0, pad),
@@ -997,5 +1072,29 @@ mod tests {
             line_widths[2], line_widths[3],
             "数据行2与数据行1宽度必须一致: {line_widths:?}"
         );
+    }
+
+    #[test]
+    fn test_markdown_table_long_cell_constrained() {
+        use unicode_width::UnicodeWidthStr;
+        let text = "| 步骤 | 详细说明与检测要点 |\n|---|---|\n| 1. 环境确认 | 防火墙：确认攻击机 8888 端口可达，避免反弹 shell 流量被拦截阻断 |\n| 2. 漏洞利用 | 注入点：测试单引号报错与堆叠注入，使用 sqlmap 对目标参数进行精准盲注注入分析 |";
+        let lines = render(text, &theme());
+        assert_eq!(lines.len(), 4, "表头 + 分隔线 + 2 数据行");
+        let line_widths: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum()
+            })
+            .collect();
+        for w in &line_widths {
+            assert!(*w <= 80, "表格行宽度必须受控 <= 80: {w}");
+        }
+        // 所有行宽度一致
+        assert_eq!(line_widths[0], line_widths[1]);
+        assert_eq!(line_widths[1], line_widths[2]);
+        assert_eq!(line_widths[2], line_widths[3]);
     }
 }

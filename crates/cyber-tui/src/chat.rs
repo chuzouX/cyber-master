@@ -699,7 +699,10 @@ impl ChatState {
                 }
 
                 if let Some(mut sel) = self.selection.take() {
-                    sel.selecting = false;
+                    // Preserve selecting flag if Shift is held, otherwise clear it
+                    if !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        sel.selecting = false;
+                    }
                     if !sel.is_empty() {
                         let wc = self.wrapped.borrow();
                         let text = crate::selection::extract_text(&wc.source, &sel);

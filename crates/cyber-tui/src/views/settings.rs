@@ -429,6 +429,8 @@ pub struct SettingsState {
     /// Custom Tools 段 cursor（在工具列表中）。
     pub custom_tools_selected: usize,
     pub memory_selected: usize,
+    /// Memory 段双击 `d` 删除确认。
+    pub memory_pending_delete_idx: Option<usize>,
     /// Providers 段 cursor 是否停在保存按钮行。
     pub provider_on_save: bool,
     /// MCP 段 cursor 是否停在保存按钮行。
@@ -923,14 +925,17 @@ fn render_fields(
             );
         } else {
             for (i, rule) in config.memory.rules.iter().enumerate() {
-                let style = if i == state.memory_selected {
+                let selected = i == state.memory_selected;
+                let pending_delete = state.memory_pending_delete_idx == Some(i);
+                let style = if selected {
                     Style::default().bg(theme.sel_bg).fg(theme.sel_fg)
                 } else {
                     Style::default().fg(theme.fg)
                 };
+                let delete_tag = if pending_delete { "  [待删除!]" } else { "" };
                 lines.push(
                     Line::from(format!(
-                        "{}. [{}] {} {}",
+                        "{}. [{}] {} {}{delete_tag}",
                         i + 1,
                         if rule.enabled { "on" } else { "off" },
                         rule.scope,
@@ -1361,6 +1366,15 @@ fn render_mcp_lines(
                     .style(Style::default().fg(theme.muted)),
             );
         }
+    }
+    if !mcp_config.servers.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(
+            Line::from(
+                "  💡 提示: 输入 /mcp 可打开独立全屏 MCP 控制台，支持工具 Schema 探查与测活重连",
+            )
+            .style(Style::default().fg(theme.muted)),
+        );
     }
 }
 
