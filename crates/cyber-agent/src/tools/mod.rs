@@ -3,6 +3,7 @@
 //! P6 将在 cyber-tools 增加安全工具（subfinder/nmap/nuclei…）并实现 `Tool` 注入
 //! 统一工具表。本模块仅注册 P2.2 的基础工具。
 
+pub mod ask_user;
 pub(crate) mod ctf_challenge;
 mod custom_tool;
 mod delegate_tasks;
@@ -38,6 +39,7 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(bg::BgStatusTool));
     reg.register(Box::new(bg::BgKillTool));
     reg.register(Box::new(custom_tool::CustomToolsListTool::empty()));
+    reg.register(Box::new(ask_user::AskUserTool::default()));
 }
 
 /// 内置工具名（供 TUI `/tools` 命令展示，避免重复构造 registry）。
@@ -59,9 +61,21 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
         "bg_kill",
         "custom_tools_list",
         "mcp_tools_list",
+        "http_request",
+        "cyberchef",
+        "hash_identifier",
+        "port_scanner",
+        "dns_recon",
+        "fuzz_endpoint",
+        "jwt_analyzer",
+        "binary_inspect",
+        "poc_validator",
+        "reverse_shell_gen",
+        "ask_user",
     ]
 }
 
+pub use ask_user::AskUserTool;
 pub use bg::{BgKillTool, BgShellTool, BgStatusTool};
 
 pub use ctf_challenge::CtfChallengeTool;

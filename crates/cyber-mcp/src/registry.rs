@@ -16,8 +16,8 @@ use tracing::warn;
 use crate::config::{McpServerSpec, McpServersConfig};
 use crate::connection::McpConnection;
 use crate::error::McpError;
+use crate::proto::McpToolSchema;
 use crate::tool::McpTool;
-
 /// 一个已注册的 MCP server 连接。
 struct RegisteredServer {
     name: String,
@@ -121,6 +121,22 @@ impl McpRegistry {
             .iter()
             .map(|s| (s.name.as_str(), s.tool_count))
             .collect()
+    }
+
+    /// 返回指定已连接 server 的工具列表（只读）。
+    pub fn server_tools(&self, server_name: &str) -> Option<&[McpToolSchema]> {
+        self.servers
+            .iter()
+            .find(|s| s.name == server_name)
+            .map(|s| s.conn.tools())
+    }
+
+    /// 返回指定已连接 server 的底层连接句柄（供连通性测活等使用）。
+    pub fn server_conn(&self, server_name: &str) -> Option<Arc<McpConnection>> {
+        self.servers
+            .iter()
+            .find(|s| s.name == server_name)
+            .map(|s| s.conn.clone())
     }
 
     /// 已连接 server 数量。

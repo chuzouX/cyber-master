@@ -96,6 +96,8 @@ pub async fn build_registries(
     for tool in &custom_tools {
         tool_reg.register_hidden(Box::new(CustomTool::new(tool.config.clone())));
     }
+    // 注册 cyber-tools 网络安全原生工具
+    cyber_tools::register_security_tools(&mut tool_reg);
 
     // 3. MCP：非 mock 时加载 servers.toml + 并行连接
     let mcp = if !mock {
@@ -135,6 +137,10 @@ pub async fn build_registries(
         .todo_state()
         .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
 
+    let (question_broker, question_rx) = cyber_agent::QuestionBroker::interactive();
+    tool_reg.register(Box::new(cyber_agent::AskUserTool::new(Arc::clone(
+        &question_broker,
+    ))));
     (
         AppRegistries {
             tools: Arc::new(tool_reg),
@@ -145,6 +151,8 @@ pub async fn build_registries(
             todos,
             subagents: Arc::new(cyber_agent::SubagentArchive::default()),
             background: Arc::new(cyber_agent::BackgroundRegistry::default()),
+            question_broker,
+            question_rx: Arc::new(Mutex::new(Some(question_rx))),
         },
         errors,
     )

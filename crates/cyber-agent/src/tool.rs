@@ -286,13 +286,18 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        // 1. 最高优先级：完全精确名称匹配（避免模糊匹配抢占同名原生工具）
+        if let Some(exact) = self.tools.iter().find(|t| t.schema().name == name) {
+            return Some(exact.as_ref());
+        }
+
+        // 2. 次级匹配：兼容 custom_、mcp_、skill_ 前缀别名调用
         self.tools
             .iter()
             .find(|t| {
                 let schema_name = &t.schema().name;
-                schema_name == name
-                    || (schema_name.starts_with("custom_")
-                        && schema_name.strip_prefix("custom_") == Some(name))
+                (schema_name.starts_with("custom_")
+                    && schema_name.strip_prefix("custom_") == Some(name))
                     || (name.starts_with("custom_")
                         && name.strip_prefix("custom_") == Some(schema_name.as_str()))
                     || (schema_name.starts_with("mcp_")
@@ -319,6 +324,13 @@ impl ToolRegistry {
             .and_then(|t| t.as_any())
             .and_then(|a| a.downcast_ref::<crate::tools::TodoTool>())
             .map(|t| t.todos())
+    }
+
+    pub fn question_broker(&self) -> Option<Arc<crate::question::QuestionBroker>> {
+        self.get("ask_user")
+            .and_then(|t| t.as_any())
+            .and_then(|a| a.downcast_ref::<crate::tools::AskUserTool>())
+            .map(|t| t.broker())
     }
 
     /// All execution entry points on this view require explicit approval.
@@ -582,15 +594,15 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 14);
+        assert_eq!(registry.all_schemas().len(), 15);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
         assert!(registry.get("bg_shell").is_some());
         assert!(registry.get("inspect_image").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 14);
-        assert_eq!(registry.schemas().len(), 14);
+        assert_eq!(registry.all_schemas().len(), 15);
+        assert_eq!(registry.schemas().len(), 15);
     }
 
     #[test]

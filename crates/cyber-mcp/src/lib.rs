@@ -22,6 +22,7 @@ pub mod transport;
 pub use config::{McpPreset, McpServerSpec, McpServersConfig, MCP_PRESETS};
 pub use connection::McpConnection;
 pub use error::{McpError, Result};
+pub use proto::McpToolSchema;
 pub use registry::McpRegistry;
 pub use tool::{McpTool, McpToolSnapshot, McpToolsListTool};
 pub use transport::McpTransport;

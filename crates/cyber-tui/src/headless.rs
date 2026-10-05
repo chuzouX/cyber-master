@@ -1624,6 +1624,12 @@ impl TurnHistory {
                     is_error,
                 });
             }
+            AgentEvent::Notice(msg) => {
+                self.entries.push(ChatEntry::System(msg.clone()));
+                if text {
+                    eprintln!("{}", terminal_text(&format!("\n[notice] {msg}")));
+                }
+            }
             AgentEvent::Error(error) => {
                 if text {
                     eprintln!("{}", terminal_text(&format!("\n[error] {error}")));
@@ -1684,6 +1690,7 @@ pub async fn run_headless(cwd: &Path, args: HeadlessArgs) -> HeadlessOutcome {
             thinking(args.think.as_deref(), ThinkingIntensity::Auto)?;
         }
         let mut runner = SessionRunner::new(cwd, args.mock).await?;
+        runner.registries.question_broker.set_headless();
         let permissions = runner.explicit_permissions(&args.allow_tools)?;
         let intensity = thinking(
             args.think.as_deref(),

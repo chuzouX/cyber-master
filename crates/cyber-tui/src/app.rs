@@ -159,6 +159,11 @@ pub struct AppRegistries {
     pub subagents: Arc<SubagentArchive>,
     /// 后台任务注册表（CLI 后台面板 + bg 工具族共享；会话生命周期）。
     pub background: Arc<BackgroundRegistry>,
+    /// 需求提问 Broker
+    pub question_broker: Arc<cyber_agent::QuestionBroker>,
+    /// 提问请求接收端 (take 一次移交给 UI 监听)
+    pub question_rx:
+        Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<cyber_agent::QuestionRequest>>>>,
 }
 
 impl std::fmt::Debug for AppRegistries {
@@ -189,6 +194,7 @@ impl AppRegistries {
         let todos = tools
             .todo_state()
             .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
+        let (question_broker, question_rx) = cyber_agent::QuestionBroker::interactive();
         Self {
             tools,
             skills: Arc::new(SkillRegistry::new()),
@@ -198,6 +204,8 @@ impl AppRegistries {
             todos,
             subagents: Arc::new(SubagentArchive::default()),
             background: Arc::new(BackgroundRegistry::default()),
+            question_broker,
+            question_rx: Arc::new(Mutex::new(Some(question_rx))),
         }
     }
 }
@@ -492,6 +500,8 @@ pub struct App {
     pub permissions: Arc<PermissionBroker>,
     pub permission_rx: Option<UnboundedReceiver<PermissionRequest>>,
     pub pending_permission: Option<PermissionRequest>,
+    pub question_rx: Option<UnboundedReceiver<cyber_agent::QuestionRequest>>,
+    pub question_state: Option<crate::question_ui::QuestionUiState>,
     pub permission_choice: Option<ApprovalChoice>,
     pub permission_mode: PermissionMode,
     last_window_title: String,
@@ -538,6 +548,11 @@ impl App {
         broker.set_mode(initial_mode);
         let permissions = Arc::new(broker);
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
+        let question_rx = registries
+            .question_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         Self {
             config_at_entry: config.clone(),
             providers_at_entry: providers.clone(),
@@ -595,6 +610,8 @@ impl App {
             permission_rx: Some(permission_rx),
             pending_permission: None,
             permission_choice: None,
+            question_rx,
+            question_state: None,
             permission_mode: initial_mode,
             last_window_title: String::new(),
             streaming_started: None,
@@ -662,6 +679,10 @@ impl App {
             .probe_rx
             .take()
             .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
+        let mut question_rx = self
+            .question_rx
+            .take()
+            .unwrap_or_else(|| cyber_agent::QuestionBroker::interactive().1);
         let result = self
             .main_loop(
                 &mut terminal,
@@ -669,8 +690,16 @@ impl App {
                 &mut fetch_rx,
                 &mut permission_rx,
                 &mut probe_rx,
+                &mut question_rx,
             )
             .await;
+        if let Some(q) = self.question_state.take() {
+            let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                answers: Vec::new(),
+                cancelled: true,
+            });
+        }
+        Self::reject_queued_questions(&mut question_rx);
         // 退出前持久化当前对话（catch-all，覆盖所有退出路径）。
         self.save_history();
         // 取消任何仍在运行的 agent 任务，避免后台 HTTP 流泄漏
@@ -742,6 +771,12 @@ impl App {
         if let Some(request) = self.pending_permission.take() {
             let _ = request.reply.send(PermissionDecision::Deny);
         }
+        if let Some(q) = self.question_state.take() {
+            let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                answers: Vec::new(),
+                cancelled: true,
+            });
+        }
         self.permission_choice = None;
         self.streaming_started = None;
         self.chat.cancel_stream();
@@ -756,6 +791,15 @@ impl App {
         }
     }
 
+    fn reject_queued_questions(question_rx: &mut UnboundedReceiver<cyber_agent::QuestionRequest>) {
+        while let Ok(request) = question_rx.try_recv() {
+            let _ = request.reply.send(cyber_agent::QuestionResponse {
+                answers: Vec::new(),
+                cancelled: true,
+            });
+        }
+    }
+
     async fn main_loop(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -763,6 +807,7 @@ impl App {
         fetch_rx: &mut UnboundedReceiver<FetchResult>,
         permission_rx: &mut UnboundedReceiver<PermissionRequest>,
         probe_rx: &mut UnboundedReceiver<ProbeResult>,
+        question_rx: &mut UnboundedReceiver<cyber_agent::QuestionRequest>,
     ) -> io::Result<()> {
         // crossterm EventStream 必须fuse；Windows console handle 可用。
         let mut events = crossterm::event::EventStream::new().fuse();
@@ -802,6 +847,13 @@ impl App {
                         }
                     }
                 }
+                q_req = question_rx.recv(), if self.question_state.is_none() => {
+                    if let Some(req) = q_req {
+                        if !req.reply.is_closed() {
+                            self.question_state = Some(crate::question_ui::QuestionUiState::new(req));
+                        }
+                    }
+                }
                 maybe_ev = events.next() => {
                     if let Some(Ok(ev)) = maybe_ev {
                         self.handle_event(ev);
@@ -828,17 +880,19 @@ impl App {
                         && crate::win_paste::is_terminal_foreground()
                         && self.mode == Mode::Chat
                         && self.pending_permission.is_none()
+                        && self.question_state.is_none()
                     {
                         self.handle_clipboard_image_only();
                     }
                     // 粘贴缓冲兜底：buffer 非空且距上次按键 > 50ms 时 flush
                     if let Some(text) = self.chat.paste_detector.flush_if_stale() {
-                        self.chat.paste(&text);
+                        self.handle_paste(text);
                     }
                 }
             }
             if self.generation != generation_before_event {
                 Self::reject_queued_permissions(permission_rx);
+                Self::reject_queued_questions(question_rx);
             }
             // 排空所有待处理的 agent 事件，合并为一次重绘（避免逐 token 触发 draw 卡顿）。
             while let Ok((gen, ae)) = agent_rx.try_recv() {
@@ -864,6 +918,26 @@ impl App {
             Event::Key(k) => {
                 if k.kind != KeyEventKind::Press {
                     return;
+                }
+                if let Some(q_state) = self.question_state.as_mut() {
+                    match q_state.handle_key(k) {
+                        crate::question_ui::QuestionUiResult::Continue => return,
+                        crate::question_ui::QuestionUiResult::Submit(resp) => {
+                            if let Some(q) = self.question_state.take() {
+                                let _ = q.request.reply.send(resp);
+                            }
+                            return;
+                        }
+                        crate::question_ui::QuestionUiResult::Cancel => {
+                            if let Some(q) = self.question_state.take() {
+                                let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                                    answers: Vec::new(),
+                                    cancelled: true,
+                                });
+                            }
+                            return;
+                        }
+                    }
                 }
                 match self.mode {
                     Mode::Chat => self.handle_chat_key(k),
@@ -919,6 +993,13 @@ impl App {
     /// Chat 模式插入输入框；表单模式仅在字段编辑态时插入。
     fn handle_paste(&mut self, text: String) {
         self.last_paste_instant = Some(std::time::Instant::now());
+        if let Some(q_state) = self.question_state.as_mut() {
+            if q_state.custom_editing {
+                let single_line = text.replace(['\r', '\n'], " ");
+                q_state.custom_textarea.insert_str(&single_line);
+            }
+            return;
+        }
         match self.mode {
             Mode::Chat => {
                 let trimmed = text.trim();
@@ -1000,6 +1081,18 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 快速键入/粘贴缓冲 flush 时的文本落点：提问自定义输入框优先，否则写入 Chat composer。
+    fn route_paste_text(&mut self, text: String) {
+        if let Some(q_state) = self.question_state.as_mut() {
+            if q_state.custom_editing {
+                let single_line = text.replace(['\r', '\n'], " ");
+                q_state.custom_textarea.insert_str(&single_line);
+            }
+            return;
+        }
+        self.chat.paste(&text);
     }
 
     /// 处理剪贴板粘贴（Ctrl+V / Alt+V）：支持位图图片自动转存为 PNG 附件并生成 [image:N] 占位符。
@@ -1161,7 +1254,7 @@ impl App {
             crate::chat::KeyDisposition::Buffer => return,
             crate::chat::KeyDisposition::FlushThenProcess => {
                 if let Some(text) = self.chat.paste_detector.flush() {
-                    self.chat.paste(&text);
+                    self.route_paste_text(text);
                 }
                 // 继续处理当前键
             }
@@ -1510,6 +1603,9 @@ impl App {
                     "连接中断，正在重试 ({attempt}/{max_retries}) · {delay_secs}s 后重试: {error}"
                 ));
             }
+            AgentEvent::Notice(text) => {
+                self.chat.entries.push(ChatEntry::System(text));
+            }
         }
     }
 
@@ -1834,7 +1930,12 @@ impl App {
                     }
                 }
                 self.provider_form = None;
-                self.mode = self.form_prev_mode;
+                // 从 Settings 进入时留在 Settings，从 Chat 进入时返回 Chat
+                if self.form_prev_mode == Mode::Settings {
+                    self.mode = Mode::Settings;
+                } else {
+                    self.mode = self.form_prev_mode;
+                }
             }
         }
     }
@@ -4250,6 +4351,25 @@ impl App {
         }
     }
 
+    /// 删除当前选中的 Memory rule（双击 d 确认）。
+    fn delete_selected_memory(&mut self) {
+        let Some(idx) = self.settings.memory_pending_delete_idx else {
+            return;
+        };
+        if idx >= self.config.memory.rules.len() {
+            self.settings.memory_pending_delete_idx = None;
+            return;
+        }
+        self.config.memory.rules.remove(idx);
+        self.settings.dirty = true;
+        self.settings.memory_pending_delete_idx = None;
+        self.toast = Some("已删除记忆规则（保存后生效）".into());
+        let len = self.config.memory.rules.len();
+        if self.settings.memory_selected >= len && len > 0 {
+            self.settings.memory_selected = len - 1;
+        }
+    }
+
     /// draw 前的 `&mut self` 准备：① 刷新 ChatState 行缓存（entries/theme 变化时重建），
     /// ② 按 current theme + streaming 态配置 textarea 边框/样式。
     /// 两者都需 `&mut self`（`prepare_render` 写缓存、`set_block`/`set_style` 写 textarea），
@@ -4349,6 +4469,13 @@ impl App {
         {
             self.settings.env_pending_delete_idx = None;
         }
+        // Memory 段：同理清除待删除确认
+        if self.mode == Mode::Settings
+            && self.settings.on_memory_section()
+            && !matches!(a, Action::DeleteProvider)
+        {
+            self.settings.memory_pending_delete_idx = None;
+        }
         match a {
             Action::Quit => self.should_quit = true,
             Action::OpenSettings => {
@@ -4410,6 +4537,8 @@ impl App {
                     } else if self.settings.on_custom_tools_section() {
                         self.settings
                             .prev_custom_tool(self.registries.custom_tools.len());
+                    } else if self.settings.on_memory_section() {
+                        self.settings.prev_memory(self.config.memory.rules.len());
                     } else {
                         self.settings.prev_field();
                     }
@@ -4430,6 +4559,8 @@ impl App {
                     } else if self.settings.on_custom_tools_section() {
                         self.settings
                             .next_custom_tool(self.registries.custom_tools.len());
+                    } else if self.settings.on_memory_section() {
+                        self.settings.next_memory(self.config.memory.rules.len());
                     } else {
                         self.settings.next_field();
                     }
@@ -4494,6 +4625,14 @@ impl App {
                                 self.settings.dirty = true;
                                 self.toast = Some(format!("默认 provider 设为 {name}"));
                             }
+                        }
+                    } else if self.settings.on_memory_section() {
+                        let cur = self.settings.memory_selected;
+                        if let Some(rule) = self.config.memory.rules.get(cur) {
+                            self.memory_rule_form =
+                                Some(MemoryRuleFormState::new(Some(cur), Some(rule)));
+                            self.form_prev_mode = Mode::Settings;
+                            self.mode = Mode::MemoryRuleForm;
                         }
                     } else if self.settings.on_save_row() {
                         self.save_settings();
@@ -4565,6 +4704,14 @@ impl App {
                     && !self.settings.env_on_save
                 {
                     self.open_env_form_edit();
+                } else if self.mode == Mode::Settings && self.settings.on_memory_section() {
+                    let cur = self.settings.memory_selected;
+                    if let Some(rule) = self.config.memory.rules.get(cur) {
+                        self.memory_rule_form =
+                            Some(MemoryRuleFormState::new(Some(cur), Some(rule)));
+                        self.form_prev_mode = Mode::Settings;
+                        self.mode = Mode::MemoryRuleForm;
+                    }
                 }
             }
             Action::DeleteProvider => {
@@ -4599,6 +4746,13 @@ impl App {
                         self.delete_selected_env();
                     } else {
                         self.settings.env_pending_delete_idx = Some(cur);
+                    }
+                } else if self.mode == Mode::Settings && self.settings.on_memory_section() {
+                    let cur = self.settings.memory_selected;
+                    if self.settings.memory_pending_delete_idx == Some(cur) {
+                        self.delete_selected_memory();
+                    } else {
+                        self.settings.memory_pending_delete_idx = Some(cur);
                     }
                 }
             }
@@ -4806,6 +4960,7 @@ impl App {
                             &self.context_usage,
                             &todos,
                             self.toast.as_deref(),
+                            self.question_state.as_ref(),
                         );
                         ctf_panel::render(
                             frame,
@@ -4832,6 +4987,7 @@ impl App {
                         &self.context_usage,
                         &todos,
                         self.toast.as_deref(),
+                        self.question_state.as_ref(),
                     );
                 }
             }
@@ -6851,5 +7007,69 @@ mod tests {
         };
         app.handle_mouse_event(up_event);
         assert!(!app.chat.is_dragging_scrollbar);
+    }
+
+    #[test]
+    fn fullscreen_settings_memory_rule_operations() {
+        let path = temp_config_path();
+        let mut app = make_app(Mode::Chat, path.clone());
+        app.handle_action(Action::OpenSettings);
+        assert_eq!(app.mode, Mode::Settings);
+
+        // Switch section to MEMORY_SECTION_IDX (10)
+        app.settings.section = crate::views::settings::MEMORY_SECTION_IDX;
+        assert!(app.settings.on_memory_section());
+
+        // Add 2 rules to config
+        app.config.memory.rules.clear();
+        app.config.memory.rules.push(cyber_core::MemoryRule {
+            enabled: true,
+            scope: "both".into(),
+            prompt: "rule 1".into(),
+        });
+        app.config.memory.rules.push(cyber_core::MemoryRule {
+            enabled: false,
+            scope: "project".into(),
+            prompt: "rule 2".into(),
+        });
+        app.settings.memory_selected = 0;
+
+        // Down navigates to next rule
+        app.handle_action(Action::Down);
+        assert_eq!(app.settings.memory_selected, 1);
+
+        // Up navigates to prev rule
+        app.handle_action(Action::Up);
+        assert_eq!(app.settings.memory_selected, 0);
+
+        // Enter opens MemoryRuleFormState for edit
+        app.handle_action(Action::Enter);
+        assert_eq!(app.mode, Mode::MemoryRuleForm);
+        assert!(app.memory_rule_form.is_some());
+        let form = app.memory_rule_form.as_ref().unwrap();
+        assert_eq!(form.index, Some(0));
+
+        // Cancel returns to Settings
+        app.memory_rule_form = None;
+        app.mode = Mode::Settings;
+
+        // EditProvider opens form as well
+        app.handle_action(Action::EditProvider);
+        assert_eq!(app.mode, Mode::MemoryRuleForm);
+        app.memory_rule_form = None;
+        app.mode = Mode::Settings;
+
+        // First DeleteProvider marks pending delete
+        app.handle_action(Action::DeleteProvider);
+        assert_eq!(app.settings.memory_pending_delete_idx, Some(0));
+
+        // Second DeleteProvider executes deletion
+        app.handle_action(Action::DeleteProvider);
+        assert_eq!(app.config.memory.rules.len(), 1);
+        assert_eq!(app.config.memory.rules[0].prompt, "rule 2");
+        assert!(app.settings.dirty);
+        assert!(app.settings.memory_pending_delete_idx.is_none());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

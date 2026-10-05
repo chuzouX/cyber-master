@@ -135,7 +135,7 @@ impl Tool for McpToolsListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "mcp_tools_list".into(),
-            description: "获取系统中所有已连接的 MCP（Model Context Protocol）扩展工具清单。当需要与外部系统交互（如外部竞赛平台靶机管理/Flag提交/题目浏览，或流量审计/重放等）但默认工具列表未列出时，调用此工具获取工具名称、所属服务、用途描述与参数规格。获取后可直接以对应工具名称（如 mcp_<server>_<tool>、<server>_<tool> 或简写）发起调用。".into(),
+            description: "获取系统中所有已连接的 MCP（Model Context Protocol）扩展工具清单。工具选择次优级入口（优先级：custom_tools_list > mcp_tools_list > 自己做）。当 custom_tools_list 中未找到所需工具，且需要与外部系统交互（如外部竞赛平台靶机管理/Flag提交/题目浏览，或流量审计/重放等）时调用本工具获取工具名称、所属服务、用途描述与参数规格。获取后可直接以对应工具名称（如 mcp_<server>_<tool>、<server>_<tool> 或简写）发起调用，避免自行编写脚本重复实现。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
