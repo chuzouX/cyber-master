@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.6.0] - 2026-10-06
 
 ### Added
 - **Provider 表单「高级设置」分组**：新增/编辑服务商时可直接填写
