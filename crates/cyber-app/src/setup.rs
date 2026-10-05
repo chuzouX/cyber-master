@@ -754,7 +754,7 @@ async fn add_provider_preset_flow(
         base_url,
         api_key: String::new(),
         model: preset.default_model.to_string(),
-        max_tokens: 4096,
+        max_tokens: cyber_core::DEFAULT_MAX_TOKENS,
         temperature: 0.7,
         ..Default::default()
     };

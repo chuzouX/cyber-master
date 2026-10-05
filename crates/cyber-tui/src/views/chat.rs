@@ -63,6 +63,7 @@ pub fn render(
         context_usage,
         todos,
         None,
+        None,
     );
 }
 
@@ -79,6 +80,7 @@ pub fn render_with_toast(
     context_usage: &ContextUsage,
     todos: &[cyber_core::TodoItem],
     toast: Option<&str>,
+    question_state: Option<&crate::question_ui::QuestionUiState>,
 ) {
     let scrolled = !state.is_following_bottom();
     let title = if scrolled {
@@ -86,6 +88,8 @@ pub fn render_with_toast(
     } else {
         format!(" Chat · provider={provider} ")
     };
+    // 标题绘制在顶边框上：裁剪防止超长 provider 名覆盖右上角边框。
+    let title = super::clip_cells_ellipsis(&title, (area.width as usize).saturating_sub(3));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -106,11 +110,13 @@ pub fn render_with_toast(
     } else {
         0
     };
+    let question_height = question_state.as_ref().map_or(0, |q| q.height_needed());
 
-    // 历史（弹性） / [Todo 常驻卡片] / 输入框（3 行含边框） / usage 状态栏（1 行） / hint（1 行）
+    // 历史（弹性） / [Todo 常驻卡片] / [提问确认卡片] / 输入框（3 行含边框） / usage 状态栏（1 行） / hint（1 行）
     let chunks = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(todo_height),
+        Constraint::Length(question_height),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -121,21 +127,69 @@ pub fn render_with_toast(
     if show_todo_table && chunks[1].height >= 2 {
         render_todo_table(frame, chunks[1], theme, todos);
     }
-    render_input(frame, chunks[2], state);
+    if let Some(q) = question_state {
+        if chunks[2].height >= 4 {
+            crate::question_ui::render_question_box(frame, chunks[2], q, Some(theme.accent));
+        }
+    }
+    render_input(frame, chunks[3], state);
     render_usage_bar(
         frame,
-        chunks[3],
+        chunks[4],
         theme,
         provider,
         usage,
         price,
         context_usage,
     );
-    render_hint(frame, chunks[4], theme, state, toast);
+    render_hint(frame, chunks[5], theme, state, toast);
     // 斜杠补全菜单：浮于输入框上方，最后绘制以叠加在最上层
     if state.slash_menu.open && !state.slash_menu.filtered.is_empty() {
-        render_slash_menu(frame, chunks[2], theme, &state.slash_menu);
+        render_slash_menu(frame, chunks[3], theme, &state.slash_menu);
     }
+}
+
+fn clip_cells(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    text.chars()
+        .take_while(|ch| {
+            used += if *ch == '\t' {
+                4
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            used <= width
+        })
+        .collect()
+}
+
+fn clip_cells_ellipsis(text: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let target = width.saturating_sub(1);
+    let mut used = 0;
+    let mut result: String = text
+        .chars()
+        .take_while(|ch| {
+            used += if *ch == '\t' {
+                4
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            used <= target
+        })
+        .collect();
+    result.push('…');
+    result
 }
 
 /// 渲染输入框正上方的常驻 Todo 任务清单卡片。
@@ -188,6 +242,7 @@ fn render_todo_table(frame: &mut Frame, area: Rect, theme: &Theme, items: &[cybe
         items.len().min(max_lines)
     };
 
+    let max_row_w = (inner.width as usize).saturating_sub(1);
     let mut lines = Vec::with_capacity(max_lines);
     for item in items.iter().take(display_count) {
         let (symbol, color) = match item.status {
@@ -196,20 +251,65 @@ fn render_todo_table(frame: &mut Frame, area: Rect, theme: &Theme, items: &[cybe
             cyber_core::TodoStatus::Completed => ("[x]", Color::Rgb(137, 210, 129)),
             cyber_core::TodoStatus::Failed => ("[!]", Color::Rgb(252, 58, 75)),
         };
-        let mut spans = vec![
-            Span::styled(
-                format!(" {symbol} "),
+        let sym_text = format!(" {symbol} ");
+        let id_text = format!("#{} ", item.id);
+        use unicode_width::UnicodeWidthStr;
+        let sym_w = UnicodeWidthStr::width(sym_text.as_str());
+        let id_w = UnicodeWidthStr::width(id_text.as_str());
+        let prefix_w = sym_w + id_w;
+        let content_budget = max_row_w.saturating_sub(prefix_w);
+
+        let mut spans = Vec::new();
+        if max_row_w < sym_w {
+            spans.push(Span::styled(
+                clip_cells(&sym_text, max_row_w),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("#{} ", item.id), Style::default().fg(theme.muted)),
-            Span::styled(item.title.as_str(), Style::default().fg(theme.fg)),
-        ];
-        if let Some(notes) = &item.notes {
-            if !notes.trim().is_empty() {
+            ));
+        } else {
+            spans.push(Span::styled(
+                sym_text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            let rem_id = max_row_w.saturating_sub(sym_w);
+            if rem_id < id_w {
                 spans.push(Span::styled(
-                    format!(" (备注: {})", notes.trim()),
+                    clip_cells(&id_text, rem_id),
                     Style::default().fg(theme.muted),
                 ));
+            } else {
+                spans.push(Span::styled(id_text, Style::default().fg(theme.muted)));
+            }
+        }
+
+        if content_budget > 0 {
+            let title_clean = item.title.as_str();
+            let title_w = UnicodeWidthStr::width(title_clean);
+
+            if let Some(notes) = &item.notes.as_ref().filter(|n| !n.trim().is_empty()) {
+                let notes_clean = notes.trim();
+                let notes_full = format!(" (备注: {notes_clean})");
+                let notes_full_w = UnicodeWidthStr::width(notes_full.as_str());
+                if title_w + notes_full_w <= content_budget {
+                    spans.push(Span::styled(title_clean, Style::default().fg(theme.fg)));
+                    spans.push(Span::styled(notes_full, Style::default().fg(theme.muted)));
+                } else if title_w < content_budget {
+                    spans.push(Span::styled(title_clean, Style::default().fg(theme.fg)));
+                    let rem = content_budget.saturating_sub(title_w);
+                    if rem >= 7 {
+                        let note_budget = rem.saturating_sub(6);
+                        let clipped_note = clip_cells_ellipsis(notes_clean, note_budget);
+                        spans.push(Span::styled(
+                            format!(" (备注: {clipped_note})"),
+                            Style::default().fg(theme.muted),
+                        ));
+                    }
+                } else {
+                    let clipped_title = clip_cells_ellipsis(title_clean, content_budget);
+                    spans.push(Span::styled(clipped_title, Style::default().fg(theme.fg)));
+                }
+            } else {
+                let clipped_title = clip_cells_ellipsis(title_clean, content_budget);
+                spans.push(Span::styled(clipped_title, Style::default().fg(theme.fg)));
             }
         }
         lines.push(Line::from(spans));
@@ -217,8 +317,9 @@ fn render_todo_table(frame: &mut Frame, area: Rect, theme: &Theme, items: &[cybe
 
     if will_truncate {
         let remaining = items.len().saturating_sub(display_count);
+        let trunc_msg = format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）");
         lines.push(Line::from(vec![Span::styled(
-            format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）"),
+            clip_cells_ellipsis(&trunc_msg, max_row_w),
             Style::default()
                 .fg(theme.muted)
                 .add_modifier(Modifier::ITALIC),
@@ -581,7 +682,11 @@ pub fn render_placeholder(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(
-            Line::from(format!(" {title} ")).style(
+            Line::from(super::clip_cells_ellipsis(
+                &format!(" {title} "),
+                (area.width as usize).saturating_sub(3),
+            ))
+            .style(
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),

@@ -23,12 +23,38 @@ impl CustomTool {
     fn substitute_command(&self, input: &Value) -> String {
         let mut command = self.config.command.clone();
         for param in &self.config.parameters {
-            let value = input
+            let mut value = input
                 .get(&param.name)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or_else(|| param.default.clone())
                 .unwrap_or_default();
+
+            // 智能兼容：若参数为 args 但调用方传入了 input/detect/recipe，自动组装为 CLI 参数
+            if param.name == "args" && value.is_empty() {
+                if let Some(target_input) = input.get("input").and_then(Value::as_str) {
+                    let mut parts = vec![format!("\"{}\"", target_input.replace('"', "\\\""))];
+                    let is_detect = input
+                        .get("detect")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if is_detect {
+                        parts.push("detect".to_string());
+                    }
+                    if let Some(recipe) = input.get("recipe").and_then(Value::as_array) {
+                        for item in recipe {
+                            if let Some(op) = item.as_str() {
+                                parts.push(op.to_string());
+                            }
+                        }
+                    }
+                    if parts.len() == 1 {
+                        parts.push("detect".to_string());
+                    }
+                    value = parts.join(" ");
+                }
+            }
+
             command = command.replace(&format!("{{{}}}", param.name), &value);
         }
         command
@@ -106,7 +132,7 @@ impl Tool for CustomToolsListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "custom_tools_list".into(),
-            description: "获取系统中所有已配置的自定义安全工具（Custom Tools）清单。当需要执行特定安全任务（如漏洞利用、密码破解、专项扫描、编码解密等）但默认工具列表未列出时，调用此工具获取工具名称、用途描述、参数规格与命令模板。获取后可直接以对应工具名称（如 custom_<name>）发起调用，或使用 shell 工具执行填入参数后的具体命令。".into(),
+            description: "获取系统中所有已配置的自定义安全工具（Custom Tools）清单。最高优先级工具发现入口（优先级：custom_tools_list > mcp_tools_list > 自己做）。当需要执行特定安全任务（如逆向分析/反编译/反汇编、漏洞利用、密码破解、专项扫描、编码解密等）但默认工具列表未列出时，必须优先调用此工具从 custom_* 中查找已有工具，能直接找到工具使用的绝不要自己翻找环境，更不要自己重写工具。获取后可直接以对应工具名称（如 custom_<name> 或简写）发起调用，或使用 shell 工具执行填入参数后的具体命令。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

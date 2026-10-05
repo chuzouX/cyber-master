@@ -9,7 +9,7 @@
 //! `kind` 用 ←→ 循环 `PROVIDER_KINDS`。「拉取模型」异步 GET `{base}/models`，结果经 mpsc
 //! 回传 App → `deliver_fetch`，弹出 picker 选中后回填 model 字段。
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -22,7 +22,7 @@ use tui_textarea::TextArea;
 
 use cyber_core::{
     ModelConfig, PriceConfig, ProviderConfig, ProviderConfig as _Cfg, ProvidersConfig,
-    PROVIDER_KINDS,
+    CONTEXT_LENGTH_PRESETS, PROVIDER_KINDS,
 };
 
 use crate::theme::Theme;
@@ -126,6 +126,7 @@ const FIELDS: &[FieldDef] = &[
 ];
 const IDX_KIND: usize = 1;
 const IDX_MODEL: usize = 4;
+const IDX_CONTEXT_LENGTH: usize = 6;
 const IDX_CURRENCY: usize = 12;
 const IDX_FETCH: usize = 16;
 const IDX_SAVE: usize = 17;
@@ -147,6 +148,8 @@ pub struct ProviderFormState {
     pub kind_idx: usize,
     /// 价格货币索引（CURRENCIES），0=usd, 1=cny。
     pub currency_idx: usize,
+    /// 上下文窗口预设索引（CONTEXT_LENGTH_PRESETS）；等于其长度时表示「自定义」。
+    pub context_idx: usize,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -192,7 +195,7 @@ pub struct ProviderFormState {
 }
 
 impl ProviderFormState {
-    /// 新增模式：默认值（openai / 空 url / 4096 / 0.7）。
+    /// 新增模式：默认值（openai / 空 url / DEFAULT_MAX_TOKENS / 0.7）。
     pub fn empty() -> Self {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("输入…");
@@ -200,12 +203,13 @@ impl ProviderFormState {
             name: String::new(),
             kind_idx: 0,
             currency_idx: 0,
+            context_idx: 0,
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
             alias: String::new(),
             context_length: String::new(),
-            max_tokens: "4096".into(),
+            max_tokens: cyber_core::DEFAULT_MAX_TOKENS.to_string(),
             temperature: "0.7".into(),
             price_input: String::new(),
             price_output: String::new(),
@@ -215,7 +219,7 @@ impl ProviderFormState {
             models_endpoint: String::new(),
             models: std::collections::HashMap::new(),
             known_models: Vec::new(),
-            provider_max_tokens: 4096,
+            provider_max_tokens: cyber_core::DEFAULT_MAX_TOKENS,
             provider_temperature: 0.7,
             provider_price: None,
             original_name: None,
@@ -306,6 +310,7 @@ impl ProviderFormState {
             _ => 0, // "usd" 或 None → 默认美元
         };
         self.notes = mc.and_then(|m| m.notes.clone()).unwrap_or_default();
+        self.sync_context_idx();
     }
 
     /// 将当前表单参数字段保存到 `models[model]`。model 为空则跳过。
@@ -379,6 +384,49 @@ impl ProviderFormState {
         CURRENCIES[self.currency_idx].1
     }
 
+    /// 依据 `context_length` 当前值重算预设下标；不在预设中 → 自定义槽。
+    fn sync_context_idx(&mut self) {
+        let cur = self.context_length.trim();
+        self.context_idx = if cur.is_empty() {
+            0
+        } else {
+            CONTEXT_LENGTH_PRESETS
+                .iter()
+                .position(|(_, v)| !v.is_empty() && cur == *v)
+                .unwrap_or(CONTEXT_LENGTH_PRESETS.len())
+        };
+    }
+
+    /// 当前 context_length 的显示标签。
+    pub fn context_label(&self) -> String {
+        if self.context_idx == CONTEXT_LENGTH_PRESETS.len() {
+            let cur = self.context_length.trim();
+            if cur.is_empty() {
+                "自定义".to_string()
+            } else {
+                format!("自定义 ({cur})")
+            }
+        } else {
+            CONTEXT_LENGTH_PRESETS[self.context_idx].0.to_string()
+        }
+    }
+
+    /// ←→ 在「默认(留空)/128K/256K/512K/1M/自定义」间循环。dir>0 下一个。
+    fn cycle_context(&mut self, dir: i32) {
+        let total = CONTEXT_LENGTH_PRESETS.len() + 1;
+        let cur = self.context_idx.min(total - 1);
+        let next = if dir > 0 {
+            (cur + 1) % total
+        } else {
+            (cur + total - 1) % total
+        };
+        self.context_idx = next;
+        if next < CONTEXT_LENGTH_PRESETS.len() {
+            self.context_length = CONTEXT_LENGTH_PRESETS[next].1.to_string();
+        }
+        // 落到自定义槽时保留当前值（可为空）
+    }
+
     /// chat_endpoint 转为 Option：空串 → None，否则 Some。
     fn chat_endpoint_opt(&self) -> Option<String> {
         let s = self.chat_endpoint.trim();
@@ -406,7 +454,11 @@ impl ProviderFormState {
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
-            max_tokens: self.max_tokens.trim().parse().unwrap_or(4096),
+            max_tokens: self
+                .max_tokens
+                .trim()
+                .parse()
+                .unwrap_or(cyber_core::DEFAULT_MAX_TOKENS),
             temperature: self.temperature.trim().parse().unwrap_or(0.7),
             price: self.build_price(),
             models: self.models.clone(),
@@ -549,7 +601,10 @@ impl ProviderFormState {
             3 => self.api_key = val,
             4 => self.model = val,
             5 => self.alias = val,
-            6 => self.context_length = val,
+            6 => {
+                self.context_length = val;
+                self.sync_context_idx();
+            }
             7 => self.max_tokens = val,
             8 => self.temperature = val,
             9 => self.price_input = val,
@@ -570,10 +625,43 @@ impl ProviderFormState {
     }
 
     fn start_editing(&mut self, idx: usize) {
-        let val = self.get_field(idx);
+        // context_length 编辑态显示原始数字而非「128K」标签。
+        let val = if idx == IDX_CONTEXT_LENGTH {
+            self.context_length.clone()
+        } else {
+            self.get_field(idx)
+        };
         self.textarea.clear();
         self.textarea.insert_str(&val);
         self.editing = true;
+    }
+
+    fn commit_current_field(&mut self) {
+        let val = self.textarea.lines().join("\n");
+        // 提交 model 字段时：先保存旧 model 参数，再装载新 model 参数
+        if self.focused == IDX_MODEL {
+            let old_model = self.model.clone();
+            let new_model = val.trim().to_string();
+            if !old_model.is_empty() && old_model != new_model {
+                self.save_model_params(&old_model);
+            }
+            self.model = new_model.clone();
+            if old_model != new_model {
+                if self.models.contains_key(&new_model) {
+                    self.load_model_params(&new_model);
+                } else if !new_model.is_empty() {
+                    // 保留当前表单中已填写的微调参数作为该新模型的初始参数写入 self.models
+                    self.save_model_params(&new_model);
+                }
+            }
+            // 将新 model 加入 known_models（去重 + 排序）
+            if !new_model.is_empty() && !self.known_models.contains(&new_model) {
+                self.known_models.push(new_model);
+                self.known_models.sort();
+            }
+        } else {
+            self.set_field(self.focused, val);
+        }
     }
 
     /// 处理一个按键，返回副作用意图。`existing` 保留供未来实时校验（当前校验在 `into_provider`）。
@@ -585,6 +673,11 @@ impl ProviderFormState {
         if self.editing {
             return self.handle_editing_key(k);
         }
+        if k.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(k.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            return FormAction::Save;
+        }
         match k.code {
             KeyCode::Up => {
                 self.focused = (self.focused + FIELDS.len() - 1) % FIELDS.len();
@@ -592,6 +685,14 @@ impl ProviderFormState {
             }
             KeyCode::Down => {
                 self.focused = (self.focused + 1) % FIELDS.len();
+                FormAction::None
+            }
+            KeyCode::Tab => {
+                self.focused = (self.focused + 1) % FIELDS.len();
+                FormAction::None
+            }
+            KeyCode::BackTab => {
+                self.focused = (self.focused + FIELDS.len() - 1) % FIELDS.len();
                 FormAction::None
             }
             KeyCode::Left => {
@@ -603,6 +704,8 @@ impl ProviderFormState {
                 } else if self.focused == IDX_CURRENCY {
                     self.currency_idx =
                         (self.currency_idx + CURRENCIES.len() - 1) % CURRENCIES.len();
+                } else if self.focused == IDX_CONTEXT_LENGTH {
+                    self.cycle_context(-1);
                 }
                 FormAction::None
             }
@@ -613,6 +716,8 @@ impl ProviderFormState {
                     self.switch_model(1);
                 } else if self.focused == IDX_CURRENCY {
                     self.currency_idx = (self.currency_idx + 1) % CURRENCIES.len();
+                } else if self.focused == IDX_CONTEXT_LENGTH {
+                    self.cycle_context(1);
                 }
                 FormAction::None
             }
@@ -626,41 +731,94 @@ impl ProviderFormState {
                 }
                 IDX_SAVE => FormAction::Save,
                 IDX_CANCEL => FormAction::Cancel,
-                IDX_KIND | IDX_CURRENCY => FormAction::None,
+                IDX_KIND => {
+                    self.kind_idx = (self.kind_idx + 1) % PROVIDER_KINDS.len();
+                    FormAction::None
+                }
+                IDX_CURRENCY => {
+                    self.currency_idx = (self.currency_idx + 1) % CURRENCIES.len();
+                    FormAction::None
+                }
+                IDX_CONTEXT_LENGTH => {
+                    if self.context_idx == CONTEXT_LENGTH_PRESETS.len() {
+                        self.start_editing(IDX_CONTEXT_LENGTH);
+                    } else {
+                        self.cycle_context(1);
+                    }
+                    FormAction::None
+                }
                 idx if Self::is_text_field(idx) => {
                     self.start_editing(idx);
                     FormAction::None
                 }
                 _ => FormAction::None,
             },
+            KeyCode::Char(c)
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if self.focused == IDX_KIND && c == ' ' {
+                    self.kind_idx = (self.kind_idx + 1) % PROVIDER_KINDS.len();
+                    FormAction::None
+                } else if self.focused == IDX_CONTEXT_LENGTH && c == ' ' {
+                    if self.context_idx == CONTEXT_LENGTH_PRESETS.len() {
+                        self.start_editing(IDX_CONTEXT_LENGTH);
+                        self.textarea.input(k);
+                    } else {
+                        self.cycle_context(1);
+                    }
+                    FormAction::None
+                } else if Self::is_text_field(self.focused) {
+                    self.start_editing(self.focused);
+                    self.textarea.input(k);
+                    FormAction::None
+                } else {
+                    FormAction::None
+                }
+            }
+            KeyCode::Backspace if Self::is_text_field(self.focused) => {
+                self.start_editing(self.focused);
+                self.textarea.input(k);
+                FormAction::None
+            }
             KeyCode::Esc => FormAction::Cancel,
             _ => FormAction::None,
         }
     }
 
     fn handle_editing_key(&mut self, k: KeyEvent) -> FormAction {
+        if k.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(k.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.commit_current_field();
+            self.editing = false;
+            return FormAction::Save;
+        }
         match k.code {
-            KeyCode::Enter => {
-                let val = self.textarea.lines().join("\n");
-                // 提交 model 字段时：先保存旧 model 参数，再装载新 model 参数
-                if self.focused == IDX_MODEL {
-                    let old_model = self.model.clone();
-                    let new_model = val.trim().to_string();
-                    if !old_model.is_empty() && old_model != new_model {
-                        self.save_model_params(&old_model);
-                    }
-                    self.model = new_model.clone();
-                    if old_model != new_model {
-                        self.load_model_params(&new_model);
-                    }
-                    // 将新 model 加入 known_models（去重 + 排序）
-                    if !new_model.is_empty() && !self.known_models.contains(&new_model) {
-                        self.known_models.push(new_model.clone());
-                        self.known_models.sort();
-                    }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.commit_current_field();
+                let next = (self.focused + FIELDS.len() - 1) % FIELDS.len();
+                self.focused = next;
+                if Self::is_text_field(next) {
+                    self.start_editing(next);
                 } else {
-                    self.set_field(self.focused, val);
+                    self.editing = false;
                 }
+                FormAction::None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.commit_current_field();
+                let next = (self.focused + 1) % FIELDS.len();
+                self.focused = next;
+                if Self::is_text_field(next) {
+                    self.start_editing(next);
+                } else {
+                    self.editing = false;
+                }
+                FormAction::None
+            }
+            KeyCode::Enter => {
+                self.commit_current_field();
                 self.editing = false;
                 FormAction::None
             }
@@ -699,7 +857,11 @@ impl ProviderFormState {
                 }
                 self.model = m.clone();
                 if old_model != m {
-                    self.load_model_params(&m);
+                    if self.models.contains_key(&m) {
+                        self.load_model_params(&m);
+                    } else if !m.is_empty() {
+                        self.save_model_params(&m);
+                    }
                 }
                 self.picker_open = false;
                 FormAction::None
@@ -777,14 +939,17 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provide
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
         .title(
-            Line::from(if state.is_edit() {
-                format!(
-                    " 编辑 Provider: {} ",
-                    state.original_name.as_deref().unwrap_or("")
-                )
-            } else {
-                " 添加 Provider ".to_string()
-            })
+            Line::from(super::clip_cells_ellipsis(
+                &if state.is_edit() {
+                    format!(
+                        " 编辑 Provider: {} ",
+                        state.original_name.as_deref().unwrap_or("")
+                    )
+                } else {
+                    " 添加 Provider ".to_string()
+                },
+                (modal.width as usize).saturating_sub(3),
+            ))
             .style(
                 Style::default()
                     .fg(theme.title)
@@ -813,10 +978,13 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provide
 fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderFormState) {
     let mut lines: Vec<Line> = Vec::new();
     let sep_width = area.width.saturating_sub(2).min(60) as usize;
+    // 每个字段自身所在的行号（用于计算跟随光标的滚屏偏移）。
+    let mut field_rows: Vec<usize> = vec![0; FIELDS.len()];
     for (i, f) in FIELDS.iter().enumerate() {
         if f.kind == FieldKind::Button {
             continue; // 按钮单独渲染
         }
+        // 在 per-model 区域前插入分隔线和标题
         // 在 per-model 区域前插入分隔线和标题
         if i == IDX_MODEL {
             lines.push(Line::from("").style(Style::default().bg(theme.bg)));
@@ -824,8 +992,17 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                 Line::from("─".repeat(sep_width))
                     .style(Style::default().fg(theme.border).bg(theme.bg)),
             );
+            let model_name = if state.model.is_empty() {
+                "(未选择)"
+            } else {
+                &state.model
+            };
             lines.push(
-                Line::from(" 模型个性化配置").style(
+                Line::from(format!(
+                    " ── 模型专属微调参数 (对当前选中的 model [{}] 独立生效) ──",
+                    model_name
+                ))
+                .style(
                     Style::default()
                         .fg(theme.title)
                         .add_modifier(Modifier::BOLD)
@@ -841,7 +1018,7 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                     .style(Style::default().fg(theme.border).bg(theme.bg)),
             );
             lines.push(
-                Line::from(" 高级选项").style(
+                Line::from(" 高级设置 高级选项").style(
                     Style::default()
                         .fg(theme.title)
                         .add_modifier(Modifier::BOLD)
@@ -851,16 +1028,39 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
         }
         let selected = i == state.focused && !state.editing && !state.picker_open;
         let marker = if selected { "▸ " } else { "  " };
+        field_rows[i] = lines.len();
         let value: String = if i == IDX_KIND {
-            format!("{}  ←→", state.kind())
+            format!(
+                "◀ {} ▶  [←/→/空格 切换: {}]",
+                state.kind(),
+                PROVIDER_KINDS.join(" · ")
+            )
         } else if i == IDX_MODEL {
-            if state.model.is_empty() {
-                "(空，Enter 输入或拉取模型)".to_string()
+            if state.known_models.len() > 1 {
+                let cur = state
+                    .known_models
+                    .iter()
+                    .position(|m| m == &state.model)
+                    .map(|p| p + 1)
+                    .unwrap_or(1);
+                format!(
+                    "◀ {} ▶ [{}/{} 按 ←/→ 切换]",
+                    state.model,
+                    cur,
+                    state.known_models.len()
+                )
+            } else if state.model.is_empty() {
+                "[直接输入模型名，或在下方按回车拉取列表]".to_string()
             } else {
-                format!("{}  ←→", state.model)
+                state.model.clone()
             }
         } else if i == IDX_CURRENCY {
-            format!("{}  ←→", state.currency_label())
+            format!("{}  [←→ 切换]", state.currency_label())
+        } else if i == IDX_CONTEXT_LENGTH {
+            format!(
+                "◀ {} ▶  [←/→/空格 切换；选「自定义」后按 Enter 手输]",
+                state.context_label()
+            )
         } else if i == 3 {
             // api_key 脱敏显示
             mask_key(&state.api_key)
@@ -892,8 +1092,21 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
             .style(row_style),
         );
     }
+    // 跟随光标的滚屏：字段总数（含分组标题行）在常见终端高度下会溢出，
+    // 必须保证选中字段可见，否则底部字段无法被编辑。
+    let visible = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let target = field_rows.get(state.focused).copied().unwrap_or(0);
+    let scroll = if visible == 0 || target < visible {
+        0
+    } else {
+        // 留 1 行余量，让选中字段下方仍有上下文
+        (target + 2).saturating_sub(visible).min(max_scroll)
+    };
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme.bg)),
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg))
+            .scroll((scroll as u16, 0)),
         area,
     );
 }
@@ -952,6 +1165,8 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
     }
     let hint = if state.fetching {
         " 拉取中…"
+    } else if state.focused == IDX_MODEL && !state.model.is_empty() {
+        " ←→ 切换模型（自动保存/装载参数） · Enter 手动输入 · Esc 取消"
     } else {
         " Enter 编辑字段 · ←→ 切换 kind/model/currency · Esc 取消"
     };
@@ -1042,9 +1257,77 @@ mod tests {
         let s = ProviderFormState::empty();
         assert!(!s.is_edit());
         assert_eq!(s.kind(), "openai");
-        assert_eq!(s.max_tokens, "4096");
+        assert_eq!(s.max_tokens, cyber_core::DEFAULT_MAX_TOKENS.to_string());
         assert_eq!(s.temperature, "0.7");
         assert_eq!(s.focused, 0);
+    }
+
+    #[test]
+    fn context_length_cycles_and_custom_edit_roundtrips() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_CONTEXT_LENGTH;
+        assert_eq!(s.context_label(), "默认(留空)");
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.context_length, "131072");
+        assert_eq!(s.context_label(), "128K");
+        // Enter 在预设槽上继续循环
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert_eq!(s.context_label(), "256K");
+        // 循环到自定义槽后 Enter 进入文本编辑
+        for _ in 0..3 {
+            s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        }
+        assert_eq!(s.context_idx, CONTEXT_LENGTH_PRESETS.len());
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert!(s.editing);
+        s.textarea.clear();
+        s.textarea.insert_str("65536");
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert!(!s.editing);
+        assert_eq!(s.context_length, "65536");
+        assert_eq!(s.context_label(), "自定义 (65536)");
+
+        // 保存路径：预设选中值写入 per-model context_length；「默认(留空)」写成 None。
+        s.name = "p".into();
+        s.base_url = "https://x".into();
+        s.model = "m".into();
+        s.cycle_context(1); // 自定义槽 →「默认(留空)」
+        s.cycle_context(1); // → 128K
+        assert_eq!(s.context_length, "131072");
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert_eq!(
+            cfg.models["m"].context_length,
+            Some(131_072),
+            "选中的预设必须持久化为该数值"
+        );
+        s.set_field(IDX_CONTEXT_LENGTH, String::new());
+        assert_eq!(s.context_idx, 0);
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert_eq!(
+            cfg.models["m"].context_length, None,
+            "「默认(留空)」必须持久化为 None（等同未设置）"
+        );
+    }
+
+    #[test]
+    fn from_provider_keeps_non_preset_context_length_as_custom() {
+        let mut cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            model: "claude-3".into(),
+            ..Default::default()
+        };
+        cfg.models.insert(
+            "claude-3".into(),
+            ModelConfig {
+                context_length: Some(200_000),
+                ..Default::default()
+            },
+        );
+        let s = ProviderFormState::from_provider("openai", &cfg);
+        assert_eq!(s.context_length, "200000");
+        assert_eq!(s.context_idx, CONTEXT_LENGTH_PRESETS.len());
+        assert_eq!(s.context_label(), "自定义 (200000)");
     }
 
     #[test]
@@ -1286,6 +1569,61 @@ mod tests {
         terminal
             .draw(|f| render_form(f, f.area(), &crate::theme::Theme::resolve("cyberpunk"), &s))
             .unwrap();
+    }
+
+    #[test]
+    fn advanced_endpoint_fields_scroll_into_view_with_cursor_follow() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = crate::theme::Theme::resolve("cyberpunk");
+        let mut s = ProviderFormState::from_provider(
+            "gw",
+            &ProviderConfig {
+                kind: "openai-compatible".into(),
+                base_url: "https://gw.test/v1".into(),
+                model: "m1".into(),
+                chat_endpoint: Some("ep-chat".into()),
+                models_endpoint: Some("ep-list".into()),
+                ..Default::default()
+            },
+        );
+        s.prepare_render(&theme);
+
+        let snapshot = |s: &ProviderFormState, h: u16| -> String {
+            let backend = TestBackend::new(120, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| render_form(f, f.area(), &theme, s))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            (0..h)
+                .map(|y| {
+                    (0..120u16)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 1. 光标停在首个字段：高级分组位于折叠线下，不应渲染
+        s.focused = 0;
+        let top = snapshot(&s, 24).replace(' ', "");
+        assert!(!top.contains("高级设置高级选项"), "{top}");
+        assert!(!top.contains("自定义对话端点chat_endpoint"), "{top}");
+
+        // 2. 光标移到 models_endpoint：跟随滚屏必须把高级分组带入视口
+        s.focused = 15;
+        let bottom = snapshot(&s, 24).replace(' ', "");
+        assert!(bottom.contains("高级设置高级选项"), "{bottom}");
+        assert!(bottom.contains("自定义对话端点chat_endpoint"), "{bottom}");
+        assert!(
+            bottom.contains("自定义模型列表端点models_endpoint"),
+            "{bottom}"
+        );
+        // 已保存的覆盖值必须显示在字段值位置
+        assert!(bottom.contains("ep-chat"), "{bottom}");
+        assert!(bottom.contains("ep-list"), "{bottom}");
     }
 
     #[test]
@@ -1562,6 +1900,46 @@ mod tests {
         assert!(ProviderFormState::is_text_field(6)); // context_length
         assert!(!ProviderFormState::is_text_field(12)); // currency (Enum)
         assert!(ProviderFormState::is_text_field(13)); // notes
+        assert!(ProviderFormState::is_text_field(14)); // chat_endpoint
+        assert!(ProviderFormState::is_text_field(15)); // models_endpoint
+    }
+
+    #[test]
+    fn advanced_endpoint_overrides_roundtrip_through_provider_config() {
+        let mut s = ProviderFormState::empty();
+        s.name = "gw".into();
+        s.base_url = "https://gw.test/v1".into();
+        s.model = "m1".into();
+        s.set_field(14, "https://gw.test/v1/chat".into());
+        s.set_field(15, "https://gw.test/v1/list".into());
+        assert_eq!(s.get_field(14), "https://gw.test/v1/chat");
+        assert_eq!(s.get_field(15), "https://gw.test/v1/list");
+
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert_eq!(
+            cfg.chat_endpoint.as_deref(),
+            Some("https://gw.test/v1/chat")
+        );
+        assert_eq!(
+            cfg.models_endpoint.as_deref(),
+            Some("https://gw.test/v1/list")
+        );
+
+        // 载入回表单后应能保留原值
+        let back = ProviderFormState::from_provider("gw", &cfg);
+        assert_eq!(back.get_field(14), "https://gw.test/v1/chat");
+        assert_eq!(back.get_field(15), "https://gw.test/v1/list");
+
+        // 留空 → None（回退默认端点）
+        let mut blank = ProviderFormState::from_provider("gw", &cfg);
+        blank.set_field(14, "  ".into());
+        blank.set_field(15, String::new());
+        let (_, cfg2) = blank.into_provider(&ProvidersConfig::default()).unwrap();
+        assert!(cfg2.chat_endpoint.is_none(), "空白 chat_endpoint 应为 None");
+        assert!(
+            cfg2.models_endpoint.is_none(),
+            "空白 models_endpoint 应为 None"
+        );
     }
 
     #[test]
@@ -1793,5 +2171,116 @@ mod tests {
             FormAction::None
         );
         assert!(!s.editing, "currency 字段 Enter 不应进入编辑模式");
+    }
+
+    #[test]
+    fn direct_char_or_backspace_starts_editing_text_field() {
+        let mut s = ProviderFormState::empty();
+        s.focused = 0; // name
+        assert!(!s.editing);
+        s.handle_key(key(KeyCode::Char('k')), &ProvidersConfig::default());
+        assert!(s.editing);
+        assert_eq!(s.textarea.lines().join(""), "k");
+
+        s.editing = false;
+        s.focused = 2; // base_url
+        s.handle_key(key(KeyCode::Backspace), &ProvidersConfig::default());
+        assert!(s.editing);
+    }
+
+    #[test]
+    fn editing_up_down_tab_backtab_navigates_and_commits() {
+        let mut s = ProviderFormState::empty();
+        s.focused = 2; // base_url
+        s.start_editing(2);
+        s.textarea.clear();
+        s.textarea.insert_str("https://example.com");
+        assert!(s.editing);
+
+        // Down navigates to 3 (api_key, text field) and stays in editing
+        s.handle_key(key(KeyCode::Down), &ProvidersConfig::default());
+        assert_eq!(s.base_url, "https://example.com");
+        assert_eq!(s.focused, 3);
+        assert!(s.editing);
+
+        // Up navigates back to 2 (base_url, text field) and stays in editing
+        s.handle_key(key(KeyCode::Up), &ProvidersConfig::default());
+        assert_eq!(s.focused, 2);
+        assert!(s.editing);
+
+        // Tab navigates to 3
+        s.handle_key(key(KeyCode::Tab), &ProvidersConfig::default());
+        assert_eq!(s.focused, 3);
+        assert!(s.editing);
+
+        // BackTab navigates back to 2
+        s.handle_key(key(KeyCode::BackTab), &ProvidersConfig::default());
+        assert_eq!(s.focused, 2);
+        assert!(s.editing);
+
+        // Up to 1 (kind, enum field) -> exits editing
+        s.handle_key(key(KeyCode::Up), &ProvidersConfig::default());
+        assert_eq!(s.focused, 1);
+        assert!(!s.editing);
+    }
+
+    #[test]
+    fn ctrl_s_returns_save_both_in_editing_and_normal() {
+        let mut s = ProviderFormState::empty();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            s.handle_key(ctrl_s, &ProvidersConfig::default()),
+            FormAction::Save
+        );
+
+        s.focused = 0;
+        s.start_editing(0);
+        s.textarea.clear();
+        s.textarea.insert_str("saved_name");
+        assert_eq!(
+            s.handle_key(ctrl_s, &ProvidersConfig::default()),
+            FormAction::Save
+        );
+        assert_eq!(s.name, "saved_name");
+        assert!(!s.editing);
+    }
+
+    #[test]
+    fn kind_quick_switch_space_and_enter() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_KIND;
+        assert_eq!(s.kind(), "openai");
+
+        // Space cycles to anthropic
+        s.handle_key(key(KeyCode::Char(' ')), &ProvidersConfig::default());
+        assert_eq!(s.kind(), "anthropic");
+
+        // Enter cycles to ollama
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert_eq!(s.kind(), "ollama");
+    }
+
+    #[test]
+    fn manual_model_entry_preserves_custom_tuned_params() {
+        let mut s = ProviderFormState::empty();
+        s.alias = "my-fast-alias".into();
+        s.max_tokens = "16384".into();
+        s.temperature = "0.2".into();
+        s.price_input = "1.5".into();
+        s.focused = IDX_MODEL;
+        s.start_editing(IDX_MODEL);
+        s.textarea.clear();
+        s.textarea.insert_str("claude-3-7-sonnet");
+
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert_eq!(s.model, "claude-3-7-sonnet");
+        assert_eq!(s.alias, "my-fast-alias");
+        assert_eq!(s.max_tokens, "16384");
+        assert_eq!(s.temperature, "0.2");
+        assert_eq!(s.price_input, "1.5");
+
+        let mc = s.models.get("claude-3-7-sonnet").unwrap();
+        assert_eq!(mc.alias.as_deref(), Some("my-fast-alias"));
+        assert_eq!(mc.max_tokens, Some(16384));
     }
 }

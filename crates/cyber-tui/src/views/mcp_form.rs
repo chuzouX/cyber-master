@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph},
     Frame,
 };
 use tui_textarea::TextArea;
@@ -95,6 +95,7 @@ pub enum McpFormAction {
 }
 
 /// MCP server 表单状态。
+#[derive(Debug, Clone)]
 pub struct McpFormState {
     pub name: String,
     pub transport_idx: usize,
@@ -376,6 +377,8 @@ impl McpFormState {
 /// 渲染表单模态层（居中）。
 pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &McpFormState) {
     let modal = centered_rect(72, 82, area);
+    // 先擦除底层面板字形，避免其文字透过表单空白行（样式镂空）混入
+    frame.render_widget(Clear, modal);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))

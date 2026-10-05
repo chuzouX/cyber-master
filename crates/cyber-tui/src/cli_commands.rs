@@ -25,14 +25,15 @@ pub(crate) enum CliAction {
     },
     Form(CommandForm),
     Picker(CommandPicker),
-    Task(CliTask),
     Cancel,
+    Task(CliTask),
     Quit,
     Mode(cyber_agent::PermissionMode),
     TodoVisibility(bool),
     Settings,
     SettingsTab(crate::cli::SettingsTab),
     Jobs(CliJobs),
+    Panel(crate::cli::Panel),
 }
 
 pub struct CommandForm {
@@ -54,13 +55,19 @@ pub enum FormKind {
     MemoryRule {
         index: Option<usize>,
     },
+    EnvVar {
+        index: Option<usize>,
+        original_key: Option<String>,
+    },
 }
 pub struct CommandPicker {
     pub title: String,
     pub items: Vec<PickerItem>,
     pub kind: PickerKind,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerKind {
+    General,
     Sessions,
     Models,
 }
@@ -219,6 +226,15 @@ fn merge_table(old: &mut toml::Value, new: toml::Value) {
         *old = new;
     }
 }
+/// 原始 TOML 中 `[providers.<name>]` 表的可变引用（用于显式清空可选字段）。
+fn provider_table_mut<'a>(
+    raw: &'a mut toml::Value,
+    name: &str,
+) -> Option<&'a mut toml::map::Map<String, toml::Value>> {
+    raw.get_mut("providers")
+        .and_then(|v| v.get_mut(name))
+        .and_then(toml::Value::as_table_mut)
+}
 fn read_configuration(path: &Path) -> Result<toml::Value> {
     let old = read_optional(path)?;
     Ok(if old.is_empty() {
@@ -279,6 +295,18 @@ fn provider_configuration_bytes(
                     {
                         table.remove("context_length");
                     }
+                }
+            }
+            // provider 级高级端点覆盖：显式清空时必须从原始 TOML 删除，
+            // 否则 merge_table 会保留陈旧值，下次启动又会被读回来。
+            if provider.chat_endpoint.is_none() && previous.chat_endpoint.is_some() {
+                if let Some(table) = provider_table_mut(&mut raw, name) {
+                    table.remove("chat_endpoint");
+                }
+            }
+            if provider.models_endpoint.is_none() && previous.models_endpoint.is_some() {
+                if let Some(table) = provider_table_mut(&mut raw, name) {
+                    table.remove("models_endpoint");
                 }
             }
         }
@@ -631,6 +659,84 @@ fn env(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
         return Ok(output("Environment", text));
     }
 
+    if command.eq_ignore_ascii_case("add") {
+        return Ok(CliAction::Form(CommandForm {
+            title: "Add Environment Variable".into(),
+            kind: FormKind::EnvVar {
+                index: None,
+                original_key: None,
+            },
+            fields: vec![
+                FormField {
+                    name: "key".into(),
+                    value: String::new(),
+                    secret: false,
+                },
+                FormField {
+                    name: "value".into(),
+                    value: String::new(),
+                    secret: false,
+                },
+                FormField {
+                    name: "sensitive".into(),
+                    value: "false".into(),
+                    secret: false,
+                },
+            ],
+        }));
+    }
+
+    if command.eq_ignore_ascii_case("edit") {
+        if rest.is_empty() {
+            bail!("Usage: /env edit <key_or_index>");
+        }
+        let config = &runner.ctx.config;
+        let found = if let Ok(idx_1based) = rest.parse::<usize>() {
+            if idx_1based >= 1 && idx_1based <= config.env.vars.len() {
+                let idx = idx_1based - 1;
+                Some((idx, &config.env.vars[idx]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (found_idx, target) = match found {
+            Some(res) => res,
+            None => config
+                .env
+                .vars
+                .iter()
+                .enumerate()
+                .find(|(_, v)| v.key == rest || v.key.eq_ignore_ascii_case(rest))
+                .ok_or_else(|| eyre!("Unknown environment variable '{rest}'"))?,
+        };
+        return Ok(CliAction::Form(CommandForm {
+            title: format!("Edit Environment Variable ({})", target.key),
+            kind: FormKind::EnvVar {
+                index: Some(found_idx),
+                original_key: Some(target.key.clone()),
+            },
+            fields: vec![
+                FormField {
+                    name: "key".into(),
+                    value: target.key.clone(),
+                    secret: false,
+                },
+                FormField {
+                    name: "value".into(),
+                    value: target.value.clone(),
+                    secret: target.sensitive,
+                },
+                FormField {
+                    name: "sensitive".into(),
+                    value: target.sensitive.to_string(),
+                    secret: false,
+                },
+            ],
+        }));
+    }
+
     let mut config = runner.ctx.config.clone();
     let message = match command.to_ascii_lowercase().as_str() {
         "set" | "set-sensitive" => {
@@ -659,7 +765,7 @@ fn env(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             format!("Environment variable '{rest}' removed")
         }
         _ => {
-            bail!("Usage: /env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]");
+            bail!("Usage: /env [list|add|edit <key>|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]");
         }
     };
     save_config(runner, config, "env", "vars")?;
@@ -944,7 +1050,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                         let cap =
                             cyber_core::get_model_vision_capability(provider, &name, &model, None);
                         let badge = cap.badge_text();
-                        let active_badge = if is_active { " ● [当前生效]" } else { "" };
+                        let active_badge = if is_active { " ✓ 当前" } else { "" };
                         let label = if badge.is_empty() {
                             format!("{model}{active_badge}")
                         } else {
@@ -953,7 +1059,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                         items.push(PickerItem {
                             label,
                             detail: if is_default_prov {
-                                format!("{name} ★默认服务商")
+                                format!("{name} ★ 默认")
                             } else {
                                 name.clone()
                             },
@@ -961,8 +1067,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                         });
                     }
                 }
-                if let Some(pos) = items.iter().position(|i| i.label.contains("● [当前生效]"))
-                {
+                if let Some(pos) = items.iter().position(|i| i.label.contains("✓ 当前")) {
                     let active_item = items.remove(pos);
                     items.insert(0, active_item);
                 }
@@ -1055,14 +1160,24 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         SlashCommand::Mcp(args) => {
             let config = McpServersConfig::load(&runner.ctx.paths.mcp_servers_file)
                 .map_err(|_| eyre!("Cannot read MCP configuration"))?;
-            match args.to_ascii_lowercase().as_str() {
+            let trimmed = args.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.is_empty()
+                || lower == "panel"
+                || lower == "add"
+                || lower == "edit"
+                || lower == "delete"
+            {
+                return Ok(CliAction::Panel(crate::cli::Panel::Mcp));
+            }
+            match lower.as_str() {
                 "connect" => {
                     if runner.registries.mcp.is_some() {
                         bail!("MCP already connected; restart before reconnecting");
                     }
                     CliAction::Task(CliTask::McpConnect { config })
                 }
-                "" | "list" | "status" => {
+                "list" | "status" => {
                     output(
                         "MCP",
                         config
@@ -1091,7 +1206,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                     )
                 }
                 _ => {
-                    bail!("Usage: /mcp list|status|connect");
+                    bail!("Usage: /mcp list|status|connect|panel");
                 }
             }
         }
@@ -1237,21 +1352,31 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
         "wizard" | "preset" | "presets" => {
             let mut items = Vec::new();
             for preset in cyber_core::PROVIDER_PRESETS {
+                let label = if preset.default_model.is_empty() {
+                    format!("{} (自定义)", preset.name)
+                } else {
+                    format!("{} ({})", preset.name, preset.default_model)
+                };
+                let detail = if preset.base_url.is_empty() {
+                    preset.description.to_string()
+                } else {
+                    format!("{} · {}", preset.base_url, preset.description)
+                };
                 items.push(PickerItem {
-                    label: format!("{} ({})", preset.name, preset.default_model),
-                    detail: preset.base_url.to_string(),
+                    label,
+                    detail,
                     command: format!("/provider add-preset {}", preset.id),
                 });
             }
             items.push(PickerItem {
                 label: "🛠️ 自定义服务商接入 (自行选择协议类型)...".into(),
-                detail: "支持 openai-compatible, anthropic, ollama, openai".into(),
+                detail: "支持 openai-compatible, anthropic, ollama, openai 等自建网关或代理".into(),
                 command: "/provider add-custom".into(),
             });
             Ok(CliAction::Picker(CommandPicker {
                 title: "Add Provider from Preset or Custom".into(),
                 items,
-                kind: PickerKind::Models,
+                kind: PickerKind::General,
             }))
         }
         "add-custom" => {
@@ -1280,7 +1405,7 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             Ok(CliAction::Picker(CommandPicker {
                 title: "Select Protocol Kind".into(),
                 items,
-                kind: PickerKind::Models,
+                kind: PickerKind::General,
             }))
         }
         "add-preset" => {
@@ -1303,7 +1428,7 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             let values = [
                 ("name", preset.id.to_string(), false),
                 ("kind", p.kind.clone(), false),
-                ("endpoint", p.base_url.clone(), true),
+                ("endpoint", p.base_url.clone(), false),
                 ("apikey", p.api_key.clone(), true),
                 ("model", p.model.clone(), false),
                 ("maxtokens", p.max_tokens.to_string(), false),
@@ -1313,6 +1438,16 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     p.effective_context_length()
                         .map(|n| n.to_string())
                         .unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "chat_endpoint",
+                    p.chat_endpoint.clone().unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "models_endpoint",
+                    p.models_endpoint.clone().unwrap_or_default(),
                     false,
                 ),
             ];
@@ -1357,7 +1492,7 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             let values = [
                 ("name", String::new(), false),
                 ("kind", kind, false),
-                ("endpoint", p.base_url.clone(), true),
+                ("endpoint", p.base_url.clone(), false),
                 ("apikey", p.api_key.clone(), true),
                 ("model", p.model.clone(), false),
                 ("maxtokens", p.max_tokens.to_string(), false),
@@ -1367,6 +1502,16 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     p.effective_context_length()
                         .map(|n| n.to_string())
                         .unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "chat_endpoint",
+                    p.chat_endpoint.clone().unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "models_endpoint",
+                    p.models_endpoint.clone().unwrap_or_default(),
                     false,
                 ),
             ];
@@ -1402,7 +1547,7 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             let values = [
                 ("name", rest.to_owned(), false),
                 ("kind", p.kind.clone(), false),
-                ("endpoint", p.base_url.clone(), true),
+                ("endpoint", p.base_url.clone(), false),
                 ("apikey", p.api_key.clone(), true),
                 ("model", p.model.clone(), false),
                 ("maxtokens", p.max_tokens.to_string(), false),
@@ -1412,6 +1557,16 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     p.effective_context_length()
                         .map(|n| n.to_string())
                         .unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "chat_endpoint",
+                    p.chat_endpoint.clone().unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "models_endpoint",
+                    p.models_endpoint.clone().unwrap_or_default(),
                     false,
                 ),
             ];
@@ -1435,7 +1590,7 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             runner.select_model_persisted(rest, None)?;
             Ok(refresh("Provider selected", false))
         }
-        "remove" => {
+        "remove" | "delete" => {
             let mut providers = runner.ctx.providers.clone();
             if providers.remove(rest).is_none() {
                 bail!("Unknown provider");
@@ -1451,6 +1606,37 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             providers.default_provider = config.agent.default_provider.clone();
             save_selection_renamed(runner, config, providers, None, false)?;
             Ok(refresh("Provider removed", false))
+        }
+        "models" => {
+            let name = rest.trim();
+            if name.is_empty() {
+                Ok(output(
+                    "Provider Models",
+                    runner
+                        .ctx
+                        .providers
+                        .sorted_names()
+                        .iter()
+                        .map(|n| {
+                            let p = &runner.ctx.providers.providers[n];
+                            let mut m: Vec<_> = p.models.keys().cloned().collect();
+                            if !p.model.is_empty() && !m.contains(&p.model) {
+                                m.push(p.model.clone());
+                            }
+                            format!("{}: {}", n, m.join(", "))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            } else if let Some(p) = runner.ctx.providers.providers.get(name) {
+                let mut m: Vec<_> = p.models.keys().cloned().collect();
+                if !p.model.is_empty() && !m.contains(&p.model) {
+                    m.push(p.model.clone());
+                }
+                Ok(output(&format!("Models for {name}"), m.join("\n")))
+            } else {
+                bail!("Unknown provider '{name}'");
+            }
         }
         _ => {
             bail!("Usage: /provider list|add|edit <name>|use <name>|remove <name>");
@@ -1819,7 +2005,11 @@ fn ctf(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             runner.ctf_enabled = sub.eq_ignore_ascii_case("enable");
             Ok(refresh("CTF mode updated", false))
         }
-        "" | "status" => Ok(output(
+        "" | "panel" | "open" => {
+            runner.ctf_enabled = true;
+            Ok(CliAction::Panel(crate::cli::Panel::Ctf))
+        }
+        "status" => Ok(output(
             "CTF",
             if runner.ctf_enabled {
                 "enabled"
@@ -1865,7 +2055,7 @@ fn ctf(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             }))
         }
         _ => {
-            bail!("Usage: /ctf enable|disable|add <name> <category>|list|writeup <name>");
+            bail!("Usage: /ctf [panel|open]|enable|disable|status|add <name> <category>|list|writeup <name>");
         }
     }
 }
@@ -1930,6 +2120,25 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
                 )
             };
             p.models.entry(p.model.clone()).or_default().context_length = context;
+            let opt_field = |name: &str| -> &str {
+                form.fields
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(|f| f.value.trim())
+                    .unwrap_or("")
+            };
+            let chat_ep = opt_field("chat_endpoint");
+            p.chat_endpoint = if chat_ep.is_empty() {
+                None
+            } else {
+                Some(chat_ep.to_string())
+            };
+            let models_ep = opt_field("models_endpoint");
+            p.models_endpoint = if models_ep.is_empty() {
+                None
+            } else {
+                Some(models_ep.to_string())
+            };
             let mut providers = runner.ctx.providers.clone();
             let mut config = runner.ctx.config.clone();
             if let Some(old) = original_name {
@@ -1976,6 +2185,129 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
             save_memory_rule(runner, *index, Some(&rule))?;
             Ok(refresh("Memory rule saved", false))
         }
+        FormKind::EnvVar {
+            index,
+            original_key,
+        } => {
+            let key = field("key")?;
+            if key.is_empty() {
+                bail!("Environment variable key cannot be empty");
+            }
+            if key.contains('=') || key.contains(char::is_whitespace) {
+                bail!("Environment variable key cannot contain '=' or whitespace");
+            }
+            let value = form
+                .fields
+                .iter()
+                .find(|f| f.name == "value")
+                .map(|f| f.value.as_str())
+                .unwrap_or("");
+            let sensitive_str = field("sensitive")?.to_ascii_lowercase();
+            let sensitive = matches!(sensitive_str.as_str(), "true" | "1" | "yes");
+
+            let mut config = runner.ctx.config.clone();
+
+            for (i, v) in config.env.vars.iter().enumerate() {
+                let is_self = match (index, original_key) {
+                    (Some(idx), _) if *idx == i => true,
+                    (_, Some(orig)) if v.key == *orig => true,
+                    _ => false,
+                };
+                if !is_self && v.key == key {
+                    bail!("Environment variable '{key}' already exists");
+                }
+            }
+
+            let new_var = EnvVar {
+                key: key.to_string(),
+                value: value.to_string(),
+                sensitive,
+            };
+
+            if let Some(idx) = index {
+                if *idx < config.env.vars.len() {
+                    config.env.vars[*idx] = new_var;
+                } else {
+                    config.env.vars.push(new_var);
+                }
+            } else if let Some(orig) = original_key {
+                if let Some(existing) = config.env.vars.iter_mut().find(|v| v.key == *orig) {
+                    *existing = new_var;
+                } else {
+                    config.env.vars.push(new_var);
+                }
+            } else {
+                config.env.vars.push(new_var);
+            }
+
+            save_config(runner, config, "env", "vars")?;
+            Ok(refresh("Environment variable saved", false))
+        }
+    }
+}
+
+pub fn panel_guide(cmd: &str) -> Option<&'static str> {
+    match cmd.to_ascii_lowercase().as_str() {
+        "/mcp" => Some("打开 MCP 面板 (服务器/工具控制中心)"),
+        "/provider" | "/providers" => Some("打开服务商面板 (查看与配置全部 Provider)"),
+        "/model" | "/models" => Some("打开模型面板 (双栏浏览与切换核心模型)"),
+        "/settings" => Some("打开设置中心面板 (Agent/界面/并发/存储)"),
+        "/ctf" => Some("打开 CTF 题目面板 (靶场题单与解题工具)"),
+        "/subagents" => Some("打开子代理转录面板 (实时查看执行流)"),
+        "/bg" => Some("打开后台任务面板 (查看与管理后台进程)"),
+        "/sessions" => Some("打开会话管理面板 (浏览与切换历史会话)"),
+        _ => None,
+    }
+}
+
+pub fn is_panel_command(cmd: &str) -> bool {
+    panel_guide(cmd).is_some()
+}
+
+pub fn subcommand_description(cmd: &str, sub: &str) -> Option<&'static str> {
+    let cmd = cmd.to_ascii_lowercase();
+    let sub = sub.to_ascii_lowercase();
+    match (cmd.as_str(), sub.as_str()) {
+        ("/mcp", "connect") => Some("测试并建立 MCP 服务器连接"),
+        ("/mcp", "list") => Some("查看已配置 MCP 服务器列表"),
+        ("/mcp", "status") => Some("查看 MCP 服务器运行状态"),
+        ("/mcp", "add") => Some("添加新 MCP 服务器配置"),
+        ("/mcp", "edit") => Some("编辑 MCP 服务器配置"),
+        ("/mcp", "delete") => Some("删除指定 MCP 服务器"),
+        ("/mcp", "panel") => Some("打开全屏 MCP 管理面板"),
+
+        ("/provider" | "/providers", "add") => Some("添加模型服务商 (向导或自定义协议)"),
+        ("/provider" | "/providers", "edit") => Some("编辑服务商参数 (端点、密钥、模型)"),
+        ("/provider" | "/providers", "delete" | "remove") => Some("删除指定模型服务商"),
+        ("/provider" | "/providers", "list") => Some("列出所有已配置服务商及默认项"),
+        ("/provider" | "/providers", "use") => Some("切换全局默认模型服务商"),
+        ("/provider" | "/providers", "models") => Some("查看或拉取服务商模型清单"),
+        ("/provider" | "/providers", "wizard" | "preset" | "presets") => {
+            Some("从主流预设向导添加服务商")
+        }
+
+        ("/sessions" | "/session", "list") => Some("浏览与切换历史会话"),
+        ("/sessions" | "/session", "read") => Some("跨会话读取历史上下文"),
+        ("/sessions" | "/session", "new") => Some("新建空白会话"),
+        ("/sessions" | "/session", "delete") => Some("删除指定历史会话"),
+
+        ("/ctf", "enable") => Some("开启 CTF 靶场辅助解题模式"),
+        ("/ctf", "disable") => Some("关闭 CTF 靶场模式"),
+        ("/ctf", "add") => Some("添加新 CTF 靶场题目"),
+        ("/ctf", "list") => Some("查看 CTF 靶场题单与解题状态"),
+        ("/ctf", "writeup") => Some("生成当前题目 Writeup 报告"),
+
+        ("/subagents", "status") => Some("查看批量子代理运行状态"),
+        ("/subagents", "enable") => Some("开启批量子代理并发执行"),
+        ("/subagents", "disable") => Some("禁用子代理功能"),
+        ("/subagents", "stop") => Some("终止指定的子代理任务"),
+
+        ("/bg", "list") => Some("查看全部后台任务与进程"),
+        ("/bg", "run") => Some("在后台异步运行 Prompt 任务"),
+        ("/bg", "shell") => Some("在后台启动持久化命令进程"),
+        ("/bg", "kill") => Some("终止指定后台任务"),
+        ("/bg", "tail") => Some("追踪后台任务实时输出"),
+        _ => None,
     }
 }
 
@@ -1988,11 +2320,20 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
         let current_session_title = runner
             .and_then(|r| r.index.current_meta())
             .map(|m| m.title.clone());
-        return commands()
+        let input_lower = input.to_ascii_lowercase();
+        let mut items: Vec<CompletionItem> = commands()
             .into_iter()
-            .filter(|c| c.name.starts_with(&input.to_ascii_lowercase()))
+            .filter(|c| c.name.starts_with(&input_lower))
             .map(|c| {
-                let description = if c.name == "/session" || c.name == "/sessions" {
+                let description = if let Some(guide) = panel_guide(c.name) {
+                    match (
+                        (c.name == "/session" || c.name == "/sessions"),
+                        &current_session_title,
+                    ) {
+                        (true, Some(title)) => format!("{guide} · {title}"),
+                        _ => guide.to_string(),
+                    }
+                } else if c.name == "/session" || c.name == "/sessions" {
                     if let Some(title) = &current_session_title {
                         format!("{} · {}", c.desc, title)
                     } else {
@@ -2007,6 +2348,16 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
                 }
             })
             .collect();
+
+        // 对完全匹配的面板主命令（如 /mcp、/provider、/model），在排序后置顶至 items[0]
+        if let Some(pos) = items.iter().position(|item| {
+            let name = item.value.trim().to_ascii_lowercase();
+            name == input_lower && is_panel_command(&name)
+        }) {
+            let exact = items.remove(pos);
+            items.insert(0, exact);
+        }
+        return items;
     }
     let (cmd, args) = split(input);
     let cmd = cmd.to_ascii_lowercase();
@@ -2036,7 +2387,10 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
         );
     }
     if cmd == "/mcp" && head.is_empty() {
-        values.push("connect".into());
+        values.extend(["connect", "add", "edit", "delete"].map(str::to_owned));
+    }
+    if (cmd == "/provider" || cmd == "/providers") && head.is_empty() {
+        values.extend(["delete", "models"].map(str::to_owned));
     }
     if (cmd == "/sessions" || cmd == "/session") && head.is_empty() {
         values.push("delete".into());
@@ -2053,8 +2407,8 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
     }
     if let Some(runner) = runner {
         if (cmd == "/model" && head.is_empty())
-            || (cmd == "/provider"
-                && ["use", "edit", "remove"]
+            || ((cmd == "/provider" || cmd == "/providers")
+                && ["use", "edit", "remove", "delete"]
                     .iter()
                     .any(|s| head.eq_ignore_ascii_case(s)))
         {
@@ -2075,7 +2429,7 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
             values.extend(runner.index.sessions.iter().map(|s| s.id.clone()));
         }
         if cmd == "/env"
-            && ["set", "set-sensitive", "remove"]
+            && ["set", "set-sensitive", "remove", "edit"]
                 .iter()
                 .any(|value| head.eq_ignore_ascii_case(value))
         {
@@ -2087,15 +2441,32 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
     }
     values.sort();
     values.dedup();
-    values
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut items: Vec<CompletionItem> = values
         .into_iter()
-        .filter(|s| s.to_lowercase().starts_with(&prefix.to_lowercase()))
+        .filter(|s| s.to_ascii_lowercase().starts_with(&prefix_lower))
         .map(|s| {
-            let description = if cmd == "/sessions" || cmd == "/session" {
+            let description = if (cmd == "/sessions" || cmd == "/session") && !head.is_empty() {
                 runner
                     .and_then(|r| r.index.get(&s))
                     .map(|m| m.title.clone())
                     .unwrap_or_else(|| cmd.clone())
+            } else if let Some(desc) = subcommand_description(&cmd, &s) {
+                desc.to_string()
+            } else if cmd == "/sessions" || cmd == "/session" {
+                runner
+                    .and_then(|r| r.index.get(&s))
+                    .map(|m| m.title.clone())
+                    .unwrap_or_else(|| {
+                        subcommand_description(&cmd, &s)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| cmd.clone())
+                    })
+            } else if cmd == "/model" && head.is_empty() {
+                format!("切换至 {s} 服务商核心模型")
+            } else if cmd == "/model" && !head.is_empty() {
+                format!("选择 {head} 服务商下的 {s} 模型")
             } else {
                 cmd.clone()
             };
@@ -2108,7 +2479,27 @@ pub fn suggestions(runner: Option<&SessionRunner>, input: &str) -> Vec<Completio
                 description,
             }
         })
-        .collect()
+        .collect();
+
+    if head.is_empty() && is_panel_command(&cmd) {
+        let prefix_matches = prefix.is_empty()
+            || cmd.trim_start_matches('/').starts_with(&prefix_lower)
+            || cmd.starts_with(&prefix_lower)
+            || "panel".starts_with(&prefix_lower);
+        if prefix_matches {
+            if let Some(guide_desc) = panel_guide(&cmd) {
+                items.insert(
+                    0,
+                    CompletionItem {
+                        value: cmd.clone(),
+                        description: guide_desc.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    items
 }
 pub async fn run_task(
     runner: &mut SessionRunner,
@@ -2549,6 +2940,78 @@ notes = "model named notes"
     }
 
     #[tokio::test]
+    async fn provider_form_exposes_and_persists_advanced_endpoint_overrides() {
+        let mut runner = test_runner().await;
+
+        // 1. edit 表单必须包含两个高级端点字段
+        let mut edit = form(execute(&mut runner, "/provider edit openai").unwrap());
+        for name in ["chat_endpoint", "models_endpoint"] {
+            let f = edit
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("missing field {name}"));
+            assert!(!f.secret, "{name} must render as plain text");
+        }
+
+        // 2. 填写自定义端点后提交 → 落盘并被运行时读取
+        set(&mut edit, "chat_endpoint", "https://gw.test/v1/chat");
+        set(&mut edit, "models_endpoint", "https://gw.test/v1/list");
+        submit_form(&mut runner, &edit).unwrap();
+        let cfg = &runner.ctx.providers.providers["openai"];
+        assert_eq!(
+            cfg.chat_endpoint.as_deref(),
+            Some("https://gw.test/v1/chat")
+        );
+        assert_eq!(
+            cfg.models_endpoint.as_deref(),
+            Some("https://gw.test/v1/list")
+        );
+        assert_eq!(cfg.chat_endpoint(), "https://gw.test/v1/chat");
+        let saved = std::fs::read_to_string(&runner.ctx.paths.providers_file).unwrap();
+        assert!(saved.contains("chat_endpoint"));
+        assert!(saved.contains("https://gw.test/v1/list"));
+
+        // 3. 留空 → 回退到 Some(None)，且默认端点恢复正常
+        let mut cleared = form(execute(&mut runner, "/provider edit openai").unwrap());
+        assert_eq!(
+            cleared
+                .fields
+                .iter()
+                .find(|f| f.name == "chat_endpoint")
+                .unwrap()
+                .value,
+            "https://gw.test/v1/chat"
+        );
+        set(&mut cleared, "chat_endpoint", "");
+        set(&mut cleared, "models_endpoint", "   ");
+        submit_form(&mut runner, &cleared).unwrap();
+        let cfg = &runner.ctx.providers.providers["openai"];
+        assert!(cfg.chat_endpoint.is_none(), "blank must clear override");
+        assert!(cfg.models_endpoint.is_none(), "blank must clear override");
+        assert_eq!(
+            cfg.chat_endpoint(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // 磁盘上必须真正删除陈旧覆盖值，否则下次启动会重新读回
+        let saved = std::fs::read_to_string(&runner.ctx.paths.providers_file).unwrap();
+        assert!(
+            !saved.contains("https://gw.test/v1/chat"),
+            "stale chat_endpoint must be removed from file: {saved}"
+        );
+        assert!(
+            !saved.contains("https://gw.test/v1/list"),
+            "stale models_endpoint must be removed from file: {saved}"
+        );
+        let reparsed: ProvidersConfig = toml::from_str(&saved).unwrap();
+        let reloaded = &reparsed.providers["openai"];
+        assert!(reloaded.chat_endpoint.is_none());
+        assert!(reloaded.models_endpoint.is_none());
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
     async fn failed_two_file_publication_rolls_back_without_changing_running_selection() {
         let mut runner = test_runner().await;
         persist(
@@ -2645,9 +3108,7 @@ notes = "model named notes"
         // 1. /model 无参数返回模型列表，且当前生效模型置顶
         if let CliAction::Picker(p) = execute(&mut runner, "/model").unwrap() {
             assert!(matches!(p.kind, PickerKind::Models));
-            assert!(p.items[0].label.contains("● [当前生效]"));
-        } else {
-            panic!("expected model picker");
+            assert!(p.items[0].label.contains("✓ 当前"));
         }
 
         // 2. /model <model_name> 自动跨服务商匹配模型
@@ -3188,12 +3649,7 @@ rules = [
                 .base_url = endpoint.into();
             let edit = form(execute(&mut runner, "/provider edit openai").unwrap());
             for field in &edit.fields {
-                assert_eq!(
-                    field.secret,
-                    ["endpoint", "apikey"].contains(&field.name.as_str()),
-                    "{}",
-                    field.name
-                );
+                assert_eq!(field.secret, field.name == "apikey", "{}", field.name);
             }
             assert_eq!(
                 edit.fields
@@ -3214,8 +3670,15 @@ rules = [
         assert!(add
             .fields
             .iter()
-            .filter(|f| ["endpoint", "apikey"].contains(&f.name.as_str()))
+            .filter(|f| f.name == "apikey")
             .all(|f| f.secret));
+        assert!(
+            !add.fields
+                .iter()
+                .find(|f| f.name == "endpoint")
+                .unwrap()
+                .secret
+        );
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 
@@ -3439,6 +3902,152 @@ rules = [
         execute(&mut runner, "/vision model openai gpt-4o").unwrap();
         assert_eq!(runner.ctx.config.agent.vision.provider, "openai");
         assert_eq!(runner.ctx.config.agent.vision.model, "gpt-4o");
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn command_panel_guides_and_top_shortcut_entries() {
+        let runner = test_runner().await;
+
+        // 1. 无空格输入 /mcp：第一项置顶 /mcp，描述为打开 MCP 面板
+        let mcp_comps = suggestions(Some(&runner), "/mcp");
+        assert!(!mcp_comps.is_empty());
+        assert_eq!(mcp_comps[0].value.trim(), "/mcp");
+        assert!(mcp_comps[0].description.contains("打开 MCP 面板"));
+
+        // 2. 带空格输入 /mcp ：第 0 项为 /mcp 面板引导项，后续为带描述的 connect、list、status
+        let mcp_sub_comps = suggestions(Some(&runner), "/mcp ");
+        assert!(!mcp_sub_comps.is_empty());
+        assert_eq!(mcp_sub_comps[0].value, "/mcp");
+        assert!(mcp_sub_comps[0].description.contains("打开 MCP 面板"));
+
+        let connect_item = mcp_sub_comps
+            .iter()
+            .find(|c| c.value == "/mcp connect ")
+            .expect("should have /mcp connect");
+        assert_eq!(connect_item.description, "测试并建立 MCP 服务器连接");
+
+        let list_item = mcp_sub_comps
+            .iter()
+            .find(|c| c.value == "/mcp list ")
+            .expect("should have /mcp list");
+        assert_eq!(list_item.description, "查看已配置 MCP 服务器列表");
+
+        let status_item = mcp_sub_comps
+            .iter()
+            .find(|c| c.value == "/mcp status ")
+            .expect("should have /mcp status");
+        assert_eq!(status_item.description, "查看 MCP 服务器运行状态");
+
+        // 3. 带前缀 /mcp c：精准过滤子命令，引导项不强行占用
+        let mcp_c_comps = suggestions(Some(&runner), "/mcp c");
+        assert_eq!(mcp_c_comps.len(), 1);
+        assert_eq!(mcp_c_comps[0].value, "/mcp connect ");
+        assert_eq!(mcp_c_comps[0].description, "测试并建立 MCP 服务器连接");
+
+        // 4. 带空格输入 /provider ：第 0 项为 /provider 面板引导项
+        let provider_comps = suggestions(Some(&runner), "/provider ");
+        assert!(!provider_comps.is_empty());
+        assert_eq!(provider_comps[0].value, "/provider");
+        assert!(provider_comps[0].description.contains("打开服务商面板"));
+        let prov_add = provider_comps
+            .iter()
+            .find(|c| c.value == "/provider add ")
+            .expect("should have /provider add");
+        assert_eq!(prov_add.description, "添加模型服务商 (向导或自定义协议)");
+
+        // 5. 带空格输入 /model ：第 0 项为 /model 面板引导项
+        let model_comps = suggestions(Some(&runner), "/model ");
+        assert!(!model_comps.is_empty());
+        assert_eq!(model_comps[0].value, "/model");
+        assert!(model_comps[0].description.contains("打开模型面板"));
+
+        // 6. 带空格输入 /settings ：第 0 项为 /settings 引导项
+        let settings_comps = suggestions(Some(&runner), "/settings ");
+        assert!(!settings_comps.is_empty());
+        assert_eq!(settings_comps[0].value, "/settings");
+        assert!(settings_comps[0].description.contains("打开设置中心面板"));
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn env_form_add_edit_and_submit_lifecycle() {
+        let mut runner = test_runner().await;
+
+        // 1. /env add opens form
+        let action = execute(&mut runner, "/env add").unwrap();
+        let mut add_form = form(action);
+        assert_eq!(add_form.title, "Add Environment Variable");
+        assert!(matches!(
+            add_form.kind,
+            FormKind::EnvVar {
+                index: None,
+                original_key: None
+            }
+        ));
+
+        // Submitting with empty key should fail
+        set(&mut add_form, "key", "");
+        assert!(submit_form(&mut runner, &add_form).is_err());
+
+        // Submitting with invalid key (contains '=') should fail
+        set(&mut add_form, "key", "INVALID=KEY");
+        assert!(submit_form(&mut runner, &add_form).is_err());
+
+        // Submitting valid new env var
+        set(&mut add_form, "key", "MY_API_KEY");
+        set(&mut add_form, "value", "secret-token-123");
+        set(&mut add_form, "sensitive", "true");
+        submit_form(&mut runner, &add_form).unwrap();
+
+        assert_eq!(runner.ctx.config.env.vars.len(), 1);
+        assert_eq!(runner.ctx.config.env.vars[0].key, "MY_API_KEY");
+        assert_eq!(runner.ctx.config.env.vars[0].value, "secret-token-123");
+        assert!(runner.ctx.config.env.vars[0].sensitive);
+
+        // Submitting duplicate key should fail
+        let action_dup = execute(&mut runner, "/env add").unwrap();
+        let mut dup_form = form(action_dup);
+        set(&mut dup_form, "key", "MY_API_KEY");
+        set(&mut dup_form, "value", "another-token");
+        assert!(submit_form(&mut runner, &dup_form).is_err());
+
+        // 2. /env edit by key
+        let action_edit = execute(&mut runner, "/env edit MY_API_KEY").unwrap();
+        let mut edit_form = form(action_edit);
+        assert_eq!(edit_form.title, "Edit Environment Variable (MY_API_KEY)");
+        assert_eq!(
+            edit_form
+                .fields
+                .iter()
+                .find(|f| f.name == "value")
+                .unwrap()
+                .value,
+            "secret-token-123"
+        );
+
+        // Edit value & keep same key
+        set(&mut edit_form, "value", "updated-token-456");
+        set(&mut edit_form, "sensitive", "false");
+        submit_form(&mut runner, &edit_form).unwrap();
+
+        assert_eq!(runner.ctx.config.env.vars.len(), 1);
+        assert_eq!(runner.ctx.config.env.vars[0].key, "MY_API_KEY");
+        assert_eq!(runner.ctx.config.env.vars[0].value, "updated-token-456");
+        assert!(!runner.ctx.config.env.vars[0].sensitive);
+
+        // 3. /env edit by 1-based index
+        let action_idx = execute(&mut runner, "/env edit 1").unwrap();
+        let edit_idx_form = form(action_idx);
+        assert_eq!(
+            edit_idx_form.title,
+            "Edit Environment Variable (MY_API_KEY)"
+        );
+
+        // 4. /env edit unknown key fails
+        assert!(execute(&mut runner, "/env edit NON_EXISTENT").is_err());
 
         let _ = std::fs::remove_dir_all(runner.cwd);
     }

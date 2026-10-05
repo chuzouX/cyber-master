@@ -14,6 +14,22 @@ pub const PROVIDER_KINDS: &[&str] = &[
     "responses",
 ];
 
+/// 上下文窗口（context_length）常用预设：(显示标签, 数值字符串)。
+/// 空字符串表示「未设置」，对应 `context_length = None`。
+pub const CONTEXT_LENGTH_PRESETS: &[(&str, &str)] = &[
+    ("默认(留空)", ""),
+    ("128K", "131072"),
+    ("256K", "262144"),
+    ("512K", "524288"),
+    ("1M", "1048576"),
+];
+
+/// 新建 / 缺省 provider 的默认最大输出 token 数。
+pub const DEFAULT_MAX_TOKENS: u32 = 384_000;
+
+/// 模型未声明 `context_length` 时的输出上限兜底：避免把超大 `max_tokens` 发给上限未知的端点。
+pub const DEFAULT_OUTPUT_TOKEN_CAP: u32 = 128_000;
+
 /// 对应 `~/.cyber/providers.toml`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,7 +112,7 @@ impl Default for ProviderConfig {
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
-            max_tokens: 4096,
+            max_tokens: DEFAULT_MAX_TOKENS,
             temperature: 0.7,
             price: None,
             models: HashMap::new(),
@@ -183,11 +199,17 @@ impl ProviderConfig {
         self.models.get(&self.model)
     }
 
-    /// 当前 model 的有效 max_tokens：per-model 优先，回退到 provider 级。
+    /// 当前 model 的有效 max_tokens：per-model 优先，回退到 provider 级；
+    /// 再按模型声明的 `context_length` 钳制（未声明时用 `DEFAULT_OUTPUT_TOKEN_CAP` 兜底）。
     pub fn effective_max_tokens(&self) -> u32 {
-        self.current_model_config()
+        let configured = self
+            .current_model_config()
             .and_then(|m| m.max_tokens)
-            .unwrap_or(self.max_tokens)
+            .unwrap_or(self.max_tokens);
+        configured.min(
+            self.effective_context_length()
+                .unwrap_or(DEFAULT_OUTPUT_TOKEN_CAP),
+        )
     }
 
     /// 当前 model 的有效 temperature：per-model 优先，回退到 provider 级。
@@ -313,7 +335,7 @@ impl ProviderPreset {
                 format!("${{{}}}", self.env_var_suggestion)
             },
             model: self.default_model.to_string(),
-            max_tokens: 4096,
+            max_tokens: DEFAULT_MAX_TOKENS,
             temperature: 0.7,
             ..Default::default()
         }
@@ -362,8 +384,8 @@ impl VisionCapability {
     /// 用于 UI 或 CLI 展示的状态文本。
     pub fn badge_text(&self) -> &'static str {
         match self {
-            Self::Supported => "👁️ [视觉]",
-            Self::Unsupported => "[文本]",
+            Self::Supported => "◈ 视觉",
+            Self::Unsupported => "",
             Self::Unknown => "",
         }
     }
@@ -625,11 +647,11 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         id: "custom",
         name: "自定义 OpenAI 兼容接口",
         kind: "openai",
-        base_url: "",
-        default_model: "",
+        base_url: "http://localhost:8000/v1",
+        default_model: "custom",
         suggested_models: &[],
-        env_var_suggestion: "",
-        description: "任意兼容 OpenAI 规范的自建模型或第三方代理",
+        env_var_suggestion: "CUSTOM_API_KEY",
+        description: "兼容 OpenAI 规范的自建模型、OneAPI、vLLM 或本地中转代理",
     },
 ];
 
@@ -789,6 +811,27 @@ mod tests {
     }
 
     // ── ModelConfig / effective_* 测试 ──
+
+    #[test]
+    fn default_max_tokens_is_384k_and_clamped_by_context_length() {
+        let mut p = ProviderConfig::default();
+        p.model = "m".into();
+        assert_eq!(p.max_tokens, DEFAULT_MAX_TOKENS);
+        // 未声明 context_length → 兜底钳制到 DEFAULT_OUTPUT_TOKEN_CAP
+        assert_eq!(p.effective_max_tokens(), DEFAULT_OUTPUT_TOKEN_CAP);
+        // 声明 context_length → 钳制到该值
+        p.models.insert(
+            "m".into(),
+            ModelConfig {
+                context_length: Some(64_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.effective_max_tokens(), 64_000);
+        // 声明值大于配置值时不放大
+        p.max_tokens = 2048;
+        assert_eq!(p.effective_max_tokens(), 2048);
+    }
 
     #[test]
     fn effective_params_fallback_to_provider_level() {
@@ -1157,5 +1200,12 @@ temperature = 0.7
             get_model_vision_capability(&cfg, "test-p", "non-existent", Some(&store)),
             VisionCapability::Unknown
         );
+    }
+
+    #[test]
+    fn vision_capability_badge_text() {
+        assert_eq!(VisionCapability::Supported.badge_text(), "◈ 视觉");
+        assert_eq!(VisionCapability::Unsupported.badge_text(), "");
+        assert_eq!(VisionCapability::Unknown.badge_text(), "");
     }
 }

@@ -73,7 +73,7 @@ pub fn load_app_context(cwd: &Path) -> Result<AppContext> {
     })
 }
 
-fn load_providers(path: &Path) -> Result<ProvidersConfig> {
+pub fn load_providers(path: &Path) -> Result<ProvidersConfig> {
     if !path.exists() {
         debug!(path = %path.display(), "providers.toml 不存在，使用默认三家模板");
         return Ok(ProvidersConfig::default_template());

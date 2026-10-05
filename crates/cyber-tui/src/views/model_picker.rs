@@ -19,6 +19,8 @@ use cyber_core::{ModelConfig, ProviderConfig, ProvidersConfig};
 use crate::app::ModelPickerState;
 use crate::theme::Theme;
 
+use super::clip_cells_ellipsis;
+
 /// 渲染 `/model` 面板。
 pub fn render(
     frame: &mut Frame,
@@ -57,10 +59,9 @@ pub fn render(
     let hint_area = chunks[1];
 
     let panes =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(body);
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(body);
     let provider_pane = panes[0];
     let model_pane = panes[1];
-
     render_providers(
         frame,
         provider_pane,
@@ -83,8 +84,8 @@ pub fn render(
     render_hint(frame, hint_area, theme, state);
 }
 
-/// 每个 provider 项在渲染中的行数：name 行 + kind/model 行 + 空行 = 3
-const PROVIDER_ITEM_LINES: usize = 3;
+/// 每个 provider 项在渲染中的行数：name 行 + kind/model 行 = 2
+const PROVIDER_ITEM_LINES: usize = 2;
 
 fn render_providers(
     frame: &mut Frame,
@@ -100,7 +101,7 @@ fn render_providers(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_fg))
         .title(
-            Line::from(" Providers ").style(
+            Line::from(" 服务商 / Providers ").style(
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),
@@ -123,7 +124,6 @@ fn render_providers(
             let selected = i == state.provider_selected;
             let is_default = name == default_provider;
             let marker = if selected { "▸ " } else { "  " };
-            let star = if is_default { " ★默认" } else { "" };
             let cfg = &providers.providers[name];
             let row_style = if selected {
                 Style::default().bg(theme.sel_bg).fg(theme.sel_fg)
@@ -137,24 +137,59 @@ fn render_providers(
             } else {
                 cfg.model.clone()
             };
-            lines.push(
-                Line::from(vec![
-                    Span::raw(marker),
-                    Span::styled(
-                        format!("{name}{star}"),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!("\n  [{}] {}", cfg.kind, model_label), {
-                        let mut s = Style::default().fg(theme.muted);
-                        if selected {
-                            s = s.bg(theme.sel_bg);
-                        }
-                        s
-                    }),
-                ])
-                .style(row_style),
-            );
-            lines.push(Line::from(""));
+
+            let max_prov_w = (inner.width as usize).saturating_sub(1);
+            let mut badges_w = 2usize;
+            if is_default {
+                badges_w += 8;
+            }
+            let name_budget = max_prov_w.saturating_sub(badges_w);
+            let clipped_name = clip_cells_ellipsis(name, name_budget);
+
+            let mut header_spans = vec![
+                Span::styled(
+                    marker,
+                    if selected {
+                        Style::default()
+                            .fg(theme.accent)
+                            .bg(theme.sel_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(
+                    clipped_name,
+                    if selected {
+                        Style::default()
+                            .fg(theme.sel_fg)
+                            .bg(theme.sel_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ];
+            if is_default {
+                let mut gold_style = Style::default()
+                    .fg(ratatui::style::Color::Rgb(254, 188, 56))
+                    .add_modifier(Modifier::BOLD);
+                if selected {
+                    gold_style = gold_style.bg(theme.sel_bg);
+                }
+                header_spans.push(Span::styled("  ★ 默认", gold_style));
+            }
+
+            let mut sub_style = Style::default().fg(theme.muted);
+            if selected {
+                sub_style = sub_style.bg(theme.sel_bg);
+            }
+
+            let sub_text = format!("    [{}] {}", cfg.kind, model_label);
+            let clipped_sub = clip_cells_ellipsis(&sub_text, max_prov_w);
+
+            lines.push(Line::from(header_spans).style(row_style));
+            lines.push(Line::from(vec![Span::styled(clipped_sub, sub_style)]).style(row_style));
         }
     }
 
@@ -199,11 +234,16 @@ fn render_models(
         current_provider.map(|(_, p)| &p.models);
     let focused = state.focus_models;
     let border_fg = if focused { theme.accent } else { theme.border };
+    let prov_title_suffix = current_provider
+        .map(|(name, _)| format!(" ({name})"))
+        .unwrap_or_default();
     let title = if state.fetching {
-        " Models (拉取中…) "
+        format!(" 模型 / Models{prov_title_suffix} (拉取中…) ")
     } else {
-        " Models "
+        format!(" 模型 / Models{prov_title_suffix} ")
     };
+    // 标题绘制在顶边框上：裁剪防止长 provider 名覆盖右上角边框。
+    let title = clip_cells_ellipsis(&title, (area.width as usize).saturating_sub(3));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_fg))
@@ -222,7 +262,7 @@ fn render_models(
     if let Some(err) = &state.fetch_error {
         lines.push(Line::from(format!(" ⚠ {err}")).style(Style::default().fg(theme.accent)));
     } else if state.fetching {
-        lines.push(Line::from(" ⏳ 正在拉取模型列表…").style(Style::default().fg(theme.muted)));
+        lines.push(Line::from(" ⟳ 正在拉取模型列表…").style(Style::default().fg(theme.muted)));
     } else if state.models.is_empty() {
         lines.push(
             Line::from("（无模型，按 Tab 切到 Providers 栏选择 provider 后自动拉取）")
@@ -257,35 +297,59 @@ fn render_models(
             };
 
             let is_probing = state.probing_model.as_deref() == Some(m.as_str());
-            let badge_span = if is_probing {
-                Span::styled(
-                    " ⏳ [探测中...]",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                )
+            let is_active = current_provider
+                .map(|(_, p)| p.model == *m)
+                .unwrap_or(false);
+
+            let max_model_w = (inner.width as usize).saturating_sub(1);
+            let has_vision = current_provider
+                .map(|(prov_name, prov_cfg)| {
+                    cyber_core::get_model_vision_capability(prov_cfg, prov_name, m, None)
+                        == cyber_core::VisionCapability::Supported
+                })
+                .unwrap_or(false);
+            let mut badges_w = 2usize; // marker
+            if is_probing || has_vision {
+                badges_w += 8;
+            }
+            if is_active {
+                badges_w += 8;
+            }
+            let label_budget = max_model_w.saturating_sub(badges_w);
+            let clipped_label = clip_cells_ellipsis(&label, label_budget);
+            let mut spans = vec![Span::styled(format!("{marker}{clipped_label}"), style)];
+
+            if is_probing {
+                let mut probe_style = Style::default()
+                    .fg(ratatui::style::Color::Rgb(254, 188, 56))
+                    .add_modifier(Modifier::BOLD);
+                if selected {
+                    probe_style = probe_style.bg(theme.sel_bg);
+                }
+                spans.push(Span::styled("  ⟳ 探测中", probe_style));
             } else if let Some((prov_name, prov_cfg)) = current_provider {
                 let cap = cyber_core::get_model_vision_capability(prov_cfg, prov_name, m, None);
-                match cap {
-                    cyber_core::VisionCapability::Supported => Span::styled(
-                        " 👁️ [视觉]",
-                        Style::default()
-                            .fg(ratatui::style::Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    cyber_core::VisionCapability::Unsupported => {
-                        Span::styled(" [文本]", Style::default().fg(theme.muted))
+                if cap == cyber_core::VisionCapability::Supported {
+                    let mut vision_style = Style::default()
+                        .fg(ratatui::style::Color::Cyan)
+                        .add_modifier(Modifier::BOLD);
+                    if selected {
+                        vision_style = vision_style.bg(theme.sel_bg);
                     }
-                    cyber_core::VisionCapability::Unknown => Span::raw(""),
+                    spans.push(Span::styled("  ◈ 视觉", vision_style));
                 }
-            } else {
-                Span::raw("")
-            };
-
-            let mut spans = vec![Span::styled(format!("{marker}{label}"), style)];
-            if !badge_span.content.is_empty() {
-                spans.push(badge_span);
             }
+
+            if is_active {
+                let mut active_style = Style::default()
+                    .fg(ratatui::style::Color::Rgb(137, 210, 129))
+                    .add_modifier(Modifier::BOLD);
+                if selected {
+                    active_style = active_style.bg(theme.sel_bg);
+                }
+                spans.push(Span::styled("  ✓ 当前", active_style));
+            }
+
             lines.push(Line::from(spans));
         }
     }
@@ -322,14 +386,12 @@ fn render_models(
 fn render_hint(frame: &mut Frame, area: Rect, theme: &Theme, state: &ModelPickerState) {
     let confirm_action = match state.target {
         crate::app::ModelPickerTarget::VisionEngine => "Enter 设为识图模型",
-        crate::app::ModelPickerTarget::DefaultAgent => "Enter 确认",
+        crate::app::ModelPickerTarget::DefaultAgent => "Enter 确认选择",
     };
     let hint = if let Some(probing) = &state.probing_model {
-        format!(" ⏳ 正在对模型 [{probing}] 进行识图能力实测中，请稍候...")
-    } else if state.focus_models {
-        format!(" ↑↓ 选模型  t 实测识图能力  Tab 切栏  {confirm_action}  Esc 退出")
+        format!(" ⟳ 正在对模型 [{probing}] 进行识图能力实测中，请稍候...")
     } else {
-        " ↑↓ 选 provider（自动拉取模型）  Tab 切到 Models  Esc 退出".to_string()
+        format!(" Tab/←/→ 切栏 · ↑/↓ 移动 · {confirm_action} · t 探测识图 · Esc 关闭 ")
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::default().fg(theme.muted)),
@@ -400,7 +462,13 @@ mod tests {
             p.models.insert("gpt-4o".into(), mc);
         }
 
+        let openai_idx = providers
+            .sorted_names()
+            .iter()
+            .position(|n| n == "openai")
+            .unwrap_or(0);
         let state = ModelPickerState {
+            provider_selected: openai_idx,
             models: vec!["gpt-4o".into(), "probing-model".into()],
             probing_model: Some("probing-model".into()),
             focus_models: true,
@@ -419,6 +487,12 @@ mod tests {
                 )
             })
             .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered_text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered_text.contains('◈') && rendered_text.contains('视'));
+        assert!(rendered_text.contains('⟳') && rendered_text.contains('探'));
+        assert!(rendered_text.contains('★') && rendered_text.contains('默'));
+        assert!(rendered_text.contains('✓') && rendered_text.contains('当'));
     }
 
     #[test]

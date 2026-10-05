@@ -24,14 +24,17 @@ pub use custom_tool::{
     load_custom_tools, save_custom_tool, CustomToolConfig, CustomToolParam, LoadedCustomTool,
 };
 pub use error::{CoreError, Result};
-pub use loader::{atomic_write, load_app_context, save_config, save_providers, AppContext};
+pub use loader::{
+    atomic_write, load_app_context, load_providers, save_config, save_providers, AppContext,
+};
 pub use memory::{MemoryEntry, MemoryScope, MemoryStore};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
 pub use providers::{
     get_model_vision_capability, is_deepseek_provider, is_deepseek_vision_model, resolve_api_key,
     save_model_vision_capability, CapabilityStore, ModelConfig, PriceConfig, ProviderConfig,
-    ProviderPreset, ProvidersConfig, VisionCapability, PROVIDER_KINDS, PROVIDER_PRESETS,
+    ProviderPreset, ProvidersConfig, VisionCapability, CONTEXT_LENGTH_PRESETS, DEFAULT_MAX_TOKENS,
+    DEFAULT_OUTPUT_TOKEN_CAP, PROVIDER_KINDS, PROVIDER_PRESETS,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use update::{
