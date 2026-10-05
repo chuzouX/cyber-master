@@ -5,4 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# P6 接入：cyber-core, tokio, serde
+cyber-core = { workspace = true }
+cyber-agent = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+dirs = { workspace = true }
+ring = "0.17"
