@@ -44,12 +44,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/model",
         usage: "/model [name]",
-        desc: "直接 /model 打开模型面板切换模型；亦可带参数快速切换（别名：/models）",
+        desc: "打开模型面板（双栏浏览与切换核心模型；亦可带参数快速切换）",
     },
     CommandSpec {
         name: "/provider",
         usage: "/provider [sub]",
-        desc: "服务商管理面板（支持 /providers 直接打开管理看板，a 预设/协议添加，e 编辑，d 删除）",
+        desc: "打开服务商面板（支持浏览配置全部 Provider，添加、编辑与删除）",
     },
     CommandSpec {
         name: "/subagents",
@@ -58,7 +58,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/env",
-        usage: "/env [list|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]",
+        usage: "/env [list|add|edit <key>|set KEY VALUE|set-sensitive KEY VALUE|remove KEY]",
         desc: "管理注入工具子进程的环境变量",
     },
     CommandSpec {
@@ -93,8 +93,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/mcp",
-        usage: "/mcp <list|status>",
-        desc: "查看 MCP server 连接状态",
+        usage: "/mcp [panel|list|status|connect]",
+        desc: "打开全屏 MCP 管理面板（支持测活、配置与工具查看）",
     },
     CommandSpec {
         name: "/cancel",
@@ -189,7 +189,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
             "timeout",
             "max_steps",
         ],
-        "/env" => vec!["list", "set", "set-sensitive", "remove"],
+        "/env" => vec!["list", "add", "edit", "set", "set-sensitive", "remove"],
         "/web" => vec!["status", "on", "off", "enable", "disable"],
         "/vision" => vec!["status", "on", "off", "provider", "model", "test"],
         "/memory" => vec!["list", "add", "project", "edit", "delete", "rule"],
@@ -228,8 +228,7 @@ pub enum SlashCommand {
     /// `/skill <name|list>` — 查看 Skill 详细说明（list 列出全部）。
     /// 空串 = list；非空 = 注入指定 skill 的 body 为 System 条目。
     Skill(String),
-    /// `/mcp <list|status>` — 查看 MCP server 连接状态。
-    /// 空串 / list / status 均列出连接状态。
+    /// `/mcp [panel|list|status|connect]` — 打开全屏 MCP 管理面板（亦支持 list/status/connect）。
     Mcp(String),
     /// `/cancel` — 取消当前生成。
     Cancel,
@@ -317,7 +316,7 @@ pub const HELP_TEXT: &str = "\
   /web [status|on|off] 联网搜索：查看状态或开启/禁用 web_fetch 功能
   /tools             列出可用工具
   /skill <name|list> 查看 Skill 详细说明（list 列出全部）
-  /mcp <list|status> 查看 MCP server 连接状态
+  /mcp [sub]         打开全屏 MCP 管理面板（支持测活、配置与工具查看）
   /cancel            取消当前生成
   /compact [instr]   手动压缩上下文（可选自定义摘要指令）
   /max_steps <N>     查看或设置工具调用步数上限（1-1000）
@@ -714,7 +713,7 @@ mod tests {
         );
         assert_eq!(
             param_suggestions("/env"),
-            vec!["list", "set", "set-sensitive", "remove"]
+            vec!["list", "add", "edit", "set", "set-sensitive", "remove"]
         );
     }
 

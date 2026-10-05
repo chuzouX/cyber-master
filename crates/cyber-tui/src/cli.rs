@@ -24,7 +24,9 @@ use cyber_agent::{
     JobKind, JobStatus, PermissionBroker, PermissionDecision, PermissionMode, PermissionRequest,
     SubagentArchive, SubagentRun, SubagentStatus,
 };
-use cyber_core::{Config, EnvVar, MemoryRule, ProvidersConfig, ThinkingIntensity};
+use cyber_core::{
+    Config, MemoryEntry, MemoryScope, MemoryStore, Paths, ProvidersConfig, ThinkingIntensity,
+};
 use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
@@ -42,13 +44,14 @@ use tui_textarea::TextArea;
 
 use crate::chat::{entries_to_messages, ChatEntry, KeyDisposition, PasteDetector};
 use crate::cli_commands::{
-    self, CliAction, CommandForm, CommandPicker, CompletionItem, PickerKind,
+    self, CliAction, CommandForm, CommandPicker, CompletionItem, FormKind, PickerKind,
 };
 use crate::headless::{HeadlessOutcome, SessionRunner};
 #[allow(unused_imports)]
 use crate::selection::default_selection_style;
 use crate::selection::{ContentCoord, TextSelection};
 use crate::theme::Theme;
+use crate::views::clipped_spans;
 
 const CY_LOGO: [&str; 5] = [
     "  ___       ",
@@ -62,6 +65,7 @@ const MUTED: Color = Color::Rgb(119, 125, 136);
 const DIM: Color = Color::Rgb(95, 102, 115);
 const ACCENT: Color = Color::Rgb(254, 188, 56);
 const AMBER: Color = ACCENT;
+const WARNING: Color = AMBER;
 const USER_BG: Color = Color::Rgb(34, 29, 26);
 const PENDING_BG: Color = Color::Rgb(29, 29, 33);
 const SUCCESS_BG: Color = Color::Rgb(22, 26, 31);
@@ -129,12 +133,20 @@ impl Drop for TerminalSession {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Panel {
+pub(crate) enum Panel {
     Shortcuts,
     Ctf,
     Settings,
     Subagents,
     Jobs,
+    ModelPicker,
+    Mcp,
+}
+
+impl Panel {
+    pub fn is_fullscreen(self) -> bool {
+        matches!(self, Self::Settings | Self::Mcp | Self::ModelPicker)
+    }
 }
 
 /// 设置面板标签页（共 7 个大类，全面覆盖所有设置）
@@ -204,12 +216,14 @@ impl SettingsTab {
             Self::AgentModel => 11, // 0..=11 (12 rows)
             Self::UiWorkflow => 6,  // 0..=6 (7 rows)
             Self::Subagents => 4,   // 0..=4 (5 rows)
-            Self::ToolsMcp => 1,    // 0..=1 (2 editable toggles)
+            Self::ToolsMcp => 2 + state.skills.len(),
             Self::Providers => state.providers_draft.providers.len().saturating_sub(1),
             Self::EnvMemory => {
                 let env_count = state.config_draft.env.vars.len();
                 let mem_count = state.config_draft.memory.rules.len();
-                (env_count + mem_count).saturating_sub(1)
+                let env_slots = env_count.max(1);
+                let mem_slots = mem_count.max(1);
+                env_slots + mem_slots - 1 + state.total_memories()
             }
             Self::StorageSystem => 1, // 0..=1 (2 rows: retention, log_level)
         }
@@ -228,8 +242,40 @@ pub struct McpServerSummary {
 pub struct SkillSummary {
     pub name: String,
     pub source: String,
+    pub description: String,
+    pub triggers: Vec<String>,
+    pub tools: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub disable_model_invocation: bool,
+    pub path: String,
+    pub body: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct SkillDetailModal {
+    /// 当前查看的技能在 `settings.skills` 中的下标索引
+    pub skill_index: usize,
+    /// 正文滚屏偏移行数
+    pub scroll: usize,
+}
+
+/// Memory List 分组：全局在前、项目级在后。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryGroup {
+    Global,
+    Project,
+}
+
+/// Memory List 详情弹窗状态。
+#[derive(Clone, Debug)]
+pub struct MemoryDetailModal {
+    /// 所属分组。
+    pub group: MemoryGroup,
+    /// 组内 0-based 索引。
+    pub entry: usize,
+    /// 正文滚屏偏移行数。
+    pub scroll: usize,
+}
 /// CLI 设置面板运行时状态
 #[derive(Clone, Debug)]
 pub struct CliSettingsState {
@@ -246,11 +292,23 @@ pub struct CliSettingsState {
     pub pending_discard_confirm: bool,
     pub mcp_servers: Vec<McpServerSummary>,
     pub skills: Vec<SkillSummary>,
+    pub skill_detail: Option<SkillDetailModal>,
+    /// 全局记忆条目（~/.cyber/memory.md）。
+    pub memories_global: Vec<MemoryEntry>,
+    /// 项目级记忆条目（<cwd>/.cyber/memory.md）。
+    pub memories_project: Vec<MemoryEntry>,
+    /// 全局记忆文件路径（展示用）。
+    pub memory_global_path: String,
+    /// 项目级记忆文件路径（展示用）。
+    pub memory_project_path: String,
+    /// Memory List 详情弹窗。
+    pub memory_detail: Option<MemoryDetailModal>,
     pub config_path: String,
     pub providers_path: String,
     pub sessions_dir: String,
     pub sessions_count: usize,
     pub has_project_config: bool,
+    pub provider_test_results: std::collections::HashMap<String, (bool, String, u128)>,
 }
 
 impl CliSettingsState {
@@ -263,8 +321,15 @@ impl CliSettingsState {
             providers_draft: providers.clone(),
             list_selected: 0,
             pending_discard_confirm: false,
+            provider_test_results: std::collections::HashMap::new(),
             mcp_servers: Vec::new(),
             skills: Vec::new(),
+            skill_detail: None,
+            memories_global: Vec::new(),
+            memories_project: Vec::new(),
+            memory_global_path: "~/.cyber/memory.md".into(),
+            memory_project_path: "<cwd>/.cyber/memory.md".into(),
+            memory_detail: None,
             config_path: "~/.cyber/config.toml".into(),
             providers_path: "~/.cyber/providers.toml".into(),
             sessions_dir: "~/.cyber/sessions".into(),
@@ -319,9 +384,41 @@ impl CliSettingsState {
                     cyber_skills::SkillSource::Global => "全局".into(),
                     cyber_skills::SkillSource::Project => "项目级".into(),
                 },
+                description: s.frontmatter.description.clone(),
+                triggers: s.frontmatter.triggers.clone(),
+                tools: s.frontmatter.tools.clone(),
+                allowed_tools: s.frontmatter.allowed_tools.clone(),
+                disable_model_invocation: s.frontmatter.disable_model_invocation,
+                path: s.path.display().to_string(),
+                body: s.body.clone(),
             })
             .collect();
+        let memory_store = MemoryStore::new(
+            runner.ctx.paths.memory_file.clone(),
+            Paths::project_memory_file(&runner.cwd),
+        );
+        state.memory_global_path = runner.ctx.paths.memory_file.display().to_string();
+        state.memory_project_path = Paths::project_memory_file(&runner.cwd)
+            .display()
+            .to_string();
+        state.memories_global = memory_store.entries(MemoryScope::Global);
+        state.memories_project = memory_store.entries(MemoryScope::Project);
         state
+    }
+
+    /// 记忆列表总条数（全局 + 项目级）。
+    pub fn total_memories(&self) -> usize {
+        self.memories_global.len() + self.memories_project.len()
+    }
+
+    /// 记忆列表第 `flat` 条（0-based，全局在前）→ (分组, 组内 0-based 索引)。
+    pub fn memory_at(&self, flat: usize) -> Option<(MemoryGroup, usize)> {
+        if flat < self.memories_global.len() {
+            Some((MemoryGroup::Global, flat))
+        } else {
+            let p = flat - self.memories_global.len();
+            (p < self.memories_project.len()).then_some((MemoryGroup::Project, p))
+        }
     }
 
     pub fn next_tab(&mut self) {
@@ -330,6 +427,8 @@ impl CliSettingsState {
         self.tab = all[(idx + 1) % all.len()];
         self.selected_row = 0;
         self.list_selected = 0;
+        self.skill_detail = None;
+        self.memory_detail = None;
     }
 
     pub fn prev_tab(&mut self) {
@@ -338,12 +437,16 @@ impl CliSettingsState {
         self.tab = all[(idx + all.len() - 1) % all.len()];
         self.selected_row = 0;
         self.list_selected = 0;
+        self.skill_detail = None;
+        self.memory_detail = None;
     }
 
     pub fn set_tab(&mut self, tab: SettingsTab) {
         self.tab = tab;
         self.selected_row = 0;
         self.list_selected = 0;
+        self.skill_detail = None;
+        self.memory_detail = None;
     }
 
     pub fn reset_current_tab(&mut self) {
@@ -456,6 +559,79 @@ struct JobsPanelState {
     follow_bottom: bool,
 }
 
+/// 模型选择面板交互状态（双栏选择服务商与模型）。
+#[derive(Clone, Debug, Default)]
+pub struct CliModelPickerState {
+    /// 焦点所在栏：false = 左栏服务商 (Providers)，true = 右栏模型 (Models)
+    pub focus_models: bool,
+    /// 左栏当前选中的服务商索引
+    pub provider_selected: usize,
+    /// 右栏当前选中的模型索引
+    pub model_selected: usize,
+    /// 所有可用服务商配置快照
+    pub providers: cyber_core::ProvidersConfig,
+    /// 默认服务商名称
+    pub default_provider: String,
+    /// 当前所选服务商下的模型列表缓存
+    pub models: Vec<String>,
+    /// 服务商列表垂直滚动偏移
+    pub provider_scroll: usize,
+    /// 模型列表垂直滚动偏移
+    pub model_scroll: usize,
+    /// 是否正在实测识图能力探针
+    pub probing_model: Option<String>,
+}
+
+impl CliModelPickerState {
+    pub(crate) fn from_runner(runner: &SessionRunner) -> Self {
+        let default_prov = runner.ctx.config.agent.default_provider.clone();
+        let providers = runner.ctx.providers.clone();
+        let names = providers.sorted_names();
+        let provider_selected = names.iter().position(|n| n == &default_prov).unwrap_or(0);
+        let mut state = Self {
+            focus_models: false,
+            provider_selected,
+            model_selected: 0,
+            providers,
+            default_provider: default_prov,
+            models: Vec::new(),
+            provider_scroll: 0,
+            model_scroll: 0,
+            probing_model: None,
+        };
+        state.refresh_models();
+        state
+    }
+
+    pub fn refresh_models(&mut self) {
+        let names = self.providers.sorted_names();
+        if self.provider_selected >= names.len() {
+            self.models.clear();
+            self.model_selected = 0;
+            return;
+        }
+        let prov_name = &names[self.provider_selected];
+        if let Some(prov_cfg) = self.providers.providers.get(prov_name) {
+            let mut list: Vec<String> = prov_cfg.models.keys().cloned().collect();
+            if !prov_cfg.model.is_empty() && !list.contains(&prov_cfg.model) {
+                list.push(prov_cfg.model.clone());
+            }
+            list.sort();
+            list.dedup();
+            self.models = list;
+            if let Some(idx) = self.models.iter().position(|m| m == &prov_cfg.model) {
+                self.model_selected = idx;
+            } else {
+                self.model_selected = 0;
+            }
+        } else {
+            self.models.clear();
+            self.model_selected = 0;
+        }
+        self.model_scroll = 0;
+    }
+}
+
 struct CliScreen {
     provider: String,
     model: String,
@@ -492,6 +668,10 @@ struct CliScreen {
     approval_visible: bool,
     panel: Option<Panel>,
     pub settings: Option<CliSettingsState>,
+    pub settings_return_tab: Option<SettingsTab>,
+    pub model_picker: Option<CliModelPickerState>,
+    pub mcp_panel: Option<crate::views::mcp_panel::McpPanelState>,
+    pub ctf_edit_form: Option<crate::views::ctf_edit_form::CtfEditFormState>,
     ctf_enabled: bool,
     ctf_challenges: Arc<std::sync::Mutex<Vec<cyber_core::CtfChallenge>>>,
     ctf_selected: usize,
@@ -544,6 +724,10 @@ struct CliScreen {
     #[allow(dead_code)]
     pub selection: Option<TextSelection>,
     pub is_dragging_scrollbar: bool,
+    #[allow(dead_code)]
+    pub question_area: Rect,
+    #[allow(dead_code)]
+    pub question_state: Option<crate::question_ui::QuestionUiState>,
 }
 
 struct FormState {
@@ -599,9 +783,18 @@ impl CliScreen {
         self.delete_pending = None;
         if self.approval.is_some() {
             // Approval is keyboard-only. Ignore paste so it cannot select or confirm an action.
+        } else if let Some(q_state) = self.question_state.as_mut() {
+            if q_state.custom_editing {
+                let single_line = clean(text).replace(['\r', '\n'], " ");
+                q_state.custom_textarea.insert_str(&single_line);
+            }
         } else if let Some(form) = &mut self.form {
             if let Some(input) = form.inputs.get_mut(form.selected) {
                 input.insert_str(clean(text));
+            }
+        } else if let Some(form) = &mut self.ctf_edit_form {
+            if form.editing {
+                form.textarea.insert_str(clean(text));
             }
         } else if self.panel.is_none() && self.picker.is_none() {
             self.input.insert_str(clean(text));
@@ -678,7 +871,15 @@ impl CliScreen {
         let Some(item) = self.completions.get(self.completion_selected) else {
             return false;
         };
-        let changed = self.input.lines().join("\n") != item.value;
+        let current = self.input.lines().join("\n");
+        if current.trim() == item.value.trim() {
+            if current != item.value.trim() {
+                self.input = composer();
+                self.input.insert_str(item.value.trim());
+            }
+            return false;
+        }
+        let changed = current != item.value;
         if changed {
             self.input = composer();
             self.input.insert_str(&item.value);
@@ -729,6 +930,10 @@ impl CliScreen {
             approval_visible: false,
             panel: None,
             settings: None,
+            settings_return_tab: None,
+            model_picker: None,
+            mcp_panel: None,
+            ctf_edit_form: None,
             ctf_enabled: runner.ctf_enabled,
             ctf_challenges: runner
                 .registries
@@ -799,6 +1004,8 @@ impl CliScreen {
             history_area: Rect::default(),
             is_dragging_scrollbar: false,
             selection: None,
+            question_area: Rect::default(),
+            question_state: None,
         };
         if let Some(info) = cyber_core::update::cached_latest_version() {
             if cyber_core::update::is_newer(cyber_core::update::CURRENT_VERSION, &info.version) {
@@ -1393,6 +1600,102 @@ impl CliScreen {
             .unwrap_or(0)
     }
 
+    pub(crate) fn ctf_challenge_at(&self, idx: usize) -> Option<cyber_core::CtfChallenge> {
+        self.ctf_challenges
+            .lock()
+            .ok()
+            .and_then(|list| list.get(idx).cloned())
+    }
+
+    pub(crate) fn ctf_remove_selected(&mut self) -> Option<String> {
+        let removed_name = self.ctf_challenges.lock().ok().and_then(|mut list| {
+            if self.ctf_selected < list.len() {
+                let name = list[self.ctf_selected].name.clone();
+                list.remove(self.ctf_selected);
+                Some(name)
+            } else {
+                None
+            }
+        });
+        if removed_name.is_some() {
+            let len = self.ctf_challenges_count();
+            if self.ctf_selected >= len && len > 0 {
+                self.ctf_selected = len - 1;
+            }
+        }
+        removed_name
+    }
+
+    pub(crate) fn ctf_toggle_status_selected(&mut self) -> Option<(String, bool)> {
+        self.ctf_challenges.lock().ok().and_then(|mut list| {
+            let c = list.get_mut(self.ctf_selected)?;
+            let was_solved = c.is_solved();
+            c.status = if was_solved {
+                cyber_core::CtfStatus::InProgress
+            } else {
+                cyber_core::CtfStatus::Solved
+            };
+            if !was_solved {
+                c.end_time = Some(cyber_core::current_time_str());
+            } else {
+                c.end_time = None;
+            }
+            Some((c.name.clone(), c.is_solved()))
+        })
+    }
+
+    pub(crate) fn ctf_toggle_global_selected(&mut self) -> Option<(String, bool)> {
+        self.ctf_challenges.lock().ok().and_then(|mut list| {
+            let c = list.get_mut(self.ctf_selected)?;
+            c.is_global = !c.is_global;
+            Some((c.name.clone(), c.is_global))
+        })
+    }
+
+    pub(crate) fn ctf_set_all_global(&mut self) -> usize {
+        self.ctf_challenges
+            .lock()
+            .ok()
+            .map(|mut list| {
+                let mut count = 0;
+                for c in list.iter_mut() {
+                    if !c.is_global {
+                        c.is_global = true;
+                        count += 1;
+                    }
+                }
+                count
+            })
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn ctf_update_selected(
+        &mut self,
+        updated: cyber_core::CtfChallenge,
+    ) -> Option<String> {
+        let name = updated.name.clone();
+        let success = self
+            .ctf_challenges
+            .lock()
+            .map(|mut list| {
+                let mut done = false;
+                for c in list.iter_mut() {
+                    if c.id == updated.id {
+                        *c = updated.clone();
+                        done = true;
+                        break;
+                    }
+                }
+                done
+            })
+            .unwrap_or(false);
+        if success {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
     #[allow(dead_code)]
     fn footer(&self) -> String {
         let todo_sum = self.todo_summary();
@@ -1702,6 +2005,10 @@ impl CliScreen {
                 self.busy = false;
                 self.thinking_started = None;
             }
+            AgentEvent::Notice(text) => {
+                self.has_run = true;
+                self.message("Notice", &text, AMBER);
+            }
             AgentEvent::Error(error) => {
                 self.has_run = true;
                 self.busy = false;
@@ -1815,6 +2122,28 @@ impl CliScreen {
             || self.picker.is_some()
         {
             return false;
+        }
+        if let Some(q_state) = self.question_state.as_mut() {
+            if mouse.row >= self.question_area.top() && mouse.row < self.question_area.bottom() {
+                match q_state.handle_mouse(mouse, self.question_area) {
+                    crate::question_ui::QuestionUiResult::Continue => return true,
+                    crate::question_ui::QuestionUiResult::Submit(resp) => {
+                        if let Some(q) = self.question_state.take() {
+                            let _ = q.request.reply.send(resp);
+                        }
+                        return true;
+                    }
+                    crate::question_ui::QuestionUiResult::Cancel => {
+                        if let Some(q) = self.question_state.take() {
+                            let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                                answers: Vec::new(),
+                                cancelled: true,
+                            });
+                        }
+                        return true;
+                    }
+                }
+            }
         }
 
         match mouse.kind {
@@ -2002,7 +2331,10 @@ impl CliScreen {
                 }
 
                 if let Some(mut sel) = self.selection.take() {
-                    sel.selecting = false;
+                    // Preserve selecting flag if Shift is held, otherwise clear it
+                    if !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        sel.selecting = false;
+                    }
                     if !sel.is_empty() {
                         let lines: &[Line<'static>] =
                             if let Some(view) = self.subagent_view.as_ref() {
@@ -2030,6 +2362,24 @@ impl CliScreen {
         false
     }
 
+    /// 是否为「由设置面板打开的弹层」（编辑环境变量 / 编辑记忆规则 表单、Models 模型选择器）。
+    ///
+    /// 这类弹层打开时 `panel` 仍为 `None`（`handle_key` 的按键路由、Esc/保存后的返回语义
+    /// 都保持不变），但绘制时下层背景必须是设置中心，而不是对话界面。
+    fn settings_opened_dialog(&self) -> bool {
+        if self.panel.is_some() || self.settings.is_none() || self.settings_return_tab.is_none() {
+            return false;
+        }
+        match (&self.form, &self.picker) {
+            (Some(form), _) => matches!(
+                form.form.kind,
+                FormKind::EnvVar { .. } | FormKind::MemoryRule { .. }
+            ),
+            (None, Some(picker)) => picker.title.starts_with("Models ("),
+            _ => false,
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let win_title = crate::history::terminal_window_title(
             self.busy,
@@ -2042,6 +2392,75 @@ impl CliScreen {
             self.last_window_title = win_title;
         }
         let area = frame.area();
+        if area.width < 4 || area.height < 4 {
+            return;
+        }
+        if self.approval.is_none() {
+            if let Some(form) = &mut self.form {
+                if matches!(form.form.kind, FormKind::Provider { .. }) {
+                    self.history_area = area;
+                    draw_fullscreen_provider_form(frame, area, form, &self.status);
+                    return;
+                }
+            }
+            if let Some(picker) = &self.picker {
+                if picker.title.contains("Provider")
+                    || picker.title.contains("Protocol")
+                    || picker.title.contains("Preset")
+                {
+                    self.history_area = area;
+                    draw_fullscreen_provider_picker(frame, area, picker, self.picker_selected);
+                    return;
+                }
+            }
+            // 由设置面板打开的弹层：面板状态仍是 None，但背景绘制为设置中心，而不是对话界面。
+            if self.settings_opened_dialog() {
+                self.history_area = area;
+                if let Some(settings) = &self.settings {
+                    draw_settings_panel(frame, area, settings, self);
+                }
+                if let Some(form) = &self.form {
+                    draw_form_dialog(frame, area, form, &self.status);
+                } else if let Some(picker) = &self.picker {
+                    draw_picker_dialog(
+                        frame,
+                        area,
+                        picker,
+                        self.picker_selected,
+                        self.delete_pending.is_some(),
+                        &self.status,
+                    );
+                }
+                return;
+            }
+            if let Some(panel) = self.panel {
+                if panel.is_fullscreen() {
+                    self.history_area = area;
+                    match panel {
+                        Panel::Settings => {
+                            if let Some(settings) = &self.settings {
+                                draw_settings_panel(frame, area, settings, self);
+                            }
+                        }
+                        Panel::Mcp => {
+                            if let Some(mcp_state) = self.mcp_panel.as_mut() {
+                                crate::views::mcp_panel::render_mcp_panel(
+                                    frame, area, mcp_state, &CLI_THEME,
+                                );
+                            }
+                        }
+                        Panel::ModelPicker => {
+                            let active_provider = self.provider.clone();
+                            if let Some(state) = self.model_picker.as_mut() {
+                                draw_model_picker(frame, area, state, &active_provider);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+            }
+        }
         if !self.tools_expanded && self.history_view.width != area.width {
             self.refresh_tools(area.width);
         }
@@ -2193,10 +2612,15 @@ impl CliScreen {
         };
         let todo_items = self.todos.lock().map(|g| g.clone()).unwrap_or_default();
         let show_todo_table = !self.todo_closed && !todo_items.is_empty();
+        let question_height = self
+            .question_state
+            .as_ref()
+            .map_or(0, |q| q.height_needed());
         let todo_height = if show_todo_table {
-            (todo_items.len() as u16 + 2)
-                .clamp(3, 7)
-                .min(area.height.saturating_sub(header_height + input_height + 4))
+            (todo_items.len() as u16 + 2).clamp(3, 7).min(
+                area.height
+                    .saturating_sub(header_height + question_height + input_height + 4),
+            )
         } else {
             0
         };
@@ -2204,11 +2628,13 @@ impl CliScreen {
             Constraint::Length(header_height),
             Constraint::Min(0),
             Constraint::Length(todo_height),
+            Constraint::Length(question_height),
             Constraint::Length(input_height + 1),
             Constraint::Length(1),
         ])
         .split(area);
         self.history_area = sections[1];
+        self.question_area = sections[3];
         // 子代理覆盖视图：panel/approval 打开时隐藏但不丢状态；run 从快照消失
         // 时防御性退出（归档条目会话级不回删，属纯防御）。
         let mut view_run: Option<SubagentRun> = None;
@@ -2393,7 +2819,6 @@ impl CliScreen {
             let offset = self
                 .completion_selected
                 .saturating_sub(menu.height.saturating_sub(1) as usize);
-            let catalog = cli_commands::commands();
             let lines = self
                 .completions
                 .iter()
@@ -2401,13 +2826,9 @@ impl CliScreen {
                 .skip(offset)
                 .take(menu.height as usize)
                 .map(|(index, item)| {
-                    let usage = catalog
-                        .iter()
-                        .find(|spec| spec.name == item.value.trim())
-                        .map(|spec| spec.usage)
-                        .unwrap_or(&item.value);
+                    let main = item.value.trim();
                     select_row(
-                        usage,
+                        main,
                         &item.description,
                         index == self.completion_selected,
                         menu.width,
@@ -2419,7 +2840,12 @@ impl CliScreen {
         if show_todo_table && sections[2].height >= 2 {
             draw_todo_table(frame, sections[2], &todo_items);
         }
-        let input_area = sections[3];
+        if let Some(q) = &self.question_state {
+            if sections[3].height >= 4 {
+                crate::question_ui::render_question_box(frame, sections[3], q, Some(ACCENT));
+            }
+        }
+        let input_area = sections[4];
         let border = if self.approval.is_some() || self.form.is_some() || self.busy {
             ACCENT
         } else {
@@ -2500,9 +2926,9 @@ impl CliScreen {
         }
         if self.ctf_enabled {
             let last_line = footer.pop().unwrap_or_default();
-            footer.push(self.append_ctf_mode_badge(last_line, sections[4].width as usize));
+            footer.push(self.append_ctf_mode_badge(last_line, sections[5].width as usize));
         }
-        frame.render_widget(Paragraph::new(footer), sections[4]);
+        frame.render_widget(Paragraph::new(footer), sections[5]);
         if let Some(request) = &self.approval {
             if self.approval_nonce != request.nonce {
                 self.approval_nonce.clone_from(&request.nonce);
@@ -2585,7 +3011,7 @@ impl CliScreen {
                 Panel::Shortcuts => {
                     let title = " Shortcuts ";
                     let text = format!(
-                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nF3 / Ctrl+,     Open Settings center panel\nCtrl+G          Toggle subagent panel (live transcripts)\nCtrl+B          Toggle background jobs panel\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nCtrl+D          Exit (empty input)\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
+                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nF3 / Ctrl+,     Open Settings center panel\nCtrl+G          Toggle subagent panel (live transcripts)\nCtrl+B          Toggle background jobs panel\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
                         cli_commands::commands()
                             .iter()
                             .map(|spec| format!("{:<30} {}", spec.usage, spec.desc))
@@ -2595,34 +3021,21 @@ impl CliScreen {
                     popup(frame, sections[1], title, &text);
                 }
                 Panel::Ctf => {
-                    let width = sections[1]
-                        .width
-                        .saturating_sub(6)
-                        .clamp(48, 86)
-                        .min(sections[1].width);
-                    let height = sections[1]
-                        .height
-                        .saturating_sub(2)
-                        .max(10)
-                        .min(sections[1].height);
-                    let popup_area = Rect::new(
-                        sections[1].x + (sections[1].width.saturating_sub(width)) / 2,
-                        sections[1].y + (sections[1].height.saturating_sub(height)) / 2,
-                        width,
-                        height,
-                    );
-                    frame.render_widget(Clear, popup_area);
-                    crate::views::ctf_panel::render(
-                        frame,
-                        popup_area,
-                        &CLI_THEME,
-                        &self.ctf_challenges_list(),
-                        self.ctf_selected,
-                        self.ctf_detail_view,
-                        self.ctf_detail_scroll,
-                        true,
-                        &self.ctf_list_scroll,
-                    );
+                    if let Some(popup_area) = panel_geometry(sections[1]) {
+                        blank_frame_surround(frame, sections[1], popup_area);
+                        frame.render_widget(Clear, popup_area);
+                        crate::views::ctf_panel::render(
+                            frame,
+                            popup_area,
+                            &CLI_THEME,
+                            &self.ctf_challenges_list(),
+                            self.ctf_selected,
+                            self.ctf_detail_view,
+                            self.ctf_detail_scroll,
+                            true,
+                            &self.ctf_list_scroll,
+                        );
+                    }
                 }
                 Panel::Settings => {
                     if let Some(settings) = &self.settings {
@@ -2642,90 +3055,24 @@ impl CliScreen {
                         draw_jobs_panel(frame, sections[1], state, &jobs, &subagents);
                     }
                 }
+                Panel::ModelPicker => {}
+                Panel::Mcp => {}
             }
         } else if let Some(form) = &self.form {
-            let lines = form
-                .form
-                .fields
-                .iter()
-                .zip(&form.inputs)
-                .enumerate()
-                .map(|(index, (field, input))| {
-                    let value = if field.secret {
-                        "*".repeat(input.lines().join("\n").chars().count().min(32))
-                    } else {
-                        clean(&input.lines().join("\n"))
-                    };
-                    select_row(
-                        &field.name,
-                        &value,
-                        index == form.selected,
-                        sections[1]
-                            .width
-                            .saturating_sub(4)
-                            .min(90)
-                            .saturating_sub(2),
-                    )
-                    .to_string()
-                })
-                .collect::<Vec<_>>();
-            let visible = sections[1].height.saturating_sub(5).max(1) as usize;
-            let offset = form.selected.saturating_sub(visible.saturating_sub(1));
-            let text = format!(
-                "{}\n\nTab/Shift+Tab fields · Enter next/save\nCtrl+S save · Esc cancel\n{}",
-                lines
-                    .into_iter()
-                    .skip(offset)
-                    .take(visible)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                clean(&self.status)
-            );
-            popup(
-                frame,
-                sections[1],
-                &format!(" {} ", clean(&form.form.title)),
-                &text,
-            );
+            draw_form_dialog(frame, sections[1], form, &self.status);
         } else if let Some(picker) = &self.picker {
-            let visible = sections[1].height.saturating_sub(5).max(1) as usize;
-            let offset = self
-                .picker_selected
-                .saturating_sub(visible.saturating_sub(1));
-            let text = picker
-                .items
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .take(visible)
-                .map(|(index, item)| {
-                    select_row(
-                        &item.label,
-                        &item.detail,
-                        index == self.picker_selected,
-                        sections[1]
-                            .width
-                            .saturating_sub(4)
-                            .min(90)
-                            .saturating_sub(2),
-                    )
-                    .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let hint = if self.delete_pending.is_some() {
-                "Press d again to delete selected session · Esc cancel"
-            } else if matches!(picker.kind, PickerKind::Sessions) {
-                "Up/Down choose · Enter open · n new · d delete · Esc close"
-            } else {
-                "Up/Down choose · Enter select · Esc close"
-            };
-            popup(
+            draw_picker_dialog(
                 frame,
                 sections[1],
-                &format!(" {} ", clean(&picker.title)),
-                &format!("{text}\n\n{hint}"),
+                picker,
+                self.picker_selected,
+                self.delete_pending.is_some(),
+                &self.status,
             );
+        }
+        if let Some(form) = self.ctf_edit_form.as_mut() {
+            form.prepare_render(&CLI_THEME);
+            crate::views::ctf_edit_form::render_form(frame, area, &CLI_THEME, form);
         }
     }
 
@@ -2909,6 +3256,34 @@ fn clip_cells(text: &str, width: usize) -> String {
             used <= width
         })
         .collect()
+}
+
+fn clip_cells_ellipsis(text: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let target = width.saturating_sub(1);
+    let mut used = 0;
+    let mut result: String = text
+        .chars()
+        .take_while(|ch| {
+            used += if *ch == '\t' {
+                4
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            used <= target
+        })
+        .collect();
+    result.push('…');
+    result
 }
 
 fn select_row(main: &str, detail: &str, selected: bool, width: u16) -> Line<'static> {
@@ -3233,38 +3608,47 @@ fn render_delegate_tasks_cards(
             }
         }
 
-        let task_state = if let Some(r) = task_result {
+        let (task_state, is_warning) = if let Some(r) = task_result {
             let status_str = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
             if status_str == "completed" {
-                ToolCardState::Success
+                (ToolCardState::Success, false)
+            } else if status_str == "step_limit_reached" {
+                (ToolCardState::Success, true)
             } else {
-                ToolCardState::Error
+                (ToolCardState::Error, false)
             }
         } else if card.state == ToolCardState::Pending {
             if let Some(last_msg) = task_progress_msgs.last() {
                 if last_msg.contains("completed") {
-                    ToolCardState::Success
+                    (ToolCardState::Success, false)
+                } else if last_msg.contains("step_limit_reached") {
+                    (ToolCardState::Success, true)
                 } else if last_msg.contains("error")
                     || last_msg.contains("timed_out")
                     || last_msg.contains("failed")
+                    || last_msg.contains("loop_detected")
                 {
-                    ToolCardState::Error
+                    (ToolCardState::Error, false)
                 } else {
-                    ToolCardState::Pending
+                    (ToolCardState::Pending, false)
                 }
             } else {
-                ToolCardState::Pending
+                (ToolCardState::Pending, false)
             }
         } else if card.state == ToolCardState::Error {
-            ToolCardState::Error
+            (ToolCardState::Error, false)
         } else {
-            ToolCardState::Success
+            (ToolCardState::Success, false)
         };
 
-        let (icon, color, bg, default_status) = match task_state {
-            ToolCardState::Pending => ("◇", ACCENT, PENDING_BG, "running"),
-            ToolCardState::Success => ("✓", SUCCESS, SUCCESS_BG, "done"),
-            ToolCardState::Error => ("✗", ERROR, ERROR_BG, "failed"),
+        let (icon, color, bg, default_status) = if is_warning {
+            ("⚠", WARNING, PENDING_BG, "step_limit_reached")
+        } else {
+            match task_state {
+                ToolCardState::Pending => ("◇", ACCENT, PENDING_BG, "running"),
+                ToolCardState::Success => ("✓", SUCCESS, SUCCESS_BG, "done"),
+                ToolCardState::Error => ("✗", ERROR, ERROR_BG, "failed"),
+            }
         };
 
         let title = format!("Subagent [{task_num}/{total}]");
@@ -3277,24 +3661,27 @@ fn render_delegate_tasks_cards(
 
         all_lines.push(Line::default());
         all_lines.push(
-            Line::from(vec![
-                Span::styled("╭─ ", Style::default().fg(color).bg(bg)),
-                Span::styled(
-                    format!("{icon} {title}"),
-                    Style::default()
-                        .fg(color)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  {detail}")
-                    },
-                    Style::default().fg(FG).bg(bg),
-                ),
-            ])
+            Line::from(clipped_spans(
+                vec![
+                    Span::styled("╭─ ", Style::default().fg(color).bg(bg)),
+                    Span::styled(
+                        format!("{icon} {title}"),
+                        Style::default()
+                            .fg(color)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {detail}")
+                        },
+                        Style::default().fg(FG).bg(bg),
+                    ),
+                ],
+                usize::from(width),
+            ))
             .style(Style::default().bg(bg)),
         );
 
@@ -3340,6 +3727,30 @@ fn render_delegate_tasks_cards(
                 } else {
                     body.push("Result: completed".into());
                 }
+            } else if status_str == "step_limit_reached" {
+                if let Some(output) = r.get("output").and_then(|v| v.as_str()) {
+                    let trimmed = output.trim();
+                    if !trimmed.is_empty() {
+                        if expanded {
+                            body.push("Result (step limit reached):".into());
+                            body.extend(trimmed.lines().map(str::to_owned));
+                        } else {
+                            let first_line = trimmed
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or(trimmed);
+                            body.push(format!("Result (step limit reached): {first_line}"));
+                        }
+                    } else {
+                        body.push("Result: step limit reached".into());
+                    }
+                } else {
+                    let msg = r
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("step limit reached");
+                    body.push(format!("Warning: {msg}"));
+                }
             } else {
                 let err_msg = r
                     .get("error")
@@ -3370,11 +3781,12 @@ fn render_delegate_tasks_cards(
             collapsed_limit
         });
         let mut clipped_body = false;
+        let body_budget = usize::from(width).saturating_sub(3).max(1);
         for line in body.iter().take(shown) {
             let content = if expanded {
                 line.clone()
             } else {
-                let clipped = clip_cells(line, usize::from(width.saturating_sub(4).max(1)) * 3);
+                let clipped = clip_cells(line, body_budget);
                 clipped_body |= clipped != *line;
                 clipped
             };
@@ -3382,6 +3794,11 @@ fn render_delegate_tasks_cards(
                 && (line.starts_with("Error:") || line.starts_with("failed"))
             {
                 ERROR
+            } else if is_warning
+                && (line.starts_with("Warning:")
+                    || line.starts_with("Result (step limit reached):"))
+            {
+                WARNING
             } else if line.starts_with("Task:")
                 || line.starts_with("Result:")
                 || line.starts_with("Progress:")
@@ -3408,10 +3825,13 @@ fn render_delegate_tasks_cards(
             default_status.into()
         };
         all_lines.push(
-            Line::from(vec![
-                Span::styled("╰─ ", Style::default().fg(color).bg(bg)),
-                Span::styled(footer, Style::default().fg(DIM).bg(bg)),
-            ])
+            Line::from(clipped_spans(
+                vec![
+                    Span::styled("╰─ ", Style::default().fg(color).bg(bg)),
+                    Span::styled(footer, Style::default().fg(DIM).bg(bg)),
+                ],
+                usize::from(width),
+            ))
             .style(Style::default().bg(bg)),
         );
     }
@@ -3454,24 +3874,27 @@ fn render_tool_card(
     let detail = clip_cells(&single_line(&detail), detail_budget);
     let mut lines = vec![
         Line::default(),
-        Line::from(vec![
-            Span::styled("╭─ ", Style::default().fg(color).bg(bg)),
-            Span::styled(
-                format!("{icon} {title}"),
-                Style::default()
-                    .fg(color)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!("  {detail}")
-                },
-                Style::default().fg(FG).bg(bg),
-            ),
-        ])
+        Line::from(clipped_spans(
+            vec![
+                Span::styled("╭─ ", Style::default().fg(color).bg(bg)),
+                Span::styled(
+                    format!("{icon} {title}"),
+                    Style::default()
+                        .fg(color)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {detail}")
+                    },
+                    Style::default().fg(FG).bg(bg),
+                ),
+            ],
+            usize::from(width),
+        ))
         .style(Style::default().bg(bg)),
     ];
     let body = tool_card_body(card, kind, expanded, show_arguments);
@@ -3492,11 +3915,14 @@ fn render_tool_card(
         0
     };
     let mut clipped_body = false;
+    // 卡片行前缀 `│  ` 占 3 列：折叠态正文严格限制在 `width - 3` 内，避免视口折行
+    // 产生无边框前缀的续行（`│` 被挤掉）。展开态保留全文（由视口折行完整展示）。
+    let body_budget = usize::from(width).saturating_sub(3).max(1);
     for line in body.iter().skip(start).take(shown) {
         let content = if expanded {
             line.clone()
         } else {
-            let clipped = clip_cells(line, usize::from(width.saturating_sub(4).max(1)) * 3);
+            let clipped = clip_cells(line, body_budget);
             clipped_body |= clipped != *line;
             clipped
         };
@@ -3517,10 +3943,13 @@ fn render_tool_card(
         status.into()
     };
     lines.push(
-        Line::from(vec![
-            Span::styled("╰─ ", Style::default().fg(color).bg(bg)),
-            Span::styled(footer, Style::default().fg(DIM).bg(bg)),
-        ])
+        Line::from(clipped_spans(
+            vec![
+                Span::styled("╰─ ", Style::default().fg(color).bg(bg)),
+                Span::styled(footer, Style::default().fg(DIM).bg(bg)),
+            ],
+            usize::from(width),
+        ))
         .style(Style::default().bg(bg)),
     );
     lines
@@ -3584,6 +4013,7 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
         items.len().min(max_lines)
     };
 
+    let max_row_w = (inner.width as usize).saturating_sub(1);
     let mut lines = Vec::with_capacity(max_lines);
     for item in items.iter().take(display_count) {
         let (symbol, color) = match item.status {
@@ -3592,20 +4022,65 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
             cyber_core::TodoStatus::Completed => ("[x]", SUCCESS),
             cyber_core::TodoStatus::Failed => ("[!]", ERROR),
         };
-        let mut spans = vec![
-            Span::styled(
-                format!(" {symbol} "),
+        let sym_text = format!(" {symbol} ");
+        let id_text = format!("#{} ", item.id);
+        use unicode_width::UnicodeWidthStr;
+        let sym_w = UnicodeWidthStr::width(sym_text.as_str());
+        let id_w = UnicodeWidthStr::width(id_text.as_str());
+        let prefix_w = sym_w + id_w;
+        let content_budget = max_row_w.saturating_sub(prefix_w);
+
+        let mut spans = Vec::new();
+        if max_row_w < sym_w {
+            spans.push(Span::styled(
+                clip_cells(&sym_text, max_row_w),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("#{} ", item.id), Style::default().fg(MUTED)),
-            Span::styled(clean(&item.title), Style::default().fg(FG)),
-        ];
-        if let Some(notes) = &item.notes {
-            if !notes.trim().is_empty() {
+            ));
+        } else {
+            spans.push(Span::styled(
+                sym_text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            let rem_id = max_row_w.saturating_sub(sym_w);
+            if rem_id < id_w {
                 spans.push(Span::styled(
-                    format!(" (备注: {})", clean(notes)),
+                    clip_cells(&id_text, rem_id),
                     Style::default().fg(MUTED),
                 ));
+            } else {
+                spans.push(Span::styled(id_text, Style::default().fg(MUTED)));
+            }
+        }
+
+        if content_budget > 0 {
+            let title_clean = clean(&item.title);
+            let title_w = UnicodeWidthStr::width(title_clean.as_str());
+
+            if let Some(notes) = &item.notes.as_ref().filter(|n| !n.trim().is_empty()) {
+                let notes_clean = clean(notes);
+                let notes_full = format!(" (备注: {notes_clean})");
+                let notes_full_w = UnicodeWidthStr::width(notes_full.as_str());
+                if title_w + notes_full_w <= content_budget {
+                    spans.push(Span::styled(title_clean, Style::default().fg(FG)));
+                    spans.push(Span::styled(notes_full, Style::default().fg(MUTED)));
+                } else if title_w < content_budget {
+                    spans.push(Span::styled(title_clean, Style::default().fg(FG)));
+                    let rem = content_budget.saturating_sub(title_w);
+                    if rem >= 7 {
+                        let note_budget = rem.saturating_sub(6);
+                        let clipped_note = clip_cells_ellipsis(&notes_clean, note_budget);
+                        spans.push(Span::styled(
+                            format!(" (备注: {clipped_note})"),
+                            Style::default().fg(MUTED),
+                        ));
+                    }
+                } else {
+                    let clipped_title = clip_cells_ellipsis(&title_clean, content_budget);
+                    spans.push(Span::styled(clipped_title, Style::default().fg(FG)));
+                }
+            } else {
+                let clipped_title = clip_cells_ellipsis(&title_clean, content_budget);
+                spans.push(Span::styled(clipped_title, Style::default().fg(FG)));
             }
         }
         lines.push(Line::from(spans));
@@ -3613,8 +4088,9 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
 
     if will_truncate {
         let remaining = items.len().saturating_sub(display_count);
+        let trunc_msg = format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）");
         lines.push(Line::from(vec![Span::styled(
-            format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）"),
+            clip_cells_ellipsis(&trunc_msg, max_row_w),
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )]));
     }
@@ -3622,14 +4098,18 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// 居中面板几何：宽 `area.width-6` clamp 60..100，高 `area.height-2` clamp 12..30。
-/// 过小的区域返回 None（面板不渲染）。
+/// 居中面板几何（与 Skill 详情弹窗一致）：宽/高取 `area` 的 85%，宽最小 70、高最小 20，
+/// 并夹紧到 `area`。过小的区域返回 None（面板不渲染）。
 fn panel_geometry(area: Rect) -> Option<Rect> {
-    let width = area.width.saturating_sub(6).clamp(60, 100).min(area.width);
-    let height = area.height.saturating_sub(2).clamp(12, 30).min(area.height);
-    if width < 20 || height < 6 {
+    if area.width < 20 || area.height < 6 {
         return None;
     }
+    let width = (area.width as usize * 85 / 100)
+        .max(70)
+        .min(area.width as usize) as u16;
+    let height = (area.height as usize * 85 / 100)
+        .max(20)
+        .min(area.height as usize) as u16;
     Some(Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
         area.y + (area.height.saturating_sub(height)) / 2,
@@ -3645,6 +4125,8 @@ fn subagent_badge(status: SubagentStatus) -> (&'static str, Color) {
         SubagentStatus::Error => ("✗ 错误", ERROR),
         SubagentStatus::TimedOut => ("⏱ 超时", ACCENT),
         SubagentStatus::Killed => ("⊘ 已终止", MUTED),
+        SubagentStatus::StepLimitReached => ("⚠ 步数耗尽", WARNING),
+        SubagentStatus::LoopDetected => ("✗ 死循环", ERROR),
     }
 }
 
@@ -3695,27 +4177,32 @@ fn draw_subagent_panel(
     let Some(popup_area) = panel_geometry(area) else {
         return;
     };
+    blank_frame_surround(frame, area, popup_area);
     frame.render_widget(Clear, popup_area);
     if state.selected >= snapshot.len() && !snapshot.is_empty() {
         state.selected = snapshot.len() - 1;
     }
 
+    let title_budget = (popup_area.width as usize).saturating_sub(2);
     let title = if snapshot.is_empty() {
         Line::from(vec![Span::styled(
             " ◉ 子代理 (Subagents) ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )])
     } else {
-        Line::from(vec![
-            Span::styled(
-                " ◉ 子代理 (Subagents) ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("· {} 次运行 ", snapshot.len()),
-                Style::default().fg(DIM),
-            ),
-        ])
+        Line::from(clipped_spans(
+            vec![
+                Span::styled(
+                    " ◉ 子代理 (Subagents) ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("· {} 次运行 ", snapshot.len()),
+                    Style::default().fg(DIM),
+                ),
+            ],
+            title_budget,
+        ))
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3730,34 +4217,39 @@ fn draw_subagent_panel(
         return;
     }
 
-    // 列宽：前缀 2 + #id 4 + 状态 8 + 名称 16，其余给最新活动。
+    // 列宽：前缀 2 + #id 5 + 状态 8 + 名称 16，其余给最新活动（预留 1 列安全余量防挤压边框）。
     const PREFIX_W: usize = 2;
-    const ID_W: usize = 4;
+    const ID_W: usize = 5;
     const BADGE_W: usize = 8;
     const NAME_W: usize = 16;
     let last_budget = inner_width
-        .saturating_sub(PREFIX_W + ID_W + BADGE_W + NAME_W)
+        .saturating_sub(PREFIX_W + ID_W + BADGE_W + NAME_W + 1)
         .max(1);
 
     let mut body: Vec<Line<'static>> = Vec::new();
     // 表头 + 分隔线
-    body.push(Line::from(vec![
-        Span::styled("  ", Style::default().fg(DIM)),
-        Span::styled(pad_cells("#", 3) + " ", Style::default().fg(DIM)),
-        Span::styled(pad_cells("状态", BADGE_W), Style::default().fg(DIM)),
-        Span::styled(pad_cells("名称", NAME_W), Style::default().fg(DIM)),
-        Span::styled("最新活动", Style::default().fg(DIM)),
-    ]));
+    body.push(Line::from(clipped_spans(
+        vec![
+            Span::styled("  ", Style::default().fg(DIM)),
+            Span::styled(pad_cells("#", 4) + " ", Style::default().fg(DIM)),
+            Span::styled(pad_cells("状态", BADGE_W), Style::default().fg(DIM)),
+            Span::styled(pad_cells("名称", NAME_W), Style::default().fg(DIM)),
+            Span::styled("最新活动", Style::default().fg(DIM)),
+        ],
+        inner_width.saturating_sub(1),
+    )));
     body.push(Line::styled(
-        "─".repeat(inner_width),
+        "─".repeat(inner_width.saturating_sub(1)),
         Style::default().fg(DIM),
     ));
     for (index, run) in snapshot.iter().enumerate() {
         let (badge, badge_color) = subagent_badge(run.status);
         let last = run
             .lines
-            .last()
+            .iter()
+            .rev()
             .map(|line| single_line(line))
+            .find(|s| !s.is_empty() && s != "thinking:")
             .unwrap_or_default();
         let selected = index == state.selected;
         let name_style = if selected {
@@ -3786,12 +4278,16 @@ fn draw_subagent_panel(
     }
     if snapshot.is_empty() {
         body.push(Line::default());
+        let max_w = inner_width.saturating_sub(1);
         body.push(Line::styled(
-            "   暂无子代理运行记录".to_string(),
+            clip_cells("   暂无子代理运行记录", max_w),
             Style::default().fg(MUTED),
         ));
         body.push(Line::styled(
-            "   （由 delegate_tasks 或 /bg run 产生；Ctrl+B 查看后台任务）".to_string(),
+            clip_cells(
+                "   （由 delegate_tasks 或 /bg run 产生；Ctrl+B 查看后台任务）",
+                max_w,
+            ),
             Style::default().fg(MUTED),
         ));
     }
@@ -3813,7 +4309,7 @@ fn draw_subagent_panel(
     let footer_hint = " 操作: ↑/↓ 选择 · Enter 覆盖对话查看 · Esc 关闭 · PgUp/PgDn 翻页 ";
     frame.render_widget(
         Paragraph::new(Line::styled(
-            clip_cells(footer_hint, inner_width),
+            clip_cells(footer_hint, inner_width.saturating_sub(1)),
             Style::default().fg(DIM),
         )),
         Rect::new(
@@ -3878,20 +4374,22 @@ fn build_subagent_view_lines(
                 merged.push_str(more);
                 end += 1;
             }
-            if !out.is_empty() {
-                out.push(Line::default());
-            }
-            out.push(Line::styled(
-                "Thinking",
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-            ));
-            let mut rendered = crate::markdown::render(&merged, &thinking_theme);
-            for rendered_line in &mut rendered {
-                for span in &mut rendered_line.spans {
-                    span.style = span.style.fg(MUTED).add_modifier(Modifier::ITALIC);
+            if !merged.trim().is_empty() {
+                if !out.is_empty() {
+                    out.push(Line::default());
                 }
+                out.push(Line::styled(
+                    "Thinking",
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                ));
+                let mut rendered = crate::markdown::render(&merged, &thinking_theme);
+                for rendered_line in &mut rendered {
+                    for span in &mut rendered_line.spans {
+                        span.style = span.style.fg(MUTED).add_modifier(Modifier::ITALIC);
+                    }
+                }
+                out.extend(rendered);
             }
-            out.extend(rendered);
             i = end;
         } else if let Some(rest) = line.strip_prefix("tool ") {
             let Some(args_idx) = rest.find(" args: ") else {
@@ -3981,6 +4479,7 @@ fn draw_jobs_panel(
     let Some(popup_area) = panel_geometry(area) else {
         return;
     };
+    blank_frame_surround(frame, area, popup_area);
     frame.render_widget(Clear, popup_area);
     if state.selected >= jobs.len() && !jobs.is_empty() {
         state.selected = jobs.len() - 1;
@@ -3996,7 +4495,9 @@ fn draw_jobs_panel(
                 JobKind::Subagent => "Subagent",
             };
             let (badge, color) = job_badge(&job.status);
-            Line::from(vec![
+            // 标题绘制在顶边框上：留出左右圆角，整体裁剪防越界。
+            let budget = (popup_area.width as usize).saturating_sub(2);
+            let spans = vec![
                 Span::styled(
                     " ⚡ 后台任务 ",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -4006,7 +4507,8 @@ fn draw_jobs_panel(
                     Style::default().fg(FG).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" · {badge}"), Style::default().fg(color)),
-            ])
+            ];
+            Line::from(clipped_spans(spans, budget))
         }
         None => Line::from(vec![Span::styled(
             " ⚡ 后台任务 (Background Jobs) ",
@@ -4045,7 +4547,10 @@ fn draw_jobs_panel(
                 for line in &run.lines {
                     let elapsed = now.duration_since(run.started).as_secs_f64();
                     body.push(Line::styled(
-                        clip_cells(&format!("{elapsed:>5.1}s  {line}"), inner_width),
+                        clip_cells(
+                            &format!("{elapsed:>5.1}s  {line}"),
+                            inner_width.saturating_sub(1),
+                        ),
                         Style::default().fg(FG),
                     ));
                     shown += 1;
@@ -4053,7 +4558,7 @@ fn draw_jobs_panel(
             } else {
                 for line in &job.lines {
                     body.push(Line::styled(
-                        clip_cells(line, inner_width),
+                        clip_cells(line, inner_width.saturating_sub(1)),
                         Style::default().fg(FG),
                     ));
                     shown += 1;
@@ -4076,7 +4581,7 @@ fn draw_jobs_panel(
         body.push(Line::styled(
             clip_cells(
                 "   #  类型      状态          名称                    最新输出",
-                inner_width,
+                inner_width.saturating_sub(1),
             ),
             Style::default().fg(DIM),
         ));
@@ -4099,7 +4604,7 @@ fn draw_jobs_panel(
                     job.id,
                     single_line(&job.name)
                 ),
-                inner_width,
+                inner_width.saturating_sub(1),
             );
             let style = if selected {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -4111,12 +4616,14 @@ fn draw_jobs_panel(
         if jobs.is_empty() {
             body.push(Line::default());
             body.push(Line::styled(
-                "   暂无后台任务（/bg shell <cmd> 或 /bg run <prompt> 启动）".to_string(),
+                clip_cells(
+                    "   暂无后台任务（/bg shell <cmd> 或 /bg run <prompt> 启动）",
+                    inner_width.saturating_sub(1),
+                ),
                 Style::default().fg(MUTED),
             ));
         }
     }
-
     let window = scroll_window(
         &body,
         content_height,
@@ -4134,7 +4641,7 @@ fn draw_jobs_panel(
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            clip_cells(footer_hint, inner_width),
+            clip_cells(footer_hint, inner_width.saturating_sub(1)),
             Style::default().fg(DIM),
         )),
         Rect::new(
@@ -4289,12 +4796,9 @@ fn popup(frame: &mut Frame, bounds: Rect, title: &str, text: &str) {
     if bounds.width < 4 || bounds.height < 3 {
         return;
     }
-    let width = bounds
-        .width
-        .saturating_sub(4)
-        .max(4)
-        .min(bounds.width)
-        .min(90);
+    let width = (bounds.width as usize * 85 / 100)
+        .max(40)
+        .min(bounds.width as usize) as u16;
     let paragraph = Paragraph::new(
         text.lines()
             .map(|line| {
@@ -4320,16 +4824,461 @@ fn popup(frame: &mut Frame, bounds: Rect, title: &str, text: &str) {
         width,
         height,
     );
+    blank_frame_surround(frame, bounds, area);
     frame.render_widget(Clear, area);
     frame.render_widget(
         paragraph.block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(title)
-                .title_style(Style::default().fg(ACCENT))
+                .title(Line::styled(
+                    clip_cells_ellipsis(title, (width as usize).saturating_sub(3)),
+                    Style::default().fg(ACCENT),
+                ))
                 .border_style(Style::default().fg(ACCENT)),
         ),
         area,
+    );
+}
+
+/// 面板外圈留白：把弹窗外扩 1 格的环形区域擦成空白（不越出 `bounds`）。
+///
+/// 与 Skill 详情弹窗一致——框体四周有留白，对话/列表文字不会紧贴边框，
+/// 避免“文字吃掉边框”的观感（标题被角点切断后与右侧正文连成一片）。
+fn blank_frame_surround(frame: &mut Frame, bounds: Rect, area: Rect) {
+    let ring = Rect {
+        x: area.x.saturating_sub(1).max(bounds.x),
+        y: area.y.saturating_sub(1).max(bounds.y),
+        width: area.width.saturating_add(2).min(
+            bounds
+                .right()
+                .saturating_sub(area.x.saturating_sub(1).max(bounds.x)),
+        ),
+        height: area.height.saturating_add(2).min(
+            bounds
+                .bottom()
+                .saturating_sub(area.y.saturating_sub(1).max(bounds.y)),
+        ),
+    };
+    if ring.width == 0 || ring.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, ring);
+}
+
+/// 居中弹窗几何（与 Skill 详情一致）：宽/高取 `bounds` 的 85%，宽最小 70、高最小 20，
+/// 并夹紧到 `bounds`；区域过小返回 `None`（不渲染弹层）。
+fn dialog_area(bounds: Rect) -> Option<Rect> {
+    if bounds.width < 40 || bounds.height < 8 {
+        return None;
+    }
+    let width = (bounds.width as usize * 85 / 100)
+        .max(70)
+        .min(bounds.width as usize) as u16;
+    let height = (bounds.height as usize * 85 / 100)
+        .max(20)
+        .min(bounds.height as usize) as u16;
+    Some(Rect::new(
+        bounds.x + (bounds.width - width) / 2,
+        bounds.y + (bounds.height - height) / 2,
+        width,
+        height,
+    ))
+}
+
+/// 表单字段中文标签与是否必填；未列出的字段回退英文原名并视为可选。
+fn form_field_label(name: &str) -> (&str, bool) {
+    match name {
+        "key" => ("变量名称 (key)", true),
+        "value" => ("变量内容 (value)", false),
+        "sensitive" => ("脱敏保护 (sensitive)", false),
+        "enabled" => ("启用状态 (enabled)", false),
+        "scope" => ("作用域 (scope)", false),
+        "prompt" => ("规则提示 (prompt)", true),
+        other => (other, false),
+    }
+}
+
+/// 表单弹层：居中模态框（视觉基准 `draw_skill_detail_modal`）。正文窗口化并跟随
+/// 当前字段滚动；值一律取自实时输入缓冲 `form.inputs`，不读取尚未 `capture()` 的
+/// `form.form.fields[i].value`。
+fn draw_form_dialog(frame: &mut Frame, bounds: Rect, form: &FormState, status: &str) {
+    let Some(area) = dialog_area(bounds) else {
+        return;
+    };
+    blank_frame_surround(frame, bounds, area);
+    frame.render_widget(Clear, area);
+
+    let title_str = match &form.form.kind {
+        FormKind::EnvVar { index: Some(_), .. } => {
+            format!(" 🔑 编辑环境变量 / {} ", clean(&form.form.title))
+        }
+        FormKind::EnvVar { index: None, .. } => {
+            " 🔑 新增环境变量 / Add Environment Variable ".to_string()
+        }
+        FormKind::MemoryRule { index: Some(_) } => {
+            " 🧠 编辑记忆规则 / Edit Memory Rule ".to_string()
+        }
+        FormKind::MemoryRule { index: None } => " 🧠 新增记忆规则 / Add Memory Rule ".to_string(),
+        // Provider 表单由 `draw_fullscreen_provider_form` 全屏分支拦截，此处仅作兜底。
+        _ => format!(" {} ", clean(&form.form.title)),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .title(Line::styled(
+            title_str,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let count = form.form.fields.len();
+    let selected = form.selected;
+    let sel_bg = Color::Rgb(38, 79, 120);
+    let current_label = form
+        .form
+        .fields
+        .get(selected)
+        .map(|field| form_field_label(&field.name).0)
+        .unwrap_or("");
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut focused_start = 0usize;
+    let mut focused_end = 0usize;
+
+    lines.push(Line::from(vec![
+        Span::styled("  当前字段: ", Style::default().fg(MUTED)),
+        Span::styled(
+            current_label.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  · 共 {count} 个字段"), Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::styled(
+        "  Tab/Shift+Tab 切换字段 · ↑/↓ 穿梭 · ←/→ 或空格 切换可选项 · Enter 下一项/保存 · Ctrl+S 立即保存 · Esc 取消",
+        Style::default().fg(DIM),
+    ));
+    lines.push(Line::raw(""));
+    let div_w = (chunks[0].width as usize).saturating_sub(4).max(10);
+    lines.push(Line::styled(
+        format!("  {}", "─".repeat(div_w)),
+        Style::default().fg(DIM),
+    ));
+    lines.push(Line::styled(
+        "  ✏️ 字段配置:",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::raw(""));
+
+    for (i, field) in form.form.fields.iter().enumerate() {
+        let start_line = lines.len();
+        let is_sel = i == selected;
+        let (cn_label, required) = form_field_label(&field.name);
+
+        let ptr_style = if is_sel {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        let label_style = if is_sel {
+            Style::default().fg(FG).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        let req_badge = if required {
+            Span::styled(" [必填]", Style::default().fg(Color::Rgb(255, 120, 120)))
+        } else {
+            Span::styled(" [可选]", Style::default().fg(DIM))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if is_sel { "▸ " } else { "  " }, ptr_style),
+            Span::styled(cn_label.to_string(), label_style),
+            req_badge,
+        ]));
+
+        // 值取自实时输入缓冲；`single_line` 保证多行输入不把换行注入单元格。
+        let raw_val = form
+            .inputs
+            .get(i)
+            .map(|input| input.lines().join("\n"))
+            .unwrap_or_default();
+        let val = single_line(&raw_val);
+        let val_key = val.trim().to_ascii_lowercase();
+        let is_true = matches!(val_key.as_str(), "true" | "1" | "yes");
+        let toggle_hint = || Span::styled("   (←/→/空格 切换)", Style::default().fg(ACCENT));
+
+        let mut spans = vec![Span::raw("    ")];
+        match field.name.as_str() {
+            "sensitive" => {
+                if is_true {
+                    spans.push(Span::styled("🔒 [脱敏保护]", Style::default().fg(MUTED)));
+                } else {
+                    spans.push(Span::styled("🔓 [明文公开]", Style::default().fg(DIM)));
+                }
+                if is_sel {
+                    spans.push(toggle_hint());
+                }
+            }
+            "enabled" => {
+                if is_true {
+                    spans.push(Span::styled(
+                        "[ ● 开启 ]",
+                        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled("[ ○ 关闭 ]", Style::default().fg(DIM)));
+                }
+                if is_sel {
+                    spans.push(toggle_hint());
+                }
+            }
+            "scope" => {
+                let (text, style) = match val_key.as_str() {
+                    "both" => ("[ 全局与项目 (both) ]", Style::default().fg(CODE)),
+                    "project" => ("[ 项目级 (project) ]", Style::default().fg(SUCCESS)),
+                    _ => ("[ 全局 (global) ]", Style::default().fg(MUTED)),
+                };
+                spans.push(Span::styled(text, style));
+                if is_sel {
+                    spans.push(toggle_hint());
+                }
+            }
+            _ if field.secret => {
+                if raw_val.is_empty() {
+                    spans.push(Span::styled("（留空）", Style::default().fg(DIM)));
+                } else {
+                    spans.push(Span::styled(
+                        "*".repeat(raw_val.chars().count().min(32)),
+                        Style::default().fg(CODE),
+                    ));
+                }
+            }
+            _ => {
+                if val.is_empty() {
+                    spans.push(Span::styled("（未填写）", Style::default().fg(DIM)));
+                } else {
+                    spans.push(Span::styled(val, Style::default().fg(FG)));
+                }
+            }
+        }
+        lines.push(Line::from(spans).style(if is_sel {
+            Style::default().bg(sel_bg)
+        } else {
+            Style::default()
+        }));
+
+        if is_sel {
+            focused_start = start_line;
+            focused_end = start_line + 1;
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  [必填] 该项不可为空   [←/→/空格] 就地切换布尔与作用域",
+        Style::default().fg(DIM),
+    ));
+
+    render_scrollable_content(frame, chunks[0], lines, focused_start, focused_end);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clean(status),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            " [Tab/⇧Tab] 切换字段 · [↑/↓] 穿梭 · [Enter] 下一项/保存 · [Ctrl+S] 保存 · [Esc] 取消 ",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )),
+        chunks[2],
+    );
+}
+
+/// 选择器弹层：居中模态框，正文为选项列表（选中项高亮 + 详情右对齐）。
+fn draw_picker_dialog(
+    frame: &mut Frame,
+    bounds: Rect,
+    picker: &CommandPicker,
+    selected: usize,
+    delete_pending: bool,
+    status: &str,
+) {
+    use unicode_width::UnicodeWidthStr;
+
+    let Some(area) = dialog_area(bounds) else {
+        return;
+    };
+    blank_frame_surround(frame, bounds, area);
+    frame.render_widget(Clear, area);
+
+    let icon = match picker.kind {
+        PickerKind::Models => "🤖",
+        PickerKind::Sessions => "💬",
+        PickerKind::General => "📋",
+    };
+    let title_str = format!(
+        " {icon} {} [{}/{}] ",
+        clean(&picker.title),
+        if picker.items.is_empty() {
+            0
+        } else {
+            selected + 1
+        },
+        picker.items.len()
+    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .title(Line::styled(
+            title_str,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let current = picker
+        .items
+        .get(selected)
+        .map(|item| item.label.clone())
+        .unwrap_or_else(|| "（无可用选项）".to_string());
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut focused_start = 0usize;
+    let mut focused_end = 0usize;
+
+    lines.push(Line::from(vec![
+        Span::styled("  当前选中: ", Style::default().fg(MUTED)),
+        Span::styled(
+            current.clone(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  · 共 {} 个选项", picker.items.len()),
+            Style::default().fg(DIM),
+        ),
+    ]));
+    if let Some(item) = picker.items.get(selected) {
+        if !item.detail.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  说明: ", Style::default().fg(MUTED)),
+                Span::styled(item.detail.clone(), Style::default().fg(FG)),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    let div_w = (chunks[0].width as usize).saturating_sub(4).max(10);
+    lines.push(Line::styled(
+        format!("  {}", "─".repeat(div_w)),
+        Style::default().fg(DIM),
+    ));
+    lines.push(Line::styled(
+        "  📋 选项列表 (↑/↓ 选择 · Enter 确认):",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::raw(""));
+
+    if picker.items.is_empty() {
+        lines.push(Line::styled("  （无可用选项）", Style::default().fg(DIM)));
+        focused_start = 0;
+        focused_end = 0;
+    } else {
+        for (i, item) in picker.items.iter().enumerate() {
+            let row_line = lines.len();
+            let is_sel = i == selected;
+            let pointer = if is_sel { "▸ " } else { "  " };
+            let ptr_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            let label_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FG)
+            };
+
+            let mut spans = vec![
+                Span::styled(pointer, ptr_style),
+                Span::styled(item.label.clone(), label_style),
+            ];
+            let mut used = pointer.width() + item.label.width();
+
+            if matches!(picker.kind, PickerKind::Models)
+                && (item.label.contains("当前使用") || item.label.contains("✓ 当前"))
+            {
+                const CURRENT_BADGE: &str = " [ 当前启用 ] ";
+                spans.push(Span::styled(
+                    CURRENT_BADGE,
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ));
+                used += CURRENT_BADGE.width();
+            }
+            if delete_pending && is_sel {
+                const DELETE_BADGE: &str = "  [待删除!]";
+                spans.push(Span::styled(
+                    DELETE_BADGE,
+                    Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+                ));
+                used += DELETE_BADGE.width();
+            }
+
+            if !item.detail.is_empty() {
+                let pad = (chunks[0].width as usize).saturating_sub(used + item.detail.width() + 2);
+                // 剩余宽度不足时整列省略 detail，绝不挤压右边框。
+                if pad > 0 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(
+                        item.detail.clone(),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+            }
+
+            lines.push(Line::from(spans));
+            if is_sel {
+                focused_start = row_line;
+                focused_end = row_line;
+            }
+        }
+    }
+
+    render_scrollable_content(frame, chunks[0], lines, focused_start, focused_end);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clean(status),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )),
+        chunks[1],
+    );
+    let legend = if delete_pending {
+        " [d] 再按一次确认删除 · [↑/↓] 切换目标 · [Esc] 取消 "
+    } else if matches!(picker.kind, PickerKind::Sessions) {
+        " [↑/↓] 选择 · [Enter] 打开会话 · [n] 新建会话 · [d] 删除会话 · [Esc] 关闭 "
+    } else {
+        " [↑/↓] 选择 · [Enter] 确认 · [Esc] 关闭 "
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            legend,
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )),
+        chunks[2],
     );
 }
 
@@ -4361,7 +5310,7 @@ fn render_setting_row(
     label: &'static str,
     value: String,
     hint: String,
-    _width: u16,
+    width: u16,
 ) -> Line<'static> {
     let pointer = if selected { "▶ " } else { "  " };
     let ptr_style = if selected {
@@ -4380,16 +5329,36 @@ fn render_setting_row(
         Style::default().fg(Color::Rgb(180, 220, 255))
     };
 
-    let label_padded = format!("{:<26}", label);
-    let val_padded = format!("{:<22}", value);
+    let max_row_w = (width as usize).saturating_sub(1);
+    if max_row_w < 51 {
+        let label_w = max_row_w.saturating_sub(2).min(26);
+        let val_w = max_row_w.saturating_sub(2 + label_w).min(22);
+        return Line::from(vec![
+            Span::styled(pointer, ptr_style),
+            Span::styled(clip_cells(label, label_w), label_style),
+            Span::styled(clip_cells(&value, val_w), val_style),
+        ]);
+    }
 
-    Line::from(vec![
+    // 指针(2) + 标签(26) + 数值(22) + 空格(1) = 51 列
+    const PREFIX_W: usize = 2 + 26 + 22 + 1;
+    let label_padded = pad_cells(label, 26);
+    let val_padded = pad_cells(&clip_cells(&value, 22), 22);
+
+    let mut spans = vec![
         Span::styled(pointer, ptr_style),
         Span::styled(label_padded, label_style),
         Span::styled(val_padded, val_style),
-        Span::raw(" "),
-        Span::styled(hint, Style::default().fg(DIM)),
-    ])
+    ];
+
+    let hint_budget = max_row_w.saturating_sub(PREFIX_W);
+    if hint_budget > 3 && !hint.is_empty() {
+        spans.push(Span::raw(" "));
+        let clipped_hint = clip_cells_ellipsis(&hint, hint_budget);
+        spans.push(Span::styled(clipped_hint, Style::default().fg(DIM)));
+    }
+
+    Line::from(spans)
 }
 
 fn render_scrollable_content<'a>(
@@ -4734,41 +5703,73 @@ fn draw_tab_tools_mcp(
         settings.config_draft.tools.extra_path.join(";")
     };
 
-    let mut lines = vec![
-        render_setting_row(
-            settings.selected_row == 0,
-            "优先容器执行 (Docker)",
-            if settings.config_draft.tools.prefer_docker {
-                "[ ● 开启 ]".into()
-            } else {
-                "[ ○ 关闭 ]".into()
-            },
-            "若环境安装 Docker，则优先容器隔离执行".into(),
-            area.width,
-        ),
-        render_setting_row(
-            settings.selected_row == 1,
-            "CTF 渗透答题模式 (CTF Mode)",
-            if screen.ctf_enabled {
-                "[ ● 开启 ]".into()
-            } else {
-                "[ ○ 关闭 ]".into()
-            },
-            "启用 Writeup 自动生成与专属解题工具".into(),
-            area.width,
-        ),
-        render_setting_row(
-            false,
-            "额外环境变量 PATH",
-            extra_path_str,
-            "附加注入到 Shell 子进程的 PATH 变量".into(),
-            area.width,
-        ),
-        Line::raw(""),
-    ];
+    let mut lines = Vec::new();
+    let mut focused_start = 0;
+    let mut focused_end = 0;
 
+    let row0_start = lines.len();
+    lines.push(render_setting_row(
+        settings.selected_row == 0,
+        "优先容器执行 (Docker)",
+        if settings.config_draft.tools.prefer_docker {
+            "[ ● 开启 ]".into()
+        } else {
+            "[ ○ 关闭 ]".into()
+        },
+        "若环境安装 Docker，则优先容器隔离执行".into(),
+        area.width,
+    ));
+    if settings.selected_row == 0 {
+        focused_start = row0_start;
+        focused_end = lines.len().saturating_sub(1);
+    }
+
+    let row1_start = lines.len();
+    lines.push(render_setting_row(
+        settings.selected_row == 1,
+        "CTF 渗透答题模式 (CTF Mode)",
+        if screen.ctf_enabled {
+            "[ ● 开启 ]".into()
+        } else {
+            "[ ○ 关闭 ]".into()
+        },
+        "启用 Writeup 自动生成与专属解题工具".into(),
+        area.width,
+    ));
+    if settings.selected_row == 1 {
+        focused_start = row1_start;
+        focused_end = lines.len().saturating_sub(1);
+    }
+
+    let row2_start = lines.len();
+    lines.push(render_setting_row(
+        settings.selected_row == 2,
+        "MCP 全屏管理控制台 (/mcp)",
+        "[ 按 Enter 打开 ]".into(),
+        "打开独立全屏 MCP 控制台，实时调试工具 Schema、测活与增删服务".into(),
+        area.width,
+    ));
+    if settings.selected_row == 2 {
+        focused_start = row2_start;
+        focused_end = lines.len().saturating_sub(1);
+    }
+
+    lines.push(render_setting_row(
+        false,
+        "额外环境变量 PATH",
+        extra_path_str,
+        "附加注入到 Shell 子进程的 PATH 变量".into(),
+        area.width,
+    ));
+    lines.push(Line::raw(""));
+
+    let total_mcp_tools: usize = settings.mcp_servers.iter().map(|s| s.tool_count).sum();
     lines.push(Line::from(vec![Span::styled(
-        format!("  [已配置 MCP 服务 ({} 个)]", settings.mcp_servers.len()),
+        format!(
+            "  [已配置 MCP 服务集群概要 (总计: {} 个服务 · {} 个工具)]",
+            settings.mcp_servers.len(),
+            total_mcp_tools
+        ),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )]));
     if settings.mcp_servers.is_empty() {
@@ -4811,36 +5812,81 @@ fn draw_tab_tools_mcp(
 
     lines.push(Line::raw(""));
 
+    let skills_header = format!(
+        "  [已加载 Skills 技能 ({} 个)] (↑/↓ 移动焦点 · Enter 查看详情与 SKILL.md 说明)",
+        settings.skills.len()
+    );
     lines.push(Line::from(vec![Span::styled(
-        format!("  [已加载 Skills 技能 ({} 个)]", settings.skills.len()),
+        skills_header,
         Style::default().fg(CODE).add_modifier(Modifier::BOLD),
     )]));
+
     if settings.skills.is_empty() {
         lines.push(Line::styled(
             "    • 暂无已加载 Skill",
             Style::default().fg(DIM),
         ));
     } else {
-        let skills_str = settings
-            .skills
-            .iter()
-            .take(6)
-            .map(|s| format!("{} ({})", s.name, s.source))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        lines.push(Line::from(vec![
-            Span::raw("    • "),
-            Span::styled(skills_str, Style::default().fg(MUTED)),
-        ]));
+        for (i, s) in settings.skills.iter().enumerate() {
+            let is_sel = settings.selected_row == 3 + i;
+            let start_line = lines.len();
+
+            let pointer = if is_sel { "▶ " } else { "  " };
+            let ptr_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let source_badge = match s.source.as_str() {
+                "全局" => Span::styled(" [全局] ", Style::default().fg(CODE)),
+                _ => Span::styled(" [项目级] ", Style::default().fg(SUCCESS)),
+            };
+            let manual_tag = if s.disable_model_invocation {
+                Span::styled(" [仅显式] ", Style::default().fg(DIM))
+            } else {
+                Span::raw("")
+            };
+
+            let enter_hint = if is_sel {
+                Span::styled(
+                    "  [按 Enter 查看详情]",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            };
+
+            let desc_preview = if s.description.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", s.description)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(pointer, ptr_style),
+                Span::styled(
+                    format!("{:<30}", s.name),
+                    if is_sel {
+                        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(FG)
+                    },
+                ),
+                source_badge,
+                manual_tag,
+                Span::styled(desc_preview, Style::default().fg(MUTED)),
+                enter_hint,
+            ]));
+
+            let end_line = lines.len().saturating_sub(1);
+            if is_sel {
+                focused_start = start_line;
+                focused_end = end_line;
+            }
+        }
     }
 
-    render_scrollable_content(
-        frame,
-        area,
-        lines,
-        settings.selected_row,
-        settings.selected_row,
-    );
+    render_scrollable_content(frame, area, lines, focused_start, focused_end);
 }
 
 fn draw_tab_providers(frame: &mut Frame, area: Rect, settings: &CliSettingsState) {
@@ -4911,9 +5957,19 @@ fn draw_tab_providers(frame: &mut Frame, area: Rect, settings: &CliSettingsState
                 );
                 lines.push(Line::styled(detail, Style::default().fg(DIM)));
             }
+            if let Some((is_ok, msg, rtt)) = settings.provider_test_results.get(name) {
+                let (icon, status_label, color) = if *is_ok {
+                    ("🟢", "连通正常", SUCCESS)
+                } else {
+                    ("🔴", "连通失败", ERROR)
+                };
+                let test_line =
+                    format!("      测速: {icon} {status_label} (延迟: {rtt}ms · {msg})");
+                lines.push(Line::styled(test_line, Style::default().fg(color)));
+            }
             lines.push(Line::raw(""));
 
-            let end_line = start_line + 1;
+            let end_line = lines.len();
             if is_sel {
                 focused_start = start_line;
                 focused_end = end_line;
@@ -4928,36 +5984,66 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
     let mut lines = Vec::new();
     let env_count = settings.config_draft.env.vars.len();
     let mem_count = settings.config_draft.memory.rules.len();
+    let env_slots = env_count.max(1);
+    let mem_slots = mem_count.max(1);
+    let is_env_focused = settings.selected_row < env_slots;
+    let is_mem_focused =
+        settings.selected_row >= env_slots && settings.selected_row < env_slots + mem_slots;
+    let mem_list_row_base = env_slots + mem_slots;
+    let is_memlist_focused =
+        settings.total_memories() > 0 && settings.selected_row >= mem_list_row_base;
+
     let mut focused_start = 0;
     let mut focused_end = 0;
 
-    let env_header = if env_count > 0 {
+    // 1. 环境变量分区标题
+    let env_header = if is_env_focused {
         format!(
-            "  [自定义环境变量 (注入 Shell/Agent 子进程)] [{}/{} 项] (A 添加 · D 删除 · 空格 切换脱敏):",
-            if settings.selected_row < env_count {
-                settings.selected_row + 1
-            } else {
-                env_count
-            },
+            "  ⚙ 自定义环境变量 (注入 Shell/Agent 子进程) [{} 项 · 当前聚焦] (A 添加 · Enter/E 编辑 · 空格 脱敏 · D 删除):",
             env_count
         )
     } else {
-        "  [自定义环境变量 (注入 Shell/Agent 子进程)] (A 添加 · D 删除 · 空格 切换脱敏):"
-            .to_string()
+        format!(
+            "  ⚙ 自定义环境变量 (注入 Shell/Agent 子进程) [{} 项] (A 添加 · Enter/E 编辑 · 空格 脱敏 · D 删除):",
+            env_count
+        )
     };
-
     lines.push(Line::styled(
         env_header,
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        if is_env_focused {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        },
     ));
-    if settings.config_draft.env.vars.is_empty() {
-        lines.push(Line::styled(
-            "    (暂无环境变量，按 A 添加)",
-            Style::default().fg(DIM),
-        ));
+
+    if env_count == 0 {
+        let is_sel = is_env_focused && settings.selected_row == 0;
+        let start_line = lines.len();
+        let pointer = if is_sel { "▶ " } else { "  " };
+        let ptr_style = if is_sel {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pointer, ptr_style),
+            Span::styled(
+                "(暂无环境变量，按 A 添加)",
+                if is_sel {
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            ),
+        ]));
+        if is_sel {
+            focused_start = start_line;
+            focused_end = start_line;
+        }
     } else {
         for (i, var) in settings.config_draft.env.vars.iter().enumerate() {
-            let is_sel = i == settings.selected_row;
+            let is_sel = is_env_focused && i == settings.selected_row;
             let start_line = lines.len();
             let pointer = if is_sel { "▶ " } else { "  " };
             let ptr_style = if is_sel {
@@ -4965,22 +6051,43 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
             } else {
                 Style::default().fg(DIM)
             };
+            let idx_badge = Span::styled(
+                format!("[ {:02} ] ", i + 1),
+                Style::default().fg(if is_sel { ACCENT } else { MUTED }),
+            );
+            let key_span = Span::styled(
+                format!("{:<20} ", var.key),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            );
+            let sensitive_badge = if var.sensitive {
+                Span::styled("🔒 [脱敏保护]  ", Style::default().fg(MUTED))
+            } else {
+                Span::styled("🔓 [明文公开]  ", Style::default().fg(DIM))
+            };
             let val_display = if var.sensitive {
-                "sk-************************ (脱敏保护)"
+                "sk-************************"
             } else {
                 &var.value
             };
+            let val_span = Span::styled(
+                val_display,
+                Style::default().fg(if var.sensitive { MUTED } else { FG }),
+            );
+            let hint_span = if is_sel {
+                Span::styled(
+                    "  [Enter/E 编辑 · 空格 脱敏 · D 删除]",
+                    Style::default().fg(ACCENT),
+                )
+            } else {
+                Span::raw("")
+            };
             lines.push(Line::from(vec![
                 Span::styled(pointer, ptr_style),
-                Span::styled(
-                    format!("{:<20}", var.key),
-                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    val_display,
-                    Style::default().fg(if var.sensitive { MUTED } else { FG }),
-                ),
+                idx_badge,
+                key_span,
+                sensitive_badge,
+                val_span,
+                hint_span,
             ]));
             if is_sel {
                 focused_start = start_line;
@@ -4991,34 +6098,55 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
 
     lines.push(Line::raw(""));
 
-    let mem_header = if mem_count > 0 {
+    // 2. 长期记忆规则分区标题
+    let mem_header = if is_mem_focused {
         format!(
-            "  [长期用户记忆约定规则 (Memory Rules)] [{}/{} 项] (空格 切换启用/禁用 · Tab 切换作用域 · A/D 增删):",
-            if settings.selected_row >= env_count {
-                settings.selected_row - env_count + 1
-            } else {
-                mem_count
-            },
+            "  🧠 长期用户记忆约定规则 (Memory Rules) [{} 项 · 当前聚焦] (A 添加 · Enter/E 编辑 · 空格 启停 · ←/→ 作用域 · D 删除):",
             mem_count
         )
     } else {
-        "  [长期用户记忆约定规则 (Memory Rules)] (空格 切换启用/禁用 · Tab 切换作用域 · A/D 增删):"
-            .to_string()
+        format!(
+            "  🧠 长期用户记忆约定规则 (Memory Rules) [{} 项] (A 添加 · Enter/E 编辑 · 空格 启停 · ←/→ 作用域 · D 删除):",
+            mem_count
+        )
     };
-
     lines.push(Line::styled(
         mem_header,
-        Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        if is_mem_focused {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        },
     ));
-    if settings.config_draft.memory.rules.is_empty() {
-        lines.push(Line::styled(
-            "    (暂无记忆规则，按 A 添加)",
-            Style::default().fg(DIM),
-        ));
+
+    if mem_count == 0 {
+        let is_sel = is_mem_focused && (settings.selected_row >= env_slots);
+        let start_line = lines.len();
+        let pointer = if is_sel { "▶ " } else { "  " };
+        let ptr_style = if is_sel {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pointer, ptr_style),
+            Span::styled(
+                "(暂无记忆规则，按 A 添加)",
+                if is_sel {
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            ),
+        ]));
+        if is_sel {
+            focused_start = start_line;
+            focused_end = start_line;
+        }
     } else {
         for (i, rule) in settings.config_draft.memory.rules.iter().enumerate() {
-            let row_idx = env_count + i;
-            let is_sel = row_idx == settings.selected_row;
+            let row_idx = env_slots + i;
+            let is_sel = is_mem_focused && row_idx == settings.selected_row;
             let start_line = lines.len();
             let pointer = if is_sel { "▶ " } else { "  " };
             let ptr_style = if is_sel {
@@ -5026,23 +6154,125 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
             } else {
                 Style::default().fg(DIM)
             };
+            let idx_badge = Span::styled(
+                format!("[ #{:02} ] ", i + 1),
+                Style::default().fg(if is_sel { ACCENT } else { MUTED }),
+            );
             let status_badge = if rule.enabled {
-                Span::styled("[ ● 开启 ]", Style::default().fg(SUCCESS))
+                Span::styled(
+                    "[ ● 开启 ] ",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                )
             } else {
-                Span::styled("[ ○ 关闭 ]", Style::default().fg(DIM))
+                Span::styled("[ ○ 关闭 ] ", Style::default().fg(DIM))
             };
             let scope_badge = match rule.scope.as_str() {
-                "both" => "[全局与项目]",
-                "project" => "[项目级]",
-                _ => "[全局]",
+                "both" => Span::styled("[ 全局与项目 (both) ] ", Style::default().fg(CODE)),
+                "project" => Span::styled("[ 项目级 (project) ]    ", Style::default().fg(SUCCESS)),
+                _ => Span::styled("[ 全局 (global) ]       ", Style::default().fg(MUTED)),
+            };
+            let scope_hint = if is_sel {
+                Span::styled("(←/→) ", Style::default().fg(DIM))
+            } else {
+                Span::raw("")
+            };
+            let prompt_span = Span::styled(
+                &rule.prompt,
+                Style::default().fg(if rule.enabled { FG } else { DIM }),
+            );
+            let hint_span = if is_sel {
+                Span::styled("  [Enter/E 编辑 · D 删除]", Style::default().fg(ACCENT))
+            } else {
+                Span::raw("")
             };
             lines.push(Line::from(vec![
                 Span::styled(pointer, ptr_style),
+                idx_badge,
                 status_badge,
-                Span::raw(" "),
-                Span::styled(format!("{:<10}", scope_badge), Style::default().fg(MUTED)),
-                Span::raw(" "),
-                Span::styled(&rule.prompt, Style::default().fg(FG)),
+                scope_badge,
+                scope_hint,
+                prompt_span,
+                hint_span,
+            ]));
+            if is_sel {
+                focused_start = start_line;
+                focused_end = start_line;
+            }
+        }
+    }
+
+    lines.push(Line::raw(""));
+
+    // 3. 用户记忆列表分区（全局 + 项目级）
+    let total_mem = settings.total_memories();
+    let memlist_header = if is_memlist_focused {
+        format!(
+            "  🧾 用户记忆列表 (Memory List) [{} 条 · 当前聚焦] (↑/↓ 选择 · Enter 查看详情):",
+            total_mem
+        )
+    } else {
+        format!(
+            "  🧾 用户记忆列表 (Memory List) [{} 条] (↑/↓ 选择 · Enter 查看详情):",
+            total_mem
+        )
+    };
+    lines.push(Line::styled(
+        memlist_header,
+        if is_memlist_focused {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        },
+    ));
+
+    let groups: [(&str, &str, &[MemoryEntry], usize); 2] = [
+        (
+            "全局记忆 (Global)",
+            &settings.memory_global_path,
+            &settings.memories_global,
+            0,
+        ),
+        (
+            "项目级记忆 (Project)",
+            &settings.memory_project_path,
+            &settings.memories_project,
+            settings.memories_global.len(),
+        ),
+    ];
+    for (label, file_hint, entries, flat_base) in groups {
+        lines.push(Line::styled(
+            format!("  ▸ {} [{} 条] — {}", label, entries.len(), file_hint),
+            Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        ));
+        if entries.is_empty() {
+            lines.push(Line::styled("      (暂无)", Style::default().fg(DIM)));
+            continue;
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            let flat = flat_base + i;
+            let is_sel = is_memlist_focused && settings.selected_row == mem_list_row_base + flat;
+            let start_line = lines.len();
+            let pointer = if is_sel { "▶ " } else { "  " };
+            let ptr_style = if is_sel {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let idx_badge = Span::styled(
+                format!("[ #{:02} ] ", entry.index),
+                Style::default().fg(if is_sel { ACCENT } else { MUTED }),
+            );
+            let content_span = Span::styled(&entry.content, Style::default().fg(FG));
+            let hint_span = if is_sel {
+                Span::styled("  [Enter 查看详情]", Style::default().fg(ACCENT))
+            } else {
+                Span::raw("")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(pointer, ptr_style),
+                idx_badge,
+                content_span,
+                hint_span,
             ]));
             if is_sel {
                 focused_start = start_line;
@@ -5174,6 +6404,314 @@ fn draw_discard_modal(frame: &mut Frame, parent: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// 清空弹窗区域，并消除底层宽字符在弹窗竖边框处的残影，之后才可安全绘制弹窗。
+///
+/// ratatui 的缓冲 diff 会跳过宽字符（CJK/emoji）的尾随单元格：若底层文本的宽字符正好
+/// 占据弹窗竖边框左侧的单元格，其尾随单元格就是边框本身，边框那一格永远不会下发到终端，
+/// 视觉上就是「边框被文字挤掉」。因此把左侧那半格宽字符先重置掉，边框即可完整刷新。
+fn clear_popup_under(frame: &mut Frame, area: Rect) {
+    use unicode_width::UnicodeWidthStr;
+
+    frame.render_widget(Clear, area);
+    if area.x == 0 {
+        return;
+    }
+    let margin_x = area.x - 1;
+    let buf = frame.buffer_mut();
+    if margin_x >= buf.area.width {
+        return;
+    }
+    let bottom = area.bottom().min(buf.area.height);
+    for y in area.y..bottom {
+        if UnicodeWidthStr::width(buf[(margin_x, y)].symbol()) > 1 {
+            buf[(margin_x, y)].reset();
+        }
+    }
+}
+
+fn draw_skill_detail_modal(
+    frame: &mut Frame,
+    parent: Rect,
+    settings: &CliSettingsState,
+    detail: &SkillDetailModal,
+) {
+    if parent.width < 20 || parent.height < 10 {
+        return;
+    }
+
+    let skill = match settings.skills.get(detail.skill_index) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let width = (parent.width * 85 / 100).max(70).min(parent.width);
+    let height = (parent.height * 85 / 100).max(20).min(parent.height);
+    let area = Rect::new(
+        parent.x + (parent.width.saturating_sub(width)) / 2,
+        parent.y + (parent.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    clear_popup_under(frame, area);
+
+    let title_str = format!(
+        " 📖 Skill 详情 [{}/{}]: {} ",
+        detail.skill_index + 1,
+        settings.skills.len(),
+        skill.name
+    );
+    let title_str = clip_cells_ellipsis(&title_str, (area.width as usize).saturating_sub(3));
+    let block = Block::bordered()
+        .border_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .title(Line::styled(
+            title_str,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+    let mut content_lines = Vec::new();
+
+    let source_badge = match skill.source.as_str() {
+        "全局" => Span::styled(" [全局] ", Style::default().fg(CODE)),
+        _ => Span::styled(" [项目级] ", Style::default().fg(SUCCESS)),
+    };
+    let manual_tag = if skill.disable_model_invocation {
+        Span::styled(" [仅显式调用] ", Style::default().fg(DIM))
+    } else {
+        Span::raw("")
+    };
+    content_lines.push(Line::from(vec![
+        Span::styled("  名称: ", Style::default().fg(MUTED)),
+        Span::styled(
+            &skill.name,
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("    来源: ", Style::default().fg(MUTED)),
+        source_badge,
+        manual_tag,
+    ]));
+
+    content_lines.push(Line::from(vec![
+        Span::styled("  文件: ", Style::default().fg(MUTED)),
+        Span::styled(&skill.path, Style::default().fg(DIM)),
+    ]));
+
+    let desc_str = if skill.description.is_empty() {
+        "(无描述)"
+    } else {
+        &skill.description
+    };
+    content_lines.push(Line::from(vec![
+        Span::styled("  简介: ", Style::default().fg(MUTED)),
+        Span::styled(desc_str, Style::default().fg(FG)),
+    ]));
+
+    if !skill.triggers.is_empty() {
+        content_lines.push(Line::from(vec![
+            Span::styled("  触发词: ", Style::default().fg(MUTED)),
+            Span::styled(skill.triggers.join(", "), Style::default().fg(CODE)),
+        ]));
+    }
+
+    if !skill.tools.is_empty() {
+        content_lines.push(Line::from(vec![
+            Span::styled("  依赖工具: ", Style::default().fg(MUTED)),
+            Span::styled(skill.tools.join(", "), Style::default().fg(ACCENT)),
+        ]));
+    }
+
+    if !skill.allowed_tools.is_empty() {
+        content_lines.push(Line::from(vec![
+            Span::styled("  预批准工具: ", Style::default().fg(MUTED)),
+            Span::styled(skill.allowed_tools.join(", "), Style::default().fg(SUCCESS)),
+        ]));
+    }
+
+    content_lines.push(Line::raw(""));
+    let div_w = (chunks[0].width as usize).saturating_sub(4).max(10);
+    content_lines.push(Line::styled(
+        format!("  {}", "─".repeat(div_w)),
+        Style::default().fg(DIM),
+    ));
+    content_lines.push(Line::from(vec![Span::styled(
+        "  📄 SKILL.md 说明与执行指令正文:",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]));
+    content_lines.push(Line::raw(""));
+
+    if skill.body.trim().is_empty() {
+        content_lines.push(Line::styled(
+            "    (该 Skill 暂无 Markdown 正文内容)",
+            Style::default().fg(DIM),
+        ));
+    } else {
+        let mut in_code_block = false;
+        for line in skill.body.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                content_lines.push(Line::styled(
+                    format!("    {}", line),
+                    Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+                ));
+            } else if in_code_block {
+                content_lines.push(Line::styled(
+                    format!("    {}", line),
+                    Style::default().fg(CODE),
+                ));
+            } else if trimmed.starts_with('#') {
+                content_lines.push(Line::styled(
+                    format!("    {}", line),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            } else if trimmed.starts_with('-')
+                || trimmed.starts_with('*')
+                || trimmed.starts_with('>')
+            {
+                content_lines.push(Line::styled(
+                    format!("    {}", line),
+                    Style::default().fg(FG),
+                ));
+            } else if trimmed.is_empty() {
+                content_lines.push(Line::raw(""));
+            } else {
+                content_lines.push(Line::styled(
+                    format!("    {}", line),
+                    Style::default().fg(FG),
+                ));
+            }
+        }
+    }
+
+    let visible_rows = chunks[0].height as usize;
+    let max_scroll = content_lines.len().saturating_sub(visible_rows);
+    let scroll = detail.scroll.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(content_lines).scroll((scroll as u16, 0)),
+        chunks[0],
+    );
+
+    let hint_line = Line::styled(
+        " [↑/↓/PgUp/PgDn] 滚屏 · [←/→] 切换上/下一技能 · [Esc/q/Enter] 关闭返回",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(Paragraph::new(hint_line), chunks[1]);
+}
+
+fn draw_memory_detail_modal(
+    frame: &mut Frame,
+    parent: Rect,
+    settings: &CliSettingsState,
+    detail: &MemoryDetailModal,
+) {
+    if parent.width < 20 || parent.height < 10 {
+        return;
+    }
+
+    let total = settings.total_memories();
+    let (label, path, entries) = match detail.group {
+        MemoryGroup::Global => (
+            "全局记忆",
+            &settings.memory_global_path,
+            &settings.memories_global,
+        ),
+        MemoryGroup::Project => (
+            "项目级记忆",
+            &settings.memory_project_path,
+            &settings.memories_project,
+        ),
+    };
+    let Some(entry) = entries.get(detail.entry) else {
+        return;
+    };
+    let flat = match detail.group {
+        MemoryGroup::Global => detail.entry,
+        MemoryGroup::Project => settings.memories_global.len() + detail.entry,
+    };
+
+    let width = (parent.width * 85 / 100).max(70).min(parent.width);
+    let height = (parent.height * 85 / 100).max(20).min(parent.height);
+    let area = Rect::new(
+        parent.x + (parent.width.saturating_sub(width)) / 2,
+        parent.y + (parent.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    clear_popup_under(frame, area);
+
+    let title_str = format!(
+        " 📖 记忆详情 [{}/{}] · {} #{} ",
+        flat + 1,
+        total,
+        label,
+        entry.index
+    );
+    let block = Block::bordered()
+        .border_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .title(Line::styled(
+            title_str,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+    let mut content_lines = Vec::new();
+    content_lines.push(Line::from(vec![
+        Span::styled("  作用域: ", Style::default().fg(MUTED)),
+        Span::styled(
+            label,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    content_lines.push(Line::from(vec![
+        Span::styled("  文件: ", Style::default().fg(MUTED)),
+        Span::styled(path, Style::default().fg(DIM)),
+    ]));
+    content_lines.push(Line::from(vec![
+        Span::styled("  编号: ", Style::default().fg(MUTED)),
+        Span::styled(format!("#{}", entry.index), Style::default().fg(CODE)),
+    ]));
+    content_lines.push(Line::raw(""));
+    let div_w = (chunks[0].width as usize).saturating_sub(4).max(10);
+    content_lines.push(Line::styled(
+        format!("  {}", "─".repeat(div_w)),
+        Style::default().fg(DIM),
+    ));
+    content_lines.push(Line::from(vec![Span::styled(
+        "  📝 记忆正文:",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]));
+    content_lines.push(Line::raw(""));
+    if entry.content.trim().is_empty() {
+        content_lines.push(Line::styled("    (该记忆为空)", Style::default().fg(DIM)));
+    } else {
+        for line in entry.content.lines() {
+            content_lines.push(Line::styled(format!("    {line}"), Style::default().fg(FG)));
+        }
+    }
+
+    let visible_rows = chunks[0].height as usize;
+    let max_scroll = content_lines.len().saturating_sub(visible_rows);
+    let scroll = detail.scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(content_lines).scroll((scroll as u16, 0)),
+        chunks[0],
+    );
+
+    let hint_line = Line::styled(
+        " [↑/↓/PgUp/PgDn] 滚屏 · [←/→] 切换上/下一条记忆 · [Esc/q/Enter] 关闭返回",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(Paragraph::new(hint_line), chunks[1]);
+}
+
 fn render_tab_bar(area_width: u16, current_tab: SettingsTab) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
 
@@ -5299,6 +6837,1070 @@ fn render_tab_bar(area_width: u16, current_tab: SettingsTab) -> Line<'static> {
     Line::from(spans)
 }
 
+fn draw_fullscreen_provider_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &CommandPicker,
+    selected: usize,
+) {
+    if area.width < 40 || area.height < 8 {
+        return;
+    }
+
+    frame.render_widget(Clear, area);
+
+    let is_protocol_picker = picker.title.contains("Protocol");
+    let main_title = if is_protocol_picker {
+        " 🔌 选择服务商协议类型 / Select Protocol Kind "
+    } else {
+        " 🚀 服务商预设库与自定义接入 / Add Provider from Preset or Custom "
+    };
+
+    let outer_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(main_title).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        );
+    let inner = outer_block.inner(area);
+    frame.render_widget(outer_block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // 顶部提示与状态摘要
+        Constraint::Min(0),    // 双栏主体 (左侧列表 + 右侧规格详情)
+        Constraint::Length(1), // 底部操作快捷键
+    ])
+    .split(inner);
+
+    let header_area = chunks[0];
+    let body_area = chunks[1];
+    let footer_area = chunks[2];
+
+    // 1. 顶部导读栏
+    let subtitle = if is_protocol_picker {
+        "选择您自建或中转服务支持的接口协议标准。不同协议对应不同的请求格式、端点规范与鉴权 Header。"
+    } else {
+        "内置主流大模型厂商开箱即用预设；亦可接入任意 OpenAI 兼容网关 (vLLM/OneAPI)、Claude 或本地 Ollama。"
+    };
+    let count_info = format!(
+        "共 {} 个选项 · 当前已选第 {} 项",
+        picker.items.len(),
+        if picker.items.is_empty() {
+            0
+        } else {
+            selected + 1
+        }
+    );
+    let header_p = Paragraph::new(vec![
+        Line::from(Span::styled(subtitle, Style::default().fg(MUTED))),
+        Line::from(Span::styled(count_info, Style::default().fg(DIM))),
+    ]);
+    frame.render_widget(header_p, header_area);
+
+    // 2. 双栏主体
+    let panes = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(body_area);
+    let list_area = panes[0];
+    let detail_area = panes[1];
+
+    // 左栏：列表
+    let list_title = if is_protocol_picker {
+        " 协议规范列表 / Protocols "
+    } else {
+        " 服务商选项 / Providers "
+    };
+    let list_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(list_title).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        );
+    let list_inner = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+
+    let total_items = picker.items.len();
+    let visible_rows = list_inner.height as usize;
+    let offset = if visible_rows == 0 {
+        0
+    } else if selected >= visible_rows {
+        selected - visible_rows + 1
+    } else {
+        0
+    };
+
+    let mut list_lines: Vec<Line<'static>> = Vec::new();
+    if total_items == 0 {
+        list_lines.push(Line::from("（无可用选项）").style(Style::default().fg(DIM)));
+    } else {
+        for (i, item) in picker
+            .items
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible_rows)
+        {
+            let is_sel = i == selected;
+            let marker = if is_sel { "▸ " } else { "  " };
+            let sel_bg = Color::Rgb(38, 79, 120);
+            let row_style = if is_sel {
+                Style::default().bg(sel_bg)
+            } else {
+                Style::default()
+            };
+
+            let is_custom = item.label.contains("自定义") || item.command.contains("add-custom");
+            let badge_span = if is_custom {
+                Span::styled(
+                    "[ 自定义 ] ",
+                    Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+                )
+            } else if is_protocol_picker {
+                Span::styled(
+                    "[ 协议 ] ",
+                    Style::default()
+                        .fg(Color::Rgb(160, 210, 255))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    "[ 预设 ] ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
+            };
+
+            let label_color = if is_sel {
+                FG
+            } else if is_custom {
+                CODE
+            } else {
+                FG
+            };
+
+            list_lines.push(
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        if is_sel {
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(MUTED)
+                        },
+                    ),
+                    badge_span,
+                    Span::styled(
+                        item.label.clone(),
+                        Style::default().fg(label_color).add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
+                ])
+                .style(row_style),
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(list_lines), list_inner);
+
+    // 右栏：详情卡片
+    let detail_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(CODE))
+        .title(
+            Line::from(" 详细规格与配置指南 / Specifications & Guide ")
+                .style(Style::default().fg(CODE).add_modifier(Modifier::BOLD)),
+        );
+    let detail_inner = detail_block.inner(detail_area);
+    frame.render_widget(detail_block, detail_area);
+
+    let mut detail_lines: Vec<Line> = Vec::new();
+    if let Some(curr_item) = picker.items.get(selected) {
+        let preset_opt = if curr_item.command.starts_with("/provider add-preset ") {
+            let id = curr_item
+                .command
+                .trim_start_matches("/provider add-preset ")
+                .trim();
+            cyber_core::PROVIDER_PRESETS
+                .iter()
+                .find(|p| p.id.eq_ignore_ascii_case(id))
+        } else {
+            None
+        };
+
+        if let Some(preset) = preset_opt {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "厂商全称: ",
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    preset.name,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("协议类型: ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("[{}]", preset.kind),
+                    Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            detail_lines.push(Line::from(""));
+
+            let base_url_str = if preset.base_url.is_empty() {
+                "（根据实际自建端点自行填写）"
+            } else {
+                preset.base_url
+            };
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "默认端点 Base URL: ",
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(base_url_str, Style::default().fg(FG)),
+            ]));
+
+            let def_model_str = if preset.default_model.is_empty() {
+                "（自定义模型标识）"
+            } else {
+                preset.default_model
+            };
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "推荐默认模型:      ",
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    def_model_str,
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+
+            if !preset.suggested_models.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("常见可选模型:      ", Style::default().fg(MUTED)),
+                    Span::styled(preset.suggested_models.join(", "), Style::default().fg(DIM)),
+                ]));
+            }
+
+            if !preset.env_var_suggestion.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("推荐环境变量:      ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("${{{}}}", preset.env_var_suggestion),
+                        Style::default().fg(Color::Rgb(255, 170, 80)),
+                    ),
+                ]));
+            }
+
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![Span::styled(
+                "服务商说明:",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(preset.description, Style::default().fg(FG)),
+            ]));
+
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![Span::styled(
+                "💡 快速接入操作指引:",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            )]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "按 Enter 选中后，将自动预填端点 URL 与默认模型。进入表单后，您只需输入 API Key (可使用 ${ENV} 语法) 即可完成接入。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        } else if curr_item.command.starts_with("/provider add-custom") {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "接入模式: ",
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "🛠️ 自定义服务商接入 (Custom Provider)",
+                    Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![Span::styled(
+                "支持的协议规范:",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(
+                    "openai-compatible",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " : 通用兼容层（vLLM / OneAPI / NewAPI / FastChat / 本地代理）",
+                    Style::default().fg(FG),
+                ),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(
+                    "anthropic",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "         : Anthropic 原生 Claude Messages API 协议",
+                    Style::default().fg(FG),
+                ),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(
+                    "ollama",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "            : Ollama 本地 / 内网实例私有运行服务",
+                    Style::default().fg(FG),
+                ),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(
+                    "openai",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "            : OpenAI 官方原生 API 规范与端点",
+                    Style::default().fg(FG),
+                ),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![Span::styled(
+                "💡 操作流程:",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            )]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "按 Enter 后将进入协议选择界面，确认协议后进入全屏表单，自主设置服务商名称、端点 Base URL、秘钥及模型。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        } else if is_protocol_picker {
+            let (proto_name, proto_desc, default_endpoint, auth_type) = if curr_item
+                .command
+                .contains("openai-compatible")
+            {
+                (
+                    "openai-compatible (通用兼容协议)",
+                    "业界事实标准协议规范。适用于 OneAPI、NewAPI、vLLM、FastChat、LocalAI 以及任何自建的反向代理网关。完全兼容 OpenAI /v1/chat/completions 路由。",
+                    "http://localhost:8000/v1 (或自建服务端口)",
+                    "HTTP Bearer Token 头部鉴权",
+                )
+            } else if curr_item.command.contains("anthropic") {
+                (
+                    "anthropic (Claude Messages 协议)",
+                    "Anthropic 官方原生 API 规范，支持 Claude 3.5 / 3.7 Sonnet 系列多模态及推理能力。采用特定的 Content Blocks 消息格式。",
+                    "https://api.anthropic.com/v1",
+                    "x-api-key 自定义 HTTP 头部鉴权",
+                )
+            } else if curr_item.command.contains("ollama") {
+                (
+                    "ollama (本地私有模型协议)",
+                    "Ollama 本地或局域网开源模型运行服务（如 Qwen2.5, DeepSeek-R1, Llama 3.3）。数据不出内网，天生支持高安全审计。",
+                    "http://127.0.0.1:11434",
+                    "免密钥鉴权（若配置了反向代理亦支持自定义 Key）",
+                )
+            } else {
+                (
+                    "openai (OpenAI 原生规范)",
+                    "OpenAI 官方 API 服务标准，支持 GPT-4o、o1/o3-mini 等旗舰通用与推理模型。",
+                    "https://api.openai.com/v1",
+                    "Bearer <OPENAI_API_KEY>",
+                )
+            };
+
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "选定协议: ",
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    proto_name,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![Span::styled(
+                "协议简介:",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(proto_desc, Style::default().fg(FG)),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("推荐默认端点: ", Style::default().fg(MUTED)),
+                Span::styled(default_endpoint, Style::default().fg(CODE)),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("鉴权认证方式: ", Style::default().fg(MUTED)),
+                Span::styled(auth_type, Style::default().fg(DIM)),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![Span::styled(
+                "💡 下一步指引:",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            )]));
+            detail_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "按 Enter 选定此协议，将自动创建该协议类型的表单，您可以进一步填写名称、Base URL、密钥和模型名称。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        } else {
+            detail_lines.push(Line::from(vec![
+                Span::styled("选项: ", Style::default().fg(MUTED)),
+                Span::styled(&curr_item.label, Style::default().fg(FG)),
+            ]));
+            if !curr_item.detail.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("详情: ", Style::default().fg(MUTED)),
+                    Span::styled(&curr_item.detail, Style::default().fg(DIM)),
+                ]));
+            }
+        }
+    }
+    let detail_p = Paragraph::new(detail_lines).wrap(Wrap { trim: false });
+    frame.render_widget(detail_p, detail_inner);
+
+    // 3. 底部快捷键提示
+    let hint_line = Line::from(vec![
+        Span::styled(" [ ↑/↓ 上下选择 ] ", Style::default().fg(MUTED)),
+        Span::raw("  "),
+        Span::styled(
+            " [ Enter 确认并进入配置 ] ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(" [ Esc 返回设置中心 ] ", Style::default().fg(MUTED)),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(Paragraph::new(vec![hint_line]), footer_area);
+}
+
+fn draw_fullscreen_provider_form(
+    frame: &mut Frame,
+    area: Rect,
+    form: &mut FormState,
+    status: &str,
+) {
+    if area.width < 40 || area.height < 8 {
+        return;
+    }
+
+    frame.render_widget(Clear, area);
+
+    let is_edit =
+        form.form.title.to_lowercase().contains("edit") || form.form.title.contains("编辑");
+    let main_title = if is_edit {
+        " ⚙️ 服务商参数配置 · 编辑模式 / Edit Provider Configuration "
+    } else {
+        " ➕ 服务商接入配置 · 新增模式 / Add Provider Configuration "
+    };
+
+    let outer_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(CODE))
+        .title(
+            Line::from(main_title).style(Style::default().fg(CODE).add_modifier(Modifier::BOLD)),
+        );
+    let inner = outer_block.inner(area);
+    frame.render_widget(outer_block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // 顶部提示与目标服务商摘要
+        Constraint::Min(0),    // 双栏主体 (左侧字段输入 + 右侧参数向导)
+        Constraint::Length(2), // 底部状态与操作快捷键
+    ])
+    .split(inner);
+
+    let header_area = chunks[0];
+    let body_area = chunks[1];
+    let footer_area = chunks[2];
+
+    // 提取当前表单中已输入的 name 和 kind
+    let cur_name = form
+        .form
+        .fields
+        .iter()
+        .position(|f| f.name == "name")
+        .and_then(|idx| form.inputs.get(idx))
+        .map(|inp| inp.lines().join("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "（未命名）".into());
+
+    let cur_kind = form
+        .form
+        .fields
+        .iter()
+        .position(|f| f.name == "kind")
+        .and_then(|idx| form.inputs.get(idx))
+        .map(|inp| inp.lines().join("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "openai".into());
+
+    // 1. 顶部导读
+    let header_p = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("服务商标识: ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{cur_name} "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("· 协议规范: ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("[{cur_kind}] "),
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("· 共 {} 个配置字段", form.form.fields.len()),
+                Style::default().fg(DIM),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "请完成以下字段配置。使用 Tab 或 ↑/↓ 切换字段，←/→ 或空格切换协议类型，Ctrl+S 保存。",
+            Style::default().fg(DIM),
+        )),
+    ]);
+    frame.render_widget(header_p, header_area);
+
+    // 2. 双栏主体
+    let panes = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(body_area);
+    let fields_area = panes[0];
+    let guide_area = panes[1];
+
+    // 左栏：字段列表
+    let fields_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(" 配置字段输入 / Field Inputs ")
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        );
+    let fields_inner = fields_block.inner(fields_area);
+    frame.render_widget(fields_block, fields_area);
+
+    let count = form.form.fields.len();
+    let sel_idx = form.selected;
+
+    // 计算滚动的起始位置以确保当前选中字段可见
+    let field_box_height = 2usize;
+    let total_field_lines = count * field_box_height + 2;
+    let visible_field_lines = fields_inner.height as usize;
+    let max_offset = total_field_lines.saturating_sub(visible_field_lines);
+    let desired_line = sel_idx * field_box_height + if sel_idx >= 8 { 2 } else { 0 };
+    let field_scroll_offset = desired_line
+        .saturating_sub(visible_field_lines.saturating_sub(field_box_height))
+        .min(max_offset);
+
+    let mut field_lines: Vec<Line> = Vec::new();
+    for (i, field) in form.form.fields.iter().enumerate() {
+        let is_sel = i == sel_idx;
+        let marker = if is_sel { "▸ " } else { "  " };
+
+        let (cn_label, is_required) = match field.name.as_str() {
+            "name" => ("服务商标识 (name)", true),
+            "kind" => ("协议类型 (kind)", true),
+            "endpoint" => ("端点地址 (endpoint)", true),
+            "apikey" => ("访问密钥 (apikey)", false),
+            "model" => ("默认模型 (model)", true),
+            "maxtokens" => ("最大 Token (maxtokens)", true),
+            "temperature" => ("采样温度 (temperature)", true),
+            "context_length" => ("上下文窗口 (context_length)", false),
+            "chat_endpoint" => (
+                "自定义对话端点 chat_endpoint（留空默认 {base_url}/chat/completions）",
+                false,
+            ),
+            "models_endpoint" => (
+                "自定义模型列表端点 models_endpoint（留空默认 {base_url}/models）",
+                false,
+            ),
+            _ => (field.name.as_str(), false),
+        };
+
+        // 在高级选项前插入分隔线与标题
+        if field.name == "chat_endpoint" {
+            field_lines.push(Line::raw(""));
+            field_lines.push(Line::styled(
+                "  ── 高级设置 高级选项 ──",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        let req_badge = if is_required {
+            Span::styled(" [必填]", Style::default().fg(Color::Rgb(255, 120, 120)))
+        } else {
+            Span::styled(" [可选]", Style::default().fg(DIM))
+        };
+
+        let label_style = if is_sel {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+
+        // 行 1: 字段标签
+        field_lines.push(Line::from(vec![
+            Span::styled(
+                marker,
+                if is_sel {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ),
+            Span::styled(cn_label, label_style),
+            req_badge,
+        ]));
+
+        // 行 2: 字段值展示
+        let sel_bg = Color::Rgb(38, 79, 120);
+        let val_str = if let Some(inp) = form.inputs.get(i) {
+            inp.lines().join("\n")
+        } else {
+            String::new()
+        };
+
+        if field.name == "kind" {
+            let cur_k = val_str.trim().to_ascii_lowercase();
+            let mut pill_spans = vec![Span::raw("    ")];
+            for k in cyber_core::PROVIDER_KINDS {
+                let is_cur = *k == cur_k;
+                let (pill_text, pill_style) = if is_cur {
+                    (
+                        format!(" [{k}] "),
+                        Style::default()
+                            .fg(Color::Rgb(20, 20, 20))
+                            .bg(CODE)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (format!(" {k} "), Style::default().fg(DIM))
+                };
+                pill_spans.push(Span::styled(pill_text, pill_style));
+                pill_spans.push(Span::raw(" "));
+            }
+            if is_sel {
+                pill_spans.push(Span::styled(
+                    " (←/→ 或空格切换)",
+                    Style::default().fg(ACCENT),
+                ));
+            }
+            let line_style = if is_sel {
+                Style::default().bg(sel_bg)
+            } else {
+                Style::default()
+            };
+            field_lines.push(Line::from(pill_spans).style(line_style));
+        } else if field.name == "context_length" {
+            let cur = val_str.trim().to_string();
+            let is_custom = !cur.is_empty()
+                && !cyber_core::CONTEXT_LENGTH_PRESETS
+                    .iter()
+                    .any(|(_, v)| !v.is_empty() && cur == *v);
+            let mut pill_spans = vec![Span::raw("    ")];
+            for (label, value) in cyber_core::CONTEXT_LENGTH_PRESETS {
+                let is_cur = if value.is_empty() {
+                    cur.is_empty()
+                } else {
+                    cur == *value
+                };
+                let (pill_text, pill_style) = if is_cur {
+                    (
+                        format!(" [{label}] "),
+                        Style::default()
+                            .fg(Color::Rgb(20, 20, 20))
+                            .bg(CODE)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (format!(" {label} "), Style::default().fg(DIM))
+                };
+                pill_spans.push(Span::styled(pill_text, pill_style));
+                pill_spans.push(Span::raw(" "));
+            }
+            let custom_text = if is_custom {
+                format!("[自定义: {cur}]")
+            } else {
+                "自定义".to_string()
+            };
+            pill_spans.push(Span::styled(
+                format!(" {custom_text} "),
+                if is_custom {
+                    Style::default()
+                        .fg(Color::Rgb(20, 20, 20))
+                        .bg(CODE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            ));
+            if is_sel {
+                pill_spans.push(Span::styled(
+                    " (←/→ 或空格切换预设；直接输入数字为自定义)",
+                    Style::default().fg(ACCENT),
+                ));
+            }
+            let line_style = if is_sel {
+                Style::default().bg(sel_bg)
+            } else {
+                Style::default()
+            };
+            field_lines.push(Line::from(pill_spans).style(line_style));
+        } else if field.secret {
+            let display_val = if val_str.is_empty() {
+                "（留空，若已配置环境变量或免密）".to_string()
+            } else {
+                "*".repeat(val_str.chars().count().min(32))
+            };
+
+            let row_style = if is_sel {
+                Style::default().bg(sel_bg).fg(FG)
+            } else {
+                Style::default().fg(if val_str.is_empty() { DIM } else { CODE })
+            };
+            field_lines.push(
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(display_val, row_style),
+                ])
+                .style(if is_sel {
+                    Style::default().bg(sel_bg)
+                } else {
+                    Style::default()
+                }),
+            );
+        } else {
+            let display_val = if val_str.is_empty() {
+                let placeholder = match field.name.as_str() {
+                    "name" => "如 deepseek, my_vllm, custom_gateway",
+                    "endpoint" => "如 https://api.deepseek.com",
+                    "model" => "如 deepseek-chat, gpt-4o",
+                    "maxtokens" => "384000",
+                    "temperature" => "0.7",
+                    "chat_endpoint" => "留空默认 {base_url}/chat/completions",
+                    "models_endpoint" => "留空默认 {base_url}/models",
+                    _ => "",
+                };
+                Span::styled(format!("({placeholder})"), Style::default().fg(DIM))
+            } else {
+                Span::styled(
+                    val_str.clone(),
+                    if is_sel {
+                        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(FG)
+                    },
+                )
+            };
+
+            let line_style = if is_sel {
+                Style::default().bg(sel_bg)
+            } else {
+                Style::default()
+            };
+            field_lines.push(Line::from(vec![Span::raw("    "), display_val]).style(line_style));
+        }
+    }
+
+    let visible_slice = field_lines
+        .into_iter()
+        .skip(field_scroll_offset)
+        .take(visible_field_lines)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible_slice), fields_inner);
+
+    // 右栏：实时动态参数向导
+    let guide_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(CODE))
+        .title(
+            Line::from(" 参数向导与协议规范 / Guidance & Tips ")
+                .style(Style::default().fg(CODE).add_modifier(Modifier::BOLD)),
+        );
+    let guide_inner = guide_block.inner(guide_area);
+    frame.render_widget(guide_block, guide_area);
+
+    let sel_field_name = form
+        .form
+        .fields
+        .get(sel_idx)
+        .map(|f| f.name.as_str())
+        .unwrap_or("");
+    let mut guide_lines: Vec<Line<'static>> = Vec::new();
+
+    // 顶部通用协议状态
+    guide_lines.push(Line::from(vec![
+        Span::styled(
+            "当前协议: ",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("[{cur_kind}]"),
+            Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    match cur_kind.as_str() {
+        "openai-compatible" => {
+            guide_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "兼容 OpenAI REST 规范的网关。适合 OneAPI、NewAPI、vLLM、FastChat、本地反代。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        }
+        "anthropic" => {
+            guide_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Anthropic Claude 原生 Messages API。端点通常为 https://api.anthropic.com/v1。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        }
+        "ollama" => {
+            guide_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "本地/内网 Ollama 实例。端点默认为 http://127.0.0.1:11434，通常无需填写密钥。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        }
+        _ => {
+            guide_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "标准 OpenAI 官方接口规范。端点默认为 https://api.openai.com/v1。",
+                    Style::default().fg(DIM),
+                ),
+            ]));
+        }
+    }
+    guide_lines.push(Line::from(""));
+
+    // 字段深度指引
+    guide_lines.push(Line::from(vec![Span::styled(
+        "当前字段配置指南:",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]));
+
+    match sel_field_name {
+        "name" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 服务商标识 (name):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 作为系统内部唯一索引键，不可与已有服务商重复。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 仅允许字母、数字、下划线及减号，不可包含空格或斜杠。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 示例: deepseek_custom, vllm_local, my_gateway",
+            ));
+        }
+        "kind" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 协议类型 (kind):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 决定网络请求的消息格式、流式响应解析协议与鉴权头。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 切换方式: 在本行按键盘 ← 或 → 箭头键，或按空格键循环切换。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 可选协议: openai-compatible, anthropic, ollama, openai",
+            ));
+        }
+        "endpoint" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 接口地址 (endpoint / Base URL):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • API 请求的基础 URL，必须包含 http:// 或 https:// 前缀。",
+            ));
+            guide_lines.push(Line::from("  • 常见端点参考:"));
+            guide_lines.push(Line::from("    - DeepSeek 官方 : https://api.deepseek.com"));
+            guide_lines.push(Line::from(
+                "    - SiliconFlow  : https://api.siliconflow.cn/v1",
+            ));
+            guide_lines.push(Line::from("    - 本地 vLLM    : http://localhost:8000/v1"));
+            guide_lines.push(Line::from("    - 本地 Ollama  : http://localhost:11434"));
+        }
+        "apikey" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 访问密钥 (apikey):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from("  • 服务商颁发的 API Key / Token。"));
+            guide_lines.push(Line::from(
+                "  • 环境变量支持: 支持以 ${ENV_VAR} 语法动态读取系统环境变量。",
+            ));
+            guide_lines.push(Line::from(
+                "    例如: ${DEEPSEEK_API_KEY} 或 ${OPENAI_API_KEY}",
+            ));
+            guide_lines.push(Line::from("  • Ollama 或免密内网网关可留空。"));
+        }
+        "model" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 默认模型名称 (model):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 请求时默认调用的模型 ID，必须与平台实际模型标识一致。",
+            ));
+            guide_lines.push(Line::from("  • 不可包含空格。"));
+            guide_lines.push(Line::from(
+                "  • 常见模型: deepseek-chat, gpt-4o, claude-3-7-sonnet-20250219, qwen2.5:32b",
+            ));
+        }
+        "maxtokens" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 最大输出 Token (maxtokens):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 单次回复的最大生成 Token 数量限制，必须为正整数。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 默认 384000；实际发送值会按该模型 context_length 自动钳制，无需手动保守设置。",
+            ));
+        }
+        "temperature" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 采样温度 (temperature):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from("  • 浮点数，有效范围 0.0 ~ 2.0。"));
+            guide_lines.push(Line::from(
+                "  • 0.0 ~ 0.3: 高度严谨确定，适合代码审计与精准漏洞分析。",
+            ));
+            guide_lines.push(Line::from("  • 0.7: 默认推荐，兼顾逻辑严密与自然表达。"));
+        }
+        "context_length" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 上下文窗口大小 (context_length):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 可选配置。指定该模型的总上下文 Token 承载上限。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 按 ←/→ 或空格在常用预设（默认/128K/256K/512K/1M）间循环切换；直接输入数字则为自定义值（此时 ←/→ 不修改已输入的值）。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 留空 = 未设置（此时不参与 max_tokens 的自动钳制）。",
+            ));
+        }
+        "chat_endpoint" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 自定义对话端点 (chat_endpoint):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 高级选项。自定义流式对话端点完整 URL 或路径。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 留空时默认使用: {base_url}/chat/completions（Ollama 默认为 {base_url}/api/chat）。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 适用于特殊自建网关、API 代理或版本路由（如 /v1/chat/completions）。",
+            ));
+        }
+        "models_endpoint" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 自定义模型列表端点 (models_endpoint):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 高级选项。自定义模型列表拉取端点完整 URL 或路径。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 留空时默认使用: {base_url}/models（Ollama 默认为 {base_url}/api/tags）。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 适用于拉取端点与对话端点不在同一子路径的自建代理服务。",
+            ));
+        }
+        _ => {
+            guide_lines.push(Line::from("  • 填写对应字段内容后，按 Tab 切换至下一项。"));
+        }
+    }
+
+    guide_lines.push(Line::from(""));
+    guide_lines.push(Line::from(vec![Span::styled(
+        "💡 实测连通性提示:",
+        Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+    )]));
+    guide_lines.push(Line::from(
+        "  保存后回到服务商列表，按下 T 键可直接向该端点发起网络与模型探针测速。",
+    ));
+
+    let guide_p = Paragraph::new(guide_lines).wrap(Wrap { trim: false });
+    frame.render_widget(guide_p, guide_inner);
+
+    // 3. 底部状态与操作栏
+    let status_line = if !status.is_empty() {
+        let is_err = status.to_lowercase().contains("error")
+            || status.to_lowercase().contains("invalid")
+            || status.contains("失败")
+            || status.contains("错误")
+            || status.contains("cannot");
+        let st_style = if is_err {
+            Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
+        };
+        Line::from(vec![
+            Span::styled("提示: ", Style::default().fg(MUTED)),
+            Span::styled(status.to_string(), st_style),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "就绪 · 修改后可按 Ctrl+S 快速保存",
+            Style::default().fg(DIM),
+        ))
+    };
+
+    let hint_line = Line::from(vec![
+        Span::styled(" [ Tab/Shift+Tab 切换字段 ] ", Style::default().fg(MUTED)),
+        Span::styled(" [ ↑/↓ 上下行 ] ", Style::default().fg(MUTED)),
+        Span::styled(
+            " [ ←/→ 或 Space 切换协议 ] ",
+            Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " [ Ctrl+S 保存生效 ] ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" [ Esc 取消返回 ] ", Style::default().fg(MUTED)),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+
+    let footer_p = Paragraph::new(vec![status_line, hint_line]);
+    frame.render_widget(footer_p, footer_area);
+}
+
 fn draw_settings_panel(
     frame: &mut Frame,
     bounds: Rect,
@@ -5309,40 +7911,28 @@ fn draw_settings_panel(
         return;
     }
 
-    let width = bounds
-        .width
-        .saturating_sub(2)
-        .clamp(60, 120)
-        .min(bounds.width);
-    let height = bounds
-        .height
-        .saturating_sub(1)
-        .clamp(6, 36)
-        .min(bounds.height);
-    let popup_area = Rect::new(
-        bounds.x + (bounds.width.saturating_sub(width)) / 2,
-        bounds.y + (bounds.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    );
+    let popup_area = bounds;
 
     frame.render_widget(Clear, popup_area);
 
     let border_color = if settings.dirty { ACCENT } else { DIM };
-    let dirty_badge = if settings.dirty {
-        " [● 已修改] "
+    let (dirty_badge, badge_style) = if settings.dirty {
+        (
+            " [● 已修改未保存] ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
     } else {
-        ""
+        (
+            " [✔ 配置已实时保存] ",
+            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+        )
     };
     let title = Line::from(vec![
         Span::styled(
-            " ⚙ 设置中心 (Settings) ",
+            " ⚙ Cyber Master 全局设置中心 (Settings) ",
             Style::default().fg(CODE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            dirty_badge,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(dirty_badge, badge_style),
     ]);
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
@@ -5379,13 +7969,45 @@ fn draw_settings_panel(
         SettingsTab::StorageSystem => draw_tab_storage_system(frame, chunks[2], settings),
     }
 
+    let provider_tip;
     let tip_text = match settings.tab {
         SettingsTab::AgentModel => "💡 提示: 思考强度用于控制 DeepSeek reasoning / Claude thinking 预算。按 Ctrl+S 立即保存生效。",
         SettingsTab::UiWorkflow => "💡 提示: 若需使用终端原生划词复制功能，可在此处将鼠标捕获关闭。主题与鼠标即时生效。",
         SettingsTab::Subagents => "💡 提示: 子任务并发数受本地 CPU 与服务商 API 频率限制，推荐配置为 2~6 个并发。",
-        SettingsTab::ToolsMcp => "💡 提示: MCP 服务器配置存储于 mcp.json，可输入 /mcp 查看详细状态或通过配置文件增删。",
-        SettingsTab::Providers => "💡 提示: 按 Enter 即可快速将高亮服务商切换为全局默认 Provider；按 A 键可打开预设/自定义向导添加服务商，T 键测试连通性，M 键浏览模型。",
-        SettingsTab::EnvMemory => "💡 提示: 标记为脱敏保护的环境变量在终端界面和日志中均会自动遮蔽，保障凭据安全。",
+        SettingsTab::ToolsMcp => {
+            if settings.selected_row >= 3 {
+                "💡 提示: 按 Enter 打开查看该 Skill 的详细配置与 SKILL.md Markdown 指令正文；弹窗内可按 ←/→ 切换技能。"
+            } else {
+                "💡 提示: MCP 服务器配置存储于 mcp.json，可输入 /mcp 调试；向下滚动即可逐项浏览并查阅已加载 Skills。"
+            }
+        }
+        SettingsTab::Providers => {
+            let names = settings.providers_draft.sorted_names();
+            if let Some(name) = names.get(settings.selected_row) {
+                if let Some((is_ok, msg, rtt)) = settings.provider_test_results.get(name) {
+                    let icon = if *is_ok { "🟢" } else { "🔴" };
+                    provider_tip = format!("💡 测速结果 [{name}]: {icon} 延迟 {rtt}ms · {msg}");
+                    &provider_tip
+                } else {
+                    "💡 提示: 按 Enter 即可快速将高亮服务商切换为全局默认 Provider；按 A 键可打开预设/自定义向导添加服务商，T 键测试连通性，M 键浏览模型。"
+                }
+            } else {
+                "💡 提示: 按 Enter 即可快速将高亮服务商切换为全局默认 Provider；按 A 键可打开预设/自定义向导添加服务商，T 键测试连通性，M 键浏览模型。"
+            }
+        }
+        SettingsTab::EnvMemory => {
+            let env_count = settings.config_draft.env.vars.len();
+            let mem_count = settings.config_draft.memory.rules.len();
+            let env_slots = env_count.max(1);
+            let mem_slots = mem_count.max(1);
+            if settings.selected_row < env_slots {
+                "💡 环境变量提示: 注入到工具执行子进程 (Bash/Shell/Agent)；标记为脱敏保护的变量在终端与日志中均会打码遮蔽。"
+            } else if settings.selected_row < env_slots + mem_slots {
+                "💡 记忆规则提示: 每次交互时自动注入 Agent 顶层 Prompt；按 Space 开关启用，←/→ 轮换作用域 (全局/项目)，Enter/E 编辑。"
+            } else {
+                "💡 记忆列表提示: 以下为 memory.md 中已写入的长期记忆条目 (全局/项目级)；按 Enter 查看完整正文，弹窗内 ←/→ 切换上/下一条。"
+            }
+        }
         SettingsTab::StorageSystem => "💡 提示: 日志级别调整后将在后台日志中实时生效；如需排查详细工具执行流，建议调至 debug 级别。",
     };
     frame.render_widget(
@@ -5429,15 +8051,54 @@ fn draw_settings_panel(
             Span::raw(" "),
             Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
         ]),
+        SettingsTab::EnvMemory if chunks[4].width < 100 => Line::from(vec![
+            Span::styled(
+                " [ A 添加 ] ",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " [ E 编辑 ] ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " [ Space 切换 ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " [ D 删除 ] ",
+                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
+        ]),
         SettingsTab::EnvMemory => Line::from(vec![
             Span::styled(
                 " [ A 添加 ] ",
                 Style::default().fg(CODE).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(" [ D 删除 ] ", Style::default().fg(ERROR)),
+            Span::styled(
+                " [ E 编辑 ] ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" "),
-            Span::styled(" [ Space 切换 ] ", Style::default().fg(ACCENT)),
+            Span::styled(
+                " [ Space 切换状态 ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " [ ←/→ 切换作用域 ] ",
+                Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " [ D 删除 ] ",
+                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" "),
             Span::styled(
                 " [ S 保存 (Ctrl+S) ] ",
@@ -5452,7 +8113,7 @@ fn draw_settings_panel(
                 Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(" [ Esc 放弃退出 ] ", Style::default().fg(MUTED)),
+            Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
             Span::raw("  "),
             Span::styled(" [ R 恢复默认 ] ", Style::default().fg(CODE)),
         ]),
@@ -5460,14 +8121,43 @@ fn draw_settings_panel(
     frame.render_widget(Paragraph::new(buttons), chunks[4]);
 
     let nav_hint = match settings.tab {
-        SettingsTab::Providers => "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭",
-        SettingsTab::EnvMemory => "操作: ↑/↓ 选择项目 · A/D 增删 · Space 切换脱敏/启用 · Tab 切换分类 · 1-7 直达 · Esc 关闭",
+        SettingsTab::Providers if chunks[5].width < 100 => {
+            "操作: ↑/↓ · Enter 设默认 · A 添加 · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
+        }
+        SettingsTab::Providers => {
+            "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
+        }
+        SettingsTab::EnvMemory if chunks[5].width < 90 => {
+            "操作: ↑/↓ · Enter 详情/编辑 · A 添加 · Space 切换 · ←/→ 作用域 · D 删除 · Esc 关闭"
+        }
+        SettingsTab::EnvMemory => {
+            "操作: ↑/↓ 选择项目 · Enter/E 编辑 (记忆列表 Enter 查看详情) · A 添加 · Space 切换脱敏/启用 · ←/→ 作用域 · D 删除 · Esc 关闭"
+        }
+        SettingsTab::ToolsMcp if chunks[5].width < 90 => {
+            "操作: ↑/↓ 移动 · Enter 详情/执行 · Tab 切换 · Esc 关闭"
+        }
+        SettingsTab::ToolsMcp => {
+            if settings.selected_row >= 3 {
+                "操作: ↑/↓ 移动焦点 · Enter/空格/o 查看 Skill 详情 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭"
+            } else {
+                "操作: ↑/↓ 选择项目 · ←/→ / 空格 切换开关 · Enter 执行 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭"
+            }
+        }
+        _ if chunks[5].width < 80 => "操作: ↑/↓ · ←/→ 微调 · Tab 轮换 · 1-7 直达 · Esc 关闭",
         _ => "操作: ↑/↓ 选择项目 · ←/→ 微调数值 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭",
     };
     frame.render_widget(
         Paragraph::new(Line::styled(nav_hint, Style::default().fg(DIM))),
         chunks[5],
     );
+
+    if let Some(detail) = &settings.skill_detail {
+        draw_skill_detail_modal(frame, popup_area, settings, detail);
+    }
+
+    if let Some(detail) = &settings.memory_detail {
+        draw_memory_detail_modal(frame, popup_area, settings, detail);
+    }
 
     if settings.pending_discard_confirm {
         draw_discard_modal(frame, popup_area);
@@ -5478,25 +8168,33 @@ fn save_settings_state(
     screen: &mut CliScreen,
     runner: &mut Option<SessionRunner>,
     permissions: &Arc<PermissionBroker>,
+    exit: bool,
 ) {
-    let Some(settings) = screen.settings.take() else {
-        screen.panel = None;
-        return;
+    let (config_draft, providers_draft) = match screen.settings.as_ref() {
+        Some(s) => (s.config_draft.clone(), s.providers_draft.clone()),
+        None => {
+            if exit {
+                screen.panel = None;
+            }
+            return;
+        }
     };
     if let Some(r) = runner.as_mut() {
-        let mouse_changed = settings.config_draft.ui.mouse != r.ctx.config.ui.mouse;
-        let new_mouse = settings.config_draft.ui.mouse;
+        let mouse_changed = config_draft.ui.mouse != r.ctx.config.ui.mouse;
+        let new_mouse = config_draft.ui.mouse;
 
-        if let Err(e) = cyber_core::save_config(&settings.config_draft, &r.ctx.paths.config_file) {
+        if let Err(e) = cyber_core::save_config(&config_draft, &r.ctx.paths.config_file) {
             screen.status = format!("保存配置失败: {e}");
-            screen.panel = None;
+            if exit {
+                screen.panel = None;
+                screen.settings = None;
+            }
             return;
         }
 
-        let _ = cyber_core::save_providers(&settings.providers_draft, &r.ctx.paths.providers_file);
-        r.ctx.providers = settings.providers_draft;
-
-        r.ctx.config = settings.config_draft;
+        let _ = cyber_core::save_providers(&providers_draft, &r.ctx.paths.providers_file);
+        r.ctx.providers = providers_draft;
+        r.ctx.config = config_draft;
 
         if let Some(mode_str) = &r.ctx.config.agent.permission_mode {
             if let Some(mode) = PermissionMode::parse(mode_str) {
@@ -5516,8 +8214,16 @@ fn save_settings_state(
 
         screen.sync(r);
     }
-    screen.panel = None;
+    if let Some(settings) = screen.settings.as_mut() {
+        settings.dirty = false;
+        settings.pending_discard_confirm = false;
+    }
     screen.status = "✔ 设置已保存并立即生效".into();
+
+    if exit {
+        screen.panel = None;
+        screen.settings = None;
+    }
 }
 
 fn handle_settings_key(
@@ -5551,7 +8257,7 @@ fn handle_settings_key(
                     return Ok(false);
                 }
                 KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
-                    save_settings_state(screen, runner, permissions);
+                    save_settings_state(screen, runner, permissions, true);
                     return Ok(false);
                 }
                 KeyCode::Left
@@ -5568,8 +8274,158 @@ fn handle_settings_key(
         }
     }
 
+    if let Some(settings) = screen.settings.as_mut() {
+        if let Some(detail) = settings.skill_detail.as_mut() {
+            match key.code {
+                // 退出弹窗返回列表
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    settings.skill_detail = None;
+                    return Ok(false);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    settings.skill_detail = None;
+                    return Ok(false);
+                }
+                // 滚屏操作
+                KeyCode::Up | KeyCode::Char('k') => {
+                    detail.scroll = detail.scroll.saturating_sub(1);
+                    return Ok(false);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    detail.scroll = detail.scroll.saturating_add(1);
+                    return Ok(false);
+                }
+                KeyCode::PageUp => {
+                    detail.scroll = detail.scroll.saturating_sub(10);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    detail.scroll = detail.scroll.saturating_add(10);
+                    return Ok(false);
+                }
+                KeyCode::Home => {
+                    detail.scroll = 0;
+                    return Ok(false);
+                }
+                KeyCode::End => {
+                    detail.scroll = usize::MAX / 2;
+                    return Ok(false);
+                }
+                // 左右键无缝切换上一个/下一个技能
+                KeyCode::Left | KeyCode::Char('h') => {
+                    if detail.skill_index > 0 {
+                        detail.skill_index -= 1;
+                        detail.scroll = 0;
+                        settings.selected_row = 3 + detail.skill_index; // 同步外层光标！
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    if detail.skill_index + 1 < settings.skills.len() {
+                        detail.skill_index += 1;
+                        detail.scroll = 0;
+                        settings.selected_row = 3 + detail.skill_index; // 同步外层光标！
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    if let Some(settings) = screen.settings.as_mut() {
+        let env_base = settings.config_draft.env.vars.len().max(1)
+            + settings.config_draft.memory.rules.len().max(1);
+        let g = settings.memories_global.len();
+        let total = g + settings.memories_project.len();
+        if let Some(detail) = settings.memory_detail.as_mut() {
+            match key.code {
+                // 退出弹窗返回列表
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    settings.memory_detail = None;
+                    return Ok(false);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    settings.memory_detail = None;
+                    return Ok(false);
+                }
+                // 滚屏操作
+                KeyCode::Up | KeyCode::Char('k') => {
+                    detail.scroll = detail.scroll.saturating_sub(1);
+                    return Ok(false);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    detail.scroll = detail.scroll.saturating_add(1);
+                    return Ok(false);
+                }
+                KeyCode::PageUp => {
+                    detail.scroll = detail.scroll.saturating_sub(10);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    detail.scroll = detail.scroll.saturating_add(10);
+                    return Ok(false);
+                }
+                KeyCode::Home => {
+                    detail.scroll = 0;
+                    return Ok(false);
+                }
+                KeyCode::End => {
+                    detail.scroll = usize::MAX / 2;
+                    return Ok(false);
+                }
+                // 左右键无缝切换上一条/下一条记忆（跨分组）
+                KeyCode::Left | KeyCode::Char('h') if total > 0 => {
+                    let cur = match detail.group {
+                        MemoryGroup::Global => detail.entry,
+                        MemoryGroup::Project => g + detail.entry,
+                    };
+                    if cur > 0 {
+                        let new = cur - 1;
+                        let (grp, ent) = if new < g {
+                            (MemoryGroup::Global, new)
+                        } else {
+                            (MemoryGroup::Project, new - g)
+                        };
+                        detail.group = grp;
+                        detail.entry = ent;
+                        detail.scroll = 0;
+                        settings.selected_row = env_base + new; // 同步外层光标！
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Right | KeyCode::Char('l') if total > 0 => {
+                    let cur = match detail.group {
+                        MemoryGroup::Global => detail.entry,
+                        MemoryGroup::Project => g + detail.entry,
+                    };
+                    if cur + 1 < total {
+                        let new = cur + 1;
+                        let (grp, ent) = if new < g {
+                            (MemoryGroup::Global, new)
+                        } else {
+                            (MemoryGroup::Project, new - g)
+                        };
+                        detail.group = grp;
+                        detail.entry = ent;
+                        detail.scroll = 0;
+                        settings.selected_row = env_base + new; // 同步外层光标！
+                    }
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
     if control && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S')) {
-        save_settings_state(screen, runner, permissions);
+        save_settings_state(screen, runner, permissions, false);
+        return Ok(false);
+    }
+
+    // Ctrl+D 已不再是退出快捷键：设置中心各段的单字母 `d` 是「删除 provider / 环境变量 /
+    // 记忆规则」，必须显式吞掉，避免「移除退出键」变成「误删数据键」。
+    if control && key.code == KeyCode::Char('d') {
         return Ok(false);
     }
 
@@ -5616,7 +8472,7 @@ fn handle_settings_key(
     }
 
     if key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S') {
-        save_settings_state(screen, runner, permissions);
+        save_settings_state(screen, runner, permissions, false);
         return Ok(false);
     }
 
@@ -6018,6 +8874,40 @@ fn handle_settings_key(
                     settings.dirty = true;
                 }
             }
+            2 if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') => {
+                if let Some(owner) = runner.as_ref() {
+                    let config =
+                        cyber_mcp::McpServersConfig::load(&owner.ctx.paths.mcp_servers_file)
+                            .unwrap_or_default();
+                    let path = owner.ctx.paths.mcp_servers_file.clone();
+                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::new(
+                        config,
+                        owner.registries.mcp.as_deref(),
+                        path,
+                    ));
+                } else {
+                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::default());
+                }
+                screen.panel = Some(Panel::Mcp);
+                return Ok(false);
+            }
+            idx if idx >= 3 => {
+                let skill_idx = idx - 3;
+                if skill_idx < settings.skills.len()
+                    && matches!(
+                        key.code,
+                        KeyCode::Enter
+                            | KeyCode::Char('o')
+                            | KeyCode::Char('O')
+                            | KeyCode::Char(' ')
+                    )
+                {
+                    settings.skill_detail = Some(SkillDetailModal {
+                        skill_index: skill_idx,
+                        scroll: 0,
+                    });
+                }
+            }
             _ => {}
         },
         SettingsTab::Providers => {
@@ -6033,6 +8923,8 @@ fn handle_settings_key(
                             if let Ok(CliAction::Picker(p)) =
                                 cli_commands::execute(r, "/provider wizard")
                             {
+                                screen.settings_return_tab = Some(SettingsTab::Providers);
+                                screen.panel = None;
                                 screen.picker = Some(p);
                                 screen.picker_selected = 0;
                             }
@@ -6050,11 +8942,14 @@ fn handle_settings_key(
                             let rtt = start.elapsed().as_millis();
                             match res {
                                 Ok(models) => {
+                                    let msg = format!("发现 {} 款可用模型", models.len());
+                                    settings
+                                        .provider_test_results
+                                        .insert(target_name.clone(), (true, msg.clone(), rtt));
                                     screen.message(
                                         "Ping",
                                         &format!(
-                                            "🟢 [{target_name}] 连通正常 (延迟: {rtt}ms，发现 {} 款可用模型)",
-                                            models.len()
+                                            "🟢 [{target_name}] 连通正常 (延迟: {rtt}ms，{msg})"
                                         ),
                                         SUCCESS,
                                     );
@@ -6062,9 +8957,15 @@ fn handle_settings_key(
                                         format!("服务商 [{target_name}] 连通正常 ({rtt}ms)");
                                 }
                                 Err(e) => {
+                                    let err_msg = e.to_string();
+                                    settings
+                                        .provider_test_results
+                                        .insert(target_name.clone(), (false, err_msg.clone(), rtt));
                                     screen.message(
                                         "Ping",
-                                        &format!("🔴 [{target_name}] 连通失败 ({rtt}ms): {e}"),
+                                        &format!(
+                                            "🔴 [{target_name}] 连通失败 ({rtt}ms): {err_msg}"
+                                        ),
                                         ERROR,
                                     );
                                     screen.status = format!("服务商 [{target_name}] 连通失败");
@@ -6073,20 +8974,49 @@ fn handle_settings_key(
                         }
                     }
                     KeyCode::Char('m') | KeyCode::Char('M') => {
-                        if let Some(r) = runner.as_mut() {
-                            if let Ok(CliAction::Picker(p)) =
-                                cli_commands::execute(r, &format!("/model {name}"))
-                            {
-                                screen.picker = Some(p);
-                                screen.picker_selected = 0;
+                        let mut items = Vec::new();
+                        if let Some(p) = settings.providers_draft.providers.get(name) {
+                            let mut models: Vec<_> = p.models.keys().cloned().collect();
+                            if !p.model.is_empty() && !models.contains(&p.model) {
+                                models.push(p.model.clone());
+                            }
+                            models.sort();
+                            for m in models {
+                                let is_curr = m == p.model;
+                                let label = if is_curr {
+                                    format!("{m} (当前使用)")
+                                } else {
+                                    m.clone()
+                                };
+                                items.push(cli_commands::PickerItem {
+                                    label,
+                                    detail: format!("Provider: {name}"),
+                                    command: format!("/model {name} {m}"),
+                                });
                             }
                         }
+                        if items.is_empty() {
+                            items.push(cli_commands::PickerItem {
+                                label: "(无独立模型配置)".into(),
+                                detail: name.clone(),
+                                command: String::new(),
+                            });
+                        }
+                        screen.settings_return_tab = Some(SettingsTab::Providers);
+                        screen.panel = None;
+                        screen.picker = Some(cli_commands::CommandPicker {
+                            title: format!("Models ({name})"),
+                            items,
+                            kind: cli_commands::PickerKind::Models,
+                        });
+                        screen.picker_selected = 0;
                     }
                     KeyCode::Char('e') | KeyCode::Char('E') => {
                         if let Some(r) = runner.as_mut() {
                             if let Ok(CliAction::Form(form)) =
                                 cli_commands::execute(r, &format!("/provider edit {name}"))
                             {
+                                screen.settings_return_tab = Some(SettingsTab::Providers);
                                 screen.form = Some(FormState::new(form));
                                 screen.panel = None;
                             }
@@ -6111,6 +9041,8 @@ fn handle_settings_key(
             } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
                 if let Some(r) = runner.as_mut() {
                     if let Ok(CliAction::Picker(p)) = cli_commands::execute(r, "/provider wizard") {
+                        screen.settings_return_tab = Some(SettingsTab::Providers);
+                        screen.panel = None;
                         screen.picker = Some(p);
                         screen.picker_selected = 0;
                     }
@@ -6118,10 +9050,52 @@ fn handle_settings_key(
             }
         }
         SettingsTab::EnvMemory => {
-            let env_len = settings.config_draft.env.vars.len();
-            if settings.selected_row < env_len {
+            let env_count = settings.config_draft.env.vars.len();
+            let mem_count = settings.config_draft.memory.rules.len();
+            let env_slots = env_count.max(1);
+            let mem_slots = mem_count.max(1);
+
+            if settings.selected_row < env_slots {
                 match key.code {
-                    KeyCode::Char(' ') => {
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if let Some(r) = runner.as_mut() {
+                            if settings.dirty {
+                                r.ctx.config = settings.config_draft.clone();
+                                let _ = cyber_core::save_config(
+                                    &r.ctx.config,
+                                    &r.ctx.paths.config_file,
+                                );
+                            }
+                            if let Ok(CliAction::Form(form)) = cli_commands::execute(r, "/env add")
+                            {
+                                screen.settings_return_tab = Some(SettingsTab::EnvMemory);
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter if env_count > 0 => {
+                        let var_key = settings.config_draft.env.vars[settings.selected_row]
+                            .key
+                            .clone();
+                        if let Some(r) = runner.as_mut() {
+                            if settings.dirty {
+                                r.ctx.config = settings.config_draft.clone();
+                                let _ = cyber_core::save_config(
+                                    &r.ctx.config,
+                                    &r.ctx.paths.config_file,
+                                );
+                            }
+                            if let Ok(CliAction::Form(form)) =
+                                cli_commands::execute(r, &format!("/env edit {var_key}"))
+                            {
+                                screen.settings_return_tab = Some(SettingsTab::EnvMemory);
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char(' ') if env_count > 0 => {
                         if let Some(var) = settings
                             .config_draft
                             .env
@@ -6130,64 +9104,122 @@ fn handle_settings_key(
                         {
                             var.sensitive = !var.sensitive;
                             settings.dirty = true;
+                            let status_str = if var.sensitive {
+                                "已开启脱敏保护 (打码遮蔽)"
+                            } else {
+                                "已切换为明文公开"
+                            };
+                            screen.status = format!("环境变量 '{}': {}", var.key, status_str);
                         }
                     }
-                    KeyCode::Char('d') | KeyCode::Char('D') => {
-                        settings.config_draft.env.vars.remove(settings.selected_row);
+                    KeyCode::Char('d') | KeyCode::Char('D') if env_count > 0 => {
+                        let removed = settings.config_draft.env.vars.remove(settings.selected_row);
                         settings.dirty = true;
+                        screen.status = format!("已删除环境变量 '{}'", removed.key);
                         let max_r = settings.tab.max_row(settings);
                         settings.selected_row = settings.selected_row.min(max_r);
                     }
+                    _ => {}
+                }
+            } else if settings.selected_row < env_slots + mem_slots {
+                let rule_idx = settings.selected_row - env_slots;
+                match key.code {
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        let new_key = format!("CUSTOM_VAR_{}", env_len + 1);
-                        settings.config_draft.env.vars.push(EnvVar {
-                            key: new_key,
-                            value: "value".into(),
-                            sensitive: false,
-                        });
+                        if let Some(r) = runner.as_mut() {
+                            if settings.dirty {
+                                r.ctx.config = settings.config_draft.clone();
+                                let _ = cyber_core::save_config(
+                                    &r.ctx.config,
+                                    &r.ctx.paths.config_file,
+                                );
+                            }
+                            if let Ok(CliAction::Form(form)) =
+                                cli_commands::execute(r, "/memory rule add")
+                            {
+                                screen.settings_return_tab = Some(SettingsTab::EnvMemory);
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter if mem_count > 0 => {
+                        if let Some(r) = runner.as_mut() {
+                            if settings.dirty {
+                                r.ctx.config = settings.config_draft.clone();
+                                let _ = cyber_core::save_config(
+                                    &r.ctx.config,
+                                    &r.ctx.paths.config_file,
+                                );
+                            }
+                            if let Ok(CliAction::Form(form)) = cli_commands::execute(
+                                r,
+                                &format!("/memory rule edit {}", rule_idx + 1),
+                            ) {
+                                screen.settings_return_tab = Some(SettingsTab::EnvMemory);
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char(' ') if mem_count > 0 => {
+                        if let Some(rule) = settings.config_draft.memory.rules.get_mut(rule_idx) {
+                            rule.enabled = !rule.enabled;
+                            settings.dirty = true;
+                            let status_str = if rule.enabled {
+                                "已开启"
+                            } else {
+                                "已关闭"
+                            };
+                            screen.status = format!("记忆规则 #{}: {}", rule_idx + 1, status_str);
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Right if mem_count > 0 => {
+                        if let Some(rule) = settings.config_draft.memory.rules.get_mut(rule_idx) {
+                            let scopes = ["both", "project", "global"];
+                            let cur_idx = scopes.iter().position(|s| *s == rule.scope).unwrap_or(0);
+                            let next_idx = if key.code == KeyCode::Left {
+                                (cur_idx + scopes.len() - 1) % scopes.len()
+                            } else {
+                                (cur_idx + 1) % scopes.len()
+                            };
+                            rule.scope = scopes[next_idx].to_string();
+                            settings.dirty = true;
+                            let scope_label = match rule.scope.as_str() {
+                                "both" => "全局与项目",
+                                "project" => "项目级",
+                                _ => "全局",
+                            };
+                            screen.status = format!(
+                                "记忆规则 #{}: 作用域切换为 [{}]",
+                                rule_idx + 1,
+                                scope_label
+                            );
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D')
+                        if mem_count > 0 && rule_idx < settings.config_draft.memory.rules.len() =>
+                    {
+                        settings.config_draft.memory.rules.remove(rule_idx);
                         settings.dirty = true;
+                        screen.status = format!("已删除记忆规则 #{}", rule_idx + 1);
+                        let max_r = settings.tab.max_row(settings);
+                        settings.selected_row = settings.selected_row.min(max_r);
                     }
                     _ => {}
                 }
             } else {
-                let rule_idx = settings.selected_row - env_len;
-                if let Some(rule) = settings.config_draft.memory.rules.get_mut(rule_idx) {
-                    match key.code {
-                        KeyCode::Char(' ') | KeyCode::Enter => {
-                            rule.enabled = !rule.enabled;
-                            settings.dirty = true;
-                        }
-                        KeyCode::Tab => {
-                            rule.scope = match rule.scope.as_str() {
-                                "both" => "project".into(),
-                                "project" => "global".into(),
-                                _ => "both".into(),
-                            };
-                            settings.dirty = true;
-                        }
-                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                            settings.config_draft.memory.rules.remove(rule_idx);
-                            settings.dirty = true;
-                            let max_r = settings.tab.max_row(settings);
-                            settings.selected_row = settings.selected_row.min(max_r);
-                        }
-                        KeyCode::Char('a') | KeyCode::Char('A') => {
-                            settings.config_draft.memory.rules.push(MemoryRule {
-                                enabled: true,
-                                scope: "both".into(),
-                                prompt: "新记忆规则".into(),
-                            });
-                            settings.dirty = true;
-                        }
-                        _ => {}
+                let mem_idx = settings.selected_row - env_slots - mem_slots;
+                if matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') | KeyCode::Char(' ')
+                ) {
+                    if let Some((group, entry)) = settings.memory_at(mem_idx) {
+                        settings.memory_detail = Some(MemoryDetailModal {
+                            group,
+                            entry,
+                            scroll: 0,
+                        });
                     }
-                } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
-                    settings.config_draft.memory.rules.push(MemoryRule {
-                        enabled: true,
-                        scope: "both".into(),
-                        prompt: "新记忆规则".into(),
-                    });
-                    settings.dirty = true;
                 }
             }
         }
@@ -6229,6 +9261,762 @@ fn handle_settings_key(
             }
             _ => {}
         },
+    }
+
+    Ok(false)
+}
+
+fn handle_mcp_key(
+    screen: &mut CliScreen,
+    _runner: &mut Option<SessionRunner>,
+    _permissions: &Arc<PermissionBroker>,
+    key: KeyEvent,
+) -> color_eyre::Result<bool> {
+    let Some(mcp) = screen.mcp_panel.as_mut() else {
+        screen.panel = None;
+        return Ok(false);
+    };
+
+    let action = mcp.handle_key(key);
+    match action {
+        crate::views::mcp_panel::McpPanelAction::None => Ok(false),
+        crate::views::mcp_panel::McpPanelAction::Close => {
+            screen.panel = None;
+            screen.mcp_panel = None;
+            Ok(false)
+        }
+        crate::views::mcp_panel::McpPanelAction::Save => {
+            if let Err(e) = mcp.save_to_disk() {
+                screen.message("MCP", &format!("保存失败: {e}"), ERROR);
+            } else {
+                screen.message("MCP", "MCP 服务器配置已保存至 servers.toml", SUCCESS);
+            }
+            Ok(false)
+        }
+        crate::views::mcp_panel::McpPanelAction::TestConnection(server_name) => {
+            let Some(item) = mcp.servers.iter().find(|s| s.spec.name == server_name) else {
+                return Ok(false);
+            };
+            let spec = item.spec.clone();
+            mcp.set_status(format!("正在测试 [{server_name}] 连接并探测工具清单..."));
+            let start = std::time::Instant::now();
+            let res = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    match cyber_mcp::McpConnection::connect(&spec).await {
+                        Ok((conn, handle)) => {
+                            let tools = conn.tools().to_vec();
+                            conn.shutdown();
+                            let _ =
+                                tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+                                    .await;
+                            Ok(tools)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            });
+            let elapsed = start.elapsed();
+            match res {
+                Ok(tools) => {
+                    let tool_count = tools.len();
+                    if let Some(s) = mcp.servers.iter_mut().find(|s| s.spec.name == server_name) {
+                        s.connected = true;
+                        s.tool_count = tool_count;
+                        s.latency = Some(elapsed);
+                        s.error = None;
+                        s.tools = tools;
+                    }
+                    mcp.set_status(format!(
+                        "🟢 [{server_name}] 连接成功 (握手延迟: {}ms, 导出 {tool_count} 个工具)",
+                        elapsed.as_millis()
+                    ));
+                }
+                Err(e) => {
+                    if let Some(s) = mcp.servers.iter_mut().find(|s| s.spec.name == server_name) {
+                        s.connected = false;
+                        s.error = Some(e.clone());
+                        s.latency = None;
+                    }
+                    mcp.set_status(format!("🔴 [{server_name}] 连接失败: {e}"));
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn draw_model_picker(
+    frame: &mut Frame,
+    bounds: Rect,
+    state: &mut CliModelPickerState,
+    active_provider: &str,
+) {
+    if bounds.width < 40 || bounds.height < 6 {
+        return;
+    }
+
+    let popup_area = bounds;
+
+    frame.render_widget(Clear, popup_area);
+
+    let outer_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(" 模型选择 / Model Picker ")
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        );
+    let inner = outer_block.inner(popup_area);
+    frame.render_widget(outer_block, popup_area);
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),    // 双栏
+        Constraint::Length(1), // 底部状态提示条
+    ])
+    .split(inner);
+    let body = chunks[0];
+    let footer_area = chunks[1];
+
+    let panes =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(body);
+    let prov_area = panes[0];
+    let model_area = panes[1];
+
+    // 1. 左栏：Providers
+    let prov_focused = !state.focus_models;
+    let prov_border_color = if prov_focused { ACCENT } else { DIM };
+    let prov_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(prov_border_color))
+        .title(
+            Line::from(" 服务商 / Providers ").style(
+                Style::default()
+                    .fg(if prov_focused { ACCENT } else { MUTED })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    let prov_inner = prov_block.inner(prov_area);
+    frame.render_widget(prov_block, prov_area);
+
+    let names = state.providers.sorted_names();
+    let mut prov_lines: Vec<Line<'static>> = Vec::new();
+    if names.is_empty() {
+        prov_lines
+            .push(Line::from("（无可用服务商）").alignment(ratatui::layout::Alignment::Center));
+    } else {
+        for (i, name) in names.iter().enumerate() {
+            let selected = i == state.provider_selected;
+            let is_default = name == &state.default_provider;
+            let is_active_session = active_provider == *name;
+            let marker = if selected { "▸ " } else { "  " };
+            let cfg = state.providers.providers.get(name);
+            let kind = cfg.map(|c| c.kind.as_str()).unwrap_or("");
+            let model = cfg.map(|c| c.model.as_str()).unwrap_or("");
+
+            let sel_bg = Color::Rgb(38, 79, 120);
+            let row_style = if selected && prov_focused {
+                Style::default().bg(sel_bg)
+            } else if selected {
+                Style::default().bg(Color::Rgb(30, 36, 48))
+            } else {
+                Style::default()
+            };
+
+            let max_prov_w = (prov_inner.width as usize).saturating_sub(1);
+            let mut badges_w = 2usize;
+            if is_default {
+                badges_w += 8;
+            }
+            if is_active_session {
+                badges_w += 2;
+            }
+            let name_budget = max_prov_w.saturating_sub(badges_w);
+            let clipped_name = clip_cells_ellipsis(name, name_budget);
+
+            let mut title_spans = vec![
+                Span::styled(
+                    marker,
+                    if selected {
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    },
+                ),
+                Span::styled(
+                    clipped_name,
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if is_default {
+                title_spans.push(Span::styled(
+                    "  ★ 默认",
+                    Style::default()
+                        .fg(Color::Rgb(254, 188, 56))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if is_active_session {
+                title_spans.push(Span::styled(
+                    " ●",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            let sub_text = format!("    [{kind}] {model}");
+            let clipped_sub = clip_cells_ellipsis(&sub_text, max_prov_w);
+
+            prov_lines.push(Line::from(title_spans).style(row_style));
+            prov_lines.push(
+                Line::from(vec![Span::styled(clipped_sub, Style::default().fg(MUTED))])
+                    .style(row_style),
+            );
+        }
+    }
+
+    // 粘性滚动计算（左栏每项 2 行）
+    let prov_h = prov_inner.height as usize;
+    let prov_total = prov_lines.len();
+    let sel_start = state.provider_selected * 2;
+    let sel_end = (sel_start + 2).min(prov_total);
+    let mut prov_scroll = state.provider_scroll;
+    if prov_total <= prov_h {
+        prov_scroll = 0;
+    } else if sel_start < prov_scroll {
+        prov_scroll = sel_start;
+    } else if sel_end > prov_scroll + prov_h {
+        prov_scroll = sel_end
+            .saturating_sub(prov_h)
+            .min(prov_total.saturating_sub(prov_h));
+    }
+    state.provider_scroll = prov_scroll;
+
+    frame.render_widget(
+        Paragraph::new(prov_lines).scroll((prov_scroll as u16, 0)),
+        prov_inner,
+    );
+
+    // 2. 右栏：Models
+    let model_focused = state.focus_models;
+    let model_border_color = if model_focused { ACCENT } else { DIM };
+    let current_prov_name = names
+        .get(state.provider_selected)
+        .cloned()
+        .unwrap_or_default();
+    let model_title = if current_prov_name.is_empty() {
+        " 模型 / Models ".to_string()
+    } else {
+        format!(" 模型 / Models ({current_prov_name}) ")
+    };
+    // 标题绘制在顶边框上：裁剪防止长 provider 名覆盖右上角边框。
+    let model_title =
+        clip_cells_ellipsis(&model_title, (model_area.width as usize).saturating_sub(3));
+    let model_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(model_border_color))
+        .title(
+            Line::from(model_title).style(
+                Style::default()
+                    .fg(if model_focused { ACCENT } else { MUTED })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    let model_inner = model_block.inner(model_area);
+    frame.render_widget(model_block, model_area);
+
+    let mut model_lines: Vec<Line<'static>> = Vec::new();
+    let cur_prov_cfg = state.providers.providers.get(&current_prov_name);
+    if state.models.is_empty() {
+        model_lines.push(
+            Line::from("（无可用模型）")
+                .style(Style::default().fg(MUTED))
+                .alignment(ratatui::layout::Alignment::Center),
+        );
+    } else {
+        for (i, m) in state.models.iter().enumerate() {
+            let selected = i == state.model_selected;
+            let marker = if selected { "▸ " } else { "  " };
+            let is_probing = state.probing_model.as_deref() == Some(m.as_str());
+            let is_active = cur_prov_cfg.map(|p| p.model == *m).unwrap_or(false);
+
+            let label = if let Some(alias) = cur_prov_cfg
+                .and_then(|p| p.models.get(m))
+                .and_then(|mc| mc.alias.as_ref())
+                .filter(|a| !a.is_empty())
+            {
+                format!("{alias} → {m}")
+            } else {
+                m.clone()
+            };
+
+            let sel_bg = Color::Rgb(38, 79, 120);
+            let row_style = if selected && model_focused {
+                Style::default().bg(sel_bg)
+            } else if selected {
+                Style::default().bg(Color::Rgb(30, 36, 48))
+            } else {
+                Style::default()
+            };
+
+            let max_model_w = (model_inner.width as usize).saturating_sub(1);
+            let has_vision = cur_prov_cfg
+                .map(|p_cfg| {
+                    cyber_core::get_model_vision_capability(p_cfg, &current_prov_name, m, None)
+                        == cyber_core::VisionCapability::Supported
+                })
+                .unwrap_or(false);
+            let mut badges_w = 2usize; // marker
+            if is_probing || has_vision {
+                badges_w += 8;
+            }
+            if is_active {
+                badges_w += 8;
+            }
+            let label_budget = max_model_w.saturating_sub(badges_w);
+            let clipped_label = clip_cells_ellipsis(&label, label_budget);
+
+            let mut spans = vec![
+                Span::styled(
+                    marker,
+                    if selected {
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    },
+                ),
+                Span::styled(
+                    clipped_label,
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                ),
+            ];
+
+            if is_probing {
+                spans.push(Span::styled(
+                    "  ⟳ 探测中",
+                    Style::default()
+                        .fg(Color::Rgb(254, 188, 56))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if has_vision {
+                spans.push(Span::styled(
+                    "  ◈ 视觉",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            if is_active {
+                spans.push(Span::styled(
+                    "  ✓ 当前",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            model_lines.push(Line::from(spans).style(row_style));
+        }
+    }
+
+    // 粘性滚动计算（右栏每项 1 行）
+    let model_h = model_inner.height as usize;
+    let model_total = model_lines.len();
+    let sel = state.model_selected;
+    let mut model_scroll = state.model_scroll;
+    if model_total <= model_h {
+        model_scroll = 0;
+    } else if sel < model_scroll {
+        model_scroll = sel;
+    } else if sel >= model_scroll + model_h {
+        model_scroll = (sel + 1).saturating_sub(model_h);
+    }
+    state.model_scroll = model_scroll;
+
+    frame.render_widget(
+        Paragraph::new(model_lines).scroll((model_scroll as u16, 0)),
+        model_inner,
+    );
+
+    // 3. 底部状态与快捷键条
+    let hint_line = Line::from(vec![
+        Span::styled(
+            " Tab/←/→",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 切栏 · ", Style::default().fg(MUTED)),
+        Span::styled(
+            "↑/↓",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 移动 · ", Style::default().fg(MUTED)),
+        Span::styled(
+            "Enter",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 确认选择 · ", Style::default().fg(MUTED)),
+        Span::styled(
+            "t",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 探测识图 · ", Style::default().fg(MUTED)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 关闭 ", Style::default().fg(MUTED)),
+    ])
+    .alignment(ratatui::layout::Alignment::Center);
+
+    frame.render_widget(Paragraph::new(hint_line), footer_area);
+}
+
+fn handle_model_picker_key(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    key: KeyEvent,
+) -> color_eyre::Result<bool> {
+    let Some(state) = screen.model_picker.as_mut() else {
+        screen.panel = None;
+        return Ok(false);
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            screen.panel = None;
+            screen.model_picker = None;
+            return Ok(false);
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            screen.panel = None;
+            screen.model_picker = None;
+            return Ok(false);
+        }
+        KeyCode::Tab => {
+            state.focus_models = !state.focus_models;
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            state.focus_models = false;
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            state.focus_models = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if state.focus_models {
+                if state.model_selected > 0 {
+                    state.model_selected -= 1;
+                } else if !state.models.is_empty() {
+                    state.model_selected = state.models.len() - 1;
+                }
+            } else {
+                let total = state.providers.sorted_names().len();
+                if total > 0 {
+                    if state.provider_selected > 0 {
+                        state.provider_selected -= 1;
+                    } else {
+                        state.provider_selected = total - 1;
+                    }
+                    state.refresh_models();
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if state.focus_models {
+                if !state.models.is_empty() {
+                    if state.model_selected + 1 < state.models.len() {
+                        state.model_selected += 1;
+                    } else {
+                        state.model_selected = 0;
+                    }
+                }
+            } else {
+                let total = state.providers.sorted_names().len();
+                if total > 0 {
+                    if state.provider_selected + 1 < total {
+                        state.provider_selected += 1;
+                    } else {
+                        state.provider_selected = 0;
+                    }
+                    state.refresh_models();
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if !state.focus_models {
+                state.focus_models = true;
+            } else {
+                let selected_model = state.models.get(state.model_selected).cloned();
+                let selected_provider = state
+                    .providers
+                    .sorted_names()
+                    .get(state.provider_selected)
+                    .cloned();
+
+                if let (Some(prov), Some(model)) = (selected_provider, selected_model) {
+                    if let Some(r) = runner.as_mut() {
+                        if let Err(err) = r.select_model_persisted(&prov, Some(&model)) {
+                            screen.message("Error", &format!("保存模型失败: {err}"), ERROR);
+                            return Ok(false);
+                        }
+                    }
+                    screen.provider = prov.clone();
+                    screen.model = model.clone();
+                    screen.status = format!("已切换模型为 {prov} · {model}");
+                    screen.message(
+                        "Model",
+                        &format!("✔ 已切换模型为 {prov} · {model}"),
+                        SUCCESS,
+                    );
+                    screen.panel = None;
+                    screen.model_picker = None;
+                }
+            }
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') if state.focus_models => {
+            let selected_model = state.models.get(state.model_selected).cloned();
+            let selected_provider = state
+                .providers
+                .sorted_names()
+                .get(state.provider_selected)
+                .cloned();
+
+            if let (Some(prov), Some(model)) = (selected_provider, selected_model) {
+                if state.probing_model.is_none() {
+                    if let Some(cfg_snapshot) = state.providers.providers.get(&prov).cloned() {
+                        state.probing_model = Some(model.clone());
+                        screen.message(
+                            "Probe",
+                            &format!("正在实测模型 [{model}] 的视觉识图能力..."),
+                            ACCENT,
+                        );
+                        let prov_name = prov.clone();
+                        let model_name = model.clone();
+                        tokio::spawn(async move {
+                            let res =
+                                cyber_agent::probe_model_vision(&cfg_snapshot, &model_name).await;
+                            if let Ok(cap) = res {
+                                let _ = cyber_core::save_model_vision_capability(
+                                    &prov_name,
+                                    &model_name,
+                                    cap,
+                                    None,
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_ctf_key(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    permissions: &Arc<PermissionBroker>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    active: &mut Option<ActiveTurn>,
+    cancel: &mut Option<oneshot::Sender<()>>,
+    key: KeyEvent,
+) -> color_eyre::Result<bool> {
+    if let Some(form) = screen.ctf_edit_form.as_mut() {
+        let action = form.handle_key(key);
+        match action {
+            crate::views::ctf_edit_form::CtfEditFormAction::None => {}
+            crate::views::ctf_edit_form::CtfEditFormAction::Cancel => {
+                screen.ctf_edit_form = None;
+            }
+            crate::views::ctf_edit_form::CtfEditFormAction::Save => {
+                if let Some(form) = screen.ctf_edit_form.take() {
+                    let challenge_id = form.challenge_id.clone();
+                    let challenge = screen
+                        .ctf_challenges
+                        .lock()
+                        .ok()
+                        .and_then(|list| list.iter().find(|c| c.id == challenge_id).cloned());
+                    if let Some(c) = challenge {
+                        let applied = form.apply_to(c);
+                        if let Some(name) = screen.ctf_update_selected(applied) {
+                            if let Some(r) = runner.as_mut() {
+                                let _ = r.save();
+                            }
+                            screen.message("CTF", &format!("「{name}」已保存"), ACCENT);
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(false);
+    }
+
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if control && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('T')) {
+        screen.panel = None;
+        screen.ctf_detail_view = false;
+        screen.ctf_detail_scroll = 0;
+        return Ok(false);
+    }
+
+    // Ctrl+D 已不再是退出快捷键；CTF 面板的单字母 `d` 是删除题目，必须显式吞掉。
+    if control && key.code == KeyCode::Char('d') {
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Esc {
+        if key.modifiers.contains(KeyModifiers::SHIFT) || !screen.ctf_detail_view {
+            screen.panel = None;
+            screen.ctf_detail_view = false;
+            screen.ctf_detail_scroll = 0;
+        } else {
+            screen.ctf_detail_view = false;
+            screen.ctf_detail_scroll = 0;
+        }
+        return Ok(false);
+    }
+
+    let len = screen.ctf_challenges_count();
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_view = false;
+                screen.ctf_detail_scroll = 0;
+            } else {
+                screen.panel = None;
+                screen.ctf_detail_view = false;
+                screen.ctf_detail_scroll = 0;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Char('8') => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(1);
+            } else if screen.ctf_selected > 0 {
+                screen.ctf_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('2') => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(1);
+            } else if len > 0 && screen.ctf_selected + 1 < len {
+                screen.ctf_selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(10);
+            } else {
+                screen.ctf_selected = screen.ctf_selected.saturating_sub(5);
+            }
+        }
+        KeyCode::PageDown => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(10);
+            } else if len > 0 {
+                screen.ctf_selected = (screen.ctf_selected + 5).min(len.saturating_sub(1));
+            }
+        }
+        KeyCode::Home => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_scroll = 0;
+            } else {
+                screen.ctf_selected = 0;
+            }
+        }
+        KeyCode::End => {
+            if screen.ctf_detail_view {
+                screen.ctf_detail_scroll = usize::MAX / 2;
+            } else if len > 0 {
+                screen.ctf_selected = len.saturating_sub(1);
+            }
+        }
+        KeyCode::Enter => {
+            if !screen.ctf_detail_view && len > 0 && screen.ctf_selected < len {
+                screen.ctf_detail_view = true;
+                screen.ctf_detail_scroll = 0;
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if !screen.ctf_detail_view {
+                if let Some(name) = screen.ctf_remove_selected() {
+                    if let Some(r) = runner.as_mut() {
+                        let _ = r.save();
+                    }
+                    screen.message("CTF", &format!("已删除「{name}」"), ACCENT);
+                }
+            }
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if !screen.ctf_detail_view {
+                if let Some((name, solved)) = screen.ctf_toggle_status_selected() {
+                    if let Some(r) = runner.as_mut() {
+                        let _ = r.save();
+                    }
+                    let status_str = if solved { "已完成" } else { "进行中" };
+                    screen.message("CTF", &format!("「{name}」→ {status_str}"), ACCENT);
+                }
+            }
+        }
+        KeyCode::Char('g') => {
+            if !screen.ctf_detail_view {
+                if let Some((name, is_global)) = screen.ctf_toggle_global_selected() {
+                    if let Some(r) = runner.as_mut() {
+                        let _ = r.save();
+                    }
+                    let scope_str = if is_global {
+                        "全局 ★"
+                    } else {
+                        "仅本 session"
+                    };
+                    screen.message("CTF", &format!("「{name}」→ {scope_str}"), ACCENT);
+                }
+            }
+        }
+        KeyCode::Char('G') => {
+            if !screen.ctf_detail_view {
+                let count = screen.ctf_set_all_global();
+                if count > 0 {
+                    if let Some(r) = runner.as_mut() {
+                        let _ = r.save();
+                    }
+                    screen.message("CTF", &format!("已将 {count} 道题目设为全局"), ACCENT);
+                } else {
+                    screen.message("CTF", "当前 session 无需转换的题目", MUTED);
+                }
+            }
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            if !screen.ctf_detail_view {
+                if let Some(challenge) = screen.ctf_challenge_at(screen.ctf_selected) {
+                    screen.ctf_edit_form = Some(
+                        crate::views::ctf_edit_form::CtfEditFormState::from_challenge(&challenge),
+                    );
+                }
+            }
+        }
+        KeyCode::Char('w') | KeyCode::Char('W') if screen.ctf_detail_view => {
+            if let Some(challenge) = screen.ctf_challenge_at(screen.ctf_selected) {
+                if challenge.is_solved() {
+                    screen.panel = None;
+                    screen.ctf_detail_view = false;
+                    screen.ctf_detail_scroll = 0;
+                    return apply_action(
+                        screen,
+                        CliAction::Task(cli_commands::CliTask::Writeup {
+                            challenge: Box::new(challenge),
+                        }),
+                        runner,
+                        permissions,
+                        events,
+                        active,
+                        cancel,
+                    );
+                } else {
+                    screen.message("CTF", "题目尚未解决，需解题完成后才能生成 Writeup", MUTED);
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(false)
@@ -6435,6 +10223,12 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     }
     let runner = SessionRunner::new(cwd, mock).await?;
     let mut screen = CliScreen::new(&runner);
+    let mut question_rx = runner
+        .registries
+        .question_rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let mut runner = Some(runner);
     let (broker, mut requests) = PermissionBroker::interactive();
     broker.set_mode(screen.permission_mode);
@@ -6479,6 +10273,12 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                     } else {
                         break;
                     }
+                    if let Some(q) = screen.question_state.take() {
+                        let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                            answers: Vec::new(),
+                            cancelled: true,
+                        });
+                    }
                 }
                 Some(new_ver) = update_rx.recv() => {
                     if screen.new_version.as_deref() != Some(&new_ver) {
@@ -6499,15 +10299,18 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                         && crate::win_paste::is_terminal_foreground()
                         && screen.approval.is_none()
                         && screen.form.is_none()
+                        && screen.question_state.is_none()
                         && screen.handle_clipboard_image_only()
                     {
                         screen.update_completions(runner.as_ref());
                     }
                     if let Some(text) = paste.flush_if_stale() {
                         screen.insert_text(&text);
-                        screen.completion_closed = false;
-                        screen.completion_accepted = false;
-                        screen.update_completions(runner.as_ref());
+                        if screen.question_state.is_none() {
+                            screen.completion_closed = false;
+                            screen.completion_accepted = false;
+                            screen.update_completions(runner.as_ref());
+                        }
                     }
                     if screen.needs_clear {
                         terminal.clear()?;
@@ -6536,6 +10339,25 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                         screen.approval_input = composer();
                         screen.approval_input.set_placeholder_text("Press 1, 2 or 3 to select an action");
                         screen.approval = Some(request);
+                    }
+                }
+                q_req = async {
+                    match question_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if screen.question_state.is_none() => {
+                    if let Some(req) = q_req {
+                        if !screen.busy || screen.status == "Cancelling" || req.reply.is_closed() {
+                            let _ = req.reply.send(cyber_agent::QuestionResponse {
+                                answers: Vec::new(),
+                                cancelled: true,
+                            });
+                            continue;
+                        }
+                        if let Some(text) = paste.flush() { screen.insert_text(&text); }
+                        screen.panel = None;
+                        screen.question_state = Some(crate::question_ui::QuestionUiState::new(req));
                     }
                 }
                 finished = async { active.as_mut().unwrap().await }, if active.is_some() => {
@@ -6588,9 +10410,11 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                 KeyDisposition::FlushThenProcess => {
                                     if let Some(text) = paste.flush() {
                                         screen.insert_text(&text);
-                                        screen.completion_closed = false;
-                                        screen.completion_accepted = false;
-                                        screen.update_completions(runner.as_ref());
+                                        if screen.question_state.is_none() {
+                                            screen.completion_closed = false;
+                                            screen.completion_accepted = false;
+                                            screen.update_completions(runner.as_ref());
+                                        }
                                     }
                                 }
                                 KeyDisposition::Process => {}
@@ -6608,28 +10432,47 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                 continue;
                             }
                             screen.last_paste_instant = Some(std::time::Instant::now());
-                            if text.trim().is_empty() {
-                                if screen.handle_clipboard_image_only() {
+                            if screen.question_state.is_none() {
+                                if text.trim().is_empty() {
+                                    if screen.handle_clipboard_image_only() {
+                                        screen.completion_closed = false;
+                                        screen.completion_accepted = false;
+                                        screen.update_completions(runner.as_ref());
+                                        continue;
+                                    }
+                                } else if screen.handle_text_image_paste(&text) {
                                     screen.completion_closed = false;
                                     screen.completion_accepted = false;
                                     screen.update_completions(runner.as_ref());
                                     continue;
                                 }
-                            } else if screen.handle_text_image_paste(&text) {
+                            }
+                            screen.insert_text(&text);
+                            if screen.question_state.is_none() {
                                 screen.completion_closed = false;
                                 screen.completion_accepted = false;
                                 screen.update_completions(runner.as_ref());
-                                continue;
                             }
-                            screen.insert_text(&text);
-                            screen.completion_closed = false;
-                            screen.completion_accepted = false;
-                            screen.update_completions(runner.as_ref());
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => {
-                                    if screen.panel == Some(Panel::Ctf) {
+                                    if screen.panel == Some(Panel::Mcp) {
+                                        if let Some(mcp) = screen.mcp_panel.as_mut() {
+                                            mcp.scroll_up(3);
+                                        }
+                                    } else if screen.panel == Some(Panel::ModelPicker) {
+                                        if let Some(state) = screen.model_picker.as_mut() {
+                                            if state.focus_models {
+                                                if state.model_selected > 0 {
+                                                    state.model_selected -= 1;
+                                                }
+                                            } else if state.provider_selected > 0 {
+                                                state.provider_selected -= 1;
+                                                state.refresh_models();
+                                            }
+                                        }
+                                    } else if screen.panel == Some(Panel::Ctf) {
                                         if screen.ctf_detail_view {
                                             screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(3);
                                         } else if screen.ctf_selected > 0 {
@@ -6650,7 +10493,25 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                     }
                                 }
                                 MouseEventKind::ScrollDown => {
-                                    if screen.panel == Some(Panel::Ctf) {
+                                    if screen.panel == Some(Panel::Mcp) {
+                                        if let Some(mcp) = screen.mcp_panel.as_mut() {
+                                            mcp.scroll_down(3);
+                                        }
+                                    } else if screen.panel == Some(Panel::ModelPicker) {
+                                        if let Some(state) = screen.model_picker.as_mut() {
+                                            if state.focus_models {
+                                                if state.model_selected + 1 < state.models.len() {
+                                                    state.model_selected += 1;
+                                                }
+                                            } else {
+                                                let total = state.providers.sorted_names().len();
+                                                if state.provider_selected + 1 < total {
+                                                    state.provider_selected += 1;
+                                                    state.refresh_models();
+                                                }
+                                            }
+                                        }
+                                    } else if screen.panel == Some(Panel::Ctf) {
                                         if screen.ctf_detail_view {
                                             screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(3);
                                         } else {
@@ -6695,6 +10556,12 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     // Cancellation is cooperative with the shared runner so history is saved
     // even if rendering/input fails. Never detach an executing agent on exit.
     screen.reply(PermissionDecision::Deny);
+    if let Some(q) = screen.question_state.take() {
+        let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+            answers: Vec::new(),
+            cancelled: true,
+        });
+    }
     if let Some(cancel) = cancel {
         let _ = cancel.send(());
     }
@@ -6905,6 +10772,26 @@ fn handle_key(
     active: &mut Option<ActiveTurn>,
     cancel: &mut Option<oneshot::Sender<()>>,
 ) -> color_eyre::Result<bool> {
+    if let Some(q_state) = screen.question_state.as_mut() {
+        match q_state.handle_key(key) {
+            crate::question_ui::QuestionUiResult::Continue => return Ok(false),
+            crate::question_ui::QuestionUiResult::Submit(resp) => {
+                if let Some(q) = screen.question_state.take() {
+                    let _ = q.request.reply.send(resp);
+                }
+                return Ok(false);
+            }
+            crate::question_ui::QuestionUiResult::Cancel => {
+                if let Some(q) = screen.question_state.take() {
+                    let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                        answers: Vec::new(),
+                        cancelled: true,
+                    });
+                }
+                return Ok(false);
+            }
+        }
+    }
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     if key.code != KeyCode::Char('d') || !key.modifiers.is_empty() {
         screen.delete_pending = None;
@@ -6926,6 +10813,12 @@ fn handle_key(
         }
         if let Some(cancel_tx) = cancel.take() {
             let _ = cancel_tx.send(());
+            if let Some(q) = screen.question_state.take() {
+                let _ = q.request.reply.send(cyber_agent::QuestionResponse {
+                    answers: Vec::new(),
+                    cancelled: true,
+                });
+            }
             screen.queued_prompts.clear();
             screen.status = "Cancelling (再按一次 Ctrl+C 强制退出)".into();
             screen.last_ctrl_c = Some(std::time::Instant::now());
@@ -6971,14 +10864,6 @@ fn handle_key(
         screen.reply(PermissionDecision::Deny);
         return Ok(false);
     }
-    if control
-        && key.code == KeyCode::Char('d')
-        && screen.input.is_empty()
-        && screen.approval.is_none()
-        && screen.form.is_none()
-    {
-        return Ok(true);
-    }
     if control && key.code == KeyCode::Char('l') {
         screen.needs_clear = true;
         return Ok(false);
@@ -7002,9 +10887,32 @@ fn handle_key(
     if screen.panel == Some(Panel::Settings) {
         return handle_settings_key(screen, runner, permissions, key);
     }
+    if screen.panel == Some(Panel::ModelPicker) {
+        return handle_model_picker_key(screen, runner, key);
+    }
+    if screen.panel == Some(Panel::Mcp) {
+        return handle_mcp_key(screen, runner, permissions, key);
+    }
+    if screen.panel == Some(Panel::Ctf) || screen.ctf_edit_form.is_some() {
+        return handle_ctf_key(screen, runner, permissions, events, active, cancel, key);
+    }
     if screen.approval.is_none() && key.code == KeyCode::Esc {
         if screen.form.take().is_some() || screen.picker.take().is_some() {
             screen.delete_pending = None;
+            if let Some(tab) = screen.settings_return_tab.take() {
+                screen.panel = Some(Panel::Settings);
+                if let Some(settings) = screen.settings.as_mut() {
+                    settings.tab = tab;
+                    if let Some(owner) = runner.as_ref() {
+                        settings.providers_draft = owner.ctx.providers.clone();
+                        settings.config_draft = owner.ctx.config.clone();
+                    }
+                } else if let Some(owner) = runner.as_ref() {
+                    let mut s = CliSettingsState::from_runner(owner);
+                    s.tab = tab;
+                    screen.settings = Some(s);
+                }
+            }
             return Ok(false);
         }
         if (!screen.completion_closed && !screen.completions.is_empty())
@@ -7116,45 +11024,6 @@ fn handle_key(
             screen.ctf_detail_view = false;
             screen.subagent_panel = None;
             screen.jobs_panel = Some(JobsPanelState::default());
-        }
-        return Ok(false);
-    }
-    if screen.panel == Some(Panel::Ctf) {
-        let len = screen.ctf_challenges_count();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('8') => {
-                if screen.ctf_detail_view {
-                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(1);
-                } else if screen.ctf_selected > 0 {
-                    screen.ctf_selected -= 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('2') => {
-                if screen.ctf_detail_view {
-                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(1);
-                } else if len > 0 && screen.ctf_selected + 1 < len {
-                    screen.ctf_selected += 1;
-                }
-            }
-            KeyCode::PageUp => {
-                if screen.ctf_detail_view {
-                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_sub(10);
-                } else {
-                    screen.ctf_selected = screen.ctf_selected.saturating_sub(5);
-                }
-            }
-            KeyCode::PageDown => {
-                if screen.ctf_detail_view {
-                    screen.ctf_detail_scroll = screen.ctf_detail_scroll.saturating_add(10);
-                } else if len > 0 {
-                    screen.ctf_selected = (screen.ctf_selected + 5).min(len.saturating_sub(1));
-                }
-            }
-            KeyCode::Enter if !screen.ctf_detail_view && len > 0 && screen.ctf_selected < len => {
-                screen.ctf_detail_view = true;
-                screen.ctf_detail_scroll = 0;
-            }
-            _ => {}
         }
         return Ok(false);
     }
@@ -7351,6 +11220,20 @@ fn handle_key(
             screen.form = None;
             screen.picker = None;
             screen.delete_pending = None;
+            if let Some(tab) = screen.settings_return_tab.take() {
+                screen.panel = Some(Panel::Settings);
+                if let Some(settings) = screen.settings.as_mut() {
+                    settings.tab = tab;
+                    if let Some(owner) = runner.as_ref() {
+                        settings.providers_draft = owner.ctx.providers.clone();
+                        settings.config_draft = owner.ctx.config.clone();
+                    }
+                } else if let Some(owner) = runner.as_ref() {
+                    let mut s = CliSettingsState::from_runner(owner);
+                    s.tab = tab;
+                    screen.settings = Some(s);
+                }
+            }
             return Ok(false);
         }
         screen.reply(PermissionDecision::Deny);
@@ -7614,6 +11497,8 @@ fn handle_key(
             }
         } else if count > 0 {
             match key.code {
+                KeyCode::Up => form.selected = (form.selected + count - 1) % count,
+                KeyCode::Down => form.selected = (form.selected + 1) % count,
                 KeyCode::BackTab => form.selected = (form.selected + count - 1) % count,
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     form.selected = (form.selected + count - 1) % count
@@ -7621,6 +11506,116 @@ fn handle_key(
                 KeyCode::Tab => form.selected = (form.selected + 1) % count,
                 KeyCode::Enter if key.modifiers.is_empty() => {
                     form.selected = (form.selected + 1) % count
+                }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
+                    .is_some_and(|f| f.name == "kind")
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    let cur_kind = form.inputs[form.selected]
+                        .lines()
+                        .join("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let cur_idx = cyber_core::PROVIDER_KINDS
+                        .iter()
+                        .position(|k| *k == cur_kind)
+                        .unwrap_or(0);
+                    let next_idx = if key.code == KeyCode::Left {
+                        (cur_idx + cyber_core::PROVIDER_KINDS.len() - 1)
+                            % cyber_core::PROVIDER_KINDS.len()
+                    } else {
+                        (cur_idx + 1) % cyber_core::PROVIDER_KINDS.len()
+                    };
+                    let new_kind = cyber_core::PROVIDER_KINDS[next_idx];
+                    form.inputs[form.selected] = composer();
+                    form.inputs[form.selected].insert_str(new_kind);
+                }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
+                    .is_some_and(|f| matches!(f.name.as_str(), "sensitive" | "enabled"))
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    let cur_val = form.inputs[form.selected]
+                        .lines()
+                        .join("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let is_true = matches!(cur_val.as_str(), "true" | "1" | "yes");
+                    let new_val = if is_true { "false" } else { "true" };
+                    form.inputs[form.selected] = composer();
+                    form.inputs[form.selected].insert_str(new_val);
+                }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
+                    .is_some_and(|f| f.name == "scope")
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    let scopes = ["both", "project", "global"];
+                    let cur_val = form.inputs[form.selected]
+                        .lines()
+                        .join("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let cur_idx = scopes.iter().position(|s| *s == cur_val).unwrap_or(0);
+                    let next_idx = if key.code == KeyCode::Left {
+                        (cur_idx + scopes.len() - 1) % scopes.len()
+                    } else {
+                        (cur_idx + 1) % scopes.len()
+                    };
+                    form.inputs[form.selected] = composer();
+                    form.inputs[form.selected].insert_str(scopes[next_idx]);
+                }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
+                    .is_some_and(|f| f.name == "context_length")
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    let cur = form.inputs[form.selected]
+                        .lines()
+                        .join("")
+                        .trim()
+                        .to_string();
+                    // 环 = 预设槽（空值 = 「默认(留空)」槽）；自定义值不属于环 → 保持不动，
+                    // 避免 ←/→ 意外覆盖用户手输的数字。
+                    let cur_idx = if cur.is_empty() {
+                        Some(0)
+                    } else {
+                        cyber_core::CONTEXT_LENGTH_PRESETS
+                            .iter()
+                            .position(|(_, v)| !v.is_empty() && cur == *v)
+                    };
+                    if let Some(cur_idx) = cur_idx {
+                        let total = cyber_core::CONTEXT_LENGTH_PRESETS.len();
+                        let next_idx = if key.code == KeyCode::Left {
+                            (cur_idx + total - 1) % total
+                        } else {
+                            (cur_idx + 1) % total
+                        };
+                        let value = cyber_core::CONTEXT_LENGTH_PRESETS[next_idx].1;
+                        form.inputs[form.selected] = composer();
+                        form.inputs[form.selected].insert_str(value);
+                    }
                 }
                 _ => {
                     form.inputs[form.selected].input(key);
@@ -7675,6 +11670,19 @@ fn handle_key(
         if let Some(command) = command {
             screen.picker = None;
             screen.delete_pending = None;
+            if command.is_empty() {
+                if let Some(tab) = screen.settings_return_tab.take() {
+                    screen.panel = Some(Panel::Settings);
+                    if let Some(settings) = screen.settings.as_mut() {
+                        settings.tab = tab;
+                        if let Some(owner) = runner.as_ref() {
+                            settings.providers_draft = owner.ctx.providers.clone();
+                            settings.config_draft = owner.ctx.config.clone();
+                        }
+                    }
+                }
+                return Ok(false);
+            }
             if let Some(owner) = runner.as_mut() {
                 match cli_commands::execute(owner, &command) {
                     Ok(action) => {
@@ -7962,6 +11970,20 @@ fn apply_action(
                 screen.todo_closed = false;
             }
             screen.message(&title, &text, MUTED);
+            if let Some(tab) = screen.settings_return_tab.take() {
+                screen.panel = Some(Panel::Settings);
+                if let Some(settings) = screen.settings.as_mut() {
+                    settings.tab = tab;
+                    if let Some(owner) = runner.as_ref() {
+                        settings.providers_draft = owner.ctx.providers.clone();
+                        settings.config_draft = owner.ctx.config.clone();
+                    }
+                } else if let Some(owner) = runner.as_ref() {
+                    let mut s = CliSettingsState::from_runner(owner);
+                    s.tab = tab;
+                    screen.settings = Some(s);
+                }
+            }
         }
         CliAction::TodoVisibility(open) => {
             screen.todo_closed = !open;
@@ -7987,12 +12009,68 @@ fn apply_action(
                     screen.status = clean(&message);
                 }
             }
+            if let Some(tab) = screen.settings_return_tab.take() {
+                screen.panel = Some(Panel::Settings);
+                if let Some(settings) = screen.settings.as_mut() {
+                    settings.tab = tab;
+                    if let Some(owner) = runner.as_ref() {
+                        settings.providers_draft = owner.ctx.providers.clone();
+                        settings.config_draft = owner.ctx.config.clone();
+                    }
+                } else if let Some(owner) = runner.as_ref() {
+                    let mut s = CliSettingsState::from_runner(owner);
+                    s.tab = tab;
+                    screen.settings = Some(s);
+                }
+            }
         }
         CliAction::Form(form) => {
             screen.status.clear();
             screen.form = Some(FormState::new(form));
         }
+        CliAction::Panel(panel) => {
+            if panel == Panel::ModelPicker {
+                if let Some(owner) = runner.as_ref() {
+                    screen.model_picker = Some(CliModelPickerState::from_runner(owner));
+                }
+            } else if panel == Panel::Mcp {
+                if let Some(owner) = runner.as_ref() {
+                    let config =
+                        cyber_mcp::McpServersConfig::load(&owner.ctx.paths.mcp_servers_file)
+                            .unwrap_or_default();
+                    let path = owner.ctx.paths.mcp_servers_file.clone();
+                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::new(
+                        config,
+                        owner.registries.mcp.as_deref(),
+                        path,
+                    ));
+                } else {
+                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::default());
+                }
+            } else if panel == Panel::Ctf {
+                screen.ctf_enabled = true;
+                if let Some(r) = runner.as_mut() {
+                    r.ctf_enabled = true;
+                    if let Some(challenges) = r.registries.ctf_challenges.as_ref() {
+                        screen.ctf_challenges = Arc::clone(challenges);
+                    }
+                }
+                screen.ctf_selected = 0;
+                screen.ctf_detail_view = false;
+                screen.ctf_detail_scroll = 0;
+                screen.ctf_list_scroll.set(0);
+            }
+            screen.panel = Some(panel);
+        }
         CliAction::Picker(picker) => {
+            if matches!(picker.kind, cli_commands::PickerKind::Models) {
+                if let Some(owner) = runner.as_ref() {
+                    screen.model_picker = Some(CliModelPickerState::from_runner(owner));
+                    screen.panel = Some(Panel::ModelPicker);
+                    screen.picker = None;
+                    return Ok(false);
+                }
+            }
             screen.picker = Some(picker);
             screen.picker_selected = 0;
             screen.delete_pending = None;
@@ -8135,6 +12213,427 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    #[test]
+    fn test_todo_table_long_text_does_not_corrupt_borders() {
+        let items = vec![
+            cyber_core::TodoItem {
+                id: "1".into(),
+                title: "这是一段极其冗长的测试渗透攻击任务步骤说明文字，包含全角中文标点与长标题，应当被安全边界截断，不能侵入右侧边框导致右边框字符被覆盖擦除。".into(),
+                status: cyber_core::TodoStatus::InProgress,
+                notes: Some("备注信息：同时包含长备注，用于测试剩余预算不足时的优雅省略号处理。".into()),
+            },
+            cyber_core::TodoItem {
+                id: "2".into(),
+                title: "第二项较短任务".into(),
+                status: cyber_core::TodoStatus::Pending,
+                notes: None,
+            },
+        ];
+
+        let width = 60u16;
+        let height = 15u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_todo_table(frame, Rect::new(0, 0, width, height), &items);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // 校验最右列 (x = 59) 从 y = 0 到 y = 14 的字符
+        // 顶部角为 ╮，底部角为 ╯，中间整列为 │，绝对不能有汉字、空格覆写
+        let top_right = buffer[(width - 1, 0)].symbol();
+        let bottom_right = buffer[(width - 1, height - 1)].symbol();
+        assert_eq!(top_right, "╮", "右上角边框未对齐或被覆写: {top_right}");
+        assert_eq!(
+            bottom_right, "╯",
+            "右下角边框未对齐或被覆写: {bottom_right}"
+        );
+        for y in 1..height - 1 {
+            let ch = buffer[(width - 1, y)].symbol();
+            assert_eq!(ch, "│", "第 {y} 行右边框被内容挤压覆盖或损坏: '{ch}'");
+        }
+    }
+
+    #[test]
+    fn test_subagent_panel_row_width_within_bounds() {
+        let run = SubagentRun {
+            id: 1,
+            name: "subagent-network-reconnaissance-and-port-enumeration".into(),
+            status: cyber_agent::SubagentStatus::Running,
+            lines: vec!["正在执行长命令扫描探测开放服务端口 80, 443, 8080, 8443...".into()],
+            result: None,
+            error: None,
+            started: std::time::Instant::now(),
+        };
+        let inner_width = 70usize;
+        const PREFIX_W: usize = 2;
+        const ID_W: usize = 5;
+        const BADGE_W: usize = 8;
+        const NAME_W: usize = 16;
+        let last_budget = inner_width
+            .saturating_sub(PREFIX_W + ID_W + BADGE_W + NAME_W + 1)
+            .max(1);
+
+        let (badge, _) = subagent_badge(run.status);
+        let last = single_line(run.lines.last().unwrap());
+
+        let line = Line::from(vec![
+            Span::styled("▶ ", Style::default()),
+            Span::styled(format!("#{:<3} ", run.id), Style::default()),
+            Span::styled(pad_cells(badge, BADGE_W), Style::default()),
+            Span::styled(
+                pad_cells(&clip_cells(&single_line(&run.name), NAME_W), NAME_W),
+                Style::default(),
+            ),
+            Span::styled(clip_cells(&last, last_budget), Style::default()),
+        ]);
+        use unicode_width::UnicodeWidthStr;
+        let total_w: usize = line
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        assert!(
+            total_w < inner_width,
+            "子代理面板数据行宽度 {total_w} 必须 <= inner_width - 1 ({})",
+            inner_width - 1
+        );
+    }
+
+    /// 检查居中弹窗的右边界整列与右上/右下圆角是否被内容覆写。
+    fn popup_border_violations(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<String> {
+        let Some(popup) = panel_geometry(area) else {
+            return vec!["panel_geometry returned None".to_string()];
+        };
+        let mut bad = Vec::new();
+        let right = popup.x + popup.width - 1;
+        let top_right = buffer[(right, popup.y)].symbol();
+        if top_right != "╮" {
+            bad.push(format!("右上角被覆写: {top_right:?}"));
+        }
+        let bottom_right = buffer[(right, popup.y + popup.height - 1)].symbol();
+        if bottom_right != "╯" {
+            bad.push(format!("右下角被覆写: {bottom_right:?}"));
+        }
+        for y in popup.y + 1..popup.y + popup.height - 1 {
+            let sym = buffer[(right, y)].symbol();
+            if sym != "│" {
+                bad.push(format!("右边界 y={y} 被覆写: {sym:?}"));
+            }
+        }
+        let left = popup.x;
+        for y in popup.y + 1..popup.y + popup.height - 1 {
+            let sym = buffer[(left, y)].symbol();
+            if sym != "│" {
+                bad.push(format!("左边界 y={y} 被覆写: {sym:?}"));
+            }
+        }
+        bad
+    }
+
+    fn hostile_commands_line() -> String {
+        "tool Commands args: {\"action\":\"list\",\"pattern\":\"/provider add-preset <id>\"} => \
+         /help  /model  /sessions  /todo  /bg  /mcp  /skills  /memory  /env  /update  /quit"
+            .to_string()
+    }
+
+    #[test]
+    fn test_jobs_panel_borders_survive_long_commands_text() {
+        let jobs = vec![
+            BackgroundJob {
+                id: 7,
+                kind: JobKind::Shell,
+                name: "help".into(),
+                status: JobStatus::Running,
+                lines: vec![hostile_commands_line(), hostile_commands_line()],
+                created: std::time::Instant::now(),
+                reported: false,
+                kill: None,
+                archive_run_id: None,
+            },
+            BackgroundJob {
+                id: 8,
+                kind: JobKind::Subagent,
+                name: "极长的后台任务名称用于测试标题裁剪与边框保护：搜索所有服务商预设与自定义接入方式并汇总".into(),
+                status: JobStatus::Finished(0),
+                lines: vec![hostile_commands_line()],
+                created: std::time::Instant::now(),
+                reported: false,
+                kill: None,
+                archive_run_id: Some(1),
+            },
+        ];
+        let archive = cyber_agent::SubagentArchive::default();
+        let run_id = archive.start("Commands-recon");
+        for _ in 0..3 {
+            archive.append_line(run_id, hostile_commands_line());
+        }
+
+        for (w, h) in [(120u16, 40u16), (70, 24), (62, 20)] {
+            // 列表模式
+            let mut state = JobsPanelState {
+                selected: 1,
+                detail: None,
+                detail_scroll: 0,
+                follow_bottom: true,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw_jobs_panel(f, f.area(), &mut state, &jobs, &archive))
+                .unwrap();
+            let bad = popup_border_violations(terminal.backend().buffer(), Rect::new(0, 0, w, h));
+            assert!(bad.is_empty(), "jobs 列表 w={w} 边框损坏: {bad:#?}");
+
+            // 详情模式（Subagent 归档转录）
+            let mut state = JobsPanelState {
+                selected: 1,
+                detail: Some(8),
+                detail_scroll: 0,
+                follow_bottom: true,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw_jobs_panel(f, f.area(), &mut state, &jobs, &archive))
+                .unwrap();
+            let bad = popup_border_violations(terminal.backend().buffer(), Rect::new(0, 0, w, h));
+            assert!(bad.is_empty(), "jobs 详情 w={w} 边框损坏: {bad:#?}");
+
+            // 详情模式（Shell 原始输出行）
+            let mut state = JobsPanelState {
+                selected: 0,
+                detail: Some(7),
+                detail_scroll: 0,
+                follow_bottom: true,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw_jobs_panel(f, f.area(), &mut state, &jobs, &archive))
+                .unwrap();
+            let bad = popup_border_violations(terminal.backend().buffer(), Rect::new(0, 0, w, h));
+            assert!(bad.is_empty(), "jobs shell 详情 w={w} 边框损坏: {bad:#?}");
+        }
+    }
+
+    #[test]
+    fn test_subagent_panel_borders_survive_long_activity() {
+        let snapshot = vec![
+            SubagentRun {
+                id: 1,
+                name: "recon".into(),
+                status: cyber_agent::SubagentStatus::Running,
+                lines: vec![hostile_commands_line()],
+                result: None,
+                error: None,
+                started: std::time::Instant::now(),
+            },
+            SubagentRun {
+                id: 2,
+                name: "极长子代理名称用于测试列宽裁剪与右边框保护：遍历所有服务商与模型组合".into(),
+                status: cyber_agent::SubagentStatus::Completed,
+                lines: vec![hostile_commands_line(); 4],
+                result: Some(hostile_commands_line()),
+                error: None,
+                started: std::time::Instant::now(),
+            },
+        ];
+        for (w, h) in [(120u16, 40u16), (70, 24), (62, 20)] {
+            let mut state = SubagentPanelState { selected: 1 };
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw_subagent_panel(f, f.area(), &mut state, &snapshot))
+                .unwrap();
+            let bad = popup_border_violations(terminal.backend().buffer(), Rect::new(0, 0, w, h));
+            assert!(bad.is_empty(), "subagents w={w} 边框损坏: {bad:#?}");
+
+            let mut state = SubagentPanelState { selected: 1 };
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| draw_subagent_panel(f, f.area(), &mut state, &[]))
+                .unwrap();
+            let bad = popup_border_violations(terminal.backend().buffer(), Rect::new(0, 0, w, h));
+            assert!(bad.is_empty(), "subagents 空态 w={w} 边框损坏: {bad:#?}");
+        }
+    }
+
+    #[test]
+    fn test_tool_cards_never_exceed_card_width_when_collapsed() {
+        use unicode_width::UnicodeWidthChar;
+        let card = ToolCard {
+            id: "commands".into(),
+            name: "Commands".into(),
+            arguments: "{\"action\":\"list\"}".into(),
+            progress: String::new(),
+            output: format!(
+                "{}\n{}\n{}",
+                hostile_commands_line(),
+                hostile_commands_line(),
+                hostile_commands_line()
+            ),
+            state: ToolCardState::Success,
+            start: 0,
+            end: 0,
+        };
+        let width_of = |line: &Line<'static>| -> usize {
+            line.spans
+                .iter()
+                .flat_map(|s| s.content.chars())
+                .map(|c| if c == '\t' { 4 } else { c.width().unwrap_or(0) })
+                .sum()
+        };
+        for width in [20u16, 24, 40, 60, 120] {
+            for expanded in [false, true] {
+                let lines = render_tool_card(&card, expanded, width, false);
+                for (i, line) in lines.iter().enumerate() {
+                    if expanded && line.spans.first().map(|s| s.content.as_ref()) == Some("│  ") {
+                        // 展开态正文允许由视口折行完整展示，不参与宽度约束。
+                        continue;
+                    }
+                    let w = width_of(line);
+                    assert!(
+                        w <= width as usize,
+                        "卡片行超宽会触发折行挤掉边框: width={width} expanded={expanded} row={i} w={w}"
+                    );
+                }
+            }
+
+            // 子代理覆盖视图（面板 Enter 进入）折叠态：每行都不得触发视口折行，
+            // 否则续行丢失 `│` 前缀，表现为卡片边框被文字顶掉。
+            let run = SubagentRun {
+                id: 1,
+                name: "commands-recon".into(),
+                status: cyber_agent::SubagentStatus::Running,
+                lines: vec![
+                    format!("tool commands args: {{\"action\":\"list\"}}"),
+                    hostile_commands_line(),
+                    hostile_commands_line(),
+                ],
+                result: None,
+                error: None,
+                started: std::time::Instant::now(),
+            };
+            let view_lines = build_subagent_view_lines(&run, false, width);
+            for (i, line) in view_lines.iter().enumerate() {
+                let w = width_of(line);
+                assert!(
+                    w <= width as usize,
+                    "子代理覆盖视图行超宽: width={width} row={i} w={w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_model_picker_borders_survive_long_provider_and_model_names() {
+        let mut providers = cyber_core::ProvidersConfig::default();
+        let mut provider = cyber_core::ProviderConfig {
+            kind: "openai-compatible".into(),
+            model: "deepseek-ai/DeepSeek-V3.2-Exp-SuperLong-Model-Identifier-2026".into(),
+            ..Default::default()
+        };
+        provider.models.insert(
+            "deepseek-ai/DeepSeek-V3.2-Exp-SuperLong-Model-Identifier-2026".into(),
+            cyber_core::ModelConfig {
+                alias: Some("极长的模型别名用于测试右栏标题裁剪与边框保护".into()),
+                ..Default::default()
+            },
+        );
+        providers.providers.insert(
+            "extremely-long-provider-name-for-border-testing".into(),
+            provider,
+        );
+        let mut state = CliModelPickerState {
+            focus_models: true,
+            provider_selected: 0,
+            model_selected: 0,
+            providers,
+            default_provider: "extremely-long-provider-name-for-border-testing".into(),
+            models: vec!["deepseek-ai/DeepSeek-V3.2-Exp-SuperLong-Model-Identifier-2026".into()],
+            provider_scroll: 0,
+            model_scroll: 0,
+            probing_model: None,
+        };
+
+        for (w, h) in [(120u16, 40u16), (90, 26), (80, 22)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_model_picker(
+                        f,
+                        f.area(),
+                        &mut state,
+                        "extremely-long-provider-name-for-border-testing",
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+
+            // 复算面板几何：外层 + 左右分栏，逐个校验边框完整性。
+            let outer = Rect::new(0, 0, w, h);
+            let inner = Block::bordered().inner(outer);
+            let chunks = Layout::vertical([
+                ratatui::layout::Constraint::Min(0),
+                ratatui::layout::Constraint::Length(1),
+            ])
+            .split(inner);
+            let panes = Layout::horizontal([
+                ratatui::layout::Constraint::Percentage(35),
+                ratatui::layout::Constraint::Percentage(65),
+            ])
+            .split(chunks[0]);
+
+            let mut bad = Vec::new();
+            for (name, rect) in [
+                ("outer", outer),
+                ("providers", panes[0]),
+                ("models", panes[1]),
+            ] {
+                let right = rect.x + rect.width - 1;
+                let top_right = buffer[(right, rect.y)].symbol();
+                if top_right != "╮" {
+                    bad.push(format!("{name} 右上角被覆写: {top_right:?}"));
+                }
+                let bottom_right = buffer[(right, rect.y + rect.height - 1)].symbol();
+                if bottom_right != "╯" {
+                    bad.push(format!("{name} 右下角被覆写: {bottom_right:?}"));
+                }
+                for y in rect.y + 1..rect.y + rect.height - 1 {
+                    let sym = buffer[(right, y)].symbol();
+                    if sym != "│" {
+                        bad.push(format!("{name} 右边界 y={y} 被覆写: {sym:?}"));
+                    }
+                    let left_sym = buffer[(rect.x, y)].symbol();
+                    if left_sym != "│" {
+                        bad.push(format!("{name} 左边界 y={y} 被覆写: {left_sym:?}"));
+                    }
+                }
+            }
+            assert!(bad.is_empty(), "model picker w={w} 边框损坏: {bad:#?}");
+        }
+    }
+
+    #[test]
+    fn test_settings_row_long_hint_clipped() {
+        use unicode_width::UnicodeWidthStr;
+        let width = 75u16;
+        let row = render_setting_row(
+            true,
+            "测试设置标签项 (Test)",
+            "当前设定值".into(),
+            "这是一段长说明文字：用户在此可以配置核心功能，说明过长时会自动添加省略号，保证不会超出设定的面板宽度。".into(),
+            width,
+        );
+        let row_w: usize = row
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        assert!(
+            row_w <= (width as usize).saturating_sub(1),
+            "设置行视觉宽度 {row_w} 必须 <= width - 1 ({})",
+            width - 1
+        );
+    }
     #[test]
     fn omp_composer_merges_last_row_and_preserves_unicode_cursor() {
         for (effort, expected) in [
@@ -8500,6 +12999,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notice_event_renders_amber_notice_entry() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.event(AgentEvent::Notice("⚠️ 输出被截断".into()));
+        assert!(
+            screen
+                .messages
+                .iter()
+                .any(|line| line.to_string().contains("输出被截断")),
+            "Notice 必须写入可见消息流"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_form_context_length_cycles_presets_and_keeps_custom() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let action = cli_commands::execute(&mut owner, "/provider add-with-kind openai").unwrap();
+        let CliAction::Form(form) = action else {
+            panic!("expected form");
+        };
+        let mut screen = CliScreen::new(&owner);
+        screen.form = Some(FormState::new(form));
+        let mut runner = Some(owner);
+        let idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "context_length")
+            .expect("表单必须含 context_length 字段");
+        screen.form.as_mut().unwrap().selected = idx;
+        // → 切到第一个预设 128K
+        input_key(&mut screen, &mut runner, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            screen.form.as_ref().unwrap().inputs[idx].lines().join(""),
+            "131072"
+        );
+        // → 依次前进到 256K
+        input_key(&mut screen, &mut runner, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            screen.form.as_ref().unwrap().inputs[idx].lines().join(""),
+            "262144"
+        );
+        // ← 回到 128K，再 ← 回到「默认(留空)」，再 ← 环绕到 1M
+        input_key(&mut screen, &mut runner, KeyCode::Left, KeyModifiers::NONE);
+        input_key(&mut screen, &mut runner, KeyCode::Left, KeyModifiers::NONE);
+        assert!(screen.form.as_ref().unwrap().inputs[idx]
+            .lines()
+            .join("")
+            .is_empty());
+        input_key(&mut screen, &mut runner, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(
+            screen.form.as_ref().unwrap().inputs[idx].lines().join(""),
+            "1048576"
+        );
+        // → 从 1M 环绕回「默认(留空)」：预设环无死胡同
+        input_key(&mut screen, &mut runner, KeyCode::Right, KeyModifiers::NONE);
+        assert!(screen.form.as_ref().unwrap().inputs[idx]
+            .lines()
+            .join("")
+            .is_empty());
+        // 直接输入数字 = 自定义值：←/→ 不覆盖用户手输
+        for digit in ["6", "5", "5", "3", "6"] {
+            input_key(
+                &mut screen,
+                &mut runner,
+                KeyCode::Char(digit.chars().next().unwrap()),
+                KeyModifiers::NONE,
+            );
+        }
+        assert_eq!(
+            screen.form.as_ref().unwrap().inputs[idx].lines().join(""),
+            "65536"
+        );
+        input_key(&mut screen, &mut runner, KeyCode::Left, KeyModifiers::NONE);
+        input_key(&mut screen, &mut runner, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            screen.form.as_ref().unwrap().inputs[idx].lines().join(""),
+            "65536"
+        );
+    }
+
+    #[tokio::test]
     async fn command_tasks_return_owner_and_persist_cancelled_history() {
         let mut owner = crate::headless::tests::test_runner().await;
         owner.entries = vec![
@@ -8851,6 +13435,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_panel_guide_render_and_direct_enter_activation() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let cwd = owner.cwd.clone();
+        let mut runner = Some(owner);
+
+        // 1. 输入 /mcp：验证渲染快照中首行左栏为 /mcp，右栏展示 打开 MCP 面板
+        screen.insert_text("/mcp");
+        screen.update_completions(runner.as_ref());
+        let snapshot = render(&mut screen, 100, 30);
+        let first_row = snapshot
+            .lines()
+            .find(|l| l.contains("/mcp") && l.replace(' ', "").contains("打开MCP面板"))
+            .expect("snapshot should render /mcp with panel guide description");
+        assert!(first_row.contains("> /mcp"));
+        assert!(first_row.replace(' ', "").contains("打开MCP面板"));
+
+        // 回车选定第 0 项：直接触发 MCP 面板激活
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.panel, Some(Panel::Mcp));
+
+        // 关闭面板并清空输入
+        screen.panel = None;
+        screen.input = composer();
+        screen.completions.clear();
+
+        // 2. 带空格输入 /mcp ：首项为引导项，后续项为子命令
+        screen.insert_text("/mcp ");
+        screen.update_completions(runner.as_ref());
+        let snapshot_spaced = render(&mut screen, 100, 30);
+        let first_row_spaced = snapshot_spaced
+            .lines()
+            .find(|l| l.contains("/mcp") && l.replace(' ', "").contains("打开MCP面板"))
+            .expect("snapshot should render /mcp with panel guide description in spaced mode");
+        assert!(first_row_spaced.contains("> /mcp"));
+        assert!(first_row_spaced.replace(' ', "").contains("打开MCP面板"));
+        assert!(snapshot_spaced.contains("/mcp connect"));
+
+        // 回车选定第 0 项引导项：直接触发 MCP 面板激活
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(screen.panel, Some(Panel::Mcp));
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
     async fn busy_commands_cancel_or_quit_without_owner_and_never_spawn_another_turn() {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
@@ -9045,7 +13675,9 @@ mod tests {
         );
         assert!(screen.delete_pending.is_some());
         assert_eq!(runner.as_ref().unwrap().index.sessions.len(), count);
-        assert!(render(&mut screen, 100, 25).contains("Press d again"));
+        // CJK 宽字符在缓冲区中占两格（第二格为空符号），需先剥离空格再断言。
+        let rendered = render(&mut screen, 100, 25).replace(' ', "");
+        assert!(rendered.contains("再按一次确认删除"), "{rendered}");
         input_key(&mut screen, &mut runner, KeyCode::Down, KeyModifiers::NONE);
         assert!(screen.delete_pending.is_none());
         input_key(
@@ -10658,6 +15290,438 @@ mod tests {
         let _ = std::fs::remove_dir_all(cwd);
     }
 
+    #[tokio::test]
+    async fn slash_ctf_opens_ctf_panel() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+        let mut runner = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        // 1. /ctf with no args returns Panel(Panel::Ctf) and enables CTF mode
+        let action = cli_commands::execute(runner.as_mut().unwrap(), "/ctf").unwrap();
+        assert!(matches!(action, CliAction::Panel(Panel::Ctf)));
+        assert!(runner.as_ref().unwrap().ctf_enabled);
+
+        // Applying action opens Panel::Ctf and initializes screen state
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert!(screen.ctf_enabled);
+        assert_eq!(screen.ctf_selected, 0);
+        assert!(!screen.ctf_detail_view);
+
+        // 2. /ctf panel and /ctf open also return Panel(Panel::Ctf)
+        let action_panel = cli_commands::execute(runner.as_mut().unwrap(), "/ctf panel").unwrap();
+        assert!(matches!(action_panel, CliAction::Panel(Panel::Ctf)));
+
+        let action_open = cli_commands::execute(runner.as_mut().unwrap(), "/ctf open").unwrap();
+        assert!(matches!(action_open, CliAction::Panel(Panel::Ctf)));
+
+        // 3. /ctf status outputs "enabled"
+        let action_status = cli_commands::execute(runner.as_mut().unwrap(), "/ctf status").unwrap();
+        if let CliAction::Output { text, .. } = action_status {
+            assert_eq!(text, "enabled");
+        } else {
+            panic!("Expected Output action for /ctf status");
+        }
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn ctf_panel_full_keyboard_operations() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+        let mut runner = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        // 1. Add two challenges
+        cli_commands::execute(runner.as_mut().unwrap(), "/ctf add web_sqli web").unwrap();
+        cli_commands::execute(runner.as_mut().unwrap(), "/ctf add pwn_rop pwn").unwrap();
+
+        // 2. Open CTF panel via /ctf
+        screen.input.insert_str("/ctf");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert_eq!(screen.ctf_challenges_count(), 2);
+        assert_eq!(screen.ctf_selected, 0);
+        assert!(!screen.ctf_detail_view);
+
+        // 3. Test navigation: j (down), k (up)
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_selected, 1);
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_selected, 0);
+
+        // 4. Test status toggle: s (InProgress -> Solved -> InProgress)
+        let c0 = screen.ctf_challenge_at(0).unwrap();
+        assert_eq!(c0.status, cyber_core::CtfStatus::InProgress);
+        assert!(c0.end_time.is_none());
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        let c0 = screen.ctf_challenge_at(0).unwrap();
+        assert_eq!(c0.status, cyber_core::CtfStatus::Solved);
+        assert!(c0.end_time.is_some());
+        assert!(history(&screen).contains("「web_sqli」→ 已完成"));
+
+        // 5. Test global toggle: g (false -> true -> false)
+        assert!(!c0.is_global);
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        let c0 = screen.ctf_challenge_at(0).unwrap();
+        assert!(c0.is_global);
+        assert!(history(&screen).contains("「web_sqli」→ 全局 ★"));
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        let c0 = screen.ctf_challenge_at(0).unwrap();
+        assert!(!c0.is_global);
+        assert!(history(&screen).contains("「web_sqli」→ 仅本 session"));
+
+        // 6. Test set all global: G
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_challenge_at(0).unwrap().is_global);
+        assert!(screen.ctf_challenge_at(1).unwrap().is_global);
+        assert!(history(&screen).contains("已将 2 道题目设为全局"));
+
+        // 7. Test Enter -> detail view, navigation inside detail view, q -> back to list
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_detail_view);
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_detail_scroll, 1);
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_detail_scroll, 0);
+
+        // Press 'q' in detail view -> returns to list view
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert!(!screen.ctf_detail_view);
+
+        // 8. Test Writeup 'w':
+        // For solved challenge: enters detail view, press 'w' -> triggers writeup task
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_detail_view);
+
+        let mut active = None;
+        let mut cancel = None;
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        // Panel closed and active task started
+        assert_eq!(screen.panel, None);
+        assert!(active.is_some());
+        if let Some(tx) = cancel {
+            let _ = tx.send(());
+        }
+        if let Some(task) = active {
+            let (r, _) = task.await.unwrap();
+            screen.sync(&r);
+            runner = Some(r);
+            screen.busy = false;
+        }
+
+        // 9. Reopen CTF panel via /ctf, test edit form 'e' and delete 'd'
+        screen.input.insert_str("/ctf");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+        assert_eq!(screen.ctf_challenges_count(), 2);
+
+        // Select challenge 1 (pwn_rop)
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_selected, 1);
+
+        // Press 'e' -> opens edit form
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_edit_form.is_some());
+
+        // Press Esc inside edit form -> cancels edit form
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_edit_form.is_none());
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+
+        // 10. Test delete 'd'
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_challenges_count(), 1);
+        assert!(history(&screen).contains("已删除「pwn_rop」"));
+
+        // Delete remaining challenge
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.ctf_challenges_count(), 0);
+        assert!(history(&screen).contains("已删除「web_sqli」"));
+
+        // 11. Press 'q' in list view -> closes panel
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, None);
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn ctf_panel_edit_form_save() {
+        let runner = crate::headless::tests::test_runner().await;
+        let cwd = runner.cwd.clone();
+        let mut screen = CliScreen::new(&runner);
+        let mut runner = Some(runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+
+        // 1. Add challenge
+        cli_commands::execute(runner.as_mut().unwrap(), "/ctf add sqli_form web").unwrap();
+
+        // 2. Open CTF panel via /ctf
+        screen.input.insert_str("/ctf");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Ctf));
+
+        // 3. Press 'e' -> opens edit form
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(screen.ctf_edit_form.is_some());
+
+        // Verify render with edit form active
+        let rendered_modal = render(&mut screen, 100, 30);
+        assert!(rendered_modal.contains("sqli_form"));
+
+        // Modify field in form (description)
+        if let Some(form) = screen.ctf_edit_form.as_mut() {
+            form.description = "New description via form".into();
+            // Focus Save button (index 9)
+            form.focused = 9;
+        }
+
+        // 4. Press Enter on Save button -> saves form
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner,
+            &permissions,
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+
+        // Form closed, challenge updated
+        assert!(screen.ctf_edit_form.is_none());
+        assert!(history(&screen).contains("「sqli_form」已保存"));
+        let updated = screen.ctf_challenge_at(0).unwrap();
+        assert_eq!(updated.description, "New description via form");
+
+        // Verify runner's saved challenges reflect the update
+        let runner_challenges = runner.as_mut().unwrap().challenges().unwrap();
+        assert_eq!(runner_challenges[0].description, "New description via form");
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
     #[test]
     fn clean_consolidates_carriage_returns() {
         assert_eq!(clean("foo\rbar"), "bar");
@@ -11277,7 +16341,13 @@ mod tests {
             KeyCode::Char('s'),
             KeyModifiers::CONTROL,
         );
-        assert_eq!(screen.panel, None, "保存后面板应关闭");
+        assert_eq!(
+            screen.panel,
+            Some(Panel::Settings),
+            "保存后面板应保持打开以便继续查看或调整"
+        );
+        assert!(screen.settings.is_some());
+        assert!(!screen.settings.as_ref().unwrap().dirty);
         assert_eq!(
             runner_opt.as_ref().unwrap().ctx.config.agent.retry_attempts,
             8
@@ -11292,6 +16362,16 @@ mod tests {
                 .retry_delay_secs,
             5
         );
+
+        // 按 Esc 显式退出设置面板
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None, "按 Esc 显式关闭面板");
+        assert!(screen.settings.is_none());
     }
 
     #[tokio::test]
@@ -11393,10 +16473,23 @@ mod tests {
             KeyModifiers::CONTROL,
         );
 
-        assert_eq!(screen.panel, None);
-        assert!(screen.settings.is_none());
+        assert_eq!(
+            screen.panel,
+            Some(Panel::Settings),
+            "Ctrl+S 保存后面板应保持打开"
+        );
+        assert!(screen.settings.is_some());
+        assert!(
+            !screen.settings.as_ref().unwrap().dirty,
+            "保存后 dirty 应重置为 false"
+        );
         assert!(screen.status.contains("已保存并立即生效"));
 
+        // 验证视觉徽标更新为已实时保存，按钮提示包含 Esc 关闭
+        let rendered = render(&mut screen, 100, 30);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("配置已实时保存"));
+        assert!(compact.contains("Esc关闭"));
         // Verify memory state updated
         let r = runner_opt.as_ref().unwrap();
         assert_eq!(
@@ -11409,6 +16502,114 @@ mod tests {
         let saved_cfg: Config =
             toml::from_str(&std::fs::read_to_string(&r.ctx.paths.config_file).unwrap()).unwrap();
         assert_eq!(saved_cfg.agent.thinking_intensity, ThinkingIntensity::Max);
+
+        // Subsequent Esc exits cleanly without discard modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+        assert!(screen.settings.is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_discard_confirm_save_and_exit() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Modify a setting to make it dirty
+        screen.settings.as_mut().unwrap().selected_row = 10;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().dirty);
+
+        // Esc triggers discard confirm modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.settings.as_ref().unwrap().pending_discard_confirm);
+
+        // In confirm modal, pressing 's' (or Enter / Ctrl+S) saves and exits (exit = true)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None, "弹窗确认保存后应退出面板");
+        assert!(screen.settings.is_none());
+        assert!(screen.status.contains("已保存并立即生效"));
+    }
+
+    #[tokio::test]
+    async fn settings_single_key_s_saves_in_place() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Modify a setting to make it dirty
+        screen.settings.as_mut().unwrap().selected_row = 10;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().dirty);
+
+        // Press 's' (without Ctrl) saves in place
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.panel,
+            Some(Panel::Settings),
+            "'s' 保存后面板应保持打开"
+        );
+        assert!(screen.settings.is_some());
+        assert!(
+            !screen.settings.as_ref().unwrap().dirty,
+            "dirty 状态应已清除"
+        );
+        assert!(screen.status.contains("已保存并立即生效"));
+
+        // Then Esc closes directly
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+        assert!(screen.settings.is_none());
     }
 
     #[tokio::test]
@@ -11640,6 +16841,234 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_tools_mcp_max_row_with_skills() {
+        let mut state = CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
+        assert_eq!(SettingsTab::ToolsMcp.max_row(&state), 2);
+
+        state.skills = vec![
+            SkillSummary {
+                name: "skill-1".into(),
+                ..Default::default()
+            },
+            SkillSummary {
+                name: "skill-2".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(SettingsTab::ToolsMcp.max_row(&state), 4);
+
+        state.skills = (0..115)
+            .map(|i| SkillSummary {
+                name: format!("skill-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(SettingsTab::ToolsMcp.max_row(&state), 117);
+    }
+
+    #[tokio::test]
+    async fn test_skill_detail_modal_navigation_and_rendering() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        // Open settings (F3)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+
+        // Switch to Tab 4 (ToolsMcp)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('4'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::ToolsMcp);
+
+        // Inject 3 skills with full details
+        let sample_skills = vec![
+            SkillSummary {
+                name: "test-skill-1".into(),
+                source: "项目级".into(),
+                description: "Skill 1 description".into(),
+                triggers: vec!["t1".into(), "t2".into()],
+                tools: vec!["bash".into()],
+                allowed_tools: vec!["bash".into()],
+                disable_model_invocation: false,
+                path: "/path/to/skill1/SKILL.md".into(),
+                body: "# Skill 1\n\nInstructions for skill 1\n```bash\necho 1\n```".into(),
+            },
+            SkillSummary {
+                name: "test-skill-2".into(),
+                source: "全局".into(),
+                description: "Skill 2 description".into(),
+                triggers: vec!["test2".into()],
+                tools: vec!["python".into()],
+                allowed_tools: vec![],
+                disable_model_invocation: true,
+                path: "/path/to/skill2/SKILL.md".into(),
+                body: "# Skill 2\n\nInstructions for skill 2".into(),
+            },
+            SkillSummary {
+                name: "test-skill-3".into(),
+                source: "项目级".into(),
+                description: "Skill 3 description".into(),
+                triggers: vec![],
+                tools: vec![],
+                allowed_tools: vec![],
+                disable_model_invocation: false,
+                path: "/path/to/skill3/SKILL.md".into(),
+                body: String::new(),
+            },
+        ];
+        screen.settings.as_mut().unwrap().skills = sample_skills;
+
+        // Move to row 3 (first skill)
+        screen.settings.as_mut().unwrap().selected_row = 3;
+
+        // Render tab content: verify skill list is visible
+        let rendered_list = render(&mut screen, 100, 30);
+        assert!(rendered_list.contains("test-skill-1"));
+        assert!(rendered_list.contains("Skill 1 description"));
+
+        // Press Enter to open skill detail modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        let detail = screen.settings.as_ref().unwrap().skill_detail.as_ref();
+        assert!(detail.is_some());
+        assert_eq!(detail.unwrap().skill_index, 0);
+        assert_eq!(detail.unwrap().scroll, 0);
+
+        // Render with modal open: verify title, metadata, and markdown body
+        let rendered_modal = render(&mut screen, 100, 30);
+        let compact = rendered_modal.replace(' ', "");
+        assert!(compact.contains("Skill详情[1/3]:test-skill-1"));
+        assert!(rendered_modal.contains("Instructions for skill 1"));
+        assert!(rendered_modal.contains("t1, t2"));
+
+        // Scroll down in modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .skill_detail
+                .as_ref()
+                .unwrap()
+                .scroll,
+            1
+        );
+
+        // Scroll up in modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .skill_detail
+                .as_ref()
+                .unwrap()
+                .scroll,
+            0
+        );
+
+        // Right arrow switches to next skill (index 1) and syncs selected_row
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .skill_detail
+                .as_ref()
+                .unwrap()
+                .skill_index,
+            1
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 4);
+
+        // Modal shows skill 2 content
+        let rendered_modal2 = render(&mut screen, 100, 30);
+        let compact2 = rendered_modal2.replace(' ', "");
+        assert!(compact2.contains("Skill详情[2/3]:test-skill-2"));
+        assert!(compact2.contains("仅显式调用"));
+        // Left arrow switches back to skill 0 and syncs selected_row
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .skill_detail
+                .as_ref()
+                .unwrap()
+                .skill_index,
+            0
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 3);
+
+        // Esc closes modal and returns to list with selected_row preserved
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().skill_detail.is_none());
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 3);
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
+        // Press 'o' to re-open modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().skill_detail.is_some());
+
+        // Press 'q' to close modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().skill_detail.is_none());
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 3);
+    }
+
     // ── 子代理面板 / 后台任务面板 ───────────────────────────────────────────
 
     fn ctrl_key(screen: &mut CliScreen, code: KeyCode) {
@@ -11804,11 +17233,21 @@ mod tests {
         // 列表（徽标着色、列布局、提示行）
         seed_subagent(&mut screen, "recon_ports", SubagentStatus::Running);
         seed_subagent(&mut screen, "vuln_scan", SubagentStatus::Completed);
-        let rendered = render(&mut screen, 80, 24).replace(' ', "");
+        seed_subagent(
+            &mut screen,
+            "step_limited",
+            SubagentStatus::StepLimitReached,
+        );
+        seed_subagent(&mut screen, "loop_broken", SubagentStatus::LoopDetected);
+        let rendered = render(&mut screen, 100, 24).replace(' ', "");
         assert!(rendered.contains("recon_ports"), "{rendered}");
         assert!(rendered.contains("⏱运行中"), "{rendered}");
         assert!(rendered.contains("vuln_scan"), "{rendered}");
         assert!(rendered.contains("✓完成"), "{rendered}");
+        assert!(rendered.contains("step_limited"), "{rendered}");
+        assert!(rendered.contains("⚠步数耗尽"), "{rendered}");
+        assert!(rendered.contains("loop_broken"), "{rendered}");
+        assert!(rendered.contains("✗死循环"), "{rendered}");
         assert!(rendered.contains("Enter覆盖对话查看"), "{rendered}");
         drop(runner);
     }
@@ -11874,6 +17313,61 @@ mod tests {
         assert!(!rendered.contains("**"), "{rendered}");
         assert!(rendered.contains("列表项"), "{rendered}");
         drop(runner);
+    }
+
+    #[tokio::test]
+    async fn subagent_view_renders_multiline_thinking_with_newlines_and_lists() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let run_id = screen.subagents.start("thinking_multiline");
+        screen
+            .subagents
+            .append_line(run_id, "thinking: 思考第一段分析目标\n".into());
+        screen.subagents.append_line(run_id, "thinking: \n".into());
+        screen
+            .subagents
+            .append_line(run_id, "thinking: - 步骤一：探测端口\n".into());
+        screen
+            .subagents
+            .append_line(run_id, "thinking: - 步骤二：漏洞验证\n".into());
+
+        ctrl_key(&mut screen, KeyCode::Char('g'));
+        page_key(&mut screen, KeyCode::Enter);
+        let raw = render(&mut screen, 100, 30);
+        let rendered = raw.replace(' ', "");
+        assert_eq!(rendered.matches("Thinking").count(), 1, "{rendered}");
+        assert!(rendered.contains("思考第一段分析目标"), "{rendered}");
+        assert!(rendered.contains("步骤一：探测端口"), "{rendered}");
+        assert!(rendered.contains("步骤二：漏洞验证"), "{rendered}");
+        drop(runner);
+    }
+
+    #[test]
+    fn subagent_view_renders_multiline_thinking_and_skips_empty() {
+        let archive = SubagentArchive::default();
+        let id = archive.start("test");
+        archive.append_line(id, "thinking: Analysis of target:\n".into());
+        archive.append_line(id, "thinking: \n".into());
+        archive.append_line(id, "thinking: - Item 1\n".into());
+        archive.append_line(id, "thinking: - Item 2\n".into());
+        let snapshot = archive.snapshot();
+        let run = &snapshot[0];
+        let lines = build_subagent_view_lines(run, true, 80);
+        let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("Thinking")));
+        assert!(texts.iter().any(|t| t.contains("Analysis of target")));
+        assert!(texts.iter().any(|t| t.contains("Item 1")));
+        assert!(texts.iter().any(|t| t.contains("Item 2")));
+        assert!(lines.len() >= 4, "lines count: {}", lines.len());
+
+        let empty_id = archive.start("empty");
+        archive.append_line(empty_id, "thinking: \n".into());
+        archive.append_line(empty_id, "thinking:    \n".into());
+        let snapshot = archive.snapshot();
+        let empty_run = snapshot.iter().find(|r| r.id == empty_id).unwrap();
+        let empty_lines = build_subagent_view_lines(empty_run, true, 80);
+        let empty_texts: Vec<String> = empty_lines.iter().map(|l| l.to_string()).collect();
+        assert!(!empty_texts.iter().any(|t| t.contains("Thinking")));
     }
 
     #[tokio::test]
@@ -12978,5 +18472,1824 @@ mod tests {
         );
         assert!(!res_esc.unwrap());
         assert!(!screen.has_selection());
+    }
+
+    #[tokio::test]
+    async fn panel_model_picker_dual_column_and_key_navigation() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _rx_ev) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner_opt = Some(owner);
+
+        // 1. /model 激活 ModelPicker 双栏面板
+        let action = cli_commands::execute(runner_opt.as_mut().unwrap(), "/model").unwrap();
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        assert_eq!(screen.panel, Some(Panel::ModelPicker));
+        assert!(screen.model_picker.is_some());
+
+        // 2. 双栏渲染验证
+        let rendered = render(&mut screen, 100, 30);
+        assert!(rendered.contains("Model Picker") || rendered.contains("模型选择"));
+        assert!(rendered.contains("Providers") || rendered.contains("服务商"));
+        assert!(rendered.contains("Models") || rendered.contains("模型"));
+        assert!(rendered.contains('★') || rendered.contains('默'));
+        assert!(rendered.contains('✓') || rendered.contains('当'));
+
+        // 3. Tab 切栏：初始在 Providers (focus_models=false) -> Tab 切换到 Models (focus_models=true)
+        assert!(!screen.model_picker.as_ref().unwrap().focus_models);
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.model_picker.as_ref().unwrap().focus_models);
+
+        // 4. 方向键切回左栏 (Left)
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(!screen.model_picker.as_ref().unwrap().focus_models);
+
+        // 5. 左栏按 Enter 下钻到右栏
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.model_picker.as_ref().unwrap().focus_models);
+
+        // 6. 右栏按 Enter 确认选择并持久化退出
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, None);
+        assert!(screen.model_picker.is_none());
+        assert!(screen.status.contains("已切换模型为"));
+    }
+
+    #[test]
+    fn panel_is_fullscreen_classification() {
+        assert!(Panel::Settings.is_fullscreen());
+        assert!(Panel::Mcp.is_fullscreen());
+        assert!(!Panel::Shortcuts.is_fullscreen());
+        assert!(!Panel::Ctf.is_fullscreen());
+        assert!(!Panel::Subagents.is_fullscreen());
+        assert!(!Panel::Jobs.is_fullscreen());
+        assert!(Panel::ModelPicker.is_fullscreen());
+    }
+
+    #[tokio::test]
+    async fn slash_model_opens_fullscreen_model_picker_panel() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let action = cli_commands::execute(&mut owner, "/model").unwrap();
+        assert!(
+            matches!(&action, CliAction::Picker(p) if p.kind == crate::cli_commands::PickerKind::Models)
+                || matches!(action, CliAction::Panel(Panel::ModelPicker))
+        );
+
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _rx_ev) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner_opt = Some(owner);
+
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        assert_eq!(screen.panel, Some(Panel::ModelPicker));
+        assert!(screen.model_picker.is_some());
+        assert!(screen.panel.unwrap().is_fullscreen());
+
+        let rendered = render(&mut screen, 120, 36);
+        assert!(rendered.contains("Model Picker") || rendered.contains("模型选择"));
+        assert!(rendered.contains("Providers") || rendered.contains("服务商"));
+        assert!(rendered.contains("Models") || rendered.contains("模型"));
+    }
+
+    #[tokio::test]
+    async fn slash_mcp_opens_fullscreen_mcp_panel() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let action = cli_commands::execute(&mut owner, "/mcp").unwrap();
+        assert!(matches!(action, CliAction::Panel(Panel::Mcp)));
+
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _rx_ev) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner_opt = Some(owner);
+
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        assert_eq!(screen.panel, Some(Panel::Mcp));
+        assert!(screen.mcp_panel.is_some());
+
+        let rendered = render(&mut screen, 120, 36);
+        assert!(rendered.contains("MCP"));
+        assert!(rendered.contains("Servers"));
+        assert!(rendered.contains("Config"));
+        assert!(rendered.contains("Tools"));
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            screen.mcp_panel.as_ref().unwrap().focus,
+            crate::views::mcp_panel::McpFocusPane::ServerDetail
+        );
+
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, None);
+        assert!(screen.mcp_panel.is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_panel_renders_fullscreen_canvas() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.panel = Some(Panel::Settings);
+        screen.settings = Some(CliSettingsState::from_runner(&owner));
+
+        let rendered = render(&mut screen, 120, 36);
+        assert!(rendered.contains("Cyber Master"));
+        assert!(rendered.contains("Settings"));
+        assert!(rendered.contains("Agent"));
+        assert!(rendered.contains("Ctrl+S"));
+    }
+
+    #[tokio::test]
+    async fn providers_tab_shortcuts_open_picker_and_form_and_esc_returns_to_settings() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _ev_rx) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+
+        screen.panel = Some(Panel::Settings);
+        let mut s = CliSettingsState::from_runner(runner_opt.as_ref().unwrap());
+        s.tab = SettingsTab::Providers;
+        screen.settings = Some(s);
+
+        // Press 'A' to open wizard picker
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, None);
+        assert!(screen.picker.is_some());
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::Providers));
+
+        // Esc returns to Settings/Providers
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::Providers
+        );
+        assert!(screen.picker.is_none());
+        assert!(screen.settings_return_tab.is_none());
+
+        // Press 'M' to open models picker
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, None);
+        assert!(screen.picker.is_some());
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::Providers));
+
+        // Esc returns to Settings/Providers
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::Providers
+        );
+        assert!(screen.picker.is_none());
+
+        // Press 'E' to open edit form
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, None);
+        assert!(screen.form.is_some());
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::Providers));
+
+        // Esc returns to Settings/Providers
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::Providers
+        );
+        assert!(screen.form.is_none());
+    }
+
+    #[tokio::test]
+    async fn providers_tab_speed_test_records_and_renders_result() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.panel = Some(Panel::Settings);
+        let mut s = CliSettingsState::from_runner(&owner);
+        s.tab = SettingsTab::Providers;
+        s.provider_test_results
+            .insert("openai".into(), (true, "发现 12 款可用模型".into(), 42));
+        screen.settings = Some(s);
+
+        let rendered = render(&mut screen, 120, 36);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("连通正常"), "{rendered}");
+        assert!(compact.contains("42ms"), "{rendered}");
+        assert!(compact.contains("发现12款可用模型"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn form_navigation_up_down_and_kind_quick_switch() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let action = cli_commands::execute(&mut owner, "/provider add").unwrap();
+        let form = match action {
+            CliAction::Form(f) => f,
+            _ => panic!("Expected form"),
+        };
+        screen.form = Some(FormState::new(form));
+        let mut runner_opt = Some(owner);
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _ev_rx) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+
+        // Initial selected is 0 (name)
+        assert_eq!(screen.form.as_ref().unwrap().selected, 0);
+
+        // Press Down -> 1 (kind)
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.form.as_ref().unwrap().selected, 1);
+        assert_eq!(screen.form.as_ref().unwrap().form.fields[1].name, "kind");
+
+        // Press Space to cycle kind
+        let old_kind = screen.form.as_ref().unwrap().inputs[1].lines().join("");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        let new_kind = screen.form.as_ref().unwrap().inputs[1].lines().join("");
+        assert_ne!(old_kind, new_kind);
+        assert!(cyber_core::PROVIDER_KINDS.contains(&new_kind.as_str()));
+
+        // Press Up -> 0
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.form.as_ref().unwrap().selected, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_wizard_preset_labels_have_no_empty_parentheses() {
+        let mut runner = crate::headless::tests::test_runner().await;
+        let action = cli_commands::execute(&mut runner, "/provider wizard").unwrap();
+        if let CliAction::Picker(picker) = action {
+            assert_eq!(picker.kind, PickerKind::General);
+            assert_eq!(picker.title, "Add Provider from Preset or Custom");
+            for item in &picker.items {
+                assert!(
+                    !item.label.contains("()"),
+                    "Label should not contain empty parentheses: {}",
+                    item.label
+                );
+            }
+            let custom_opt = picker
+                .items
+                .iter()
+                .find(|i| i.label.contains("自定义服务商接入"));
+            assert!(
+                custom_opt.is_some(),
+                "Custom option must be present in wizard"
+            );
+            assert_eq!(custom_opt.unwrap().command, "/provider add-custom");
+        } else {
+            panic!("Expected CliAction::Picker for /provider wizard");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_provider_flow_routes_through_protocol_picker_not_model_panel() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _ev_rx) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner_opt = Some(runner);
+
+        let action =
+            cli_commands::execute(runner_opt.as_mut().unwrap(), "/provider add-custom").unwrap();
+        if let CliAction::Picker(picker) = &action {
+            assert_eq!(picker.kind, PickerKind::General);
+            assert_eq!(picker.title, "Select Protocol Kind");
+        } else {
+            panic!("Expected Picker for /provider add-custom");
+        }
+
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        assert!(screen.picker.is_some());
+        assert_ne!(screen.panel, Some(Panel::ModelPicker));
+        assert_eq!(
+            screen.picker.as_ref().unwrap().title,
+            "Select Protocol Kind"
+        );
+
+        let form_action = cli_commands::execute(
+            runner_opt.as_mut().unwrap(),
+            "/provider add-with-kind openai-compatible",
+        )
+        .unwrap();
+
+        apply_action(
+            &mut screen,
+            form_action,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+
+        assert!(screen.form.is_some());
+        assert_eq!(
+            screen.form.as_ref().unwrap().form.title,
+            "Add Custom Provider"
+        );
+        let kind_idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "kind")
+            .unwrap();
+        assert_eq!(
+            screen.form.as_ref().unwrap().inputs[kind_idx]
+                .lines()
+                .join(""),
+            "openai-compatible"
+        );
+    }
+
+    #[tokio::test]
+    async fn fullscreen_provider_picker_and_form_render_without_truncation() {
+        let mut runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        let picker_action = cli_commands::execute(&mut runner, "/provider wizard").unwrap();
+        if let CliAction::Picker(picker) = picker_action {
+            screen.picker = Some(picker);
+            screen.picker_selected = 0;
+            let rendered = render(&mut screen, 120, 40);
+            let compact = rendered.replace(' ', "");
+            assert!(compact.contains("服务商预设库与自定义接入"), "{rendered}");
+            assert!(compact.contains("服务商选项"), "{rendered}");
+            assert!(compact.contains("详细规格与配置指南"), "{rendered}");
+            assert!(compact.contains("DeepSeek官方"), "{rendered}");
+            assert!(compact.contains("自定义服务商接入"), "{rendered}");
+        }
+
+        let form_action =
+            cli_commands::execute(&mut runner, "/provider add-with-kind openai-compatible")
+                .unwrap();
+        if let CliAction::Form(form) = form_action {
+            screen.picker = None;
+            screen.form = Some(FormState::new(form));
+            let rendered = render(&mut screen, 120, 40);
+            let compact = rendered.replace(' ', "");
+            assert!(compact.contains("服务商接入配置"), "{rendered}");
+            assert!(compact.contains("配置字段输入"), "{rendered}");
+            assert!(compact.contains("参数向导与协议规范"), "{rendered}");
+            assert!(compact.contains("服务商标识(name)"), "{rendered}");
+            assert!(compact.contains("协议类型(kind)"), "{rendered}");
+            assert!(compact.contains("[openai-compatible]"), "{rendered}");
+            // 高级设置区标题与自定义端点字段
+            assert!(compact.contains("高级设置高级选项"), "{rendered}");
+            assert!(
+                compact.contains("自定义对话端点chat_endpoint"),
+                "{rendered}"
+            );
+            assert!(
+                compact.contains("自定义模型列表端点models_endpoint"),
+                "{rendered}"
+            );
+
+            // 小窗口下光标移动到最后一个字段：跟随滚屏必须把高级端点字段带入视口
+            let fields_len = screen.form.as_ref().unwrap().form.fields.len();
+            screen.form.as_mut().unwrap().selected = fields_len - 1;
+            let small = render(&mut screen, 100, 20).replace(' ', "");
+            assert!(
+                small.contains("自定义模型列表端点models_endpoint"),
+                "focused advanced field must stay visible: {small}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_memory_max_row_and_slot_partition() {
+        let mut state = CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
+        state.tab = SettingsTab::EnvMemory;
+
+        // 1. Both empty -> max_row = 1 (slot 0: env, slot 1: memory)
+        state.config_draft.env.vars.clear();
+        state.config_draft.memory.rules.clear();
+        assert_eq!(state.tab.max_row(&state), 1);
+
+        // 2. Empty env, 2 rules -> env_slots=1, mem_slots=2, max_row = 2 (0: env, 1..=2: rules)
+        state
+            .config_draft
+            .memory
+            .rules
+            .push(cyber_core::MemoryRule {
+                enabled: true,
+                scope: "both".into(),
+                prompt: "rule 1".into(),
+            });
+        state
+            .config_draft
+            .memory
+            .rules
+            .push(cyber_core::MemoryRule {
+                enabled: true,
+                scope: "project".into(),
+                prompt: "rule 2".into(),
+            });
+        assert_eq!(state.tab.max_row(&state), 2);
+
+        // 3. 2 env, empty rules -> env_slots=2, mem_slots=1, max_row = 2 (0..=1: env, 2: rules)
+        state.config_draft.memory.rules.clear();
+        state.config_draft.env.vars.push(cyber_core::EnvVar {
+            key: "VAR1".into(),
+            value: "val1".into(),
+            sensitive: false,
+        });
+        state.config_draft.env.vars.push(cyber_core::EnvVar {
+            key: "VAR2".into(),
+            value: "val2".into(),
+            sensitive: true,
+        });
+        assert_eq!(state.tab.max_row(&state), 2);
+
+        // 4. 2 env, 2 rules -> env_slots=2, mem_slots=2, max_row = 3 (0..=1: env, 2..=3: rules)
+        state
+            .config_draft
+            .memory
+            .rules
+            .push(cyber_core::MemoryRule {
+                enabled: true,
+                scope: "both".into(),
+                prompt: "rule 1".into(),
+            });
+        state
+            .config_draft
+            .memory
+            .rules
+            .push(cyber_core::MemoryRule {
+                enabled: false,
+                scope: "global".into(),
+                prompt: "rule 2".into(),
+            });
+        assert_eq!(state.tab.max_row(&state), 3);
+
+        // 5. 2 env + 2 rules + 3 memories -> env_slots=2, mem_slots=2, 记忆槽位 4..=6
+        state.memories_global = vec![
+            cyber_core::MemoryEntry {
+                index: 1,
+                content: "g1".into(),
+            },
+            cyber_core::MemoryEntry {
+                index: 2,
+                content: "g2".into(),
+            },
+        ];
+        state.memories_project = vec![cyber_core::MemoryEntry {
+            index: 1,
+            content: "p1".into(),
+        }];
+        assert_eq!(state.total_memories(), 3);
+        assert_eq!(state.tab.max_row(&state), 6);
+        assert_eq!(state.memory_at(0), Some((MemoryGroup::Global, 0)));
+        assert_eq!(state.memory_at(1), Some((MemoryGroup::Global, 1)));
+        assert_eq!(state.memory_at(2), Some((MemoryGroup::Project, 0)));
+        assert_eq!(state.memory_at(3), None);
+    }
+
+    fn buffer_of(screen: &mut CliScreen, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| screen.draw(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// 校验弹窗（弹窗矩形由父区域按 85%/最小 70x20 规则居中算出）边框每一格是否完整。
+    ///
+    /// 断言的是 **终端实际显示的内容**：`TestBackend` 缓冲是 ratatui 缓冲 diff 应用后的
+    /// 结果，宽字符尾随单元格被 diff 跳过时，边框会在这里缺格。
+    fn modal_border_violations(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> Vec<String> {
+        let width = (w * 85 / 100).max(70).min(w);
+        let height = (h * 85 / 100).max(20).min(h);
+        let x0 = (w - width) / 2;
+        let y0 = (h - height) / 2;
+        let right = x0 + width - 1;
+        let bottom = y0 + height - 1;
+        let mut bad = Vec::new();
+        if !(x0..=right).any(|x| buf[(x, y0)].symbol() == "📖") {
+            bad.push("弹窗标题未出现在预期位置".into());
+        }
+        for y in (y0 + 1)..bottom {
+            if buf[(x0, y)].symbol() != "│" {
+                bad.push(format!("左边框 y={y} 为 {:?}", buf[(x0, y)].symbol()));
+            }
+            if buf[(right, y)].symbol() != "│" {
+                bad.push(format!("右边框 y={y} 为 {:?}", buf[(right, y)].symbol()));
+            }
+        }
+        for x in (x0 + 1)..right {
+            if buf[(x, bottom)].symbol() != "─" {
+                bad.push(format!("下边框 x={x} 为 {:?}", buf[(x, bottom)].symbol()));
+            }
+        }
+        for (x, y, want, name) in [
+            (x0, y0, "┌", "左上角"),
+            (right, y0, "┐", "右上角"),
+            (x0, bottom, "└", "左下角"),
+            (right, bottom, "┘", "右下角"),
+        ] {
+            if buf[(x, y)].symbol() != want {
+                bad.push(format!("{name} ({x},{y}) 为 {:?}", buf[(x, y)].symbol()));
+            }
+        }
+        bad
+    }
+
+    /// 弹窗边框必须完整：底层文本的宽字符（CJK/emoji）尾随单元格会被 ratatui 的缓冲
+    /// diff 跳过，曾导致「记忆详情」竖边框与左上/左下角缺一格，看起来像被文字挤掉。
+    #[tokio::test]
+    async fn test_detail_modals_border_survives_underlying_wide_text() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('6'),
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.config_draft.env.vars.clear();
+            s.config_draft.memory.rules.clear();
+            s.memories_global = vec![MemoryEntry {
+                index: 1,
+                content: "全局记忆内容 一二三四五六七八九十".into(),
+            }];
+            s.memories_project = vec![MemoryEntry {
+                index: 1,
+                content: "项目记忆 甲乙丙丁".into(),
+            }];
+            s.selected_row = 2;
+            s.memory_detail = Some(MemoryDetailModal {
+                group: MemoryGroup::Global,
+                entry: 0,
+                scroll: 0,
+            });
+        }
+        for (w, h) in [(100u16, 24u16), (80, 20), (60, 18), (140, 40)] {
+            let buf = buffer_of(&mut screen, w, h);
+            let bad = modal_border_violations(&buf, w, h);
+            assert!(
+                bad.is_empty(),
+                "记忆详情弹窗边框在 {w}x{h} 下被文字挤掉: {bad:?}"
+            );
+        }
+
+        // 同构的 Skill 详情弹窗使用同一套清屏逻辑，边框同样必须完整
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.memory_detail = None;
+            s.tab = SettingsTab::ToolsMcp;
+            s.skills = vec![SkillSummary {
+                name: "demo-skill".into(),
+                description: "演示技能 一二三四五六七八九十".into(),
+                body: "# 标题\n正文一二三四五六七八九十".into(),
+                ..Default::default()
+            }];
+            s.skill_detail = Some(SkillDetailModal {
+                skill_index: 0,
+                scroll: 0,
+            });
+        }
+        for (w, h) in [(100u16, 24u16), (80, 20), (140, 40)] {
+            let buf = buffer_of(&mut screen, w, h);
+            let bad = modal_border_violations(&buf, w, h);
+            assert!(
+                bad.is_empty(),
+                "Skill 详情弹窗边框在 {w}x{h} 下被文字挤掉: {bad:?}"
+            );
+        }
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_env_memory_list_rendering_and_detail_modal() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        // Open settings (F3) then switch to tab 6 (EnvMemory)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('6'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::EnvMemory
+        );
+
+        // env_slots = 1 + mem_slots = 1 -> first memory row is selected_row == 2
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.config_draft.env.vars.clear();
+            s.config_draft.memory.rules.clear();
+            s.memories_global = vec![MemoryEntry {
+                index: 1,
+                content: "全局偏好 Python".into(),
+            }];
+            s.memories_project = vec![MemoryEntry {
+                index: 1,
+                content: "项目使用 tokio".into(),
+            }];
+            s.selected_row = 2;
+        }
+
+        let rendered = render(&mut screen, 120, 40).replace(' ', "");
+        for needle in [
+            "用户记忆列表",
+            "全局记忆",
+            "项目级记忆",
+            "全局偏好Python",
+            "项目使用tokio",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "rendered settings must contain {needle}: {rendered}"
+            );
+        }
+
+        // Enter on a memory row opens the read-only detail modal
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        {
+            let detail = screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .memory_detail
+                .as_ref()
+                .expect("memory detail modal must open");
+            assert_eq!(detail.group, MemoryGroup::Global);
+            assert_eq!(detail.entry, 0);
+            assert_eq!(detail.scroll, 0);
+        }
+
+        let modal = render(&mut screen, 120, 40).replace(' ', "");
+        for needle in ["记忆详情[1/2]", "全局偏好Python"] {
+            assert!(
+                modal.contains(needle),
+                "memory detail modal must contain {needle}: {modal}"
+            );
+        }
+
+        // Down scrolls the modal body
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .memory_detail
+                .as_ref()
+                .unwrap()
+                .scroll,
+            1
+        );
+
+        // Right jumps to the next memory across groups and syncs the outer cursor
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        {
+            let settings = screen.settings.as_ref().unwrap();
+            let detail = settings.memory_detail.as_ref().unwrap();
+            assert_eq!(detail.group, MemoryGroup::Project);
+            assert_eq!(detail.entry, 0);
+            assert_eq!(detail.scroll, 0);
+            assert_eq!(settings.selected_row, 3);
+        }
+
+        // Esc closes the modal, keeping the list cursor where the modal left it
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        {
+            let settings = screen.settings.as_ref().unwrap();
+            assert!(settings.memory_detail.is_none());
+            assert_eq!(settings.selected_row, 3);
+        }
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_env_memory_shortcuts_and_interactions() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let mut runner_opt = Some(runner);
+
+        // Open settings panel with F(3), then switch to tab 6 (EnvMemory)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('6'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::EnvMemory
+        );
+
+        // Add 1 env var and 1 memory rule into config_draft
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.config_draft.env.vars.clear();
+            s.config_draft.memory.rules.clear();
+            s.config_draft.env.vars.push(cyber_core::EnvVar {
+                key: "FOO_TOKEN".into(),
+                value: "abc-123".into(),
+                sensitive: false,
+            });
+            s.config_draft.memory.rules.push(cyber_core::MemoryRule {
+                enabled: true,
+                scope: "both".into(),
+                prompt: "remember test rule".into(),
+            });
+            s.selected_row = 0; // Focus on FOO_TOKEN
+        }
+
+        // Space on env var toggles sensitive
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().config_draft.env.vars[0].sensitive);
+        assert!(screen.status.contains("已开启脱敏保护"));
+
+        // Enter on env var opens /env edit form
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_some());
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::EnvMemory));
+
+        // Esc returns to settings EnvMemory
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_none());
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::EnvMemory
+        );
+
+        // Press 'A' on env partition opens /env add form
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_some());
+        assert_eq!(
+            screen.form.as_ref().unwrap().form.title,
+            "Add Environment Variable"
+        );
+
+        // Esc returns
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+
+        // Move to memory rule partition (selected_row = 1)
+        screen.settings.as_mut().unwrap().selected_row = 1;
+
+        // Space on memory rule toggles enabled
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        assert!(!screen.settings.as_ref().unwrap().config_draft.memory.rules[0].enabled);
+        assert!(screen.status.contains("已关闭"));
+
+        // Right on memory rule cycles scope: "both" -> "project"
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().config_draft.memory.rules[0].scope,
+            "project"
+        );
+
+        // Right again: "project" -> "global"
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().config_draft.memory.rules[0].scope,
+            "global"
+        );
+
+        // Enter on memory rule opens /memory rule edit form
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_some());
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::EnvMemory));
+
+        // Esc returns
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+
+        // Press 'A' on memory partition opens /memory rule add form
+        screen.settings.as_mut().unwrap().selected_row = 1;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_some());
+        assert_eq!(screen.form.as_ref().unwrap().form.title, "Memory Rule");
+
+        // Esc returns
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+
+        // Press 'D' on memory rule deletes it
+        screen.settings.as_mut().unwrap().selected_row = 1;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .memory
+                .rules
+                .len(),
+            0
+        );
+
+        // Press 'D' on env var deletes it
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .env
+                .vars
+                .len(),
+            0
+        );
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_env_memory_rendering_badges_and_hints() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let mut runner_opt = Some(runner);
+
+        // Open settings panel with F(3), then switch to tab 6 (EnvMemory)
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('6'),
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.config_draft.env.vars = vec![
+                cyber_core::EnvVar {
+                    key: "SECRET_KEY".into(),
+                    value: "secret-data".into(),
+                    sensitive: true,
+                },
+                cyber_core::EnvVar {
+                    key: "PUBLIC_URL".into(),
+                    value: "http://localhost:8080".into(),
+                    sensitive: false,
+                },
+            ];
+            s.config_draft.memory.rules = vec![cyber_core::MemoryRule {
+                enabled: true,
+                scope: "both".into(),
+                prompt: "always check tests".into(),
+            }];
+            s.selected_row = 0; // Focus on SECRET_KEY in Env partition
+        }
+
+        let rendered = render(&mut screen, 120, 40);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("SECRET_KEY"), "{rendered}");
+        assert!(compact.contains("PUBLIC_URL"), "{rendered}");
+        assert!(compact.contains("脱敏保护"), "{rendered}");
+        assert!(compact.contains("明文公开"), "{rendered}");
+        assert!(
+            compact.contains("sk-************************"),
+            "{rendered}"
+        );
+        assert!(compact.contains("alwayschecktests"), "{rendered}");
+        assert!(compact.contains("开启"), "{rendered}");
+        assert!(compact.contains("全局与项目"), "{rendered}");
+        assert!(compact.contains("当前聚焦"), "{rendered}");
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_question_custom_input_chinese_text_does_not_leak_to_composer() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let req = cyber_agent::QuestionRequest {
+            id: "test".into(),
+            questions: vec![cyber_agent::QuestionItem {
+                id: "q1".into(),
+                question: "选择方案".into(),
+                header: None,
+                options: vec![cyber_agent::QuestionOption {
+                    label: "A".into(),
+                    description: None,
+                    recommended: false,
+                }],
+                multi: false,
+            }],
+            reply,
+        };
+        let mut q_state = crate::question_ui::QuestionUiState::new(req);
+        // 进入自定义输入编辑模式
+        q_state.start_custom_editing();
+        screen.question_state = Some(q_state);
+
+        // 模拟中文输入法一次性提交多个中文字符（或粘贴）
+        screen.insert_text("需要启用全文检索和向量扩展");
+
+        // 验证：内容完整进入 question_state 的 custom_textarea，底部 input 保持完全为空！
+        let q_state_ref = screen.question_state.as_ref().unwrap();
+        assert_eq!(
+            q_state_ref.custom_textarea.lines().join(""),
+            "需要启用全文检索和向量扩展"
+        );
+        assert!(screen.input.is_empty(), "底部输入框必须为空，绝不能泄漏！");
+    }
+
+    #[tokio::test]
+    async fn test_question_non_editing_paste_does_not_leak_to_composer() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let req = cyber_agent::QuestionRequest {
+            id: "test".into(),
+            questions: vec![cyber_agent::QuestionItem {
+                id: "q1".into(),
+                question: "选择方案".into(),
+                header: None,
+                options: vec![cyber_agent::QuestionOption {
+                    label: "A".into(),
+                    description: None,
+                    recommended: false,
+                }],
+                multi: false,
+            }],
+            reply,
+        };
+        let q_state = crate::question_ui::QuestionUiState::new(req);
+        assert!(!q_state.custom_editing);
+        screen.question_state = Some(q_state);
+
+        // 在非自定义编辑模式下意外粘贴或快速按键
+        screen.insert_text("随意内容");
+
+        // 验证：绝不进入底部 input
+        assert!(screen.input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn env_form_dialog_renders_modal_style_and_masks_secret() {
+        let mut runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        runner.ctx.config.env.vars.push(cyber_core::EnvVar {
+            key: "MY_TOKEN".into(),
+            value: "abcdef123456".into(),
+            sensitive: true,
+        });
+        let CliAction::Form(form) =
+            cli_commands::execute(&mut runner, "/env edit MY_TOKEN").unwrap()
+        else {
+            panic!("expected form");
+        };
+        screen.form = Some(FormState::new(form));
+        let rendered = render(&mut screen, 120, 40);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("编辑环境变量"), "{rendered}");
+        assert!(
+            compact.contains("EditEnvironmentVariable(MY_TOKEN)"),
+            "{rendered}"
+        );
+        assert!(compact.contains("变量名称(key)"), "{rendered}");
+        assert!(compact.contains("变量内容(value)"), "{rendered}");
+        assert!(compact.contains("脱敏保护(sensitive)"), "{rendered}");
+        assert!(compact.contains("🔒[脱敏保护]"), "{rendered}");
+        assert!(compact.contains("************"), "{rendered}");
+        assert!(
+            !rendered.contains("abcdef123456"),
+            "敏感值绝不能出现在渲染结果中: {rendered}"
+        );
+        assert!(compact.contains("[Esc]取消"), "{rendered}");
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn memory_rule_dialog_renders_modal_style_badges() {
+        let mut runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let CliAction::Form(form) = cli_commands::execute(&mut runner, "/memory rule add").unwrap()
+        else {
+            panic!("expected form");
+        };
+        screen.form = Some(FormState::new(form));
+        let rendered = render(&mut screen, 120, 40);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("新增记忆规则"), "{rendered}");
+        assert!(compact.contains("启用状态(enabled)"), "{rendered}");
+        assert!(compact.contains("[●开启]"), "{rendered}");
+        assert!(compact.contains("作用域(scope)"), "{rendered}");
+        assert!(compact.contains("[全局与项目(both)]"), "{rendered}");
+        assert!(compact.contains("规则提示(prompt)"), "{rendered}");
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    /// 由设置面板打开的弹层（编辑环境变量 / 编辑记忆规则 / Models 模型选择器）必须以
+    /// 设置中心为背景：弹层打开期间 `panel` 仍为 `None`，但绘制不得回落到对话界面。
+    #[tokio::test]
+    async fn settings_opened_dialogs_keep_settings_panel_as_background() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        owner.ctx.config.env.vars.push(cyber_core::EnvVar {
+            key: "DASCTF_ACCESS_KEY".into(),
+            value: "demo".into(),
+            sensitive: false,
+        });
+        owner.ctx.config.memory.rules.push(cyber_core::MemoryRule {
+            enabled: true,
+            scope: "both".into(),
+            prompt: "demo rule".into(),
+        });
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('6'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::EnvMemory
+        );
+
+        // 1) 编辑环境变量表单：selected_row = 0 即第一个环境变量
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_some(), "Enter 应打开编辑环境变量表单");
+        let frame = render(&mut screen, 120, 36);
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "编辑环境变量弹层的背景必须是设置中心，而不是对话界面: {frame}"
+        );
+        assert!(frame.replace(' ', "").contains("编辑环境变量"), "{frame}");
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_none());
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
+        // 2) 编辑记忆规则表单：env_slots = 1，selected_row = 1 即第一条规则
+        screen.settings.as_mut().unwrap().selected_row = 1;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_some(), "Enter 应打开编辑记忆规则表单");
+        let frame = render(&mut screen, 120, 36);
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "{frame}"
+        );
+        assert!(frame.replace(' ', "").contains("编辑记忆规则"), "{frame}");
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_none());
+
+        // 3) Models 模型选择弹层
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::Providers
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+        );
+        assert!(screen.picker.is_some(), "'M' 应打开 Models 弹层");
+        let frame = render(&mut screen, 120, 36);
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "{frame}"
+        );
+        assert!(frame.replace(' ', "").contains("🤖Models("), "{frame}");
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.picker.is_none());
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        let frame = render(&mut screen, 120, 36);
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "{frame}"
+        );
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    fn models_picker(label: &str, detail: &str) -> CommandPicker {
+        CommandPicker {
+            title: "Models (demo)".into(),
+            items: vec![cli_commands::PickerItem {
+                label: label.into(),
+                detail: detail.into(),
+                command: "/model demo demo-model".into(),
+            }],
+            kind: PickerKind::Models,
+        }
+    }
+
+    #[tokio::test]
+    async fn models_picker_dialog_renders_modal_style_with_selected_summary() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.picker = Some(models_picker("demo-model (当前使用)", "Provider: demo"));
+        let rendered = render(&mut screen, 120, 40);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("🤖Models(demo)[1/1]"), "{rendered}");
+        assert!(compact.contains("当前选中:"), "{rendered}");
+        assert!(compact.contains("demo-model(当前使用)"), "{rendered}");
+        assert!(compact.contains("[当前启用]"), "{rendered}");
+        assert!(compact.contains("Provider:demo"), "{rendered}");
+        assert!(compact.contains("选项列表"), "{rendered}");
+        assert!(
+            compact.contains("[↑/↓]选择·[Enter]确认·[Esc]关闭"),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn picker_dialog_narrow_and_tiny_sizes_do_not_panic() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        screen.picker = Some(models_picker("demo-model", "Provider: demo"));
+        for (w, h) in [(39u16, 7u16), (40, 8), (60, 12), (1, 1), (0, 0)] {
+            let _ = render(&mut screen, w, h);
+        }
+        // 对话区（sections[1]）需 ≥ 8 行才渲染模态框；100x25 时约 16 行。
+        let compact = render(&mut screen, 100, 25).replace(' ', "");
+        assert!(
+            compact.contains("当前选中:"),
+            "100x25 应渲染模态正文: {compact}"
+        );
+        let _ = std::fs::remove_dir_all(runner.cwd);
+
+        // dialog_area 边界：40x8 为最小可渲染区域，39x7 直接早退（不绘制、不 panic）。
+        let picker = models_picker("demo-model", "Provider: demo");
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_picker_dialog(frame, Rect::new(0, 0, 40, 8), &picker, 0, false, ""))
+            .unwrap();
+        let mut text = String::new();
+        for y in 0..8 {
+            for x in 0..40 {
+                text.push_str(terminal.backend().buffer()[(x, y)].symbol());
+            }
+        }
+        assert!(
+            text.replace(' ', "").contains("选项列表")
+                && text.replace(' ', "").contains("demo-model"),
+            "40x8 应渲染模态框且聚焦行可见: {text}"
+        );
+        terminal
+            .draw(|frame| draw_picker_dialog(frame, Rect::new(0, 0, 39, 7), &picker, 0, false, ""))
+            .unwrap();
+    }
+
+    /// Ctrl+D 不再退出进程：空输入与有输入下均返回 `false`（不退出）、不破坏输入内容；
+    /// shortcuts 面板也不得再宣传该快捷键（退出仍走 Ctrl+C / `/quit`）。
+    #[tokio::test]
+    async fn ctrl_d_no_longer_exits_the_process() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+
+        assert!(
+            !input_key(
+                &mut screen,
+                &mut runner,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL
+            ),
+            "空输入 Ctrl+D 不应退出进程"
+        );
+        assert!(screen.input.is_empty(), "空输入 Ctrl+D 不应写入输入框");
+
+        screen.input.insert_str("token");
+        assert!(
+            !input_key(
+                &mut screen,
+                &mut runner,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL
+            ),
+            "有输入 Ctrl+D 不应退出进程"
+        );
+        assert_eq!(
+            screen.input.lines().join(""),
+            "token",
+            "有输入 Ctrl+D 只能由输入框自行处理，不得清空内容"
+        );
+
+        screen.input = composer();
+        screen.panel = Some(Panel::Shortcuts);
+        let rendered = render(&mut screen, 110, 40);
+        assert!(
+            !rendered.contains("Ctrl+D"),
+            "shortcuts 不应再列出 Ctrl+D: {rendered}"
+        );
+        assert!(
+            rendered.contains("PgUp / PgDn"),
+            "shortcuts 应渲染到 Ctrl+D 原位置之后，缺席断言才成立: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(runner.unwrap().cwd);
+    }
+
+    /// 移除「空输入 Ctrl+D 退出」后，Ctrl+D 不得落入面板的 `d` 单键动作
+    /// （设置面板 Providers/Env/Memory 段均为「删除」）。
+    #[tokio::test]
+    async fn ctrl_d_in_settings_does_not_trigger_delete_shortcuts() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _ev_rx) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+
+        screen.panel = Some(Panel::Settings);
+        let mut settings = CliSettingsState::from_runner(runner_opt.as_ref().unwrap());
+        settings.tab = SettingsTab::Providers;
+        let providers_before = settings.providers_draft.providers.len();
+        assert!(
+            providers_before > 1,
+            "测试前提：默认模板需有多个 provider 才能触发删除分支"
+        );
+        screen.settings = Some(settings);
+
+        let press_ctrl_d = |screen: &mut CliScreen,
+                            runner: &mut Option<SessionRunner>,
+                            permissions: &Arc<PermissionBroker>,
+                            events: &mpsc::UnboundedSender<AgentEvent>,
+                            active: &mut Option<ActiveTurn>,
+                            cancel: &mut Option<oneshot::Sender<()>>| {
+            handle_key(
+                screen,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                runner,
+                permissions,
+                events,
+                active,
+                cancel,
+            )
+            .unwrap()
+        };
+
+        assert!(
+            !press_ctrl_d(
+                &mut screen,
+                &mut runner_opt,
+                &permissions,
+                &events,
+                &mut active,
+                &mut cancel
+            ),
+            "Ctrl+D 不应退出进程"
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .providers_draft
+                .providers
+                .len(),
+            providers_before,
+            "Ctrl+D 不得触发 provider 删除"
+        );
+
+        // 同法覆盖 EnvMemory 段：该段 `d` 为删除环境变量/记忆规则。
+        {
+            let settings = screen.settings.as_mut().unwrap();
+            settings.tab = SettingsTab::EnvMemory;
+            settings.config_draft.env.vars.push(cyber_core::EnvVar {
+                key: "KEEP_ME".into(),
+                value: "1".into(),
+                sensitive: false,
+            });
+        }
+        let env_before = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .env
+            .vars
+            .len();
+        assert!(env_before > 0);
+        assert!(
+            !press_ctrl_d(
+                &mut screen,
+                &mut runner_opt,
+                &permissions,
+                &events,
+                &mut active,
+                &mut cancel
+            ),
+            "Ctrl+D 不应退出进程"
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .env
+                .vars
+                .len(),
+            env_before,
+            "Ctrl+D 不得触发环境变量删除"
+        );
+        let _ = std::fs::remove_dir_all(runner_opt.unwrap().cwd);
+    }
+
+    /// 定位缓冲区内最上（且最左）的圆角框，校验四条边框字符是否被内容覆写。
+    fn rounded_frame_violations(buffer: &ratatui::buffer::Buffer, w: u16, h: u16) -> Vec<String> {
+        let mut origin = None;
+        'find: for y in 0..h {
+            for x in 0..w {
+                if buffer[(x, y)].symbol() == "╭" {
+                    origin = Some((x, y));
+                    break 'find;
+                }
+            }
+        }
+        let Some((x0, y0)) = origin else {
+            return vec!["未找到任何圆角框".into()];
+        };
+        let x1 = (x0 + 1..w).find(|&x| buffer[(x, y0)].symbol() == "╮");
+        let Some(x1) = x1 else {
+            return vec![format!("顶边 y={y0} 缺少右上角 ╮")];
+        };
+        let y1 = (y0 + 1..h).find(|&y| buffer[(x0, y)].symbol() == "╰");
+        let Some(y1) = y1 else {
+            return vec![format!("左边 x={x0} 缺少左下角 ╰")];
+        };
+        let mut bad = Vec::new();
+        for y in y0..=y1 {
+            let (left_expect, right_expect) = if y == y0 {
+                ("╭", "╮")
+            } else if y == y1 {
+                ("╰", "╯")
+            } else {
+                ("│", "│")
+            };
+            for (x, expect) in [(x0, left_expect), (x1, right_expect)] {
+                let got = buffer[(x, y)].symbol();
+                if got != expect {
+                    bad.push(format!("({x},{y}) 期望 {expect} 实际 {got:?}"));
+                }
+            }
+        }
+        bad
+    }
+
+    #[tokio::test]
+    async fn sessions_picker_borders_intact_over_long_chat_content() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let long_title =
+            "测试提问 → 仅测试提问（无需后续操作）  你好 你是什么模型 dkrw7ul84mtw 67 messages";
+        screen.messages.push(Line::from(format!(
+            " 工具调用、单选/多选、推荐标记均正常返回 {long_title}"
+        )));
+        for _ in 0..40 {
+            screen.messages.push(Line::from(format!(
+                "你好 你是什么模型 这是一段较长的对话内容用于验证边框是否被覆盖 {long_title}"
+            )));
+        }
+        screen.picker = Some(cli_commands::CommandPicker {
+            title: format!("Sessions · {long_title}"),
+            kind: cli_commands::PickerKind::Sessions,
+            items: vec![
+                cli_commands::PickerItem {
+                    label: long_title.into(),
+                    detail: "dkrw7ul84mtw  67 messages".into(),
+                    command: "/sessions 1".into(),
+                },
+                cli_commands::PickerItem {
+                    label:
+                        "多选测试 → 优先启用 custom_* 自定义工具（含超长的会话标题用于测试边框）"
+                            .into(),
+                    detail: "abc12345678  12 messages".into(),
+                    command: "/sessions 2".into(),
+                },
+            ],
+        });
+
+        for (w, h) in [(120u16, 40u16), (100, 30), (80, 24), (60, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_picker_dialog(
+                        frame,
+                        Rect::new(0, 0, w, h),
+                        screen.picker.as_ref().unwrap(),
+                        0,
+                        false,
+                        "测试提问 → 仅测试提问",
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let bad = rounded_frame_violations(buffer, w, h);
+            assert!(bad.is_empty(), "会话选择器 w={w} 边框损坏: {bad:#?}");
+
+            // 框体外围必须留白：对话文字不得紧贴边框（与 Skill 详情弹窗一致）。
+            let frame_area = dialog_area(Rect::new(0, 0, w, h)).unwrap();
+            let (x0, y0) = (frame_area.x, frame_area.y);
+            let x1 = frame_area.x + frame_area.width - 1;
+            let y1 = frame_area.y + frame_area.height - 1;
+            let mut adjacency = Vec::new();
+            for y in y0..=y1 {
+                if x0 > 0 && buffer[(x0 - 1, y)].symbol() != " " {
+                    adjacency.push(format!("左边贴边 ({},{y})", x0 - 1));
+                }
+                if x1 + 1 < w && buffer[(x1 + 1, y)].symbol() != " " {
+                    adjacency.push(format!("右边贴边 ({},{y})", x1 + 1));
+                }
+            }
+            for x in x0..=x1 {
+                if y0 > 0 && buffer[(x, y0 - 1)].symbol() != " " {
+                    adjacency.push(format!("上边贴边 ({x},{})", y0 - 1));
+                }
+                if y1 + 1 < h && buffer[(x, y1 + 1)].symbol() != " " {
+                    adjacency.push(format!("下边贴边 ({x},{})", y1 + 1));
+                }
+            }
+            assert!(
+                adjacency.is_empty(),
+                "会话选择器 w={w} 边框外圈未留白: {adjacency:#?}"
+            );
+        }
     }
 }
