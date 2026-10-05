@@ -19,6 +19,8 @@ pub enum SubagentStatus {
     Error,
     TimedOut,
     Killed,
+    StepLimitReached,
+    LoopDetected,
 }
 
 /// 一次子代理运行的完整转录（会话生命周期内可回看）。
@@ -173,7 +175,7 @@ impl TranscriptWriter {
         }
     }
 
-    /// 追加推理片段：按缓冲聚合，`\n` 断行转为行尾空格；超阈值落盘保持实时可见。
+    /// 追加推理片段：按缓冲聚合，保留真实换行与空行；超阈值落盘保持实时可见。
     pub(crate) fn reasoning(&self, text: &str) {
         let mut buf = match self.reasoning_buf.lock() {
             Ok(guard) => guard,
@@ -182,15 +184,12 @@ impl TranscriptWriter {
         buf.push_str(text);
         while let Some(idx) = buf.find('\n') {
             let complete: String = buf.drain(..=idx).collect();
-            let line = complete.trim_end_matches(['\n', '\r']).trim_end();
-            if !line.is_empty() {
-                self.push(format!("thinking: {line} "));
-            }
+            let line = complete.trim_end_matches(['\n', '\r']);
+            self.push(format!("thinking: {line}\n"));
         }
         if buf.len() >= REASONING_FLUSH_CHARS {
             let chunk: String = buf.drain(..).collect();
-            let chunk = chunk.trim_end_matches(['\n', '\r']);
-            if !chunk.trim().is_empty() {
+            if !chunk.is_empty() {
                 self.push(format!("thinking: {chunk}"));
             }
         }
@@ -215,7 +214,7 @@ impl TranscriptWriter {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         };
-        let tail = tail.trim_end_matches(['\n', '\r']).trim_end();
+        let tail = tail.trim_end_matches(['\n', '\r']);
         if !tail.is_empty() {
             self.push(format!("thinking: {tail}"));
         }
@@ -296,7 +295,7 @@ mod tests {
         let id = archive.start("reasoning");
         let writer = TranscriptWriter::new(archive.run_handle(id).unwrap());
         // 事件边界切在词/数字中间（node_ / modules、118 / 42）：不得插入空格；
-        // 真正的 \n 断行转成行尾空格（保词间分隔）；无换行尾部在 flush 时落盘。
+        // 真正的 \n 断行保留为真实换行 \n（保证段落与 Markdown 结构）；无换行尾部在 flush 时落盘。
         writer.reasoning("no node_");
         writer.reasoning("modules, 118");
         writer.reasoning("42 files.\nsecond paragraph\n");
@@ -306,9 +305,28 @@ mod tests {
         assert_eq!(
             run.lines,
             vec![
-                "thinking: no node_modules, 11842 files. ",
-                "thinking: second paragraph ",
+                "thinking: no node_modules, 11842 files.\n",
+                "thinking: second paragraph\n",
                 "thinking: tail without newline",
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_writer_reasoning_preserves_multiline_paragraphs_and_blank_lines() {
+        let archive = SubagentArchive::default();
+        let id = archive.start("multiline-reasoning");
+        let writer = TranscriptWriter::new(archive.run_handle(id).unwrap());
+        writer.reasoning("Paragraph 1\n\n- step 1\n- step 2\n");
+        writer.flush();
+        let run = &archive.snapshot()[0];
+        assert_eq!(
+            run.lines,
+            vec![
+                "thinking: Paragraph 1\n",
+                "thinking: \n",
+                "thinking: - step 1\n",
+                "thinking: - step 2\n",
             ]
         );
     }

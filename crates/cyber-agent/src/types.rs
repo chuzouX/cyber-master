@@ -181,6 +181,8 @@ pub enum StreamEvent {
     Usage(Usage),
     /// 流正常结束。
     Done,
+    /// 输出被 provider 截断（达到 max_tokens / max_output_tokens）。随后仍会到达 `Done`。
+    Truncated(String),
     /// 流内可恢复错误（HTTP/stream/解析失败），不终止 agent 任务，仅展示。
     Error(String),
 }
@@ -263,6 +265,8 @@ pub enum AgentEvent {
         delay_secs: u64,
         error: String,
     },
+    /// 非致命提示（如输出被截断且无法自动补全）。回合仍正常结束。
+    Notice(String),
     Done,
     Error(String),
 }

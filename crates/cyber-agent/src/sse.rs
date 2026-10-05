@@ -118,6 +118,18 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
             out.push(StreamEvent::Usage(u));
         }
     }
+    // 输出长度截断：OpenAI 常在**无 delta** 的独立 chunk 里携带 finish_reason，
+    // 必须在下面的 `delta` 取值（None → return）之前判定，否则信号被静默丢弃。
+    if let Some(finish) = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|f| f.as_str())
+    {
+        if finish == "length" {
+            out.push(StreamEvent::Truncated("max_tokens".into()));
+        }
+    }
     let delta = match v
         .get("choices")
         .and_then(|c| c.get(0))
@@ -260,6 +272,15 @@ pub fn parse_anthropic_line(line: &str) -> Vec<StreamEvent> {
                 }
             }
         }
+        Some("message_delta") => {
+            if v.get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|r| r.as_str())
+                == Some("max_tokens")
+            {
+                out.push(StreamEvent::Truncated("max_tokens".into()));
+            }
+        }
         Some("message_stop") => out.push(StreamEvent::Done),
         _ => {} // message_start / ping / content_block_stop 等
     }
@@ -341,6 +362,9 @@ pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
             cache_miss_tokens: prompt_tokens,
         }));
     }
+    if v.get("done_reason").and_then(|d| d.as_str()) == Some("length") {
+        out.push(StreamEvent::Truncated("max_tokens".into()));
+    }
     if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
         out.push(StreamEvent::Done);
     }
@@ -351,12 +375,12 @@ pub fn parse_ollama_line(line: &str) -> Vec<StreamEvent> {
 /// - `response.output_text.delta` → `Delta`（`delta` 字段）
 /// - `response.output_item.added` 且 item.type=function_call → `ToolCallDelta` 首片（id+name）
 /// - `response.function_call_arguments.delta` → `ToolCallDelta` 参数片段
-/// - `response.completed` / `response.incomplete` → `Done`（incomplete = 输出被截断，仍终止）
+/// - `response.completed` → `Done`；`response.incomplete` → `Truncated(reason)` + `Done`
 /// - `response.failed` → `Error`（提取 `error.message`）
 /// - `response.completed` 携带 `usage` → `Usage`（input_tokens/output_tokens 映射）
 ///
-/// 注意：`response.incomplete` 在 `max_output_tokens` 截断时触发，这里同样发 `Done`
-/// 而非 Error——与 OpenAI chat 的 `finish_reason` 语义一致（流正常结束但输出不完整）。
+/// 注意：`response.incomplete` 在 `max_output_tokens` 截断时触发，这里发 `Truncated`
+/// 而非 Error——流正常结束但输出不完整，由 agent loop 决定续写或提示。
 /// 不用 `function_call_arguments.done`（完整 arguments）兜底：delta 已逐片累积过，
 /// done 再推完整 JSON 会导致参数重复拼接。
 pub fn parse_responses_line(line: &str) -> Vec<StreamEvent> {
@@ -426,7 +450,15 @@ pub fn parse_responses_line(line: &str) -> Vec<StreamEvent> {
             }
             out.push(StreamEvent::Done);
         }
-        "response.incomplete" => out.push(StreamEvent::Done),
+        "response.incomplete" => {
+            let reason = v
+                .pointer("/response/incomplete_details/reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("max_output_tokens")
+                .to_string();
+            out.push(StreamEvent::Truncated(reason));
+            out.push(StreamEvent::Done);
+        }
         "response.failed" => {
             let msg = v
                 .get("error")
@@ -524,6 +556,34 @@ mod tests {
         // role-only delta（无 content，无 tool_calls）→ 空
         let role_only = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
         assert!(parse_openai_line(role_only).is_empty());
+    }
+
+    #[test]
+    fn openai_finish_reason_length_emits_truncated() {
+        let events =
+            parse_openai_line(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#);
+        assert!(matches!(events.first(), Some(StreamEvent::Truncated(r)) if r == "max_tokens"));
+    }
+
+    #[test]
+    fn openai_finish_reason_stop_does_not_emit_truncated() {
+        let events = parse_openai_line(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Truncated(_))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Delta(t) if t == "hi")));
+    }
+
+    #[test]
+    fn anthropic_message_delta_max_tokens_emits_truncated() {
+        let events = parse_anthropic_line(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+        );
+        assert!(matches!(events.first(), Some(StreamEvent::Truncated(_))));
     }
 
     #[test]
@@ -802,10 +862,17 @@ mod tests {
         assert!(matches!(&r[0], StreamEvent::Usage(_)));
         assert!(matches!(r[1], StreamEvent::Done));
 
-        // incomplete → Done
+        // incomplete → Truncated（默认 reason）+ Done
         let r = parse_responses_line(r#"data: {"type":"response.incomplete"}"#);
-        assert_eq!(r.len(), 1);
-        assert!(matches!(r[0], StreamEvent::Done));
+        assert_eq!(r.len(), 2);
+        assert!(matches!(&r[0], StreamEvent::Truncated(reason) if reason == "max_output_tokens"));
+        assert!(matches!(r[1], StreamEvent::Done));
+
+        // incomplete_details.reason 透传
+        let r = parse_responses_line(
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+        );
+        assert!(matches!(&r[0], StreamEvent::Truncated(reason) if reason == "content_filter"));
 
         // 无关事件 → 空
         assert!(parse_responses_line(r#"data: {"type":"response.created"}"#).is_empty());

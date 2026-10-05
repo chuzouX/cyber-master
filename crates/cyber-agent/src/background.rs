@@ -429,6 +429,7 @@ pub fn spawn_background_subagent(
         job_id,
         run_id,
         kill_rx,
+        None,
     ));
     job_id
 }
@@ -450,6 +451,7 @@ pub(crate) async fn run_detached_subagent(
     job_id: u64,
     run_id: Option<u64>,
     mut kill_rx: oneshot::Receiver<()>,
+    custom_max_steps: Option<u32>,
 ) {
     let run_fut = runtime.run_task(
         specialist_prompt,
@@ -460,6 +462,7 @@ pub(crate) async fn run_detached_subagent(
         tools,
         None,
         transcript,
+        custom_max_steps,
     );
     tokio::pin!(run_fut);
     tokio::select! {
@@ -475,12 +478,23 @@ pub(crate) async fn run_detached_subagent(
         result = &mut run_fut => {
             match result {
                 Ok(output) => {
+                    let (status, error_msg) = match output.exit_reason {
+                        crate::agent::AgentExitReason::Finished => (SubagentStatus::Completed, None),
+                        crate::agent::AgentExitReason::MaxStepsReached => (
+                            SubagentStatus::StepLimitReached,
+                            Some("step limit reached".to_string()),
+                        ),
+                        crate::agent::AgentExitReason::LoopDetected => (
+                            SubagentStatus::LoopDetected,
+                            Some("loop detected".to_string()),
+                        ),
+                    };
                     if let Some(archive) = &archive {
                         if let Some(run_id) = run_id {
-                            archive.finish(run_id, SubagentStatus::Completed, Some(output.clone()), None);
+                            archive.finish(run_id, status, Some(output.output.clone()), error_msg);
                         }
                     }
-                    background.append_line(job_id, truncate_chars(&output, 400));
+                    background.append_line(job_id, truncate_chars(&output.output, 400));
                     background.set_status(job_id, JobStatus::Finished(0));
                 }
                 Err(error) => {

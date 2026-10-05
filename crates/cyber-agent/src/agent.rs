@@ -36,6 +36,43 @@ use crate::types::{AgentEvent, Message, StreamEvent, ToolCall, ToolCallDelta, Us
 /// 用户可在 providers.toml 精确配置以获得更准确的阈值。
 const DEFAULT_CONTEXT_LENGTH: u32 = 128_000;
 
+/// 截断后连续「零新增正文」轮次容忍上限：达到即判定无法再产出正文，发 Notice 并结束回合。
+const MAX_EMPTY_TRUNCATION_ROUNDS: u32 = 2;
+
+/// 截断续写注入的内部指令（写入模型消息历史，不直接渲染到 UI）。
+const TRUNCATION_CONTINUE_NUDGE: &str = "（系统提示：上一条输出因达到模型长度上限被截断。请立刻停止长篇推理，直接继续输出正文内容，不要重复已经输出过的部分。）";
+
+/// 模型只产生思考、未输出正文时的提醒（整个回合最多注入一次）。
+const EMPTY_ANSWER_NUDGE: &str =
+    "（系统提示：你还没有输出任何面向用户的正文内容。请停止思考，直接给出最终答复。）";
+
+/// 回合结束时的截断提示文案。
+fn truncation_notice(answer: &str, truncated: bool) -> String {
+    let hint = "可尝试用 /think 降低思考强度，或提高 providers.toml 中该模型的 max_tokens。";
+    if truncated {
+        if answer.trim().is_empty() {
+            format!("⚠️ 模型输出因长度上限（max_tokens）被截断，自动续写后仍未产出正文内容。{hint}")
+        } else {
+            format!("⚠️ 模型回复因长度上限（max_tokens）被截断，已自动续写并保留全部已输出内容，但结尾可能不完整。{hint}")
+        }
+    } else {
+        "⚠️ 模型未输出正文内容（仅产生思考）。可尝试用 /think 降低思考强度后重发。".to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentExitReason {
+    Finished,
+    MaxStepsReached,
+    LoopDetected,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentTaskOutput {
+    pub output: String,
+    pub exit_reason: AgentExitReason,
+}
+
 pub(crate) struct SubagentRuntime {
     config: Config,
     providers: ProvidersConfig,
@@ -117,7 +154,8 @@ impl SubagentRuntime {
         tool_names: Vec<String>,
         task_progress: Option<UnboundedSender<String>>,
         transcript: Option<Arc<std::sync::Mutex<crate::subagent::SubagentRun>>>,
-    ) -> Result<String> {
+        custom_max_steps: Option<u32>,
+    ) -> Result<SubagentTaskOutput> {
         let provider_name =
             provider_name.unwrap_or_else(|| self.config.agent.default_provider.clone());
         let mut provider_config = self
@@ -164,7 +202,7 @@ impl SubagentRuntime {
             "\n\nComplete only this task. Return an evidence-based result. You must not delegate or create subagents.",
         );
         system.push_str(
-            "\n\nCollect data with single aggregate commands (e.g., PowerShell pipelines, rg --count, one-shot statistics). Do not explore the tree directory by directory; keep every tool output short and precise so the context stays within budget.",
+            "\n\n你是独立自主运行的专家子代理，全权负责完成所委派的具体任务。必须将任务执行到最终可验收状态（如需修改文件则必须完成写入，如需验证则必须运行验证命令）。不要中途停下询问，也不要在仅有计划时停止调用工具。在全部操作执行完毕前，保持通过工具推进。",
         );
         let user_message = if context.is_empty() {
             task
@@ -198,6 +236,9 @@ impl SubagentRuntime {
             task_progress.as_ref(),
             transcript.as_ref(),
         );
+        let effective_steps = custom_max_steps
+            .map(|s| s.clamp(1, 200))
+            .unwrap_or_else(|| self.config.agent.subagents.effective_max_steps());
         let output = run_agent_loop(
             provider.as_ref(),
             system,
@@ -206,7 +247,7 @@ impl SubagentRuntime {
             schemas,
             Some(&allowed),
             Arc::clone(&self.registry),
-            self.config.agent.subagents.effective_max_steps(),
+            effective_steps,
             provider_config
                 .effective_context_length()
                 .or(Some(DEFAULT_CONTEXT_LENGTH)),
@@ -218,33 +259,47 @@ impl SubagentRuntime {
         )
         .await?;
         sink.flush_transcript();
-        finalize_subagent_output(output)
+        finalize_subagent_output(output, effective_steps)
     }
 }
 
 /// 子代理最终结果守卫：每个结束的子代理都必须带非空、有意义的结果内容。
 ///
-/// - 非空 final → 原样返回。
+/// - 非空 final → 原样返回（若达到步数上限或死循环则前置说明前缀）。
 /// - 空 final 但有工具轨迹 → 合成摘要（截 1500 字符），完成的工作不丢失。
 /// - 二者皆空 → 显式错误（内容非空）。
-fn finalize_subagent_output(output: AgentRunOutput) -> Result<String> {
+fn finalize_subagent_output(output: AgentRunOutput, max_steps: u32) -> Result<SubagentTaskOutput> {
     const MAX_SUMMARY_CHARS: usize = 1500;
-    if output.final_text.trim().is_empty() {
+    let mut text = if output.final_text.trim().is_empty() {
         if !output.tool_trail.is_empty() {
             let summary = format!(
                 "subagent completed tool work without a final summary. Tool activity:\n{}",
                 output.tool_trail.join("\n")
             );
-            return Ok(crate::background::truncate_chars(
-                &summary,
-                MAX_SUMMARY_CHARS,
+            crate::background::truncate_chars(&summary, MAX_SUMMARY_CHARS)
+        } else {
+            return Err(AgentError::Provider(
+                "subagent produced no output and executed no tools".into(),
             ));
         }
-        return Err(AgentError::Provider(
-            "subagent produced no output and executed no tools".into(),
-        ));
+    } else {
+        output.final_text
+    };
+
+    match output.exit_reason {
+        AgentExitReason::Finished => {}
+        AgentExitReason::MaxStepsReached => {
+            text = format!("[阶段性总结：已达到步数上限 {max_steps}]\n\n{text}");
+        }
+        AgentExitReason::LoopDetected => {
+            text = format!("[执行中断：检测到重复工具死循环]\n\n{text}");
+        }
     }
-    Ok(output.final_text)
+
+    Ok(SubagentTaskOutput {
+        output: text,
+        exit_reason: output.exit_reason,
+    })
 }
 
 /// 连续相同工具调用检测器：记录每轮工具调用指纹，连续 `threshold` 轮相同则判定死循环。
@@ -611,6 +666,7 @@ struct AgentRunOutput {
     final_text: String,
     /// 每次工具执行的一行摘要（`工具名: 结果前 200 字符`），供空 final 时合成兜底结果。
     tool_trail: Vec<String>,
+    exit_reason: AgentExitReason,
 }
 
 #[derive(Clone, Copy)]
@@ -788,6 +844,11 @@ async fn run_agent_loop(
     emit_context_update(sink, &messages, effective_ctx_len);
     let mut detector = LoopDetector::new(3);
     let mut loop_detected = false;
+    let mut nudged = false;
+    let mut answer_text = String::new();
+    let mut empty_truncation_rounds: u32 = 0;
+    let mut empty_answer_nudged = false;
+    let is_subagent = allowed_tools.is_some();
     let mut tool_trail: Vec<String> = Vec::new();
     for step in 0..max_steps {
         debug!(step, gen = sink.gen, "agent loop 迭代");
@@ -826,21 +887,64 @@ async fn run_agent_loop(
             sink.send(AgentEvent::Usage(usage.clone()));
         }
         if accumulation.calls.is_empty() {
-            let final_text = accumulation.text;
-            if !final_text.is_empty() {
-                messages.push(Message::assistant(final_text.clone()));
+            let truncated = accumulation.truncated.is_some();
+            let round_text = accumulation.text;
+            answer_text.push_str(&round_text);
+            if !round_text.is_empty() {
+                messages.push(Message::assistant(round_text.clone()));
             }
             let has_steer = drain_steering(&mut steering, &mut messages, sink);
             if has_steer && step + 1 < max_steps {
+                // 用户追加了新指示 → 新一轮答复取代本轮正文（维持「final_text = 最后一轮」语义）。
+                answer_text.clear();
                 continue;
             }
+            if is_subagent
+                && !tools.is_empty()
+                && tool_trail.is_empty()
+                && !nudged
+                && step + 1 < max_steps
+            {
+                nudged = true;
+                messages.push(Message::user(
+                    "（系统提醒：你是一个自主运行的子代理，输出纯文本将永久结束你的执行，没有交互用户为你补充反馈。如果你还有未执行的步骤、文件修改或命令验证，请立即在当前轮次调用相应工具执行；若目标已切实完成或客观无法继续，请直接总结说明。）".to_string(),
+                ));
+                answer_text.clear();
+                continue;
+            }
+            // 截断 / 空正文自动续写：继续请求，直到产出正文或判定无法再取得进展。
+            if step + 1 < max_steps {
+                if truncated {
+                    empty_truncation_rounds = if round_text.is_empty() {
+                        empty_truncation_rounds + 1
+                    } else {
+                        0
+                    };
+                    if empty_truncation_rounds < MAX_EMPTY_TRUNCATION_ROUNDS {
+                        messages.push(Message::user(TRUNCATION_CONTINUE_NUDGE.to_string()));
+                        continue;
+                    }
+                } else if answer_text.trim().is_empty() && !empty_answer_nudged {
+                    empty_answer_nudged = true;
+                    messages.push(Message::user(EMPTY_ANSWER_NUDGE.to_string()));
+                    continue;
+                }
+            }
             emit_context_update(sink, &messages, effective_ctx_len);
+            if truncated || answer_text.trim().is_empty() {
+                sink.send(AgentEvent::Notice(truncation_notice(
+                    &answer_text,
+                    truncated,
+                )));
+            }
             sink.send(AgentEvent::Done);
             return Ok(AgentRunOutput {
-                final_text,
+                final_text: answer_text,
                 tool_trail,
+                exit_reason: AgentExitReason::Finished,
             });
         }
+        answer_text.clear();
 
         let calls = accumulation.calls;
         let history_calls = sanitized_tool_calls(&calls);
@@ -975,11 +1079,17 @@ async fn run_agent_loop(
         }
     }
 
-    let wrap = if loop_detected {
-        "（系统提示：检测到连续多次相同的工具调用，可能已陷入循环。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）".to_string()
+    let (wrap, exit_reason) = if loop_detected {
+        (
+            "（系统提示：检测到连续多次相同的工具调用，可能已陷入循环。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）".to_string(),
+            AgentExitReason::LoopDetected,
+        )
     } else {
-        format!(
-            "（系统提示：已达到工具调用步数上限 {max_steps}。请根据已收集的信息直接给出最终回答或阶段性结论，不要再调用工具。）"
+        (
+            format!(
+                "（系统提示：已达到本次任务的步数上限（最大步数限制 {max_steps}）。请立即停止工具操作，并对当前任务进行完整的收敛总结：1. 已完成的具体工作与关键发现；2. 尚未完成的部分与阻碍原因；3. 当前系统/文件的最终状态；4. 后续建议执行的步骤。如实说明现状，严禁谎称任务已全部完成。）"
+            ),
+            AgentExitReason::MaxStepsReached,
         )
     };
     messages.push(Message::user(wrap));
@@ -1006,6 +1116,7 @@ async fn run_agent_loop(
     Ok(AgentRunOutput {
         final_text,
         tool_trail,
+        exit_reason,
     })
 }
 
@@ -1216,6 +1327,7 @@ struct StreamAccumulation {
     text: String,
     calls: BTreeMap<u32, ToolCall>,
     usage: Option<Usage>,
+    truncated: Option<String>,
 }
 
 /// 驱动一个流到结束，累积文本、工具调用和 usage。
@@ -1226,6 +1338,7 @@ async fn accumulate_stream(
     let mut text = String::new();
     let mut calls: BTreeMap<u32, ToolCall> = BTreeMap::new();
     let mut usage: Option<Usage> = None;
+    let mut truncated: Option<String> = None;
 
     while let Some(event) = stream.next().await {
         match event {
@@ -1248,11 +1361,19 @@ async fn accumulate_stream(
             StreamEvent::Usage(value) => {
                 usage = Some(value);
             }
+            StreamEvent::Truncated(reason) => {
+                truncated = Some(reason);
+            }
             StreamEvent::Done => break,
             StreamEvent::Error(message) => return Err(AgentError::Provider(message)),
         }
     }
-    Ok(StreamAccumulation { text, calls, usage })
+    Ok(StreamAccumulation {
+        text,
+        calls,
+        usage,
+        truncated,
+    })
 }
 
 /// 判断错误信息是否属于临时性异常（可安全重试）。
@@ -1636,9 +1757,11 @@ mod tests {
         let output = AgentRunOutput {
             final_text: "  结论：发现 2 个漏洞  ".into(),
             tool_trail: vec!["shell: nmap 输出".into()],
+            exit_reason: AgentExitReason::Finished,
         };
-        let result = finalize_subagent_output(output).unwrap();
-        assert_eq!(result, "  结论：发现 2 个漏洞  ");
+        let result = finalize_subagent_output(output, 25).unwrap();
+        assert_eq!(result.output, "  结论：发现 2 个漏洞  ");
+        assert_eq!(result.exit_reason, AgentExitReason::Finished);
     }
 
     #[test]
@@ -1646,11 +1769,21 @@ mod tests {
         let output = AgentRunOutput {
             final_text: String::new(),
             tool_trail: vec!["counting: TOOL-OUT-42".into()],
+            exit_reason: AgentExitReason::Finished,
         };
-        let result = finalize_subagent_output(output).unwrap();
-        assert!(result.contains("Tool activity"), "应合成摘要：{result}");
-        assert!(result.contains("TOOL-OUT-42"), "应含工具轨迹：{result}");
-        assert!(result.contains("counting"));
+        let result = finalize_subagent_output(output, 25).unwrap();
+        assert!(
+            result.output.contains("Tool activity"),
+            "应合成摘要：{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("TOOL-OUT-42"),
+            "应含工具轨迹：{}",
+            result.output
+        );
+        assert!(result.output.contains("counting"));
+        assert_eq!(result.exit_reason, AgentExitReason::Finished);
     }
 
     #[test]
@@ -1658,12 +1791,42 @@ mod tests {
         let output = AgentRunOutput {
             final_text: "   \n".into(),
             tool_trail: Vec::new(),
+            exit_reason: AgentExitReason::Finished,
         };
-        let error = finalize_subagent_output(output).unwrap_err();
+        let error = finalize_subagent_output(output, 25).unwrap_err();
         assert!(
             matches!(&error, AgentError::Provider(m) if m == "subagent produced no output and executed no tools"),
             "应为显式错误：{error}"
         );
+    }
+
+    #[test]
+    fn finalize_subagent_output_prepends_step_limit_prefix() {
+        let output = AgentRunOutput {
+            final_text: "已完成部分扫描".into(),
+            tool_trail: vec!["nmap: done".into()],
+            exit_reason: AgentExitReason::MaxStepsReached,
+        };
+        let result = finalize_subagent_output(output, 10).unwrap();
+        assert!(result
+            .output
+            .starts_with("[阶段性总结：已达到步数上限 10]\n\n"));
+        assert!(result.output.contains("已完成部分扫描"));
+        assert_eq!(result.exit_reason, AgentExitReason::MaxStepsReached);
+    }
+
+    #[test]
+    fn finalize_subagent_output_prepends_loop_detected_prefix() {
+        let output = AgentRunOutput {
+            final_text: "死循环中断".into(),
+            tool_trail: vec!["ls: a".into()],
+            exit_reason: AgentExitReason::LoopDetected,
+        };
+        let result = finalize_subagent_output(output, 25).unwrap();
+        assert!(result
+            .output
+            .starts_with("[执行中断：检测到重复工具死循环]\n\n"));
+        assert_eq!(result.exit_reason, AgentExitReason::LoopDetected);
     }
 
     #[tokio::test]
@@ -1756,9 +1919,366 @@ mod tests {
         assert_eq!(output.tool_trail.len(), 1);
         assert_eq!(output.tool_trail[0], "counting: TOOL-OUT-42");
         // 合成兜底结果非空且含工具产出
-        let fallback = finalize_subagent_output(output).unwrap();
-        assert!(fallback.contains("Tool activity"));
-        assert!(fallback.contains("TOOL-OUT-42"));
+        let fallback = finalize_subagent_output(output, 20).unwrap();
+        assert!(fallback.output.contains("Tool activity"));
+        assert!(fallback.output.contains("TOOL-OUT-42"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_loop_nudges_on_empty_tool_calls() {
+        use futures::{stream, Stream};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct NudgeProvider {
+            calls: AtomicUsize,
+        }
+
+        impl Provider for NudgeProvider {
+            fn stream(
+                &self,
+                req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_num == 0 {
+                    // 第一轮：纯文本输出，无工具调用。应触发 nudge。
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("我想先分析一下".into()),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    // 第二轮：必须收到了包含引导提示的消息
+                    let last_msg = req
+                        .messages
+                        .last()
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
+                    assert!(
+                        last_msg.contains("你是一个自主运行的子代理"),
+                        "第二轮应收到系统级引导提示，实际最后消息：{last_msg}"
+                    );
+                    // 再次输出纯文本，模型确认收敛，本次应正常退出
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("确认目标已完成，这是最终总结。".into()),
+                        StreamEvent::Done,
+                    ]))
+                }
+            }
+        }
+
+        struct DummyTool;
+        impl crate::Tool for DummyTool {
+            fn schema(&self) -> crate::ToolSchema {
+                crate::ToolSchema {
+                    name: "dummy".into(),
+                    description: "dummy tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: Vec::new(),
+                }
+            }
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async move {
+                    Ok(ToolOutput {
+                        content: "ok".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool));
+        let registry = Arc::new(registry);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::child(&tx, 1);
+        let allowed = std::collections::HashSet::from(["dummy".to_string()]);
+        let provider = NudgeProvider {
+            calls: AtomicUsize::new(0),
+        };
+
+        let output = run_agent_loop(
+            &provider,
+            String::new(),
+            vec![Message::user("do something")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            registry.schemas(),
+            Some(&allowed),
+            registry,
+            5,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            None,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "应执行 2 轮调用（第 1 轮 nudge，第 2 轮退出）"
+        );
+        assert_eq!(output.final_text, "确认目标已完成，这是最终总结。");
+        assert_eq!(output.exit_reason, AgentExitReason::Finished);
+        assert!(output.tool_trail.is_empty());
+    }
+
+    /// 截断后应自动续写：第 1 轮只产出思考并被截断，第 2 轮必须带上续写指令并产出正文。
+    #[tokio::test]
+    async fn truncated_stream_triggers_continuation_until_answer() {
+        use futures::{stream, Stream};
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct TruncatingProvider {
+            calls: AtomicUsize,
+            last_messages: parking_lot::Mutex<Vec<Message>>,
+        }
+
+        impl Provider for TruncatingProvider {
+            fn stream(
+                &self,
+                req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                *self.last_messages.lock() = req.messages.clone();
+                let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_num == 0 {
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Reasoning("长篇推理……".into()),
+                        StreamEvent::Truncated("max_tokens".into()),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("最终答复".into()),
+                        StreamEvent::Done,
+                    ]))
+                }
+            }
+        }
+
+        let provider = TruncatingProvider::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // parent sink：child 模式只转发进度/转录，不向通道发 AgentEvent。
+        let sink = EventSink::parent(&tx, 1);
+        let output = run_agent_loop(
+            &provider,
+            String::new(),
+            vec![Message::user("解题")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            Vec::new(),
+            None,
+            registry,
+            5,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            None,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.final_text.contains("最终答复"));
+        assert_eq!(output.exit_reason, AgentExitReason::Finished);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let last = provider.last_messages.lock().last().cloned();
+        let last = last.expect("第 2 轮请求应有消息");
+        assert_eq!(last.role, crate::types::Role::User);
+        assert_eq!(last.content, TRUNCATION_CONTINUE_NUDGE);
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok((_, ev)) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Notice(_))),
+            "已成功续写出正文时不应发 Notice"
+        );
+    }
+
+    /// 持续「被截断且零新增正文」时必须终止并给出 Notice，不得无限续写。
+    #[tokio::test]
+    async fn persistent_empty_truncation_emits_notice_and_finishes() {
+        use futures::{stream, Stream};
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlwaysTruncatedProvider {
+            calls: AtomicUsize,
+        }
+
+        impl Provider for AlwaysTruncatedProvider {
+            fn stream(
+                &self,
+                _req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(stream::iter(vec![
+                    StreamEvent::Truncated("max_tokens".into()),
+                    StreamEvent::Done,
+                ]))
+            }
+        }
+
+        let provider = AlwaysTruncatedProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let registry = Arc::new(ToolRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::parent(&tx, 1);
+        let output = run_agent_loop(
+            &provider,
+            String::new(),
+            vec![Message::user("解题")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            Vec::new(),
+            None,
+            registry,
+            50,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            None,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.exit_reason, AgentExitReason::Finished);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            MAX_EMPTY_TRUNCATION_ROUNDS as usize,
+            "应在 MAX_EMPTY_TRUNCATION_ROUNDS 轮后停止续写"
+        );
+        drop(tx);
+        let mut events = Vec::new();
+        while let Ok((_, ev)) = rx.try_recv() {
+            events.push(ev);
+        }
+        let notice_pos = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Notice(t) if t.contains("截断")));
+        let notice_pos = notice_pos.expect("应发出含「截断」的 Notice");
+        let done_pos = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Done))
+            .expect("应以 Done 结束");
+        assert!(notice_pos < done_pos, "Notice 应先于 Done 到达");
+    }
+
+    #[tokio::test]
+    async fn run_agent_loop_reports_step_limit_reached() {
+        use futures::{stream, Stream};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StepLimitProvider {
+            calls: AtomicUsize,
+        }
+
+        impl Provider for StepLimitProvider {
+            fn stream(
+                &self,
+                _req: StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_num == 0 {
+                    // 第 1 步：调用工具
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::ToolCallDelta(ToolCallDelta {
+                            index: 0,
+                            id: Some("call-1".into()),
+                            name: Some("test_tool".into()),
+                            arguments_fragment: "{}".into(),
+                        }),
+                        StreamEvent::Done,
+                    ]))
+                } else {
+                    // 步数耗尽收尾调用
+                    Box::pin(stream::iter(vec![
+                        StreamEvent::Delta("这是达到步数限制后的阶段性总结。".into()),
+                        StreamEvent::Done,
+                    ]))
+                }
+            }
+        }
+
+        struct SimpleTool;
+        impl crate::Tool for SimpleTool {
+            fn schema(&self) -> crate::ToolSchema {
+                crate::ToolSchema {
+                    name: "test_tool".into(),
+                    description: "test tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    tags: Vec::new(),
+                }
+            }
+            fn run<'a>(
+                &'a self,
+                _input: Value,
+                _ctx: &'a ToolCtx,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
+                Box::pin(async move {
+                    Ok(ToolOutput {
+                        content: "tool output ok".into(),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SimpleTool));
+        let registry = Arc::new(registry);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = EventSink::child(&tx, 1);
+        let allowed = std::collections::HashSet::from(["test_tool".to_string()]);
+        let provider = StepLimitProvider {
+            calls: AtomicUsize::new(0),
+        };
+
+        // max_steps = 1：第 1 轮调用工具后即达到步数限制
+        let output = run_agent_loop(
+            &provider,
+            String::new(),
+            vec![Message::user("run task")],
+            ToolCtx::new(std::env::temp_dir(), Vec::new(), None, Vec::new()),
+            registry.schemas(),
+            Some(&allowed),
+            registry,
+            1,
+            Some(DEFAULT_CONTEXT_LENGTH),
+            &sink,
+            None,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.exit_reason, AgentExitReason::MaxStepsReached);
+        assert_eq!(output.final_text, "这是达到步数限制后的阶段性总结。");
+        assert_eq!(output.tool_trail.len(), 1);
+
+        let finalized = finalize_subagent_output(output, 1).unwrap();
+        assert!(finalized
+            .output
+            .starts_with("[阶段性总结：已达到步数上限 1]\n\n"));
+        assert_eq!(finalized.exit_reason, AgentExitReason::MaxStepsReached);
     }
 
     #[tokio::test]

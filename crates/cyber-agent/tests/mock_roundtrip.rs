@@ -219,6 +219,7 @@ async fn mock_tool_loop_roundtrip() {
             AgentEvent::Reasoning(_) => {}
             AgentEvent::ToolProgress { .. } => {}
             AgentEvent::SteeringReceived(_) => {}
+            AgentEvent::Notice(_) => {}
             AgentEvent::Retry { .. } => {}
             AgentEvent::Error(m) => panic!("tool-loop 不应产生错误: {m}"),
         }
@@ -267,6 +268,7 @@ async fn mock_tool_loop_not_loop_detected() {
             AgentEvent::Reasoning(_) => {}
             AgentEvent::ToolProgress { .. } => {}
             AgentEvent::SteeringReceived(_) => {}
+            AgentEvent::Notice(_) => {}
             AgentEvent::Retry { .. } => {}
             AgentEvent::Error(m) => panic!("不应产生错误: {m}"),
         }
@@ -328,6 +330,7 @@ async fn mock_max_steps_exhaustion_does_graceful_summary() {
             AgentEvent::Reasoning(_) => {}
             AgentEvent::ToolProgress { .. } => {}
             AgentEvent::SteeringReceived(_) => {}
+            AgentEvent::Notice(_) => {}
             AgentEvent::Retry { .. } => {}
             AgentEvent::Error(m) => panic!("max_steps 耗尽不应产生 Error（应优雅收尾）: {m}"),
         }
@@ -340,8 +343,8 @@ async fn mock_max_steps_exhaustion_does_graceful_summary() {
         "耗尽后应有收尾总结文本（非裸中断）"
     );
     assert!(
-        summary_text.contains("步数上限"),
-        "收尾总结应含步数上限提示: {summary_text}"
+        summary_text.contains("步数上限") || summary_text.contains("步数限制"),
+        "收尾总结应含步数上限或限制提示: {summary_text}"
     );
     assert!(got_done, "应以 Done 结束（非 Error）");
     handle.await.unwrap();

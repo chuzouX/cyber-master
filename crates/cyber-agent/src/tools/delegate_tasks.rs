@@ -39,6 +39,8 @@ struct DelegateTask {
     #[serde(default)]
     model: Option<String>,
     tools: Vec<String>,
+    #[serde(default)]
+    max_steps: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +91,24 @@ impl DelegateTaskResult {
             error: Some(error),
         }
     }
+
+    fn step_limit_reached(name: String, output: String) -> Self {
+        Self {
+            name,
+            status: "step_limit_reached",
+            output: Some(output),
+            error: Some("step limit reached".to_string()),
+        }
+    }
+
+    fn loop_detected(name: String, output: String) -> Self {
+        Self {
+            name,
+            status: "loop_detected",
+            output: Some(output),
+            error: Some("loop detected".to_string()),
+        }
+    }
 }
 
 impl Tool for DelegateTasksTool {
@@ -120,6 +140,12 @@ impl Tool for DelegateTasksTool {
                                     "type": "array",
                                     "items": {"type": "string"},
                                     "description": "Exact tool allowlist. Empty means text-only; parent tools are not inherited."
+                                },
+                                "max_steps": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 200,
+                                    "description": "Optional step limit for this subagent (1-200). Use fewer steps (10-15) for quick reconnaissance/read-only tasks, or more steps (40-80) for complex multi-phase exploitation/refactoring. Defaults to configured subagents limit."
                                 }
                             }
                         }
@@ -220,6 +246,7 @@ impl Tool for DelegateTasksTool {
                             task.tools,
                             Some(task_tx),
                             transcript_for_timeout,
+                            task.max_steps,
                         )
                         .await;
                     let _ = forwarder_handle.await;
@@ -228,11 +255,22 @@ impl Tool for DelegateTasksTool {
                     if let (Some(archive), Some(run_id)) = (&archive_for_finish, run_id_for_finish)
                     {
                         let (status, output, error) = match &res {
-                            Ok(output) => (
-                                crate::subagent::SubagentStatus::Completed,
-                                Some(output.clone()),
-                                None,
-                            ),
+                            Ok(output) => {
+                                let (status, error) = match output.exit_reason {
+                                    crate::agent::AgentExitReason::Finished => {
+                                        (crate::subagent::SubagentStatus::Completed, None)
+                                    }
+                                    crate::agent::AgentExitReason::MaxStepsReached => (
+                                        crate::subagent::SubagentStatus::StepLimitReached,
+                                        Some("step limit reached".to_string()),
+                                    ),
+                                    crate::agent::AgentExitReason::LoopDetected => (
+                                        crate::subagent::SubagentStatus::LoopDetected,
+                                        Some("loop detected".to_string()),
+                                    ),
+                                };
+                                (status, Some(output.output.clone()), error)
+                            }
                             Err(error) => (
                                 crate::subagent::SubagentStatus::Error,
                                 None,
@@ -280,7 +318,9 @@ impl Tool for DelegateTasksTool {
             }
             results.sort_by_key(|(index, _)| *index);
             let results: Vec<_> = results.into_iter().map(|(_, result)| result).collect();
-            let all_failed = results.iter().all(|result| result.status != "completed");
+            let all_failed = results.iter().all(|result| {
+                result.status != "completed" && result.status != "step_limit_reached"
+            });
             Ok(ToolOutput {
                 content: serde_json::to_string(&DelegateTasksOutput { results })?,
                 is_error: all_failed,
@@ -339,6 +379,7 @@ async fn run_background(
             job_id,
             run_id,
             kill_rx,
+            task.max_steps,
         ));
     }
     Ok(ToolOutput {
@@ -413,12 +454,22 @@ async fn run_ordered_bounded<F>(
     timeout: Duration,
 ) -> Vec<(usize, DelegateTaskResult)>
 where
-    F: Future<Output = Result<String>> + Send,
+    F: Future<Output = Result<crate::agent::SubagentTaskOutput>> + Send,
 {
     let mut results: Vec<_> = stream::iter(tasks.into_iter().map(
         |(index, name, transcript, future)| async move {
             let result = match tokio::time::timeout(timeout, future).await {
-                Ok(Ok(output)) => DelegateTaskResult::completed(name, output),
+                Ok(Ok(output)) => match output.exit_reason {
+                    crate::agent::AgentExitReason::Finished => {
+                        DelegateTaskResult::completed(name, output.output)
+                    }
+                    crate::agent::AgentExitReason::MaxStepsReached => {
+                        DelegateTaskResult::step_limit_reached(name, output.output)
+                    }
+                    crate::agent::AgentExitReason::LoopDetected => {
+                        DelegateTaskResult::loop_detected(name, output.output)
+                    }
+                },
                 Ok(Err(error)) => DelegateTaskResult::error(name, error.to_string()),
                 Err(_) => DelegateTaskResult::timed_out(
                     name,
@@ -439,14 +490,18 @@ where
 /// 超时子代理的部分产出：取转录最后 3 行（空转录返回 None，退化为现有文案）。
 fn transcript_tail(transcript: TranscriptHandle) -> Option<String> {
     let lines = transcript.and_then(|run| run.lock().ok().map(|run| run.lines.clone()))?;
-    let tail = lines
+    let mut tail_lines: Vec<&str> = lines
         .iter()
+        .map(|line| line.trim_end_matches(['\n', '\r']))
+        .filter(|line| {
+            let t = line.trim();
+            !t.is_empty() && t != "thinking:"
+        })
         .rev()
         .take(3)
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    tail_lines.reverse();
+    let tail = tail_lines.join("\n");
     if tail.is_empty() {
         None
     } else {
@@ -524,6 +579,36 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn delegate_tasks_honors_dynamic_max_steps() {
+        let tool = DelegateTasksTool;
+        let ctx = context(Config::default());
+        let output = tool
+            .run(
+                json!({
+                    "tasks": [
+                        {
+                            "name": "limited",
+                            "system_prompt": "specialist",
+                            "task": "list files",
+                            "tools": ["list_dir"],
+                            "max_steps": 1
+                        }
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        let results = value["results"].as_array().unwrap();
+        assert_eq!(results[0]["name"], "limited");
+        assert_eq!(results[0]["status"], "step_limit_reached");
+        let task_output = results[0]["output"].as_str().unwrap();
+        assert!(task_output.contains("阶段性总结：已达到步数上限 1"));
     }
 
     #[tokio::test]
@@ -648,7 +733,10 @@ mod tests {
                     peak.fetch_max(current, Ordering::SeqCst);
                     barrier.wait().await;
                     active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(format!("output-{index}"))
+                    Ok(crate::agent::SubagentTaskOutput {
+                        output: format!("output-{index}"),
+                        exit_reason: crate::agent::AgentExitReason::Finished,
+                    })
                 })
             })
             .collect();
@@ -821,7 +909,10 @@ mod tests {
                     if index == 0 {
                         std::future::pending::<()>().await;
                     }
-                    Ok(format!("output-{index}"))
+                    Ok(crate::agent::SubagentTaskOutput {
+                        output: format!("output-{index}"),
+                        exit_reason: crate::agent::AgentExitReason::Finished,
+                    })
                 })
             })
             .collect();
@@ -844,7 +935,12 @@ mod tests {
         let transcript = archive.run_handle(run_id);
         let tasks = vec![(0usize, "slow".to_string(), transcript, async {
             std::future::pending::<()>().await;
-            Ok::<String, crate::error::AgentError>(String::new())
+            Ok::<crate::agent::SubagentTaskOutput, crate::error::AgentError>(
+                crate::agent::SubagentTaskOutput {
+                    output: String::new(),
+                    exit_reason: crate::agent::AgentExitReason::Finished,
+                },
+            )
         })];
         let results = run_ordered_bounded(tasks, 1, Duration::from_secs(5)).await;
         assert_eq!(results[0].1.status, "timed_out");
@@ -855,5 +951,22 @@ mod tests {
         );
         assert!(error.contains("shell => PORT 80 http"));
         assert!(error.contains("shell => PORT 443 https"));
+    }
+
+    #[test]
+    fn transcript_tail_strips_newlines_and_skips_blank_lines() {
+        let archive = crate::subagent::SubagentArchive::default();
+        let run_id = archive.start("transcript_tail");
+        archive.append_line(run_id, "thinking: line 1\n".into());
+        archive.append_line(run_id, "thinking: \n".into());
+        archive.append_line(run_id, "thinking: line 2\n".into());
+        archive.append_line(run_id, "thinking: line 3\n".into());
+        archive.append_line(run_id, "\n".into());
+        let transcript = archive.run_handle(run_id);
+        let tail = transcript_tail(transcript);
+        assert_eq!(
+            tail.as_deref(),
+            Some("thinking: line 1\nthinking: line 2\nthinking: line 3")
+        );
     }
 }
