@@ -6,13 +6,19 @@
 #   或:
 #   curl -fsSL https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.sh | sh -s -- --version v0.1.0
 #   或本仓库内直接运行:
-#   sh install.sh [--version v0.1.0] [--install-dir /path/to/bin]
+#   sh install.sh [--version v0.1.0] [--install-dir /path/to/bin] [--force]
+#
+# 若本机已安装 cyber，脚本会先检测已安装版本并与云端最新版本对比：
+#   - 已是最新：直接提示并退出（除非 --force）；
+#   - 不是最新：询问是否更新到最新版本（回车 / y 确认，n 取消）；
+#   - --force 或 CYBER_FORCE=1：跳过版本检查与询问，直接下载并覆盖安装。
 #
 # 环境变量覆盖：
 #   CYBER_VERSION     指定版本 tag（如 v0.1.0），默认取 latest release
 #   CYBER_INSTALL_DIR 安装目录，默认 ~/.local/bin
 #   CYBER_REPO        GitHub 仓库（owner/name），默认 chuzouX/cyber-master
 #   CYBER_DOWNLOAD_MIRROR 下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
+#   CYBER_FORCE       设为 1 时等价于 --force（跳过版本检查与询问，直接覆盖安装）
 #
 # Windows 用户请改用 install.ps1：
 #   irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
@@ -24,6 +30,7 @@ CNB_REPO="${CYBER_CNB_REPO:-funxlink/cyber-master}"
 VERSION="${CYBER_VERSION:-}"
 INSTALL_DIR="${CYBER_INSTALL_DIR:-$HOME/.local/bin}"
 USE_CNB="${CYBER_USE_CNB:-0}"
+FORCE="${CYBER_FORCE:-0}"
 # ─── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +42,8 @@ while [ $# -gt 0 ]; do
       INSTALL_DIR="$2"; shift 2 ;;
     --cnb)
       USE_CNB=1; shift ;;
+    --force|-f)
+      FORCE=1; shift ;;
     --help|-h)
       cat <<EOF
 Cyber Master installer
@@ -45,6 +54,7 @@ Options:
   --version <tag>        指定版本（如 v0.1.0），默认 latest
   --install-dir <path>   安装目录，默认 ~/.local/bin
   --cnb                  优先使用 CNB 国内极速源
+  --force, -f            跳过版本检查与询问，直接下载并覆盖安装
   -h, --help             显示此帮助
 
 Environment:
@@ -54,6 +64,7 @@ Environment:
   CYBER_DOWNLOAD_MIRROR  下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
   CYBER_CNB_REPO         CNB 镜像仓库（默认同 CYBER_REPO）
   CYBER_USE_CNB          设为 1 时优先使用 CNB 源
+  CYBER_FORCE            设为 1 时等价于 --force
 EOF
       exit 0 ;;
     *)
@@ -128,6 +139,82 @@ if [ -z "$VERSION" ]; then
     echo "无法获取最新版本。请用 --version <tag> 显式指定，或检查网络。" >&2
     exit 1
   fi
+fi
+
+# ─── 已安装版本检测、版本对比与更新确认 ────────────────────────────────────
+# 版本号比较：ver_lt A B，当 A 严格小于 B 时返回 0（忽略 v/V 前缀，按数字段比较）。
+ver_lt() {
+  awk -v a="$(printf '%s' "$1" | sed 's/^[vV]//')" \
+      -v b="$(printf '%s' "$2" | sed 's/^[vV]//')" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, ".");
+    n = (na > nb) ? na : nb;
+    for (i = 1; i <= n; i++) {
+      va = x[i] + 0; vb = y[i] + 0;
+      if (va < vb) exit 0;
+      if (va > vb) exit 1;
+    }
+    exit 1;
+  }'
+}
+
+# 交互式确认：优先从控制终端读取，兼容 `curl | sh` 管道安装时 stdin 被脚本占用的情况；
+# 无控制终端的非交互环境默认不更新（返回失败），需要强制覆盖时请使用 --force。
+ask_confirm() {
+  _ans=""
+  if [ -r /dev/tty ]; then
+    # /dev/tty 可能因无控制终端而 open 失败：视为非交互，默认不更新。
+    # 2>/dev/null 必须置于 /dev/tty 重定向之前，才能压掉 shell 的重定向失败报错。
+    if printf '%s' "$1" 2>/dev/null > /dev/tty && read -r _ans 2>/dev/null </dev/tty; then
+      :
+    else
+      echo "$1非交互环境，已跳过更新（如需强制覆盖安装请使用 --force）" >&2
+      return 1
+    fi
+  elif [ -t 0 ]; then
+    printf '%s' "$1"
+    read -r _ans || _ans=""
+  else
+    echo "$1非交互环境，已跳过更新（如需强制覆盖安装请使用 --force）" >&2
+    return 1
+  fi
+  case "$_ans" in
+    ""|y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+installed_bin=""
+if command -v cyber >/dev/null 2>&1; then
+  installed_bin="$(command -v cyber)"
+elif [ -x "$INSTALL_DIR/cyber" ]; then
+  installed_bin="$INSTALL_DIR/cyber"
+fi
+
+if [ -n "$installed_bin" ]; then
+  installed_version="$("$installed_bin" --version 2>/dev/null | head -n 1 | awk '{ print $NF }' || true)"
+  installed_norm="$(printf '%s' "$installed_version" | sed 's/^[vV]//')"
+  target_norm="$(printf '%s' "$VERSION" | sed 's/^[vV]//')"
+  echo "→ 检测到已安装的 cyber: $installed_bin"
+  echo "  已安装版本: ${installed_version:-未知}"
+  echo "  云端最新版本: $VERSION"
+  if [ "$FORCE" = "1" ]; then
+    echo "→ --force 已启用：跳过版本检查与询问，直接下载并覆盖安装。"
+  elif [ -z "$installed_version" ]; then
+    ask_confirm "无法确定已安装版本，是否覆盖安装 $VERSION？[Y/n]: " \
+      || { echo "已取消更新。"; exit 0; }
+  elif [ "$installed_norm" = "$target_norm" ]; then
+    echo "✓ 已是最新版本（$installed_version），无需更新。"
+    echo "  如需强制覆盖安装，请运行: cyber update --force"
+    exit 0
+  elif ver_lt "$installed_version" "$VERSION"; then
+    ask_confirm "是否更新到最新版本 $VERSION？[Y/n]: " \
+      || { echo "已取消更新。"; exit 0; }
+  else
+    ask_confirm "已安装版本 $installed_version 高于目标版本 $VERSION，是否覆盖安装？[Y/n]: " \
+      || { echo "已取消更新。"; exit 0; }
+  fi
+else
+  echo "→ 未检测到已安装的 cyber，将进行全新安装。"
 fi
 
 # ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────

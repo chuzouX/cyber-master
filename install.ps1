@@ -10,11 +10,17 @@
 #   $env:CYBER_VERSION='v0.1.0'; irm https://raw.githubusercontent.com/.../install.ps1 | iex
 #   irm https://raw.githubusercontent.com/.../install.ps1 | iex  # 默认装到 %USERPROFILE%\.local\bin
 #
+# 若本机已安装 cyber，脚本会先检测已安装版本并与云端最新版本对比：
+#   - 已是最新：直接提示并退出（除非 $env:CYBER_FORCE=1）；
+#   - 不是最新：询问是否更新到最新版本（回车 / y 确认，n 取消）；
+#   - $env:CYBER_FORCE=1：跳过版本检查与询问，直接下载并覆盖安装。
+#
 # 环境变量覆盖：
 #   $env:CYBER_VERSION       指定版本 tag，如 'v0.1.0'
 #   $env:CYBER_INSTALL_DIR   安装目录，默认 $env:USERPROFILE\.local\bin
 #   $env:CYBER_REPO          GitHub owner/name，默认 chuzouX/cyber-master
 #   $env:CYBER_DOWNLOAD_MIRROR 下载镜像前缀（默认自动尝试 ghproxy.net/gh-proxy.com/ghfast.top）
+#   $env:CYBER_FORCE         设为 1 时跳过版本检查与询问，直接覆盖安装
 
 #Requires -Version 5.1
 
@@ -36,6 +42,8 @@ if (-not $Version)    { $Version    = $env:CYBER_VERSION }
 if (-not $InstallDir) { $InstallDir = $env:CYBER_INSTALL_DIR }
 if (-not $InstallDir) { $InstallDir = Join-Path $env:USERPROFILE '.local\bin' }
 if ($env:CYBER_REPO)  { $Repo       = $env:CYBER_REPO }
+$Force = $false
+if ($env:CYBER_FORCE -and $env:CYBER_FORCE -ne '0') { $Force = $true }
 $CnbRepo = if ($env:CYBER_CNB_REPO) { $env:CYBER_CNB_REPO } else { 'funxlink/cyber-master' }
 # ─── 平台检测（PowerShell 只支持 Windows 二进制；WSL 用户请用 install.sh）──
 $architecture = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -80,6 +88,80 @@ if (-not $Version) {
         Write-Error "无法获取最新版本。请设置 `$env:CYBER_VERSION 显式指定版本 tag。"
         exit 1
     }
+}
+
+# ─── 已安装版本检测、版本对比与更新确认 ────────────────────────────────────
+# 版本号比较：返回 -1 / 0 / 1（忽略 v/V 前缀，按数字段比较）。
+function Compare-CyberVersion([string]$A, [string]$B) {
+    function ConvertTo-CyberVersionParts([string]$Value) {
+        @((($Value.TrimStart('v', 'V')) -split '\.') | ForEach-Object { [int]($_ -replace '\D.*$', '') })
+    }
+    $pa = ConvertTo-CyberVersionParts $A
+    $pb = ConvertTo-CyberVersionParts $B
+    for ($i = 0; $i -lt [Math]::Max($pa.Count, $pb.Count); $i++) {
+        $x = if ($i -lt $pa.Count) { $pa[$i] } else { 0 }
+        $y = if ($i -lt $pb.Count) { $pb[$i] } else { 0 }
+        if ($x -lt $y) { return -1 }
+        if ($x -gt $y) { return 1 }
+    }
+    return 0
+}
+
+# 询问是否继续；非交互环境下不自动更新。
+function Confirm-CyberUpdate([string]$Prompt) {
+    if ([Console]::IsInputRedirected) {
+        Write-Host '非交互环境，已跳过更新（如需强制覆盖安装请运行: cyber update --force）' -ForegroundColor DarkGray
+        return $false
+    }
+    $answer = ''
+    try {
+        $answer = Read-Host $Prompt
+    } catch {
+        Write-Host '非交互环境，已跳过更新（如需强制覆盖安装请运行: cyber update --force）' -ForegroundColor DarkGray
+        return $false
+    }
+    return (-not $answer) -or ($answer -match '^(?i)y(es)?$')
+}
+
+$installedPath = ''
+$installedCmd = Get-Command cyber -ErrorAction SilentlyContinue
+if ($installedCmd) {
+    $installedPath = $installedCmd.Source
+} elseif (Test-Path -LiteralPath (Join-Path $InstallDir 'cyber.exe') -PathType Leaf) {
+    $installedPath = Join-Path $InstallDir 'cyber.exe'
+}
+
+if ($installedPath) {
+    $installedVersion = ''
+    try {
+        $rawVersion = & $installedPath --version 2>$null | Select-Object -First 1
+        if ($rawVersion) { $installedVersion = ($rawVersion.ToString().Trim() -split '\s+')[-1] }
+    } catch {}
+    Write-Host "→ 检测到已安装的 cyber: $installedPath" -ForegroundColor Cyan
+    $installedLabel = if ($installedVersion) { $installedVersion } else { '未知' }
+    Write-Host "  已安装版本: $installedLabel"
+    Write-Host "  云端最新版本: $Version"
+    if ($Force) {
+        Write-Host "→ CYBER_FORCE 已启用：跳过版本检查与询问，直接下载并覆盖安装。" -ForegroundColor Cyan
+    } elseif (-not $installedVersion) {
+        if (-not (Confirm-CyberUpdate "无法确定已安装版本，是否覆盖安装 $Version？[Y/n]")) {
+            Write-Host '已取消更新。'; exit 0
+        }
+    } elseif ((Compare-CyberVersion $installedVersion $Version) -eq 0) {
+        Write-Host "✓ 已是最新版本（$installedVersion），无需更新。" -ForegroundColor Green
+        Write-Host '  如需强制覆盖安装，请运行: cyber update --force' -ForegroundColor DarkGray
+        exit 0
+    } elseif ((Compare-CyberVersion $installedVersion $Version) -lt 0) {
+        if (-not (Confirm-CyberUpdate "是否更新到最新版本 $Version？[Y/n]")) {
+            Write-Host '已取消更新。'; exit 0
+        }
+    } else {
+        if (-not (Confirm-CyberUpdate "已安装版本 $installedVersion 高于目标版本 $Version，是否覆盖安装？[Y/n]")) {
+            Write-Host '已取消更新。'; exit 0
+        }
+    }
+} else {
+    Write-Host '→ 未检测到已安装的 cyber，将进行全新安装。' -ForegroundColor DarkGray
 }
 
 # ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────
