@@ -401,6 +401,31 @@ fn parse_cargo_toml_version(content: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// `install.ps1` / `install.sh` 会被 `irm ... | iex`（Windows）与 `curl ... | sh` 直接管道执行，
+    /// 二者都不容忍文件开头的 UTF-8 BOM：PowerShell 5.1 的 `iex` 会把 BOM 并进首个标记（实测报
+    /// `CommandNotFoundException: 无法将“#”项识别为 cmdlet…`），`sh` 也会把它当未知命令。
+    /// 这里锁定「无 BOM + 合法 UTF-8 + 首行是注释」，防止编辑器保存时又把 BOM 加回来。
+    #[test]
+    fn install_scripts_are_bom_free_utf8() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("cyber-core 位于 <repo>/crates/cyber-core");
+        for name in ["install.ps1", "install.sh"] {
+            let path = root.join(name);
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("无法读取 {}: {e}", path.display()));
+            assert!(
+                !bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+                "{name} 不得带 UTF-8 BOM：`irm ... | iex` / `curl ... | sh` 会把它当命令执行，\
+                 管道安装与 `cyber update` 全部失败"
+            );
+            let text = std::str::from_utf8(&bytes)
+                .unwrap_or_else(|e| panic!("{name} 必须是合法 UTF-8: {e}"));
+            assert!(text.starts_with('#'), "{name} 首行必须是注释（# 开头）");
+        }
+    }
+
     #[test]
     fn parse_version_handles_standard_and_prefixed() {
         assert_eq!(parse_version("0.4.2"), Some((0, 4, 2)));

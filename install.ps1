@@ -1,10 +1,17 @@
-﻿# Cyber Master 一键安装脚本（Windows / PowerShell）
+# Cyber Master 一键安装脚本（Windows / PowerShell）
 #
 # 用法（PowerShell 5.1+ / PowerShell 7+）：
 #   irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | iex
 #
-# 或先下载再执行（适用于 ExecutionPolicy 受限环境）：
-#   powershell -ExecutionPolicy Bypass -File install.ps1
+# 或先下载再执行（适用于离线 / 代理受限环境；必须显式按 UTF-8 读取）：
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (Get-Content -Raw -Encoding UTF8 .\install.ps1)"
+#
+# 注意：本文件必须保持 **无 BOM 的 UTF-8**，不要用编辑器加回 UTF-8 BOM。
+#   - 带 BOM 时 `irm ... | iex` 会把 BOM 并进首个标记，PowerShell 5.1 直接报
+#     「无法将“#”项识别为 cmdlet、函数、脚本文件或可运行程序的名称」；
+#   - 代价：PowerShell 5.1 直接 `-File` 会按系统 ANSI 代码页解码本文件（中文会乱码
+#     甚至解析失败），故本地执行请用上面 `Get-Content -Raw -Encoding UTF8` 的形式；
+#     PowerShell 7 的 `-File` 默认按 UTF-8 解码，不受影响。
 #
 # 高级用法：
 #   $env:CYBER_VERSION='v0.1.0'; irm https://raw.githubusercontent.com/.../install.ps1 | iex
