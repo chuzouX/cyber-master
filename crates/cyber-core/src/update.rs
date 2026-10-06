@@ -312,7 +312,10 @@ pub fn needs_exit_before_install() -> bool {
 }
 
 /// 分离执行的安装脚本内容（Windows PowerShell / 其它 sh）。
-pub fn detached_script(version: &str, wait_for_exit: bool) -> String {
+///
+/// `version = None` 时不写入 `CYBER_VERSION`，由安装脚本自行解析最新版本
+/// （`--force` 场景：CLI 没查过版本，避免为了一个名字多打一次网络请求）。
+fn detached_script_for(version: Option<&str>, wait_for_exit: bool) -> String {
     let pid = std::process::id();
     #[cfg(windows)]
     {
@@ -323,7 +326,7 @@ pub fn detached_script(version: &str, wait_for_exit: bool) -> String {
         };
         format!(
             "$ErrorActionPreference = 'Stop'\n{wait}{}\n",
-            powershell_invocation(Some(version))
+            powershell_invocation(version)
         )
     }
     #[cfg(not(windows))]
@@ -333,26 +336,28 @@ pub fn detached_script(version: &str, wait_for_exit: bool) -> String {
         } else {
             String::new()
         };
-        format!(
-            "#!/bin/sh\nset -u\n{wait}{}\n",
-            shell_invocation(Some(version))
-        )
+        format!("#!/bin/sh\nset -u\n{wait}{}\n", shell_invocation(version))
     }
 }
 
-/// 写脚本到 `~/.cyber/logs/update-v<version>.ps1|sh` 并分离启动，返回脚本路径。
+/// 分离执行的安装脚本内容（指定版本）。
+pub fn detached_script(version: &str, wait_for_exit: bool) -> String {
+    detached_script_for(Some(version), wait_for_exit)
+}
+
+/// 写脚本到 `~/.cyber/logs/update-<label>.ps1|sh` 并分离启动，返回脚本路径。
 ///
 /// Windows 走 `cmd /c start "" powershell … -File <脚本>`：新控制台窗口，安装进度可见，
 /// 且不阻塞本进程；Unix 直接 `sh <脚本>`，stdout/stderr 追加到同目录 `update.log`。
-pub fn launch_detached_install(version: &str, wait_for_exit: bool) -> std::io::Result<PathBuf> {
+fn launch_detached(label: &str, content: String) -> std::io::Result<PathBuf> {
     use std::process::Stdio;
     let paths = Paths::detect().map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::create_dir_all(&paths.logs_dir)?;
     #[cfg(windows)]
-    let script = paths.logs_dir.join(format!("update-v{version}.ps1"));
+    let script = paths.logs_dir.join(format!("update-{label}.ps1"));
     #[cfg(not(windows))]
-    let script = paths.logs_dir.join(format!("update-v{version}.sh"));
-    std::fs::write(&script, detached_script(version, wait_for_exit))?;
+    let script = paths.logs_dir.join(format!("update-{label}.sh"));
+    std::fs::write(&script, content)?;
     #[cfg(windows)]
     {
         std::process::Command::new("cmd")
@@ -385,6 +390,22 @@ pub fn launch_detached_install(version: &str, wait_for_exit: bool) -> std::io::R
             .spawn()?;
     }
     Ok(script)
+}
+
+/// 分离安装：脚本写到 `~/.cyber/logs/update-v<version>.ps1|sh`，安装指定版本。
+pub fn launch_detached_install(version: &str, wait_for_exit: bool) -> std::io::Result<PathBuf> {
+    launch_detached(
+        &format!("v{version}"),
+        detached_script(version, wait_for_exit),
+    )
+}
+
+/// 分离安装（不指定版本）：脚本写到 `~/.cyber/logs/update-latest.ps1|sh`，由安装脚本自己取最新版。
+///
+/// 供 `cyber update --force` 使用：该路径本来就不查版本，而 Windows 上运行中的二进制无法被
+/// 覆盖，必须先退出本进程再由脚本接管（`wait_for_exit`）。
+pub fn launch_detached_install_latest(wait_for_exit: bool) -> std::io::Result<PathBuf> {
+    launch_detached("latest", detached_script_for(None, wait_for_exit))
 }
 
 fn parse_cargo_toml_version(content: &str) -> Option<String> {
@@ -594,6 +615,37 @@ edition = "2021"
         assert!(!immediate.contains("Get-Process"), "{immediate}");
         #[cfg(not(windows))]
         assert!(!immediate.contains("kill -0"), "{immediate}");
+    }
+
+    /// `--force` 走「退出后再装」时不给版本：脚本必须让安装脚本自己取最新版
+    /// （不写 `CYBER_VERSION` / `--version`），否则会把 CLI 没查过的版本硬塞进去。
+    #[test]
+    fn detached_script_without_version_leaves_resolution_to_installer() {
+        let pinned = detached_script("0.9.9", true);
+        let latest = detached_script_for(None, true);
+        #[cfg(windows)]
+        {
+            assert!(pinned.contains("CYBER_VERSION='v0.9.9'"), "{pinned}");
+            assert!(!latest.contains("CYBER_VERSION"), "{latest}");
+            assert!(latest.contains("CYBER_FORCE='1'"), "{latest}");
+            assert!(latest.contains("install.ps1 | iex"), "{latest}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(pinned.contains("--version v0.9.9"), "{pinned}");
+            assert!(!latest.contains("--version"), "{latest}");
+            assert!(latest.contains("--force"), "{latest}");
+            assert!(latest.contains("install.sh"), "{latest}");
+        }
+        // 两者都必须等本进程退出（wait_for_exit=true）。
+        let pid = std::process::id();
+        #[cfg(windows)]
+        assert!(
+            latest.contains(&format!("Get-Process -Id {pid}")),
+            "{latest}"
+        );
+        #[cfg(not(windows))]
+        assert!(latest.contains(&format!("kill -0 {pid}")), "{latest}");
     }
 
     #[test]

@@ -522,6 +522,92 @@ fn log_filter(log_level: Option<&str>) -> tracing_subscriber::EnvFilter {
     )
 }
 
+/// 从 `cyber --version` 输出里取版本号（`cyber 0.6.0` → `0.6.0`）。
+fn parse_version_output(text: &str) -> Option<String> {
+    let token = text.split_whitespace().last()?;
+    let version = token.trim_start_matches(['v', 'V']);
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// 安装目标二进制现在自报的版本（读不到或不是可用二进制时为 `None`）。
+fn installed_version_now() -> Option<String> {
+    let path = cyber_core::update::installed_binary_path()?;
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_version_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// 汇报安装脚本结束后的**真实**结果。
+///
+/// 用户取消（拒绝终止占用进程、非交互环境放弃更新）时安装脚本依然以 0 退出，
+/// 所以只凭退出码宣布成功会撒谎；这里以「本地二进制现在自报的版本」为准，
+/// `before` 是调用安装脚本之前记录的版本，用于区分「已重新安装」与「已取消」。
+/// `expected = None` 表示 `--force`：版本由脚本自行解析，只能与当前版本比对。
+fn report_update_result(expected: Option<&str>, before: Option<String>) {
+    let after = installed_version_now();
+    let before_label = before.as_deref().unwrap_or("未知");
+    let after_label = after.as_deref().unwrap_or("未知");
+    let expected = expected.map(|v| v.trim_start_matches(['v', 'V']).to_string());
+    match (expected.as_deref(), after.as_deref()) {
+        (Some(expected), Some(after)) if expected == after => {
+            if Some(after) == before.as_deref() {
+                println!("安装脚本已结束；本地仍是 v{after}（本来就已是该版本，无法区分「已重装」与「已取消」）。");
+                println!("  确认：cyber --version");
+            } else {
+                println!(
+                    "🎉 升级成功：v{after}（原 {before_label}）。请重新打开终端或直接运行 cyber。"
+                );
+            }
+        }
+        (Some(expected), _) => {
+            eprintln!(
+                "⚠ 安装脚本已结束，但本地仍是 {after_label}（目标 v{expected}），未完成更新。"
+            );
+            eprintln!("  可能已取消（例如拒绝终止正在运行的 cyber）。重试：cyber update");
+        }
+        (None, Some(after)) if after != cyber_core::update::CURRENT_VERSION => {
+            println!(
+                "🎉 升级成功：v{after}（原 v{}）。",
+                cyber_core::update::CURRENT_VERSION
+            );
+        }
+        (None, Some(after)) => {
+            println!("安装脚本已结束，本地仍是 v{after}（可能已取消，或当前就是最新版本）。");
+            println!("  如需确认：cyber --version");
+        }
+        (None, None) => {
+            println!("安装脚本已结束，但无法确认本地版本；请运行 cyber --version 确认结果。");
+        }
+    }
+}
+
+/// Windows 上运行中的 `cyber` 会锁住自己的 exe（安装脚本 `Copy-Item -Force` 必然失败）：
+/// 改为写一个「等本进程退出后再安装」的分离脚本并在新窗口启动，然后让调用方结束进程。
+///
+/// 返回 `Ok(true)`＝已安排分离安装，调用方必须立即退出；`Ok(false)`＝无需退出，
+/// 可按前台方式直接执行 `install_script_command`（非 Windows，或当前进程不是安装目标）。
+fn schedule_detached_update(version: Option<&str>) -> color_eyre::Result<bool> {
+    if !cyber_core::update::needs_exit_before_install() {
+        return Ok(false);
+    }
+    let script = match version {
+        Some(version) => cyber_core::update::launch_detached_install(version, true)?,
+        None => cyber_core::update::launch_detached_install_latest(true)?,
+    };
+    let target = version.map_or_else(|| "最新版本".to_string(), |v| format!("v{v}"));
+    println!();
+    println!("→ 当前进程就是安装目标（Windows 无法覆盖运行中的 exe，否则会报 being used by another process），");
+    println!("  已安排在本进程退出后自动安装 {target}。");
+    println!("  脚本: {}", script.display());
+    println!("  新窗口会显示安装进度；安装完成后再运行 cyber 即可（本进程现在退出）。");
+    Ok(true)
+}
+
 async fn run_update(args: UpdateArgs, _cwd: &Path) -> color_eyre::Result<()> {
     use std::io::Write;
     println!("Cyber Master 版本更新检查");
@@ -532,11 +618,15 @@ async fn run_update(args: UpdateArgs, _cwd: &Path) -> color_eyre::Result<()> {
     if args.force {
         println!();
         println!("→ --force：跳过版本检查，直接下载并覆盖安装最新版本…");
+        if schedule_detached_update(None)? {
+            return Ok(());
+        }
         println!("正在通过 CNB 国内极速源执行强制覆盖更新...");
         let (program, args) = cyber_core::update::install_script_command(None);
+        let before_version = installed_version_now();
         let status = std::process::Command::new(program).args(args).status()?;
         if status.success() {
-            println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
+            report_update_result(None, before_version);
         } else {
             eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
         }
@@ -587,15 +677,19 @@ async fn run_update(args: UpdateArgs, _cwd: &Path) -> color_eyre::Result<()> {
             };
 
             if should_update {
+                if schedule_detached_update(Some(&info.version))? {
+                    return Ok(());
+                }
                 println!(
                     "正在通过 CNB 国内极速源执行一键更新升级 (v{})...",
                     info.version
                 );
                 let (program, args) =
                     cyber_core::update::install_script_command(Some(&info.version));
+                let before_version = installed_version_now();
                 let status = std::process::Command::new(program).args(args).status()?;
                 if status.success() {
-                    println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
+                    report_update_result(Some(&info.version), before_version);
                 } else {
                     eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
                 }
@@ -674,6 +768,24 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         assert!(resolve_cwd(file.path().to_owned()).is_err());
     }
+    #[test]
+    fn parse_version_output_reads_last_token() {
+        assert_eq!(
+            parse_version_output("cyber 0.6.0\n").as_deref(),
+            Some("0.6.0")
+        );
+        assert_eq!(
+            parse_version_output("cyber v1.2.3").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            parse_version_output("cyber V0.6.1").as_deref(),
+            Some("0.6.1")
+        );
+        assert_eq!(parse_version_output("   \n"), None);
+        assert_eq!(parse_version_output(""), None);
+    }
+
     #[test]
     fn update_command_parses_flags() {
         let cli = Cli::try_parse_from(["cyber", "update"]).unwrap();
