@@ -11,7 +11,7 @@ use cyber_core::{
 use cyber_mcp::McpServersConfig;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
-use crate::headless::{validate_session_id, HeadlessOutcome, SessionRunner};
+use crate::headless::{validate_session_id, HeadlessOutcome, SessionRunner, ViewCtx};
 use crate::slash::{self, CommandSpec, SlashCommand};
 
 pub(crate) enum CliAction {
@@ -33,6 +33,7 @@ pub(crate) enum CliAction {
     Settings,
     SettingsTab(crate::cli::SettingsTab),
     Jobs(CliJobs),
+    Update(CliUpdate),
     Panel(crate::cli::Panel),
 }
 
@@ -62,6 +63,8 @@ pub enum FormKind {
     CustomTool {
         original_name: Option<String>,
     },
+    /// 工具库「AI 智能扫描」表单：目标路径/提示词 + 扫描服务商与模型 + 仅预览。
+    ToolboxScan,
 }
 pub struct CommandPicker {
     pub title: String,
@@ -92,6 +95,10 @@ pub enum CliTask {
     ToolboxScan {
         preview: bool,
         target: Option<String>,
+        /// 扫描所用服务商（`None` = 当前默认 Provider）。
+        provider: Option<String>,
+        /// 扫描所用模型（`None` = 服务商自身配置的模型）。
+        model: Option<String>,
     },
 }
 /// `/bg` 命令族（用户级后台任务入口）。
@@ -102,6 +109,13 @@ pub enum CliJobs {
     List,
     Kill(u64),
     Tail(u64),
+}
+/// `/update` 子命令：`Check` 仅检查；`Prompt`（无参数）检查后询问；`Apply` 检查后直接更新。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliUpdate {
+    Check,
+    Prompt,
+    Apply,
 }
 pub struct CompletionItem {
     pub value: String,
@@ -117,12 +131,27 @@ const SESSION: CommandSpec = CommandSpec {
     usage: "/session [id|list|read|new]",
     desc: "打开指令面板",
 };
+const UPDATE: CommandSpec = CommandSpec {
+    name: "/update",
+    usage: "/update [check|apply]",
+    desc: "检查更新并用安装脚本升级",
+};
+/// `/about`：打开「关于」页（全屏只读面板；与设置中心「9. 关于」页共用同一内容）。
+const ABOUT: CommandSpec = CommandSpec {
+    name: "/about",
+    usage: "/about",
+    desc: "打开关于页（版本 / 运行环境 / 快捷键说明书）",
+};
+/// `/mode`（无参数）帮助文案。
+pub const MODE_HELP: &str = "审批模式选项：\n/mode auto       自动审批（低风险自动放行，高风险弹出确认）\n/mode manual     手动审批（每次调用工具都弹出确认）\n/mode unlimited  无限制（不弹出确认，直接执行）\n快捷键：按 F2 可快速循环切换审批模式。";
 pub fn commands() -> Vec<&'static CommandSpec> {
     slash::COMMANDS
         .iter()
         .filter(|c| c.name != "/mode")
         .chain(std::iter::once(&EFFORT))
         .chain(std::iter::once(&SESSION))
+        .chain(std::iter::once(&UPDATE))
+        .chain(std::iter::once(&ABOUT))
         .collect()
 }
 fn output(title: &str, text: impl Into<String>) -> CliAction {
@@ -143,6 +172,34 @@ fn split(value: &str) -> (&str, &str) {
         .split_once(char::is_whitespace)
         .unwrap_or((value.trim(), ""));
     (a, b.trim())
+}
+
+/// `/mode <auto|manual|unlimited>`（不触碰 runner）。
+pub fn mode_action(args: &str) -> Result<CliAction> {
+    if args.is_empty() {
+        return Ok(output("Mode", MODE_HELP));
+    }
+    let mode = cyber_agent::PermissionMode::parse(args).ok_or_else(|| {
+        eyre!("未知审批模式：{args}。可用值：auto(自动)、manual(手动)、unlimited(无限制)")
+    })?;
+    Ok(CliAction::Mode(mode))
+}
+
+/// `/help` 输出（不触碰 runner）。
+pub fn help_action() -> CliAction {
+    output(
+        "Commands",
+        commands()
+            .iter()
+            .map(|c| format!("{}  {}", c.usage, c.desc))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// 把命令错误包装成 `CliAction::Output{title:"Error"}`（与空闲路径 `screen.message("Error", …)` 同文案）。
+pub fn error_action(error: &color_eyre::eyre::Report) -> CliAction {
+    output("Error", error.to_string())
 }
 
 /// 解析 `/bg` 参数为 `CliJobs`（不依赖 runner；busy 时也可用）。
@@ -578,21 +635,6 @@ pub(crate) fn stop_subagents(
 }
 fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (command, value) = split(args);
-    if command.is_empty() || command.eq_ignore_ascii_case("status") {
-        let config = &runner.ctx.config.agent.subagents;
-        return Ok(output(
-            "Subagents",
-            format!(
-                "enabled={}\nmax_tasks={}\nmax_parallel={}\ntimeout_secs={}\nmax_steps={}",
-                config.enabled,
-                config.effective_max_tasks(),
-                config.effective_max_parallel(),
-                config.effective_timeout_secs(),
-                config.effective_max_steps()
-            ),
-        ));
-    }
-
     if command.eq_ignore_ascii_case("stop") {
         let message = stop_subagents(
             &runner.registries.background,
@@ -660,26 +702,6 @@ fn subagents(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
 
 fn env(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (command, rest) = split(args);
-    if command.is_empty() || command.eq_ignore_ascii_case("list") {
-        let mut vars = runner.ctx.config.env.vars.clone();
-        vars.sort_by(|left, right| left.key.cmp(&right.key));
-        let text = if vars.is_empty() {
-            "No environment variables configured".to_string()
-        } else {
-            vars.into_iter()
-                .map(|var| {
-                    if var.sensitive {
-                        format!("{}=<sensitive>", var.key)
-                    } else {
-                        format!("{}={}", var.key, var.value)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        return Ok(output("Environment", text));
-    }
-
     if command.eq_ignore_ascii_case("add") {
         return Ok(CliAction::Form(CommandForm {
             title: "Add Environment Variable".into(),
@@ -794,17 +816,6 @@ fn env(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
 }
 fn web(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let sub = args.trim().to_ascii_lowercase();
-    if sub.is_empty() || sub == "status" {
-        let status_str = if runner.ctx.config.tools.web_search {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        return Ok(output(
-            "Web Search",
-            format!("web_search is currently {status_str}"),
-        ));
-    }
     let (enabled, message) = match sub.as_str() {
         "on" | "enable" | "1" | "true" => (
             true,
@@ -828,24 +839,6 @@ fn web(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
 fn toolbox(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (command, rest) = split(args);
     match command.to_ascii_lowercase().as_str() {
-        "" | "list" => {
-            let (tools, _) = cyber_core::load_custom_tools(&runner.ctx.paths.tools_dir);
-            let text = if tools.is_empty() {
-                "（暂无自定义工具；/toolbox add 手动录入，/toolbox scan 自动扫描）".to_string()
-            } else {
-                tools
-                    .iter()
-                    .map(|tool| {
-                        format!(
-                            "{} — {}  ({})",
-                            tool.config.name, tool.config.description, tool.config.command
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok(output("自定义工具库", text))
-        }
         "add" => Ok(CliAction::Form(custom_tool_form(
             None,
             cyber_core::CustomToolConfig::default(),
@@ -891,19 +884,33 @@ fn toolbox(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             ))
         }
         "scan" => {
-            let preview = rest.split_whitespace().any(|token| token == "--preview");
-            let target = rest
-                .split_whitespace()
-                .filter(|token| *token != "--preview")
-                .collect::<Vec<_>>()
-                .join(" ");
+            let mut preview = false;
+            let mut provider: Option<String> = None;
+            let mut model: Option<String> = None;
+            let mut target_words: Vec<&str> = Vec::new();
+            let mut words = rest.split_whitespace();
+            while let Some(token) = words.next() {
+                match token {
+                    "--preview" => preview = true,
+                    "--provider" => {
+                        provider = words.next().map(str::to_string).filter(|v| !v.is_empty());
+                    }
+                    "--model" => {
+                        model = words.next().map(str::to_string).filter(|v| !v.is_empty());
+                    }
+                    other => target_words.push(other),
+                }
+            }
+            let target = target_words.join(" ");
             Ok(CliAction::Task(CliTask::ToolboxScan {
                 preview,
                 target: (!target.is_empty()).then_some(target),
+                provider,
+                model,
             }))
         }
         other => {
-            bail!("未知子命令：{other}（用法：/toolbox [list|add|edit <name>|remove <name>|scan]）")
+            bail!("未知子命令：{other}（用法：/toolbox [list|add|edit <name>|remove <name>|scan [目录|提示词] [--preview] [--provider <n>] [--model <m>]]）")
         }
     }
 }
@@ -949,35 +956,44 @@ fn custom_tool_form(
     }
 }
 
+/// 「AI 智能扫描本地安全工具」表单：目标（本地路径/提示词）+ 服务商 + 模型 + 仅预览。
+///
+/// `provider` / `model` 为入口处的默认值（当前默认服务商与其配置模型）；两者均可改。
+pub fn toolbox_scan_form(provider: String, model: String) -> CommandForm {
+    CommandForm {
+        title: "AI 智能扫描本地安全工具".to_string(),
+        fields: vec![
+            FormField {
+                name: "target".into(),
+                value: String::new(),
+                secret: false,
+            },
+            FormField {
+                name: "provider".into(),
+                value: provider,
+                secret: false,
+            },
+            FormField {
+                name: "model".into(),
+                value: model,
+                secret: false,
+            },
+            FormField {
+                name: "preview".into(),
+                value: "false".into(),
+                secret: false,
+            },
+        ],
+        kind: FormKind::ToolboxScan,
+    }
+}
+
 fn vision(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let mut parts = args.trim().splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("").to_lowercase();
     let rest = parts.next().unwrap_or("").trim();
 
     match sub.as_str() {
-        "" | "status" => {
-            let status_str = if runner.ctx.config.agent.vision.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            let provider = if runner.ctx.config.agent.vision.provider.is_empty() {
-                "auto"
-            } else {
-                &runner.ctx.config.agent.vision.provider
-            };
-            let model = if runner.ctx.config.agent.vision.model.is_empty() {
-                "auto"
-            } else {
-                &runner.ctx.config.agent.vision.model
-            };
-            let out = format!(
-                "Vision Engine: {status_str}\nProvider: {provider}\nModel: {model}\nDetail: {}\nPrompt: {}",
-                runner.ctx.config.agent.vision.detail,
-                runner.ctx.config.agent.vision.prompt
-            );
-            Ok(output("Vision Engine", out))
-        }
         "on" | "enable" | "1" | "true" => {
             let mut config = runner.ctx.config.clone();
             config.agent.vision.enabled = true;
@@ -1090,253 +1106,231 @@ fn vision(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     }
 }
 
-pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
+/// `/effort` 归一化为 `/think` 后解析：空闲与回合进行中两条路径共用
+/// （修复 busy 期间 `/effort` 被判为 Unknown 的缺陷）。
+pub(crate) fn parse_line(line: &str) -> SlashCommand {
     let (name, args) = split(line);
-    if name.eq_ignore_ascii_case("/mode") || name.eq_ignore_ascii_case("/approval") {
-        if args.is_empty() {
-            return Ok(output(
-                "Mode",
-                "审批模式选项：\n/mode auto       自动审批（低风险自动放行，高风险弹出确认）\n/mode manual     手动审批（每次调用工具都弹出确认）\n/mode unlimited  无限制（不弹出确认，直接执行）\n快捷键：按 F2 可快速循环切换审批模式。",
-            ));
-        }
-        let mode = cyber_agent::PermissionMode::parse(args).ok_or_else(|| {
-            eyre!("未知审批模式：{args}。可用值：auto(自动)、manual(手动)、unlimited(无限制)")
-        })?;
-        return Ok(CliAction::Mode(mode));
-    }
-    if name.eq_ignore_ascii_case("/update") {
-        let release = cyber_core::update::cached_latest_version();
-        return Ok(match release {
-            Some(info)
-                if cyber_core::update::is_newer(
-                    cyber_core::update::CURRENT_VERSION,
-                    &info.version,
-                ) =>
-            {
-                output(
-                    "更新检查",
-                    format!(
-                        "✨ 发现新版本 V{}（当前 V{}）！\n\n发布页面：{}\nCNB 镜像：{}\n可在终端退出后运行 `cyber update` 进行升级。",
-                        info.version,
-                        cyber_core::update::CURRENT_VERSION,
-                        info.html_url,
-                        cyber_core::update::CNB_RELEASES_URL,
-                    ),
-                )
-            }
-            Some(_) => output(
-                "更新检查",
-                format!(
-                    "✅ 当前已是最新版本 V{}\n（如需强行联网检查，请在终端退出后运行 `cyber update`）",
-                    cyber_core::update::CURRENT_VERSION
-                ),
-            ),
-            None => output(
-                "更新检查",
-                format!(
-                    "当前版本 V{}\n未检测到本地版本缓存。请在终端执行 `cyber update` 联网检查最新版本。\n发布地址：https://github.com/{}\nCNB 镜像：{}",
-                    cyber_core::update::CURRENT_VERSION,
-                    cyber_core::update::GITHUB_REPO,
-                    cyber_core::update::CNB_RELEASES_URL,
-                ),
-            ),
-        });
-    }
-    let parsed = if name.eq_ignore_ascii_case("/effort") {
+    if name.eq_ignore_ascii_case("/effort") {
         let args = match args.to_ascii_lowercase().as_str() {
             "medium" => "middle",
             "xhigh" => "max",
             _ => args,
         };
-        slash::parse(&format!("/think {args}"))
+        return slash::parse(&format!("/think {args}"));
+    }
+    slash::parse(line)
+}
+
+/// 若 `line` 是 `/update …`，返回解析后的动作；非该命令返回 `None`。
+///
+/// `Check` 与无参数检查只做网络请求 + 提示，回合进行中亦可用；`Apply` 与无参数确认态
+/// 由 `CliScreen` 在执行安装前检查回合状态。
+pub(crate) fn update_action(line: &str) -> Option<Result<CliAction>> {
+    let (name, args) = split(line);
+    if !name.eq_ignore_ascii_case("/update") {
+        return None;
+    }
+    Some(match args.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(CliAction::Update(CliUpdate::Prompt)),
+        "check" => Ok(CliAction::Update(CliUpdate::Check)),
+        "apply" | "yes" | "now" => Ok(CliAction::Update(CliUpdate::Apply)),
+        _ => Err(eyre!(
+            "Usage: /update [check|apply]（无参数＝检查并询问是否更新）"
+        )),
+    })
+}
+
+/// 若 `line` 是 `/about`，返回打开关于页的动作；非该命令返回 `None`。
+///
+/// 与 `/update` 一样不经 `slash::parse`：只读、回合进行中亦可用，且不需要 runner。
+pub(crate) fn about_action(line: &str) -> Option<Result<CliAction>> {
+    let (name, args) = split(line);
+    if !name.eq_ignore_ascii_case("/about") {
+        return None;
+    }
+    if args.trim().is_empty() {
+        Some(Ok(CliAction::Panel(crate::cli::Panel::About)))
     } else {
-        slash::parse(line)
-    };
-    Ok(match parsed {
-        SlashCommand::Help => output(
-            "Commands",
-            commands()
-                .iter()
-                .map(|c| format!("{}  {}", c.usage, c.desc))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        SlashCommand::Clear => {
-            runner.entries.clear();
-            runner.save()?;
-            refresh("History cleared", true)
-        }
-        SlashCommand::Cancel => CliAction::Cancel,
-        SlashCommand::Quit => {
-            runner.save()?;
-            CliAction::Quit
-        }
-        SlashCommand::New => {
-            runner.create_session()?;
-            refresh("New session", true)
-        }
-        SlashCommand::Model(args) => {
-            if args.is_empty() {
-                let mut items = Vec::new();
-                let current_default = &runner.ctx.config.agent.default_provider;
-                let current_prov_cfg = runner.ctx.providers.providers.get(current_default);
-                let current_model = current_prov_cfg.map(|p| p.model.as_str()).unwrap_or("");
+        Some(Err(eyre!("Usage: /about")))
+    }
+}
 
-                for name in runner.ctx.providers.sorted_names() {
-                    let provider = &runner.ctx.providers.providers[&name];
-                    let is_default_prov = &name == current_default;
-                    let mut models: Vec<_> = provider.models.keys().cloned().collect();
-                    if !provider.model.is_empty() && !models.contains(&provider.model) {
-                        models.push(provider.model.clone());
-                    }
-                    models.sort();
-                    models.dedup();
-                    for model in models.into_iter().filter(|m| !m.is_empty()) {
-                        let is_active = is_default_prov && model == current_model;
-                        let cap =
-                            cyber_core::get_model_vision_capability(provider, &name, &model, None);
-                        let badge = cap.badge_text();
-                        let active_badge = if is_active { " ✓ 当前" } else { "" };
-                        let label = if badge.is_empty() {
-                            format!("{model}{active_badge}")
-                        } else {
-                            format!("{model} {badge}{active_badge}")
-                        };
-                        items.push(PickerItem {
-                            label,
-                            detail: if is_default_prov {
-                                format!("{name} ★ 默认")
-                            } else {
-                                name.clone()
-                            },
-                            command: format!("/model {name} {model}"),
-                        });
-                    }
-                }
-                if let Some(pos) = items.iter().position(|i| i.label.contains("✓ 当前")) {
-                    let active_item = items.remove(pos);
-                    items.insert(0, active_item);
-                }
-                CliAction::Picker(CommandPicker {
-                    title: "Models".into(),
-                    items,
-                    kind: PickerKind::Models,
-                })
-            } else {
-                let (first, second) = split(&args);
-                if !second.is_empty() {
-                    runner.select_model_persisted(first, Some(second))?;
-                    refresh("Model selected", false)
-                } else if runner.ctx.providers.providers.contains_key(first) {
-                    runner.select_model_persisted(first, None)?;
-                    refresh("Model selected", false)
-                } else {
-                    let target = first.to_ascii_lowercase();
-                    let mut matched = Vec::new();
-                    for name in runner.ctx.providers.sorted_names() {
-                        let p = &runner.ctx.providers.providers[&name];
-                        if p.model.to_ascii_lowercase() == target
-                            || p.models.keys().any(|m| m.to_ascii_lowercase() == target)
-                        {
-                            matched.push((name, first.to_string()));
-                        }
-                    }
-
-                    if matched.len() == 1 {
-                        let (prov, mdl) = &matched[0];
-                        runner.select_model_persisted(prov, Some(mdl))?;
-                        refresh("Model selected", false)
-                    } else if matched.is_empty() {
-                        bail!("Unknown provider");
-                    } else {
-                        let items = matched
-                            .into_iter()
-                            .map(|(prov, mdl)| PickerItem {
-                                label: mdl.clone(),
-                                detail: prov.clone(),
-                                command: format!("/model {prov} {mdl}"),
-                            })
-                            .collect();
-                        CliAction::Picker(CommandPicker {
-                            title: format!("Select Provider for '{first}'"),
-                            items,
-                            kind: PickerKind::Models,
-                        })
-                    }
-                }
-            }
-        }
-        SlashCommand::Provider(args) => provider(runner, &args)?,
-        SlashCommand::Subagents(args) => subagents(runner, &args)?,
-        SlashCommand::Env(args) => env(runner, &args)?,
-        SlashCommand::Web(args) => web(runner, &args)?,
-        SlashCommand::Vision(args) => vision(runner, &args)?,
+/// 只读指令分派：不写盘、不改会话，回合进行中（runner 已被 `take()` 走）亦可立即执行。
+///
+/// `Ok(None)` = 该输入需要 runner（写盘 / 改会话），由调用方排队到回合结束后执行。
+/// 与 `execute` 共用本函数，保证同一指令在空闲与 busy 下输出逐字节一致。
+pub fn readonly_action(view: &ViewCtx<'_>, line: &str) -> Result<Option<CliAction>> {
+    let (name, args) = split(line);
+    if name.eq_ignore_ascii_case("/mode") || name.eq_ignore_ascii_case("/approval") {
+        return mode_action(args).map(Some);
+    }
+    if let Some(action) = update_action(line) {
+        return action.map(Some);
+    }
+    if let Some(action) = about_action(line) {
+        return action.map(Some);
+    }
+    let action = match parse_line(line) {
+        SlashCommand::Help => help_action(),
+        SlashCommand::Settings => CliAction::Settings,
         SlashCommand::Tools => output(
             "Tools",
-            runner
-                .registries
-                .tools
+            view.tools
                 .all_schemas()
                 .iter()
                 .map(|s| format!("{}  {}", s.name, s.description))
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        SlashCommand::Toolbox(args) => toolbox(runner, &args)?,
         SlashCommand::Skill(args) => {
             if args.is_empty() || args.eq_ignore_ascii_case("list") {
                 output(
                     "Skills",
-                    runner
-                        .registries
-                        .skills
+                    view.skills
                         .iter()
                         .map(|s| format!("{}  {}", s.name(), s.frontmatter.description))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )
             } else {
-                let skill = runner
-                    .registries
+                let skill = view
                     .skills
                     .find(&args)
                     .ok_or_else(|| eyre!("Unknown skill"))?;
                 output("Skill", skill.body.clone())
             }
         }
-        SlashCommand::Mcp(args) => {
-            let config = McpServersConfig::load(&runner.ctx.paths.mcp_servers_file)
-                .map_err(|_| eyre!("Cannot read MCP configuration"))?;
-            let trimmed = args.trim();
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.is_empty()
-                || lower == "panel"
-                || lower == "add"
-                || lower == "edit"
-                || lower == "delete"
-            {
-                return Ok(CliAction::Panel(crate::cli::Panel::Mcp));
+        SlashCommand::Think(args) if args.trim().is_empty() => {
+            output("Thinking", view.config.agent.thinking_intensity.as_str())
+        }
+        SlashCommand::MaxSteps(args) if args.trim().is_empty() => {
+            output("Max Steps", view.config.agent.max_steps.to_string())
+        }
+        SlashCommand::Subagents(args) => {
+            let (command, _) = split(&args);
+            if command.is_empty() || command.eq_ignore_ascii_case("status") {
+                let config = &view.config.agent.subagents;
+                output(
+                    "Subagents",
+                    format!(
+                        "enabled={}\nmax_tasks={}\nmax_parallel={}\ntimeout_secs={}\nmax_steps={}",
+                        config.enabled,
+                        config.effective_max_tasks(),
+                        config.effective_max_parallel(),
+                        config.effective_timeout_secs(),
+                        config.effective_max_steps()
+                    ),
+                )
+            } else {
+                return Ok(None);
             }
+        }
+        SlashCommand::Env(args) => {
+            let (command, _) = split(&args);
+            if command.is_empty() || command.eq_ignore_ascii_case("list") {
+                let mut vars = view.config.env.vars.clone();
+                vars.sort_by(|left, right| left.key.cmp(&right.key));
+                let text = if vars.is_empty() {
+                    "No environment variables configured".to_string()
+                } else {
+                    vars.into_iter()
+                        .map(|var| {
+                            if var.sensitive {
+                                format!("{}=<sensitive>", var.key)
+                            } else {
+                                format!("{}={}", var.key, var.value)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                output("Environment", text)
+            } else {
+                return Ok(None);
+            }
+        }
+        SlashCommand::Web(args) => {
+            let sub = args.trim().to_ascii_lowercase();
+            if sub.is_empty() || sub == "status" {
+                let status_str = if view.config.tools.web_search {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                output(
+                    "Web Search",
+                    format!("web_search is currently {status_str}"),
+                )
+            } else {
+                return Ok(None);
+            }
+        }
+        SlashCommand::Vision(args) => {
+            let sub = args.split_whitespace().next().unwrap_or("").to_lowercase();
+            if sub.is_empty() || sub == "status" {
+                let status_str = if view.config.agent.vision.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let provider = if view.config.agent.vision.provider.is_empty() {
+                    "auto"
+                } else {
+                    &view.config.agent.vision.provider
+                };
+                let model = if view.config.agent.vision.model.is_empty() {
+                    "auto"
+                } else {
+                    &view.config.agent.vision.model
+                };
+                let out = format!(
+                    "Vision Engine: {status_str}\nProvider: {provider}\nModel: {model}\nDetail: {}\nPrompt: {}",
+                    view.config.agent.vision.detail, view.config.agent.vision.prompt
+                );
+                output("Vision Engine", out)
+            } else {
+                return Ok(None);
+            }
+        }
+        SlashCommand::Toolbox(args) => {
+            let (command, _) = split(&args);
+            if command.is_empty() || command.eq_ignore_ascii_case("list") {
+                let (tools, _) = cyber_core::load_custom_tools(&view.paths.tools_dir);
+                let text = if tools.is_empty() {
+                    "（暂无自定义工具；/toolbox add 手动录入，/toolbox scan 自动扫描）".to_string()
+                } else {
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            format!(
+                                "{} — {}  ({})",
+                                tool.config.name, tool.config.description, tool.config.command
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                output("自定义工具库", text)
+            } else {
+                return Ok(None);
+            }
+        }
+        SlashCommand::Mcp(args) => {
+            let lower = args.trim().to_ascii_lowercase();
             match lower.as_str() {
-                "connect" => {
-                    if runner.registries.mcp.is_some() {
-                        bail!("MCP already connected; restart before reconnecting");
-                    }
-                    CliAction::Task(CliTask::McpConnect { config })
+                "" | "panel" | "add" | "edit" | "delete" => {
+                    CliAction::Panel(crate::cli::Panel::Mcp)
                 }
                 "list" | "status" => {
+                    let config = McpServersConfig::load(&view.paths.mcp_servers_file)
+                        .map_err(|_| eyre!("Cannot read MCP configuration"))?;
                     output(
                         "MCP",
                         config
                             .servers
                             .iter()
                             .map(|s| {
-                                let status_str = match runner
-                                    .registries
-                                    .mcp
-                                    .as_ref()
-                                    .and_then(|m| m.tool_count(&s.name))
-                                {
+                                let status_str = match view.mcp.and_then(|m| m.tool_count(&s.name)) {
                                     Some(0) => "connected (0 tools - hint: if SSE server, set transport = \"sse\")".to_string(),
                                     Some(n) => format!("connected ({n} tools)"),
                                     None => "not connected (explicit approval required)".to_string(),
@@ -1352,6 +1346,300 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                             .join("\n"),
                     )
                 }
+                _ => return Ok(None),
+            }
+        }
+        SlashCommand::Model(args) if args.trim().is_empty() => {
+            let mut items = Vec::new();
+            let current_default = &view.config.agent.default_provider;
+            let current_prov_cfg = view.providers.providers.get(current_default);
+            let current_model = current_prov_cfg.map(|p| p.model.as_str()).unwrap_or("");
+
+            for name in view.providers.sorted_names() {
+                let provider = &view.providers.providers[&name];
+                let is_default_prov = &name == current_default;
+                let mut models: Vec<_> = provider.models.keys().cloned().collect();
+                if !provider.model.is_empty() && !models.contains(&provider.model) {
+                    models.push(provider.model.clone());
+                }
+                models.sort();
+                models.dedup();
+                for model in models.into_iter().filter(|m| !m.is_empty()) {
+                    let is_active = is_default_prov && model == current_model;
+                    let cap =
+                        cyber_core::get_model_vision_capability(provider, &name, &model, None);
+                    let badge = cap.badge_text();
+                    let active_badge = if is_active { " ✓ 当前" } else { "" };
+                    let label = if badge.is_empty() {
+                        format!("{model}{active_badge}")
+                    } else {
+                        format!("{model} {badge}{active_badge}")
+                    };
+                    items.push(PickerItem {
+                        label,
+                        detail: if is_default_prov {
+                            format!("{name} ★ 默认")
+                        } else {
+                            name.clone()
+                        },
+                        command: format!("/model {name} {model}"),
+                    });
+                }
+            }
+            if let Some(pos) = items.iter().position(|i| i.label.contains("✓ 当前")) {
+                let active_item = items.remove(pos);
+                items.insert(0, active_item);
+            }
+            CliAction::Picker(CommandPicker {
+                title: "Models".into(),
+                items,
+                kind: PickerKind::Models,
+            })
+        }
+        SlashCommand::Sessions(args) => {
+            let (sub, _) = split(&args);
+            if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+                let current_title = view
+                    .current_meta()
+                    .map(|m| m.title.as_str())
+                    .unwrap_or("默认会话");
+                CliAction::Picker(CommandPicker {
+                    title: format!("Sessions · {current_title}"),
+                    kind: PickerKind::Sessions,
+                    items: view
+                        .sessions
+                        .iter()
+                        .map(|s| PickerItem {
+                            label: s.title.clone(),
+                            detail: format!("{}  {} messages", s.id, s.message_count),
+                            command: format!("/sessions {}", s.id),
+                        })
+                        .collect(),
+                })
+            } else {
+                return Ok(None);
+            }
+        }
+        SlashCommand::Provider(args) => {
+            let (sub, rest) = split(&args);
+            match sub.to_ascii_lowercase().as_str() {
+                "" | "panel" | "dashboard" => {
+                    CliAction::SettingsTab(crate::cli::SettingsTab::Providers)
+                }
+                "list" => output(
+                    "Providers",
+                    view.providers
+                        .sorted_names()
+                        .iter()
+                        .map(|n| {
+                            let p = &view.providers.providers[n];
+                            format!(
+                                "{}{}  {}  {}",
+                                n,
+                                if *n == view.config.agent.default_provider {
+                                    " (default)"
+                                } else {
+                                    ""
+                                },
+                                p.kind,
+                                p.model
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                "models" => {
+                    let name = rest.trim();
+                    if name.is_empty() {
+                        output(
+                            "Provider Models",
+                            view.providers
+                                .sorted_names()
+                                .iter()
+                                .map(|n| {
+                                    let p = &view.providers.providers[n];
+                                    let mut m: Vec<_> = p.models.keys().cloned().collect();
+                                    if !p.model.is_empty() && !m.contains(&p.model) {
+                                        m.push(p.model.clone());
+                                    }
+                                    format!("{}: {}", n, m.join(", "))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    } else if let Some(p) = view.providers.providers.get(name) {
+                        let mut m: Vec<_> = p.models.keys().cloned().collect();
+                        if !p.model.is_empty() && !m.contains(&p.model) {
+                            m.push(p.model.clone());
+                        }
+                        output(&format!("Models for {name}"), m.join("\n"))
+                    } else {
+                        bail!("Unknown provider '{name}'");
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        SlashCommand::Ctf(args) => {
+            let (sub, _) = split(&args);
+            match sub.to_ascii_lowercase().as_str() {
+                "status" => output(
+                    "CTF",
+                    if view.ctf_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                ),
+                "list" => {
+                    let shared = view
+                        .ctf_challenges
+                        .ok_or_else(|| eyre!("CTF registry unavailable"))?;
+                    let list = shared
+                        .lock()
+                        .map_err(|_| eyre!("CTF state lock poisoned"))?
+                        .clone();
+                    output(
+                        "CTF",
+                        list.iter()
+                            .map(|c| format!("{} [{}] {}", c.name, c.category, c.status.label()))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                }
+                _ => return Ok(None),
+            }
+        }
+        SlashCommand::Memory(args) => {
+            let (sub, rest) = split(&args);
+            if sub.eq_ignore_ascii_case("rule") {
+                let (op, _) = split(rest);
+                if !op.eq_ignore_ascii_case("list") {
+                    return Ok(None);
+                }
+                output(
+                    "Memory Rules",
+                    view.config
+                        .memory
+                        .rules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| format!("{}. {} {} {}", i + 1, r.enabled, r.scope, r.prompt))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+                let project = cyber_core::Paths::project_memory_file(view.cwd);
+                let mut text = String::new();
+                for (name, path) in [("global", &view.paths.memory_file), ("project", &project)] {
+                    let content = String::from_utf8(read_optional(path)?)?;
+                    for (i, line) in content
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("- "))
+                        .enumerate()
+                    {
+                        text.push_str(&format!("{name} {}. {line}\n", i + 1));
+                    }
+                }
+                output("Memory", text)
+            } else {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(action))
+}
+
+pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
+    // 只读指令优先：与回合进行中（busy）路径共用 `readonly_action`，输出逐字节一致。
+    let readonly = readonly_action(&runner.view(), line);
+    match readonly {
+        Ok(Some(action)) => return Ok(action),
+        Err(error) => return Err(error),
+        Ok(None) => {}
+    }
+    let parsed = parse_line(line);
+    Ok(match parsed {
+        // 只读变体在上方已由 `readonly_action` 消费；此分支仅为穷尽性，
+        // 若被命中说明分派表与实现已不一致。
+        SlashCommand::Help | SlashCommand::Tools | SlashCommand::Skill(_) => {
+            bail!("Command must be dispatched by readonly_action");
+        }
+        SlashCommand::Clear => {
+            runner.entries.clear();
+            runner.save()?;
+            refresh("History cleared", true)
+        }
+        SlashCommand::Cancel => CliAction::Cancel,
+        SlashCommand::Quit => {
+            runner.save()?;
+            CliAction::Quit
+        }
+        SlashCommand::New => {
+            runner.create_session()?;
+            refresh("New session", true)
+        }
+        SlashCommand::Model(args) => {
+            let (first, second) = split(&args);
+            if !second.is_empty() {
+                runner.select_model_persisted(first, Some(second))?;
+                refresh("Model selected", false)
+            } else if runner.ctx.providers.providers.contains_key(first) {
+                runner.select_model_persisted(first, None)?;
+                refresh("Model selected", false)
+            } else {
+                let target = first.to_ascii_lowercase();
+                let mut matched = Vec::new();
+                for name in runner.ctx.providers.sorted_names() {
+                    let p = &runner.ctx.providers.providers[&name];
+                    if p.model.to_ascii_lowercase() == target
+                        || p.models.keys().any(|m| m.to_ascii_lowercase() == target)
+                    {
+                        matched.push((name, first.to_string()));
+                    }
+                }
+
+                if matched.len() == 1 {
+                    let (prov, mdl) = &matched[0];
+                    runner.select_model_persisted(prov, Some(mdl))?;
+                    refresh("Model selected", false)
+                } else if matched.is_empty() {
+                    bail!("Unknown provider");
+                } else {
+                    let items = matched
+                        .into_iter()
+                        .map(|(prov, mdl)| PickerItem {
+                            label: mdl.clone(),
+                            detail: prov.clone(),
+                            command: format!("/model {prov} {mdl}"),
+                        })
+                        .collect();
+                    CliAction::Picker(CommandPicker {
+                        title: format!("Select Provider for '{first}'"),
+                        items,
+                        kind: PickerKind::Models,
+                    })
+                }
+            }
+        }
+        SlashCommand::Provider(args) => provider(runner, &args)?,
+        SlashCommand::Subagents(args) => subagents(runner, &args)?,
+        SlashCommand::Env(args) => env(runner, &args)?,
+        SlashCommand::Web(args) => web(runner, &args)?,
+        SlashCommand::Vision(args) => vision(runner, &args)?,
+        SlashCommand::Toolbox(args) => toolbox(runner, &args)?,
+        SlashCommand::Mcp(args) => {
+            let config = McpServersConfig::load(&runner.ctx.paths.mcp_servers_file)
+                .map_err(|_| eyre!("Cannot read MCP configuration"))?;
+            let lower = args.trim().to_ascii_lowercase();
+            match lower.as_str() {
+                "connect" => {
+                    if runner.registries.mcp.is_some() {
+                        bail!("MCP already connected; restart before reconnecting");
+                    }
+                    CliAction::Task(CliTask::McpConnect { config })
+                }
                 _ => {
                     bail!("Usage: /mcp list|status|connect|panel");
                 }
@@ -1362,37 +1650,24 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
         }),
         SlashCommand::Ctf(args) => ctf(runner, &args)?,
         SlashCommand::MaxSteps(args) => {
-            if args.is_empty() {
-                output("Max Steps", runner.ctx.config.agent.max_steps.to_string())
-            } else {
-                let steps: u32 = args
-                    .parse()
-                    .map_err(|_| eyre!("Max steps must be 1-1000"))?;
-                if !(1..=1000).contains(&steps) {
-                    bail!("Max steps must be 1-1000");
-                }
-                let mut config = runner.ctx.config.clone();
-                config.agent.max_steps = steps;
-                save_config(runner, config, "agent", "max_steps")?;
-                refresh("Max steps saved", false)
+            let steps: u32 = args
+                .parse()
+                .map_err(|_| eyre!("Max steps must be 1-1000"))?;
+            if !(1..=1000).contains(&steps) {
+                bail!("Max steps must be 1-1000");
             }
+            let mut config = runner.ctx.config.clone();
+            config.agent.max_steps = steps;
+            save_config(runner, config, "agent", "max_steps")?;
+            refresh("Max steps saved", false)
         }
         SlashCommand::Think(args) => {
-            if args.is_empty() {
-                output(
-                    "Thinking",
-                    runner.ctx.config.agent.thinking_intensity.as_str(),
-                )
-            } else {
-                let intensity = crate::headless::thinking(
-                    Some(&args),
-                    runner.ctx.config.agent.thinking_intensity,
-                )?;
-                let mut config = runner.ctx.config.clone();
-                config.agent.thinking_intensity = intensity;
-                save_config(runner, config, "agent", "thinking_intensity")?;
-                refresh("Thinking intensity saved", false)
-            }
+            let intensity =
+                crate::headless::thinking(Some(&args), runner.ctx.config.agent.thinking_intensity)?;
+            let mut config = runner.ctx.config.clone();
+            config.agent.thinking_intensity = intensity;
+            save_config(runner, config, "agent", "thinking_intensity")?;
+            refresh("Thinking intensity saved", false)
         }
         SlashCommand::Sessions(args) => sessions(runner, &args)?,
         SlashCommand::Memory(args) => memory(runner, &args)?,
@@ -1469,33 +1744,6 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
 fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (sub, rest) = split(args);
     match sub.to_ascii_lowercase().as_str() {
-        "" | "panel" | "dashboard" => {
-            Ok(CliAction::SettingsTab(crate::cli::SettingsTab::Providers))
-        }
-        "list" => Ok(output(
-            "Providers",
-            runner
-                .ctx
-                .providers
-                .sorted_names()
-                .iter()
-                .map(|n| {
-                    let p = &runner.ctx.providers.providers[n];
-                    format!(
-                        "{}{}  {}  {}",
-                        n,
-                        if *n == runner.ctx.config.agent.default_provider {
-                            " (default)"
-                        } else {
-                            ""
-                        },
-                        p.kind,
-                        p.model
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )),
         "wizard" | "preset" | "presets" => {
             let mut items = Vec::new();
             for preset in cyber_core::PROVIDER_PRESETS {
@@ -1802,53 +2050,27 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             save_selection_renamed(runner, config, providers, None, false)?;
             Ok(refresh("Provider removed", false))
         }
-        "models" => {
-            let name = rest.trim();
-            if name.is_empty() {
-                Ok(output(
-                    "Provider Models",
-                    runner
-                        .ctx
-                        .providers
-                        .sorted_names()
-                        .iter()
-                        .map(|n| {
-                            let p = &runner.ctx.providers.providers[n];
-                            let mut m: Vec<_> = p.models.keys().cloned().collect();
-                            if !p.model.is_empty() && !m.contains(&p.model) {
-                                m.push(p.model.clone());
-                            }
-                            format!("{}: {}", n, m.join(", "))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ))
-            } else if let Some(p) = runner.ctx.providers.providers.get(name) {
-                let mut m: Vec<_> = p.models.keys().cloned().collect();
-                if !p.model.is_empty() && !m.contains(&p.model) {
-                    m.push(p.model.clone());
-                }
-                Ok(output(&format!("Models for {name}"), m.join("\n")))
-            } else {
-                bail!("Unknown provider '{name}'");
-            }
-        }
         _ => {
             bail!("Usage: /provider list|add|edit <name>|use <name>|remove <name>");
         }
     }
 }
-fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+/// `/todo` 核心实现（不触碰 runner）。返回 `(动作, 是否改动了清单)`。
+pub fn todo_action(
+    todos: &std::sync::Arc<std::sync::Mutex<Vec<cyber_core::TodoItem>>>,
+    args: &str,
+) -> Result<(CliAction, bool)> {
     let (sub, rest) = split(args);
-    let mut todos = runner
-        .registries
-        .todos
+    let mut todos = todos
         .lock()
         .map_err(|_| color_eyre::eyre::eyre!("Failed to acquire todo lock"))?;
     match sub.to_ascii_lowercase().as_str() {
         "" | "list" => {
             if todos.is_empty() {
-                Ok(output("Todo", "当前没有任务，可用 /todo add <title> 添加"))
+                Ok((
+                    output("Todo", "当前没有任务，可用 /todo add <title> 添加"),
+                    false,
+                ))
             } else {
                 let mut lines = String::from("📋 任务清单：");
                 for t in todos.iter() {
@@ -1860,7 +2082,7 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     };
                     lines.push_str(&format!("\n  {} #{} {}", status_mark, t.id, t.title));
                 }
-                Ok(output("Todo", lines))
+                Ok((output("Todo", lines), false))
             }
         }
         "add" => {
@@ -1880,8 +2102,10 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 cyber_core::TodoStatus::Pending,
             ));
             drop(todos);
-            runner.save()?;
-            Ok(output("Todo", format!("已添加任务 #{id_str}：{rest}")))
+            Ok((
+                output("Todo", format!("已添加任务 #{id_str}：{rest}")),
+                true,
+            ))
         }
         "done" => {
             if rest.is_empty() {
@@ -1890,25 +2114,23 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             if let Some(item) = todos.iter_mut().find(|t| t.id == rest) {
                 item.status = cyber_core::TodoStatus::Completed;
                 drop(todos);
-                runner.save()?;
-                Ok(output("Todo", format!("任务 #{rest} 已标记为完成")))
+                Ok((output("Todo", format!("任务 #{rest} 已标记为完成")), true))
             } else {
                 bail!("未找到编号为 #{rest} 的任务");
             }
         }
         "close" | "hide" => {
             drop(todos);
-            Ok(CliAction::TodoVisibility(false))
+            Ok((CliAction::TodoVisibility(false), false))
         }
         "open" | "show" => {
             drop(todos);
-            Ok(CliAction::TodoVisibility(true))
+            Ok((CliAction::TodoVisibility(true), false))
         }
         "clear" => {
             todos.clear();
             drop(todos);
-            runner.save()?;
-            Ok(output("Todo", "任务清单已清空"))
+            Ok((output("Todo", "任务清单已清空"), true))
         }
         other => {
             bail!(
@@ -1918,31 +2140,17 @@ fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     }
 }
 
+fn todo_cmd(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let (action, mutated) = todo_action(&runner.registries.todos, args)?;
+    if mutated {
+        runner.save()?;
+    }
+    Ok(action)
+}
+
 fn sessions(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let (sub, rest) = split(args);
     match sub.to_ascii_lowercase().as_str() {
-        "" | "list" => {
-            let _ = runner.save();
-            let current_title = runner
-                .index
-                .current_meta()
-                .map(|m| m.title.as_str())
-                .unwrap_or("默认会话");
-            Ok(CliAction::Picker(CommandPicker {
-                title: format!("Sessions · {current_title}"),
-                kind: PickerKind::Sessions,
-                items: runner
-                    .index
-                    .sessions
-                    .iter()
-                    .map(|s| PickerItem {
-                        label: s.title.clone(),
-                        detail: format!("{}  {} messages", s.id, s.message_count),
-                        command: format!("/sessions {}", s.id),
-                    })
-                    .collect(),
-            }))
-        }
         "new" => {
             runner.create_session()?;
             Ok(refresh("New session", true))
@@ -2006,9 +2214,13 @@ fn sessions(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     .join("\n"),
             ))
         }
-        _ => {
+        _ if !sub.is_empty() && !sub.eq_ignore_ascii_case("list") => {
             runner.select_session(args.trim())?;
             Ok(refresh("Session selected", true))
+        }
+        _ => {
+            // `""` / `list` 由 `cli_commands::readonly_action` 分派为会话面板。
+            bail!("Usage: /sessions [list|read <id|关键词>|new|delete <id>|<id>]");
         }
     }
 }
@@ -2040,19 +2252,6 @@ fn memory(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             })
             .transpose()?;
         return match op.to_ascii_lowercase().as_str() {
-            "list" => Ok(output(
-                "Memory Rules",
-                runner
-                    .ctx
-                    .config
-                    .memory
-                    .rules
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| format!("{}. {} {} {}", i + 1, r.enabled, r.scope, r.prompt))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )),
             "delete" => {
                 let i = index.ok_or_else(|| eyre!("Usage: /memory rule delete <index>"))?;
                 save_memory_rule(runner, Some(i), None)?;
@@ -2093,20 +2292,6 @@ fn memory(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     }
     let global = runner.ctx.paths.memory_file.clone();
     let project = runner.cwd.join(".cyber/memory.md");
-    if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
-        let mut text = String::new();
-        for (name, path) in [("global", &global), ("project", &project)] {
-            let content = String::from_utf8(read_optional(path)?)?;
-            for (i, line) in content
-                .lines()
-                .filter_map(|l| l.strip_prefix("- "))
-                .enumerate()
-            {
-                text.push_str(&format!("{name} {}. {line}\n", i + 1));
-            }
-        }
-        return Ok(output("Memory", text));
-    }
     let sub = sub.to_ascii_lowercase();
     let (path, index, content) = if sub == "add" || sub == "project" {
         (if sub == "add" { global } else { project }, None, rest)
@@ -2204,23 +2389,6 @@ fn ctf(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             runner.ctf_enabled = true;
             Ok(CliAction::Panel(crate::cli::Panel::Ctf))
         }
-        "status" => Ok(output(
-            "CTF",
-            if runner.ctf_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-        )),
-        "list" => Ok(output(
-            "CTF",
-            runner
-                .challenges()?
-                .iter()
-                .map(|c| format!("{} [{}] {}", c.name, c.category, c.status.label()))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )),
         "add" => {
             let (name, category) = split(rest);
             validate_challenge_name(name)?;
@@ -2499,6 +2667,25 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
                 message: Some(format!("已保存自定义工具 {name}（重启后生效）")),
                 reset_usage: false,
             })
+        }
+        FormKind::ToolboxScan => {
+            let provider = field("provider")?.to_string();
+            if !provider.is_empty() && !runner.ctx.providers.providers.contains_key(&provider) {
+                bail!("未知服务商：{provider}（请在服务商管理中先配置）");
+            }
+            let model = field("model")?.to_string();
+            let preview = match field("preview")?.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" | "" => false,
+                _ => bail!("仅预览 (preview) 只能是 true / false"),
+            };
+            let target = field("target")?.to_string();
+            Ok(CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target: (!target.is_empty()).then_some(target),
+                provider: (!provider.is_empty()).then_some(provider),
+                model: (!model.is_empty()).then_some(model),
+            }))
         }
     }
 }
@@ -2795,6 +2982,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn toolbox_scan_form_submits_task_with_target_provider_and_model() {
+        let mut runner = test_runner().await;
+        let mut form = toolbox_scan_form("openai".into(), "gpt-4o-mini".into());
+        set(&mut form, "target", "D:/tools");
+        set(&mut form, "model", "gpt-4o");
+        set(&mut form, "preview", "true");
+        match submit_form(&mut runner, &form).unwrap() {
+            CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target,
+                provider,
+                model,
+            }) => {
+                assert!(preview);
+                assert_eq!(target.as_deref(), Some("D:/tools"));
+                assert_eq!(provider.as_deref(), Some("openai"));
+                assert_eq!(model.as_deref(), Some("gpt-4o"));
+            }
+            _ => panic!("expected toolbox scan task"),
+        }
+
+        // 留空目标/模型 → None（各取默认值），preview 默认 false
+        let mut blank = toolbox_scan_form("openai".into(), String::new());
+        match submit_form(&mut runner, &blank).unwrap() {
+            CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target,
+                provider,
+                model,
+            }) => {
+                assert!(!preview);
+                assert!(target.is_none());
+                assert_eq!(provider.as_deref(), Some("openai"));
+                assert!(model.is_none());
+            }
+            _ => panic!("expected toolbox scan task"),
+        }
+
+        // 未知服务商 / 非布尔 preview 必须被拒绝
+        set(&mut blank, "provider", "nope");
+        assert!(submit_form(&mut runner, &blank).is_err());
+        set(&mut blank, "provider", "openai");
+        set(&mut blank, "preview", "maybe");
+        assert!(submit_form(&mut runner, &blank).is_err());
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
     async fn adding_a_provider_adopts_it_as_default_only_when_the_current_default_is_unusable() {
         let mut runner = test_runner().await;
         runner
@@ -2918,18 +3153,51 @@ mod tests {
         set(&mut empty_command, "tool_name", "other");
         assert!(submit_form(&mut runner, &empty_command).is_err());
 
-        // scan 解析为任务（--preview + 目标）
+        // scan 解析为任务（--preview + 目标 + 可选 provider/model）
         match execute(&mut runner, "/toolbox scan --preview D:/tools").unwrap() {
-            CliAction::Task(CliTask::ToolboxScan { preview, target }) => {
+            CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target,
+                provider,
+                model,
+            }) => {
                 assert!(preview);
                 assert_eq!(target.as_deref(), Some("D:/tools"));
+                assert!(provider.is_none());
+                assert!(model.is_none());
             }
             _ => panic!("expected toolbox scan task"),
         }
         match execute(&mut runner, "/toolbox scan").unwrap() {
-            CliAction::Task(CliTask::ToolboxScan { preview, target }) => {
+            CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target,
+                provider,
+                model,
+            }) => {
                 assert!(!preview);
                 assert!(target.is_none());
+                assert!(provider.is_none());
+                assert!(model.is_none());
+            }
+            _ => panic!("expected toolbox scan task"),
+        }
+        match execute(
+            &mut runner,
+            "/toolbox scan --provider demo --model demo-model D:/tools",
+        )
+        .unwrap()
+        {
+            CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target,
+                provider,
+                model,
+            }) => {
+                assert!(!preview);
+                assert_eq!(target.as_deref(), Some("D:/tools"));
+                assert_eq!(provider.as_deref(), Some("demo"));
+                assert_eq!(model.as_deref(), Some("demo-model"));
             }
             _ => panic!("expected toolbox scan task"),
         }
@@ -2958,7 +3226,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 28);
+        assert_eq!(commands().len(), 30);
         assert!(commands().iter().any(|c| c.name == "/settings"));
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
@@ -4340,16 +4608,26 @@ rules = [
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
     #[tokio::test]
-    async fn slash_update_checks_version_and_outputs_result() {
+    async fn slash_update_parses_subcommands_without_touching_the_network() {
         let mut runner = test_runner().await;
-        let action = execute(&mut runner, "/update").unwrap();
-        match action {
-            CliAction::Output { title, text } => {
-                assert_eq!(title, "更新检查");
-                assert!(text.contains("版本"));
+        for (line, expected) in [
+            ("/update", CliUpdate::Prompt),
+            ("/update check", CliUpdate::Check),
+            ("/UPDATE APPLY", CliUpdate::Apply),
+            ("/update now", CliUpdate::Apply),
+            ("/update yes", CliUpdate::Apply),
+        ] {
+            match execute(&mut runner, line).unwrap() {
+                CliAction::Update(kind) => assert_eq!(kind, expected, "{line}"),
+                _ => panic!("expected Update action for {line}"),
             }
-            _ => panic!("expected Output"),
         }
+        // `CliAction` 故意不实现 `Debug`（表单含凭据），因此不能用 `unwrap_err`。
+        let error = match execute(&mut runner, "/update bogus") {
+            Ok(_) => panic!("expected /update usage error"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Usage: /update"), "{error}");
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 

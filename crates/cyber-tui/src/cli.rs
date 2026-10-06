@@ -46,7 +46,7 @@ use crate::chat::{entries_to_messages, ChatEntry, KeyDisposition, PasteDetector}
 use crate::cli_commands::{
     self, CliAction, CommandForm, CommandPicker, CompletionItem, FormKind, PickerKind,
 };
-use crate::headless::{HeadlessOutcome, SessionRunner};
+use crate::headless::{HeadlessOutcome, SessionRunner, ViewCtx};
 #[allow(unused_imports)]
 use crate::selection::default_selection_style;
 use crate::selection::{ContentCoord, TextSelection};
@@ -141,15 +141,19 @@ pub(crate) enum Panel {
     Jobs,
     ModelPicker,
     Mcp,
+    About,
 }
 
 impl Panel {
     pub fn is_fullscreen(self) -> bool {
-        matches!(self, Self::Settings | Self::Mcp | Self::ModelPicker)
+        matches!(
+            self,
+            Self::Settings | Self::Mcp | Self::ModelPicker | Self::About
+        )
     }
 }
 
-/// 设置面板标签页（共 8 个大类，全面覆盖所有设置）
+/// 设置面板标签页（共 9 个大类，全面覆盖所有设置）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SettingsTab {
     #[default]
@@ -161,6 +165,7 @@ pub enum SettingsTab {
     EnvMemory,     // 6. 环境变量与记忆
     StorageSystem, // 7. 系统与存储日志
     Toolbox,       // 8. 自定义工具库
+    About,         // 9. 关于（版本 / 项目 / 运行环境 / 快捷键说明书）
 }
 
 impl SettingsTab {
@@ -174,6 +179,7 @@ impl SettingsTab {
             SettingsTab::EnvMemory,
             SettingsTab::StorageSystem,
             SettingsTab::Toolbox,
+            SettingsTab::About,
         ]
     }
 
@@ -187,6 +193,7 @@ impl SettingsTab {
             Self::EnvMemory => "6. 环境与记忆",
             Self::StorageSystem => "7. 系统与存储",
             Self::Toolbox => "8. 工具库",
+            Self::About => "9. 关于",
         }
     }
 
@@ -200,6 +207,7 @@ impl SettingsTab {
             Self::EnvMemory => "6.环境记忆",
             Self::StorageSystem => "7.系统存储",
             Self::Toolbox => "8.工具库",
+            Self::About => "9.关于",
         }
     }
 
@@ -213,6 +221,7 @@ impl SettingsTab {
             Self::EnvMemory => "6.环境",
             Self::StorageSystem => "7.存储",
             Self::Toolbox => "8.工具",
+            Self::About => "9.关于",
         }
     }
 
@@ -233,6 +242,8 @@ impl SettingsTab {
             Self::StorageSystem => 1, // 0..=1 (2 rows: retention, log_level)
             // N 个工具行 + 1 个 AI 扫描行
             Self::Toolbox => state.custom_tools.len(),
+            // 「关于」页只读，无可编辑行（滚动由 `about_scroll` 承担）。
+            Self::About => 0,
         }
     }
 }
@@ -289,6 +300,8 @@ pub struct CliSettingsState {
     pub tab: SettingsTab,
     pub selected_row: usize,
     pub dirty: bool,
+    /// 焦点行是否处于编辑态：Enter 进入；Enter/Esc 退出；只读态 ←/→ 改为切换标签页。
+    pub editing: bool,
     /// 编辑中的配置草稿（保存时落盘并同步至 AppContext；退出时可丢弃）
     pub config_draft: Config,
     /// 编辑中的服务商配置草稿
@@ -328,6 +341,7 @@ impl CliSettingsState {
             tab: SettingsTab::AgentModel,
             selected_row: 0,
             dirty: false,
+            editing: false,
             config_draft: config.clone(),
             providers_draft: providers.clone(),
             list_selected: 0,
@@ -351,19 +365,19 @@ impl CliSettingsState {
         }
     }
 
-    pub(crate) fn from_runner(runner: &SessionRunner) -> Self {
-        let mut state = Self::new(&runner.ctx.config, &runner.ctx.providers);
-        state.config_path = runner.ctx.paths.config_file.display().to_string();
-        state.providers_path = runner.ctx.paths.providers_file.display().to_string();
-        state.sessions_dir = runner.ctx.paths.history_dir.display().to_string();
-        state.sessions_count = runner.index.sessions.len();
-        state.has_project_config = runner.ctx.project.is_some();
-        if let Ok(mcp_cfg) = cyber_mcp::McpServersConfig::load(&runner.ctx.paths.mcp_servers_file) {
+    pub(crate) fn from_view(view: &ViewCtx<'_>) -> Self {
+        let mut state = Self::new(view.config, view.providers);
+        state.config_path = view.paths.config_file.display().to_string();
+        state.providers_path = view.paths.providers_file.display().to_string();
+        state.sessions_dir = view.paths.history_dir.display().to_string();
+        state.sessions_count = view.sessions.len();
+        state.has_project_config = view.has_project;
+        if let Ok(mcp_cfg) = cyber_mcp::McpServersConfig::load(&view.paths.mcp_servers_file) {
             state.mcp_servers = mcp_cfg
                 .servers
                 .into_iter()
                 .map(|s| {
-                    let (connected, tool_count) = match runner.registries.mcp.as_ref() {
+                    let (connected, tool_count) = match view.mcp {
                         Some(m) => match m.tool_count(&s.name) {
                             Some(c) => (true, c),
                             None => (false, 0),
@@ -387,13 +401,12 @@ impl CliSettingsState {
                 })
                 .collect();
         }
-        state.custom_tools = cyber_core::load_custom_tools(&runner.ctx.paths.tools_dir)
+        state.custom_tools = cyber_core::load_custom_tools(&view.paths.tools_dir)
             .0
             .into_iter()
             .map(|tool| tool.config)
             .collect();
-        state.skills = runner
-            .registries
+        state.skills = view
             .skills
             .iter()
             .map(|s| SkillSummary {
@@ -412,13 +425,11 @@ impl CliSettingsState {
             })
             .collect();
         let memory_store = MemoryStore::new(
-            runner.ctx.paths.memory_file.clone(),
-            Paths::project_memory_file(&runner.cwd),
+            view.paths.memory_file.clone(),
+            Paths::project_memory_file(view.cwd),
         );
-        state.memory_global_path = runner.ctx.paths.memory_file.display().to_string();
-        state.memory_project_path = Paths::project_memory_file(&runner.cwd)
-            .display()
-            .to_string();
+        state.memory_global_path = view.paths.memory_file.display().to_string();
+        state.memory_project_path = Paths::project_memory_file(view.cwd).display().to_string();
         state.memories_global = memory_store.entries(MemoryScope::Global);
         state.memories_project = memory_store.entries(MemoryScope::Project);
         state
@@ -447,6 +458,7 @@ impl CliSettingsState {
         self.list_selected = 0;
         self.skill_detail = None;
         self.memory_detail = None;
+        self.editing = false;
     }
 
     pub fn prev_tab(&mut self) {
@@ -457,6 +469,7 @@ impl CliSettingsState {
         self.list_selected = 0;
         self.skill_detail = None;
         self.memory_detail = None;
+        self.editing = false;
     }
 
     pub fn set_tab(&mut self, tab: SettingsTab) {
@@ -465,6 +478,7 @@ impl CliSettingsState {
         self.list_selected = 0;
         self.skill_detail = None;
         self.memory_detail = None;
+        self.editing = false;
     }
 
     pub fn reset_current_tab(&mut self) {
@@ -500,8 +514,31 @@ impl CliSettingsState {
             }
             // 工具是磁盘上的文件，不是 config 草稿，无法“恢复默认”。
             SettingsTab::Toolbox => {}
+            // 只读页：提前返回，避免下方统一置 `dirty` 触发「未保存丢弃确认」。
+            SettingsTab::About => return,
         }
+        self.editing = false;
         self.dirty = true;
+    }
+
+    /// 焦点行是否「可编辑值行」：Enter 进入编辑态；只读态 ←/→ 不作用于该行。
+    ///
+    /// 可编辑值行 = bool / enum / number 等就地改值行；
+    /// 打开弹窗/表单或执行动作的行（Providers、MCP、Skills、Toolbox、记忆列表）返回 false。
+    pub fn focused_row_is_value(&self) -> bool {
+        let env_slots = self.config_draft.env.vars.len().max(1);
+        let mem_slots = self.config_draft.memory.rules.len().max(1);
+        match self.tab {
+            SettingsTab::AgentModel => !matches!(self.selected_row, 1 | 9),
+            SettingsTab::UiWorkflow => true,
+            SettingsTab::Subagents => true,
+            SettingsTab::ToolsMcp => self.selected_row <= 1,
+            SettingsTab::Providers => false,
+            SettingsTab::EnvMemory => self.selected_row < env_slots + mem_slots,
+            SettingsTab::StorageSystem => true,
+            SettingsTab::Toolbox => false,
+            SettingsTab::About => false,
+        }
     }
 }
 
@@ -539,10 +576,18 @@ struct ToolCard {
     end: usize,
 }
 
+/// 排队输入的种类（同一队列保序）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedKind {
+    Prompt,
+    Command,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedPrompt {
     pub text: String,
     pub displayed: bool,
+    pub kind: QueuedKind,
 }
 
 /// 子代理面板交互状态：仅列表选择（Enter 进入覆盖对话视图）。
@@ -611,9 +656,9 @@ pub struct CliModelPickerState {
 }
 
 impl CliModelPickerState {
-    pub(crate) fn from_runner(runner: &SessionRunner) -> Self {
-        let default_prov = runner.ctx.config.agent.default_provider.clone();
-        let providers = runner.ctx.providers.clone();
+    pub(crate) fn from_view(view: &ViewCtx<'_>) -> Self {
+        let default_prov = view.config.agent.default_provider.clone();
+        let providers = view.providers.clone();
         let names = providers.sorted_names();
         let provider_selected = names.iter().position(|n| n == &default_prov).unwrap_or(0);
         let mut state = Self {
@@ -761,6 +806,136 @@ struct ModelFetchResult {
     result: Result<Vec<String>, String>,
 }
 
+/// 安装脚本启动器：`(version, wait_for_exit) -> 脚本路径`。
+///
+/// 生产实现为 `cyber_core::update::launch_detached_install`；测试注入假实现。
+pub(crate) type UpdateLauncher =
+    Arc<dyn Fn(&str, bool) -> std::io::Result<std::path::PathBuf> + Send + Sync>;
+
+/// `/update` 检查结果：`check_for_updates(true)` 任务 → CLI 主循环。
+struct UpdateCheckResult {
+    kind: cli_commands::CliUpdate,
+    info: Option<cyber_core::update::ReleaseInfo>,
+}
+
+/// CLI 对话页 todo 清单三态视图（原 `todo_closed: bool` 二元态的扩展）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TodoView {
+    /// 完整收起：不画表格，只在对话区底部保留 1 行进度条。
+    Collapsed,
+    /// 精简：表格高度 clamp(3, 7)（内区最多 5 条 + 折叠提示），与改动前一致。
+    #[default]
+    Summary,
+    /// 全量：表格按内容要高度，上限为可用空间；超出仍由 `todo_visible_window` 窗口化。
+    Full,
+}
+
+/// 回合期间（runner 已被 `take()` 走）只读指令的数据快照，在 `CliScreen::sync` 刷新。
+///
+/// 只做克隆、不做任何磁盘 I/O：busy 期间每条只读指令都不得引入 per-turn 读盘。
+struct ViewSnapshot {
+    config: Config,
+    providers: ProvidersConfig,
+    paths: Paths,
+    cwd: std::path::PathBuf,
+    sessions: Vec<crate::history::SessionMeta>,
+    current_session_id: String,
+    has_project: bool,
+    ctf_enabled: bool,
+    ctf_challenges: Option<Arc<std::sync::Mutex<Vec<cyber_core::CtfChallenge>>>>,
+    tools: Arc<cyber_agent::ToolRegistry>,
+    skills: Arc<cyber_skills::SkillRegistry>,
+    mcp: Option<Arc<cyber_mcp::McpRegistry>>,
+}
+
+impl ViewSnapshot {
+    /// 快照当前 runner 的只读数据（无磁盘 I/O）。
+    fn refresh_from(runner: &SessionRunner) -> Self {
+        Self {
+            config: runner.ctx.config.clone(),
+            providers: runner.ctx.providers.clone(),
+            paths: runner.ctx.paths.clone(),
+            cwd: runner.cwd.clone(),
+            sessions: runner.index.sessions.clone(),
+            current_session_id: runner.index.current.clone(),
+            has_project: runner.ctx.project.is_some(),
+            ctf_enabled: runner.ctf_enabled,
+            ctf_challenges: runner.registries.ctf_challenges.clone(),
+            tools: Arc::clone(&runner.registries.tools),
+            skills: Arc::clone(&runner.registries.skills),
+            mcp: runner.registries.mcp.clone(),
+        }
+    }
+
+    fn view(&self) -> crate::headless::ViewCtx<'_> {
+        crate::headless::ViewCtx {
+            config: &self.config,
+            providers: &self.providers,
+            paths: &self.paths,
+            cwd: &self.cwd,
+            sessions: &self.sessions,
+            current_session_id: &self.current_session_id,
+            has_project: self.has_project,
+            ctf_enabled: self.ctf_enabled,
+            ctf_challenges: self.ctf_challenges.as_deref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            mcp: self.mcp.as_deref(),
+        }
+    }
+}
+
+/// 「关于」页内容快照：进入该页时一次性采集，渲染期不做磁盘 I/O。
+#[derive(Clone, Debug)]
+struct AboutInfo {
+    version: &'static str,
+    latest: Option<String>,
+    binary: Option<String>,
+    provider: String,
+    model: String,
+    effort: String,
+    cwd: String,
+    config_path: String,
+    providers_path: String,
+    sessions_dir: String,
+    tools_dir: String,
+    sessions_count: usize,
+    has_project_config: bool,
+    log_level: String,
+    tool_count: usize,
+    skill_count: usize,
+    custom_tool_count: usize,
+}
+
+impl AboutInfo {
+    /// 采集当前运行环境（`view_snapshot` + 顶栏字段 + `new_version`）。
+    /// 唯一 I/O：统计自定义工具目录（`cyber_core::load_custom_tools`，每次进入页面一次）。
+    fn collect(screen: &CliScreen) -> Self {
+        let snap = &screen.view_snapshot;
+        Self {
+            version: cyber_core::update::CURRENT_VERSION,
+            latest: screen.new_version.clone(),
+            binary: std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string()),
+            provider: screen.provider.clone(),
+            model: screen.model.clone(),
+            effort: effort_label(screen.effort).to_string(),
+            cwd: screen.cwd.clone(),
+            config_path: snap.paths.config_file.display().to_string(),
+            providers_path: snap.paths.providers_file.display().to_string(),
+            sessions_dir: snap.paths.history_dir.display().to_string(),
+            tools_dir: snap.paths.tools_dir.display().to_string(),
+            sessions_count: snap.sessions.len(),
+            has_project_config: snap.has_project,
+            log_level: snap.config.storage.log_level.clone(),
+            tool_count: snap.tools.all_schemas().len(),
+            skill_count: snap.skills.len(),
+            custom_tool_count: cyber_core::load_custom_tools(&snap.paths.tools_dir).0.len(),
+        }
+    }
+}
+
 struct CliScreen {
     provider: String,
     model: String,
@@ -828,13 +1003,21 @@ struct CliScreen {
     thinking_started: Option<std::time::Instant>,
     has_run: bool,
     todos: Arc<std::sync::Mutex<Vec<cyber_core::TodoItem>>>,
-    pub todo_closed: bool,
+    pub(crate) todo_view: TodoView,
     last_window_title: String,
     pub needs_clear: bool,
     pub queued_prompts: std::collections::VecDeque<QueuedPrompt>,
     pub active_steering_tx: Option<cyber_agent::SteeringSender>,
     /// 模型列表异步拉取结果通道。仅 `run_cli` 注入（测试为 `None` → 不发网络请求）。
     model_fetch_tx: Option<mpsc::UnboundedSender<ModelFetchResult>>,
+    /// `/update` 联网检查通道（仅 `run_cli_inner` 注入；测试为 `None` → 只读本地缓存，不联网）。
+    update_check_tx: Option<mpsc::UnboundedSender<UpdateCheckResult>>,
+    /// 正在联网检查（占位，避免重复发起）。
+    update_checking: bool,
+    /// 已发现新版本、等待用户按 `y` 确认。
+    update_pending: Option<cyber_core::update::ReleaseInfo>,
+    /// 安装脚本启动器（测试注入点；生产为 `cyber_core::update::launch_detached_install`）。
+    update_launcher: UpdateLauncher,
     /// 子代理转录注册表（Ctrl+G 面板数据源）。
     subagents: Arc<cyber_agent::SubagentArchive>,
     /// 后台任务注册表（Ctrl+B 面板 + /bg 命令数据源）。
@@ -849,6 +1032,12 @@ struct CliScreen {
     subagent_view: Option<SubagentViewState>,
     /// 检测到的新版本（若有新版本则为 Some(ver)，在顶栏黄色标出）
     pub new_version: Option<String>,
+    /// 「关于」页内容快照（进入该页时采集；`Panel::About` 与设置中心「9. 关于」共用）。
+    about: Option<AboutInfo>,
+    /// 「关于」页滚动行偏移（绘制时按内容/可视高度收敛）。
+    about_scroll: usize,
+    /// 回合期间只读指令的数据快照（sync 刷新）。
+    view_snapshot: ViewSnapshot,
     pub attached_images: Vec<cyber_agent::AttachedImage>,
     pub next_image_id: usize,
     pub last_ctrl_c: Option<std::time::Instant>,
@@ -943,6 +1132,53 @@ fn provider_config_from_form(form: &FormState) -> cyber_core::ProviderConfig {
         models_endpoint: opt("models_endpoint"),
         ..Default::default()
     }
+}
+
+/// 表单当前服务商名：Provider 表单取 `name` 字段，工具库扫描表单取 `provider` 字段。
+fn form_provider_name(form: &FormState) -> String {
+    let field = match form.form.kind {
+        FormKind::ToolboxScan => "provider",
+        _ => "name",
+    };
+    form.input_value(field).trim().to_string()
+}
+
+/// 表单当前服务商对应的配置：Provider 表单取正在编辑的输入值；
+/// 工具库扫描表单按 `provider` 名查已保存的 `providers.toml`（拉取模型 / 探针用）。
+fn provider_config_for_form(
+    form: &FormState,
+    runner: Option<&SessionRunner>,
+) -> cyber_core::ProviderConfig {
+    if matches!(form.form.kind, FormKind::ToolboxScan) {
+        let name = form_provider_name(form);
+        return runner
+            .and_then(|r| r.ctx.providers.providers.get(&name).cloned())
+            .unwrap_or_default();
+    }
+    provider_config_from_form(form)
+}
+
+/// 「AI 智能扫描」表单的默认服务商与模型：当前默认 Provider（不可用时取首个已配置服务商）
+/// 及其 `providers.toml` 中配置的模型。
+fn scan_form_defaults(runner: Option<&SessionRunner>) -> (String, String) {
+    let default_provider = runner
+        .map(|r| r.ctx.config.agent.default_provider.clone())
+        .unwrap_or_default();
+    let provider = if default_provider.is_empty()
+        || !runner.is_some_and(|r| r.ctx.providers.providers.contains_key(&default_provider))
+    {
+        runner
+            .map(|r| r.ctx.providers.sorted_names())
+            .and_then(|names| names.first().cloned())
+            .unwrap_or(default_provider)
+    } else {
+        default_provider
+    };
+    let model = runner
+        .and_then(|r| r.ctx.providers.providers.get(&provider))
+        .map(|p| p.model.clone())
+        .unwrap_or_default();
+    (provider, model)
 }
 
 impl FormState {
@@ -1267,12 +1503,16 @@ impl CliScreen {
             thinking_started: None,
             todos: Arc::clone(&runner.registries.todos),
             has_run: false,
-            todo_closed: false,
+            todo_view: TodoView::Summary,
             last_window_title: String::new(),
             needs_clear: false,
             queued_prompts: std::collections::VecDeque::new(),
             active_steering_tx: None,
             model_fetch_tx: None,
+            update_check_tx: None,
+            update_checking: false,
+            update_pending: None,
+            update_launcher: Arc::new(cyber_core::update::launch_detached_install),
             subagents: Arc::clone(&runner.registries.subagents),
             background: Arc::clone(&runner.registries.background),
             background_env: Some((
@@ -1291,6 +1531,9 @@ impl CliScreen {
             jobs_panel: None,
             subagent_view: None,
             new_version: None,
+            about: None,
+            about_scroll: 0,
+            view_snapshot: ViewSnapshot::refresh_from(runner),
             attached_images: Vec::new(),
             next_image_id: 1,
             last_ctrl_c: None,
@@ -1420,6 +1663,13 @@ impl CliScreen {
         }
         self.stream.clear();
         self.scroll = 0;
+        // 回合期间 runner 已被 take 走，只读指令依赖此快照。
+        self.view_snapshot = ViewSnapshot::refresh_from(runner);
+    }
+
+    /// 只读视图：空闲时取 runner 快照，回合期间取 `sync` 缓存的快照。
+    pub(crate) fn view(&self) -> crate::headless::ViewCtx<'_> {
+        self.view_snapshot.view()
     }
 
     fn reset_usage(&mut self) {
@@ -1880,6 +2130,165 @@ impl CliScreen {
             .unwrap_or_default();
         format!("Todo: [{completed}/{total}]{active_desc}")
     }
+
+    /// `/update`：发起（或退化执行）一次更新检查。
+    fn begin_update_check(&mut self, kind: cli_commands::CliUpdate) {
+        if self.update_checking {
+            self.message("更新", "正在检查更新，请稍候…", MUTED);
+            return;
+        }
+        if let (Some(tx), Ok(handle)) = (
+            self.update_check_tx.clone(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            self.update_checking = true;
+            self.status = "正在检查更新…".into();
+            handle.spawn(async move {
+                let info = cyber_core::update::check_for_updates(true).await;
+                let _ = tx.send(UpdateCheckResult { kind, info });
+            });
+            return;
+        }
+        // 未注入通道（单元测试 / mock 模式）或无 tokio 运行时：退化为本地缓存，不联网。
+        let info = cyber_core::update::cached_latest_version();
+        self.deliver_update(UpdateCheckResult { kind, info });
+    }
+
+    /// 检查结果落地：打印版本信息，并按 `kind` 进入确认态或直接开始安装。
+    fn deliver_update(&mut self, result: UpdateCheckResult) {
+        self.update_checking = false;
+        let current = cyber_core::update::CURRENT_VERSION;
+        match result.info {
+            None => {
+                self.status = "更新检查失败".into();
+                self.message(
+                    "更新检查",
+                    &format!(
+                        "⚠ 检查失败：无法连接版本源（GitHub / CNB 可能超时或不可达）。\n当前版本 V{current}；CNB 镜像：{}",
+                        cyber_core::update::CNB_RELEASES_URL
+                    ),
+                    ERROR,
+                );
+            }
+            Some(info) if cyber_core::update::is_newer(current, &info.version) => {
+                self.new_version = Some(info.version.clone());
+                // 关于页已打开时同步刷新「可更新版本」行（面板内看不到对话区的状态提示）。
+                if let Some(about) = self.about.as_mut() {
+                    about.latest = Some(info.version.clone());
+                }
+                let mut text = format!(
+                    "✨ 发现新版本 V{}（当前 V{current}）\n发布页面：{}\nCNB 镜像：{}",
+                    info.version,
+                    info.html_url,
+                    cyber_core::update::CNB_RELEASES_URL
+                );
+                if let Some(at) = info
+                    .published_at
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    text.push_str(&format!("\n发布时间：{at}"));
+                }
+                if let Some(notes) = info
+                    .release_notes
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    text.push_str("\n发布说明：");
+                    let lines: Vec<&str> = notes.lines().collect();
+                    for line in lines.iter().take(15) {
+                        text.push_str(&format!("\n  {line}"));
+                    }
+                    if lines.len() > 15 {
+                        text.push_str("\n  ...（更多更新说明见发布页面）");
+                    }
+                }
+                match result.kind {
+                    cli_commands::CliUpdate::Check => {
+                        self.status =
+                            format!("发现新版本 V{}（/update apply 可立即更新）", info.version);
+                        self.message("更新检查", &text, ACCENT);
+                    }
+                    cli_commands::CliUpdate::Prompt => {
+                        self.status = format!(
+                            "发现新版本 V{}：按 y 用安装脚本更新 · 其它键取消",
+                            info.version
+                        );
+                        self.message("更新检查", &text, ACCENT);
+                        self.update_pending = Some(info);
+                    }
+                    cli_commands::CliUpdate::Apply => {
+                        self.message("更新检查", &text, ACCENT);
+                        self.start_update(&info.version);
+                    }
+                }
+            }
+            Some(info) => {
+                if let Some(about) = self.about.as_mut() {
+                    about.latest = None;
+                }
+                self.status.clear();
+                self.message(
+                    "更新检查",
+                    &format!(
+                        "✅ 当前已是最新版本 V{current}（版本源最新：V{}）",
+                        info.version
+                    ),
+                    SUCCESS,
+                );
+            }
+        }
+    }
+
+    /// 启动安装脚本。返回 `true` = 需要退出（Windows 上运行中的二进制无法被覆盖）。
+    fn start_update(&mut self, version: &str) -> bool {
+        self.update_pending = None;
+        if self.busy {
+            self.message(
+                "更新",
+                "回合进行中：请先 /cancel 或等回合结束后再更新",
+                ERROR,
+            );
+            self.status.clear();
+            return false;
+        }
+        let wait_for_exit = cyber_core::update::needs_exit_before_install();
+        match (self.update_launcher)(version, wait_for_exit) {
+            Ok(script) if wait_for_exit => {
+                self.message(
+                    "更新",
+                    &format!(
+                        "更新已安排：退出 cyber 后自动安装 V{version}（脚本：{}）。正在退出…",
+                        script.display()
+                    ),
+                    ACCENT,
+                );
+                true
+            }
+            Ok(script) => {
+                self.message(
+                    "更新",
+                    &format!(
+                        "已开始后台安装 V{version}（脚本：{}）。安装完成后重启 cyber 生效。",
+                        script.display()
+                    ),
+                    ACCENT,
+                );
+                self.status = format!("后台安装 V{version} 中 · 重启后生效");
+                false
+            }
+            Err(error) => {
+                self.message(
+                    "更新",
+                    &format!("无法启动安装脚本：{error}\n请在终端运行 `cyber update` 完成升级。"),
+                    ERROR,
+                );
+                self.status.clear();
+                false
+            }
+        }
+    }
     fn ctf_challenges_list(&self) -> Vec<cyber_core::CtfChallenge> {
         self.ctf_challenges
             .lock()
@@ -2260,7 +2669,7 @@ impl CliScreen {
             } => {
                 self.has_run = true;
                 if name.eq_ignore_ascii_case("todo") && !is_error {
-                    self.todo_closed = false;
+                    self.todo_view = TodoView::Summary;
                 }
                 self.tool_result(&id, &name, &output, is_error);
             }
@@ -2656,7 +3065,71 @@ impl CliScreen {
         false
     }
 
-    /// 是否为「由设置面板打开的弹层」（编辑环境变量 / 编辑记忆规则 表单、Models 模型选择器）。
+    /// 设置面板下的鼠标滚轮：语义等同于按 ↑（`up=true`）/ ↓ 键。
+    ///
+    /// 依次处理：丢弃确认弹层 → 技能详情弹窗滚屏 → 记忆详情弹窗滚屏 → 主列表光标移动。
+    /// 返回 `true` 表示事件已被设置面板消费（调用方不应再退回聊天区滚动）。
+    fn settings_scroll(&mut self, up: bool) -> bool {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|s| s.tab == SettingsTab::About)
+        {
+            if up {
+                self.about_scroll = self.about_scroll.saturating_sub(1);
+            } else {
+                self.about_scroll = self.about_scroll.saturating_add(1);
+            }
+            return true;
+        }
+        let Some(settings) = self.settings.as_mut() else {
+            return false;
+        };
+        if settings.pending_discard_confirm {
+            settings.pending_discard_confirm = false;
+            return true;
+        }
+        if let Some(detail) = settings.skill_detail.as_mut() {
+            if up {
+                detail.scroll = detail.scroll.saturating_sub(1);
+            } else {
+                detail.scroll = detail.scroll.saturating_add(1);
+            }
+            return true;
+        }
+        if let Some(detail) = settings.memory_detail.as_mut() {
+            if up {
+                detail.scroll = detail.scroll.saturating_sub(1);
+            } else {
+                detail.scroll = detail.scroll.saturating_add(1);
+            }
+            return true;
+        }
+        let max_row = settings.tab.max_row(settings);
+        settings.editing = false;
+        if up {
+            settings.selected_row = settings.selected_row.saturating_sub(1);
+        } else {
+            settings.selected_row = (settings.selected_row + 1).min(max_row);
+        }
+        true
+    }
+
+    /// 页签切到「关于」时刷新内容快照并复位滚动（其它页签不动）。
+    fn sync_about_if_active(&mut self) {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|s| s.tab == SettingsTab::About)
+        {
+            self.about_scroll = 0;
+            let info = AboutInfo::collect(self);
+            self.about = Some(info);
+        }
+    }
+
+    /// 是否为「由设置面板打开的弹层」（自定义工具 / 环境变量 / 记忆规则 / 工具库扫描表单、
+    /// Models 模型选择器）。
     ///
     /// 这类弹层打开时 `panel` 仍为 `None`（`handle_key` 的按键路由、Esc/保存后的返回语义
     /// 都保持不变），但绘制时下层背景必须是设置中心，而不是对话界面。
@@ -2665,10 +3138,10 @@ impl CliScreen {
             return false;
         }
         match (&self.form, &self.picker) {
-            (Some(form), _) => matches!(
-                form.form.kind,
-                FormKind::EnvVar { .. } | FormKind::MemoryRule { .. }
-            ),
+            // Provider 表单与 Provider/Protocol/Preset 向导选择器由 `draw()` 更早的全屏分支
+            // 接管（cli.rs 约 2764–2783），永远走不到这里；其余表单只要是从设置中心打开的
+            // （`settings_return_tab` 非空）就必须以设置中心为背景。
+            (Some(form), _) => !matches!(form.form.kind, FormKind::Provider { .. }),
             (None, Some(picker)) => picker.title.starts_with("Models ("),
             _ => false,
         }
@@ -2770,6 +3243,14 @@ impl CliScreen {
                             let active_provider = self.provider.clone();
                             if let Some(state) = self.model_picker.as_mut() {
                                 draw_model_picker(frame, area, state, &active_provider);
+                            }
+                        }
+                        Panel::About => {
+                            if self.about.is_none() {
+                                self.about = Some(AboutInfo::collect(self));
+                            }
+                            if let Some(info) = &self.about {
+                                draw_about_panel(frame, area, info, self.about_scroll);
                             }
                         }
                         _ => {}
@@ -2928,16 +3409,26 @@ impl CliScreen {
             normal_header
         };
         let todo_items = self.todos.lock().map(|g| g.clone()).unwrap_or_default();
-        let show_todo_table = !self.todo_closed && !todo_items.is_empty();
+        let has_todos = !todo_items.is_empty();
+        let show_todo_table = has_todos && self.todo_view != TodoView::Collapsed;
+        let show_todo_strip = has_todos && self.todo_view == TodoView::Collapsed;
         let question_height = self
             .question_state
             .as_ref()
             .map_or(0, |q| q.height_needed());
+        // 其它区域（头部/对话/提问/输入/状态栏）至少留 4 行，超出部分不作为 todo 高度。
+        let todo_budget = area
+            .height
+            .saturating_sub(header_height + question_height + input_height + 4);
         let todo_height = if show_todo_table {
-            (todo_items.len() as u16 + 2).clamp(3, 7).min(
-                area.height
-                    .saturating_sub(header_height + question_height + input_height + 4),
-            )
+            let desired = match self.todo_view {
+                TodoView::Summary => (todo_items.len() as u16 + 2).clamp(3, 7),
+                TodoView::Full => (todo_items.len() as u16).saturating_add(2),
+                TodoView::Collapsed => 0,
+            };
+            desired.min(todo_budget)
+        } else if show_todo_strip {
+            1.min(todo_budget)
         } else {
             0
         };
@@ -3080,7 +3571,7 @@ impl CliScreen {
                 if let Some(newer) = &self.new_version {
                     welcome.push(Line::default());
                     welcome.push(Line::styled(
-                        format!(" 💡 检测到新版本 V{newer}，可运行 cyber update 进行更新"),
+                        format!(" 💡 检测到新版本 V{newer}，可运行 /update 更新（或退出后 cyber update）"),
                         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
                     ));
                 }
@@ -3155,7 +3646,10 @@ impl CliScreen {
             frame.render_widget(Paragraph::new(lines), menu);
         }
         if show_todo_table && sections[2].height >= 2 {
-            draw_todo_table(frame, sections[2], &todo_items);
+            draw_todo_table(frame, sections[2], &todo_items, self.todo_view);
+        }
+        if show_todo_strip && sections[2].height >= 1 {
+            draw_todo_strip(frame, sections[2], &todo_items);
         }
         if let Some(q) = &self.question_state {
             if sections[3].height >= 4 {
@@ -3327,8 +3821,13 @@ impl CliScreen {
             match panel {
                 Panel::Shortcuts => {
                     let title = " Shortcuts ";
+                    let keys = SHORTCUT_KEYS
+                        .iter()
+                        .map(|(key, desc)| format!("{key:<16}{desc}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     let text = format!(
-                        "Enter          Send / select completion\nAlt/Shift+Enter New line\nTab · Up/Down   Complete / choose command\nF2 / Ctrl+P     Cycle mode (manual/auto/unlimited)\nF3 / Ctrl+,     Open Settings center panel\nCtrl+G          Toggle subagent panel (live transcripts)\nCtrl+B          Toggle background jobs panel\nUp / Down       History prompts / scroll line\nMouse Wheel     Scroll chat / approval arguments\nCtrl+O          Toggle tool details\nCtrl+T          Toggle CTF challenges panel (when CTF enabled)\nCtrl+C          Cancel task\nPgUp / PgDn     Scroll conversation\n?               Toggle shortcuts (empty input)\n\n{}\n\nEsc closes this panel.",
+                        "{keys}\n\n{}\n\nEsc closes this panel.",
                         cli_commands::commands()
                             .iter()
                             .map(|spec| format!("{:<30} {}", spec.usage, spec.desc))
@@ -3374,6 +3873,7 @@ impl CliScreen {
                 }
                 Panel::ModelPicker => {}
                 Panel::Mcp => {}
+                Panel::About => {}
             }
         } else if let Some(form) = &self.form {
             draw_form_dialog(frame, sections[1], form, &self.status);
@@ -3520,6 +4020,22 @@ fn push_session_title_line(lines: &mut Vec<Line<'static>>, session_title: &str) 
             ),
         ]));
     }
+}
+
+/// ` (▶ 标题) ` 片段：优先 InProgress，其次第一条 Pending；无则空串。
+///
+/// 底栏 `todo_summary` 与收起态 1 行进度条（`draw_todo_strip`）共用，保证两处当前任务一致。
+fn todo_active_desc(items: &[cyber_core::TodoItem]) -> String {
+    items
+        .iter()
+        .find(|t| t.status == cyber_core::TodoStatus::InProgress)
+        .or_else(|| {
+            items
+                .iter()
+                .find(|t| t.status == cyber_core::TodoStatus::Pending)
+        })
+        .map(|t| format!(" (▶ {})", t.title))
+        .unwrap_or_default()
 }
 
 fn clean(text: &str) -> String {
@@ -4290,7 +4806,7 @@ fn effort_color(effort: ThinkingIntensity) -> Color {
     }
 }
 
-fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]) {
+fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem], view: TodoView) {
     if area.height < 2 || area.width < 10 {
         return;
     }
@@ -4312,7 +4828,13 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
         DIM
     };
 
-    let title = format!(" 📋 任务清单 [{completed}/{total}] · 输入 /todo close 收起 ");
+    let title = match view {
+        TodoView::Full => {
+            format!(" 📋 任务清单 [{completed}/{total}] · 全部 {total} 项 · [Alt+↓] 收起 ")
+        }
+        // Collapsed 不画表格（此处按 Summary 处理以满足穷尽匹配，不会实际走到）。
+        _ => format!(" 📋 任务清单 [{completed}/{total}] · 输入 /todo close 收起 · [Alt+↑] 全展 "),
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4421,6 +4943,48 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 完整收起态的 1 行进度条：`  📋 任务清单 [c/t] (▶ 当前任务) · [Alt+↑] 展开 `。
+///
+/// 无边框、无窗口化；整行由 `clip_cells` 截断防越界（宽度不足时截掉的是尾部提示前缀）。
+fn draw_todo_strip(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|i| i.status == cyber_core::TodoStatus::Completed)
+        .count();
+    let in_progress = items
+        .iter()
+        .filter(|i| i.status == cyber_core::TodoStatus::InProgress)
+        .count();
+    let color = if in_progress > 0 {
+        ACCENT
+    } else if completed == total && total > 0 {
+        SUCCESS
+    } else {
+        DIM
+    };
+    const HINT: &str = " · [Alt+↑] 展开 ";
+    use unicode_width::UnicodeWidthStr;
+    let budget = (area.width as usize).saturating_sub(UnicodeWidthStr::width(HINT));
+    let prefix = format!(
+        "  📋 任务清单 [{completed}/{total}]{}",
+        clean(&todo_active_desc(items))
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                clip_cells(&prefix, budget),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(HINT, Style::default().fg(DIM)),
+        ])),
+        area,
+    );
 }
 
 /// 居中面板几何（与 Skill 详情弹窗一致）：宽/高取 `area` 的 85%，宽最小 70、高最小 20，
@@ -5219,6 +5783,10 @@ fn form_field_label(name: &str) -> (&str, bool) {
         "enabled" => ("启用状态 (enabled)", false),
         "scope" => ("作用域 (scope)", false),
         "prompt" => ("规则提示 (prompt)", true),
+        "target" => ("扫描目标 (本地路径或提示词，留空=自动探测本机工具)", false),
+        "provider" => ("扫描服务商 (←/→ 切换)", false),
+        "model" => ("扫描模型 (Enter 打开模型列表，可直接输入)", false),
+        "preview" => ("仅预览不写盘 (preview)", false),
         other => (other, false),
     }
 }
@@ -5244,6 +5812,7 @@ fn draw_form_dialog(frame: &mut Frame, bounds: Rect, form: &FormState, status: &
             " 🧠 编辑记忆规则 / Edit Memory Rule ".to_string()
         }
         FormKind::MemoryRule { index: None } => " 🧠 新增记忆规则 / Add Memory Rule ".to_string(),
+        FormKind::ToolboxScan => " 🤖 AI 智能扫描本地安全工具 / Toolbox Scan ".to_string(),
         // Provider 表单由 `draw_fullscreen_provider_form` 全屏分支拦截，此处仅作兜底。
         _ => format!(" {} ", clean(&form.form.title)),
     };
@@ -5407,7 +5976,12 @@ fn draw_form_dialog(frame: &mut Frame, bounds: Rect, form: &FormState, status: &
 
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "  [必填] 该项不可为空   [←/→/空格] 就地切换布尔与作用域",
+        match &form.form.kind {
+            FormKind::ToolboxScan => {
+                "  模型行按 Enter 打开模型列表（↑/↓ 选择 · Enter 确认 · m/f 手输模型名 · r 重新拉取）；保存后立即开始扫描"
+            }
+            _ => "  [必填] 该项不可为空   [←/→/空格] 就地切换布尔与作用域",
+        },
         Style::default().fg(DIM),
     ));
 
@@ -5426,6 +6000,11 @@ fn draw_form_dialog(frame: &mut Frame, bounds: Rect, form: &FormState, status: &
         )),
         chunks[2],
     );
+
+    // 工具库扫描表单的模型列表浮层（Provider 表单由全屏渲染函数负责）。
+    if let Some(p) = form.model_picker.as_ref().filter(|p| !p.manual) {
+        draw_form_model_picker(frame, bounds, p);
+    }
 }
 
 /// 选择器弹层：居中模态框，正文为选项列表（选中项高亮 + 详情右对齐）。
@@ -5630,14 +6209,24 @@ const SETTINGS_PERMISSION_MODES: &[PermissionMode] = &[
     PermissionMode::Unlimited,
 ];
 
+/// 焦点行指针：编辑态 `✎ `，只读态 `▶ `，未聚焦 `  `。
+fn row_pointer(is_sel: bool, editing: bool) -> &'static str {
+    match (is_sel, editing) {
+        (true, true) => "✎ ",
+        (true, false) => "▶ ",
+        _ => "  ",
+    }
+}
+
 fn render_setting_row(
     selected: bool,
+    editing: bool,
     label: &'static str,
     value: String,
     hint: String,
     width: u16,
 ) -> Line<'static> {
-    let pointer = if selected { "▶ " } else { "  " };
+    let pointer = row_pointer(selected, editing);
     let ptr_style = if selected {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
@@ -5746,6 +6335,7 @@ fn draw_tab_agent_model(
     let lines = vec![
         render_setting_row(
             settings.selected_row == 0,
+            settings.editing && settings.selected_row == 0,
             "默认服务商 (Provider)",
             format!("◄ [ {} ] ►", prov),
             format!("◄/► 切换 (已配置 {} 个 Provider)", prov_count),
@@ -5753,6 +6343,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 1,
+            settings.editing && settings.selected_row == 1,
             "对应模型 (Model)",
             model,
             "由所选 Provider 决定 (/model 细调)".into(),
@@ -5760,6 +6351,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 2,
+            settings.editing && settings.selected_row == 2,
             "思考强度 (Thinking)",
             format!(
                 "◄ [ {} ] ►",
@@ -5775,6 +6367,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 3,
+            settings.editing && settings.selected_row == 3,
             "工具审批模式 (Permission)",
             format!("◄ [ {} ] ►", perm_mode.label()),
             match perm_mode {
@@ -5787,6 +6380,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 4,
+            settings.editing && settings.selected_row == 4,
             "自动工具调用 (Auto Tools)",
             if settings.config_draft.agent.auto_tool_call {
                 "[ ● 开启 ]".into()
@@ -5798,6 +6392,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 5,
+            settings.editing && settings.selected_row == 5,
             "工具执行步数上限 (Max Steps)",
             format!("◄ [ {} 步 ] ►", settings.config_draft.agent.max_steps),
             "◄/► 调整 (范围: 1-1000 步)".into(),
@@ -5805,6 +6400,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 6,
+            settings.editing && settings.selected_row == 6,
             "联网搜索与抓取 (Web Search)",
             if settings.config_draft.tools.web_search {
                 "[ ● 开启 ]".into()
@@ -5816,6 +6412,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 7,
+            settings.editing && settings.selected_row == 7,
             "自适应识图引擎 (Vision Engine)",
             if settings.config_draft.agent.vision.enabled {
                 "[ ● 开启 ]".into()
@@ -5827,6 +6424,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 8,
+            settings.editing && settings.selected_row == 8,
             "识图专用服务商 (Vision Provider)",
             format!(
                 "◄ [ {} ] ►",
@@ -5841,6 +6439,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 9,
+            settings.editing && settings.selected_row == 9,
             "识图专用模型 (Vision Model)",
             if settings.config_draft.agent.vision.model.is_empty() {
                 "跟随服务商默认模型".into()
@@ -5852,6 +6451,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 10,
+            settings.editing && settings.selected_row == 10,
             "异常重试次数 (Retry Attempts)",
             format!("◄ [ {} 次 ] ►", settings.config_draft.agent.retry_attempts),
             "◄/► 调整 (范围: 0-20 次，0 为不重试)".into(),
@@ -5859,6 +6459,7 @@ fn draw_tab_agent_model(
         ),
         render_setting_row(
             settings.selected_row == 11,
+            settings.editing && settings.selected_row == 11,
             "重试时间间隔 (Retry Interval)",
             format!(
                 "◄ [ {} 秒 ] ►",
@@ -5887,6 +6488,7 @@ fn draw_tab_ui_workflow(
     let lines = vec![
         render_setting_row(
             settings.selected_row == 0,
+            settings.editing && settings.selected_row == 0,
             "主题配色 (Theme)",
             format!("◄ [ {} ] ►", settings.config_draft.ui.theme),
             "即时生效 (支持 cyberpunk/dracula/nord 等)".into(),
@@ -5894,6 +6496,7 @@ fn draw_tab_ui_workflow(
         ),
         render_setting_row(
             settings.selected_row == 1,
+            settings.editing && settings.selected_row == 1,
             "鼠标捕获 (Mouse Capture)",
             if settings.config_draft.ui.mouse {
                 "[ ● 开启 ]".into()
@@ -5905,6 +6508,7 @@ fn draw_tab_ui_workflow(
         ),
         render_setting_row(
             settings.selected_row == 2,
+            settings.editing && settings.selected_row == 2,
             "默认启动模式 (Default Mode)",
             format!("◄ [ {} ] ►", settings.config_draft.ui.default_mode),
             "重启生效 (chat / workflow / dashboard)".into(),
@@ -5912,6 +6516,7 @@ fn draw_tab_ui_workflow(
         ),
         render_setting_row(
             settings.selected_row == 3,
+            settings.editing && settings.selected_row == 3,
             "界面动效渲染 (Animations)",
             if settings.config_draft.ui.animations {
                 "[ ● 开启 ]".into()
@@ -5923,6 +6528,7 @@ fn draw_tab_ui_workflow(
         ),
         render_setting_row(
             settings.selected_row == 4,
+            settings.editing && settings.selected_row == 4,
             "工作流最大并行节点",
             format!(
                 "◄ [ {} 节点 ] ►",
@@ -5933,6 +6539,7 @@ fn draw_tab_ui_workflow(
         ),
         render_setting_row(
             settings.selected_row == 5,
+            settings.editing && settings.selected_row == 5,
             "工作流执行超时 (Timeout)",
             format!(
                 "◄ [ {} 秒 ] ►",
@@ -5943,6 +6550,7 @@ fn draw_tab_ui_workflow(
         ),
         render_setting_row(
             settings.selected_row == 6,
+            settings.editing && settings.selected_row == 6,
             "断点续跑检查点 (Checkpoint)",
             if settings.config_draft.workflow.checkpoint {
                 "[ ● 开启 ]".into()
@@ -5968,6 +6576,7 @@ fn draw_tab_subagents(frame: &mut Frame, area: Rect, settings: &CliSettingsState
     let lines = vec![
         render_setting_row(
             settings.selected_row == 0,
+            settings.editing && settings.selected_row == 0,
             "子代理系统 (Subagents)",
             if sub.enabled {
                 "[ ● 开启 ]".into()
@@ -5979,6 +6588,7 @@ fn draw_tab_subagents(frame: &mut Frame, area: Rect, settings: &CliSettingsState
         ),
         render_setting_row(
             settings.selected_row == 1,
+            settings.editing && settings.selected_row == 1,
             "单轮最大任务数 (Max Tasks)",
             format!("◄ [ {} 个 ] ►", sub.max_tasks),
             "一次最多拆分派发的子任务上限 (1-64)".into(),
@@ -5986,6 +6596,7 @@ fn draw_tab_subagents(frame: &mut Frame, area: Rect, settings: &CliSettingsState
         ),
         render_setting_row(
             settings.selected_row == 2,
+            settings.editing && settings.selected_row == 2,
             "最大并行执行数 (Parallel)",
             format!("◄ [ {} 并发 ] ►", sub.max_parallel),
             "后台同时运行的独立子代理线程上限 (1-16)".into(),
@@ -5993,6 +6604,7 @@ fn draw_tab_subagents(frame: &mut Frame, area: Rect, settings: &CliSettingsState
         ),
         render_setting_row(
             settings.selected_row == 3,
+            settings.editing && settings.selected_row == 3,
             "单任务超时时限 (Timeout)",
             format!("◄ [ {} 秒 ] ►", sub.timeout_secs),
             "单个子任务最大执行时限 (10-3600秒)".into(),
@@ -6000,6 +6612,7 @@ fn draw_tab_subagents(frame: &mut Frame, area: Rect, settings: &CliSettingsState
         ),
         render_setting_row(
             settings.selected_row == 4,
+            settings.editing && settings.selected_row == 4,
             "子任务最大步数 (Sub Steps)",
             format!("◄ [ {} 步 ] ►", sub.max_steps),
             "单个子任务工具调用最大循环次数 (5-100)".into(),
@@ -6035,6 +6648,7 @@ fn draw_tab_tools_mcp(
     let row0_start = lines.len();
     lines.push(render_setting_row(
         settings.selected_row == 0,
+        settings.editing && settings.selected_row == 0,
         "优先容器执行 (Docker)",
         if settings.config_draft.tools.prefer_docker {
             "[ ● 开启 ]".into()
@@ -6052,6 +6666,7 @@ fn draw_tab_tools_mcp(
     let row1_start = lines.len();
     lines.push(render_setting_row(
         settings.selected_row == 1,
+        settings.editing && settings.selected_row == 1,
         "CTF 渗透答题模式 (CTF Mode)",
         if screen.ctf_enabled {
             "[ ● 开启 ]".into()
@@ -6069,6 +6684,7 @@ fn draw_tab_tools_mcp(
     let row2_start = lines.len();
     lines.push(render_setting_row(
         settings.selected_row == 2,
+        false,
         "MCP 全屏管理控制台 (/mcp)",
         "[ 按 Enter 打开 ]".into(),
         "打开独立全屏 MCP 控制台，实时调试工具 Schema、测活与增删服务".into(),
@@ -6080,6 +6696,7 @@ fn draw_tab_tools_mcp(
     }
 
     lines.push(render_setting_row(
+        false,
         false,
         "额外环境变量 PATH",
         extra_path_str,
@@ -6305,7 +6922,18 @@ fn draw_tab_providers(frame: &mut Frame, area: Rect, settings: &CliSettingsState
     render_scrollable_content(frame, area, lines, focused_start, focused_end);
 }
 
-/// 「8. 工具库」页：自定义工具列表 + AI 智能扫描入口行。
+/// 「8. 工具库」页显示行 → 自定义工具下标。
+///
+/// 行 `0` 固定是 `🤖 AI 智能扫描本地安全工具` 入口，其后 `1..=N` 依次对应
+/// `custom_tools[0..N]`；扫描行与越界行返回 `None`。
+fn toolbox_tool_row(settings: &CliSettingsState) -> Option<usize> {
+    settings
+        .selected_row
+        .checked_sub(1)
+        .filter(|idx| *idx < settings.custom_tools.len())
+}
+
+/// 「8. 工具库」页：AI 扫描入口行 + 自定义工具列表。
 fn draw_tab_toolbox(
     frame: &mut Frame,
     area: Rect,
@@ -6327,15 +6955,48 @@ fn draw_tab_toolbox(
     let mut focused_start = 0;
     let mut focused_end = 0;
 
+    // 首行固定为 AI 智能扫描入口（Enter 打开扫描表单），自定义工具列表在其后。
+    let scan_sel = settings.selected_row == 0;
+    let scan_start = lines.len();
+    let scan_pointer = if scan_sel { "▶ " } else { "  " };
+    let scan_style = if scan_sel {
+        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    lines.push(Line::from(crate::views::clipped_spans(
+        vec![
+            Span::styled(
+                scan_pointer,
+                if scan_sel {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            ),
+            Span::styled("🤖 AI 智能扫描本地安全工具", scan_style),
+            Span::styled(
+                " (Enter 打开扫描表单：可输入路径/提示词并选择模型)",
+                Style::default().fg(DIM),
+            ),
+        ],
+        area.width as usize,
+    )));
+    if scan_sel {
+        focused_start = scan_start;
+        focused_end = lines.len();
+    }
+    lines.push(Line::raw(""));
+
     if total == 0 {
         lines.push(Line::styled(
-            "    （暂无自定义工具：按 A 手动录入，或选中末行运行 AI 智能扫描）",
+            "    （暂无自定义工具：按 A 手动录入）",
             Style::default().fg(DIM),
         ));
     }
 
     for (i, tool) in settings.custom_tools.iter().enumerate() {
-        let is_sel = settings.selected_row == i;
+        let is_sel = toolbox_tool_row(settings) == Some(i);
         let start_line = lines.len();
         let pointer = if is_sel { "▶ " } else { "  " };
         let ptr_style = if is_sel {
@@ -6361,8 +7022,13 @@ fn draw_tab_toolbox(
             vec![
                 Span::styled(pointer, ptr_style),
                 Span::styled(format!("[{}] ", tool.name), name_style),
-                Span::styled(tool.description.clone(), Style::default().fg(MUTED)),
-                Span::styled(format!("  · {}", tool.command), Style::default().fg(DIM)),
+                // 描述可能来自模型生成，含换行/控制字符时必须在单行内归一化，
+                // 否则整行会被后续字段挤掉。
+                Span::styled(single_line(&tool.description), Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("  · {}", single_line(&tool.command)),
+                    Style::default().fg(DIM),
+                ),
                 delete_tag,
             ],
             area.width as usize,
@@ -6374,37 +7040,6 @@ fn draw_tab_toolbox(
             focused_start = start_line;
             focused_end = lines.len();
         }
-    }
-
-    let scan_sel = settings.selected_row >= total;
-    let scan_start = lines.len();
-    let scan_pointer = if scan_sel { "▶ " } else { "  " };
-    let scan_style = if scan_sel {
-        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(MUTED)
-    };
-    lines.push(Line::from(crate::views::clipped_spans(
-        vec![
-            Span::styled(
-                scan_pointer,
-                if scan_sel {
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(DIM)
-                },
-            ),
-            Span::styled("🤖 AI 智能扫描本地安全工具", scan_style),
-            Span::styled(
-                " (Enter 运行；按 --preview 只预览)",
-                Style::default().fg(DIM),
-            ),
-        ],
-        area.width as usize,
-    )));
-    if scan_sel {
-        focused_start = scan_start;
-        focused_end = lines.len();
     }
 
     render_scrollable_content(frame, area, lines, focused_start, focused_end);
@@ -6429,12 +7064,12 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
     // 1. 环境变量分区标题
     let env_header = if is_env_focused {
         format!(
-            "  ⚙ 自定义环境变量 (注入 Shell/Agent 子进程) [{} 项 · 当前聚焦] (A 添加 · Enter/E 编辑 · 空格 脱敏 · D 删除):",
+            "  ⚙ 自定义环境变量 (注入 Shell/Agent 子进程) [{} 项 · 当前聚焦] (A 添加 · Enter 编辑 · 空格 脱敏 · E 表单 · D 删除):",
             env_count
         )
     } else {
         format!(
-            "  ⚙ 自定义环境变量 (注入 Shell/Agent 子进程) [{} 项] (A 添加 · Enter/E 编辑 · 空格 脱敏 · D 删除):",
+            "  ⚙ 自定义环境变量 (注入 Shell/Agent 子进程) [{} 项] (A 添加 · Enter 编辑 · 空格 脱敏 · E 表单 · D 删除):",
             env_count
         )
     };
@@ -6450,7 +7085,7 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
     if env_count == 0 {
         let is_sel = is_env_focused && settings.selected_row == 0;
         let start_line = lines.len();
-        let pointer = if is_sel { "▶ " } else { "  " };
+        let pointer = row_pointer(is_sel, settings.editing && is_sel);
         let ptr_style = if is_sel {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
@@ -6475,7 +7110,7 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
         for (i, var) in settings.config_draft.env.vars.iter().enumerate() {
             let is_sel = is_env_focused && i == settings.selected_row;
             let start_line = lines.len();
-            let pointer = if is_sel { "▶ " } else { "  " };
+            let pointer = row_pointer(is_sel, settings.editing && is_sel);
             let ptr_style = if is_sel {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
@@ -6505,7 +7140,7 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
             );
             let hint_span = if is_sel {
                 Span::styled(
-                    "  [Enter/E 编辑 · 空格 脱敏 · D 删除]",
+                    "  [Enter 编辑 · 空格 脱敏 · E 表单 · D 删除]",
                     Style::default().fg(ACCENT),
                 )
             } else {
@@ -6531,12 +7166,12 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
     // 2. 长期记忆规则分区标题
     let mem_header = if is_mem_focused {
         format!(
-            "  🧠 长期用户记忆约定规则 (Memory Rules) [{} 项 · 当前聚焦] (A 添加 · Enter/E 编辑 · 空格 启停 · ←/→ 作用域 · D 删除):",
+            "  🧠 长期用户记忆约定规则 (Memory Rules) [{} 项 · 当前聚焦] (A 添加 · Enter 编辑 · 空格 启停 · ←/→ 作用域 · E 表单 · D 删除):",
             mem_count
         )
     } else {
         format!(
-            "  🧠 长期用户记忆约定规则 (Memory Rules) [{} 项] (A 添加 · Enter/E 编辑 · 空格 启停 · ←/→ 作用域 · D 删除):",
+            "  🧠 长期用户记忆约定规则 (Memory Rules) [{} 项] (A 添加 · Enter 编辑 · 空格 启停 · ←/→ 作用域 · E 表单 · D 删除):",
             mem_count
         )
     };
@@ -6552,7 +7187,7 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
     if mem_count == 0 {
         let is_sel = is_mem_focused && (settings.selected_row >= env_slots);
         let start_line = lines.len();
-        let pointer = if is_sel { "▶ " } else { "  " };
+        let pointer = row_pointer(is_sel, settings.editing && is_sel);
         let ptr_style = if is_sel {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
@@ -6578,7 +7213,7 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
             let row_idx = env_slots + i;
             let is_sel = is_mem_focused && row_idx == settings.selected_row;
             let start_line = lines.len();
-            let pointer = if is_sel { "▶ " } else { "  " };
+            let pointer = row_pointer(is_sel, settings.editing && is_sel);
             let ptr_style = if is_sel {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
@@ -6611,7 +7246,10 @@ fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsStat
                 Style::default().fg(if rule.enabled { FG } else { DIM }),
             );
             let hint_span = if is_sel {
-                Span::styled("  [Enter/E 编辑 · D 删除]", Style::default().fg(ACCENT))
+                Span::styled(
+                    "  [Enter 编辑 · E 表单 · D 删除]",
+                    Style::default().fg(ACCENT),
+                )
             } else {
                 Span::raw("")
             };
@@ -6718,6 +7356,7 @@ fn draw_tab_storage_system(frame: &mut Frame, area: Rect, settings: &CliSettings
     let lines = vec![
         render_setting_row(
             settings.selected_row == 0,
+            settings.editing && settings.selected_row == 0,
             "会话历史保留天数",
             format!(
                 "◄ [ {} 天 ] ►",
@@ -6728,6 +7367,7 @@ fn draw_tab_storage_system(frame: &mut Frame, area: Rect, settings: &CliSettings
         ),
         render_setting_row(
             settings.selected_row == 1,
+            settings.editing && settings.selected_row == 1,
             "日志记录级别 (Log Level)",
             format!("◄ [ {} ] ►", settings.config_draft.storage.log_level),
             "trace / debug / info / warn / error".into(),
@@ -6779,6 +7419,186 @@ fn draw_tab_storage_system(frame: &mut Frame, area: Rect, settings: &CliSettings
         lines,
         settings.selected_row,
         settings.selected_row,
+    );
+}
+
+/// 「关于」页内容行（单一来源）：设置中心「9. 关于」页签与全屏 `Panel::About` 共用。
+fn about_lines(info: &AboutInfo) -> Vec<Line<'static>> {
+    let section = |title: &str| {
+        Line::styled(
+            format!("  [{title}]"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    };
+    let kv = |key: &str, value: String| {
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{key:<12}"), Style::default().fg(MUTED)),
+            Span::styled(value, Style::default().fg(FG)),
+        ])
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::styled(
+        format!("Cyber Master V{}  ·  网络安全智能体终端", info.version),
+        Style::default().fg(FG).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::styled(
+        "对话式安全智能体终端：多 LLM 流式对话、统一工具表（内置 + MCP + Skill）、Todo 任务编排、子 Agent 并发与 CTF 协作面板。",
+        Style::default().fg(MUTED),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(section("版本与更新"));
+    lines.push(kv("当前版本", format!("V{}", info.version)));
+    lines.push(match &info.latest {
+        Some(latest) => kv(
+            "可更新版本",
+            format!("V{latest}（按 U 或输入 /update 检查并升级）"),
+        ),
+        None => kv("可更新版本", "未检测到新版本（按 U 检查更新）".into()),
+    });
+    lines.push(kv(
+        "可执行文件",
+        info.binary.clone().unwrap_or_else(|| "(未知)".into()),
+    ));
+    lines.push(kv("升级方式", "cyber update（或本页按 U 检查更新）".into()));
+    lines.push(Line::raw(""));
+    lines.push(section("项目信息"));
+    lines.push(kv(
+        "简介",
+        "网络安全智能体终端：代码交互、任务编排与 CTF 协作".into(),
+    ));
+    lines.push(kv(
+        "仓库",
+        format!("https://github.com/{}", cyber_core::update::GITHUB_REPO),
+    ));
+    lines.push(kv(
+        "镜像",
+        format!("https://cnb.cool/{}", cyber_core::update::CNB_REPO),
+    ));
+    lines.push(kv("协议", env!("CARGO_PKG_LICENSE").to_string()));
+    lines.push(kv("作者", "chuzouX".into()));
+    lines.push(Line::raw(""));
+    lines.push(section("运行环境"));
+    lines.push(kv(
+        "服务商 / 模型",
+        format!(
+            "{} / {} · {} effort",
+            info.provider, info.model, info.effort
+        ),
+    ));
+    lines.push(kv("工作目录", info.cwd.clone()));
+    lines.push(kv("会话数", info.sessions_count.to_string()));
+    lines.push(kv(
+        "项目级配置",
+        if info.has_project_config {
+            "已启用（.cyber.md / .cyber/）".into()
+        } else {
+            "未启用（以全局配置为准）".into()
+        },
+    ));
+    lines.push(kv("日志级别", info.log_level.clone()));
+    lines.push(kv(
+        "内置工具 / Skills",
+        format!("{} 个工具 · {} 个 Skill", info.tool_count, info.skill_count),
+    ));
+    lines.push(kv(
+        "自定义工具",
+        format!("{} 个（{}）", info.custom_tool_count, info.tools_dir),
+    ));
+    lines.push(kv("配置文件", info.config_path.clone()));
+    lines.push(kv("服务商文件", info.providers_path.clone()));
+    lines.push(kv("会话目录", info.sessions_dir.clone()));
+    lines.push(Line::raw(""));
+    lines.push(section("核心能力"));
+    for (name, desc) in [
+        (
+            "流式对话与思考链",
+            "多 Provider（OpenAI / Anthropic / Ollama / Responses）× 思考强度 × 上下文自动压缩",
+        ),
+        (
+            "统一工具表",
+            "内置 Shell / 文件 / 搜索工具 + MCP（stdio / HTTP / SSE）+ Skill 渐进式披露",
+        ),
+        (
+            "任务编排",
+            "Todo 结构化清单三态视图 + 子 Agent 并发委派 + 后台任务面板",
+        ),
+        (
+            "安全作业",
+            "CTF 题目协作与 writeup 归档、自定义安全工具库与 AI 智能扫描",
+        ),
+        (
+            "设置中心",
+            "F3 打开：模型 / 界面 / 并发 / 工具 MCP / 服务商 / 环境记忆 / 系统存储 / 工具库 / 关于",
+        ),
+    ] {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("▸ {name}  "), Style::default().fg(ACCENT)),
+            Span::styled(desc.to_string(), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(section("快捷键说明书"));
+    lines.push(Line::styled(
+        "    对话页输入框为空时直接生效；面板内按键见各行说明。",
+        Style::default().fg(MUTED),
+    ));
+    for (key, desc) in SHORTCUT_KEYS {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{key:<16}"), Style::default().fg(CODE)),
+            Span::styled((*desc).to_string(), Style::default().fg(FG)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(section("斜杠命令速查"));
+    for spec in cli_commands::commands() {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{:<34}", spec.usage), Style::default().fg(CODE)),
+            Span::styled(spec.desc.to_string(), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines
+}
+
+/// 设置中心「9. 关于」页：只读长页；`scroll` 为行偏移，按内容高度自动收敛。
+fn draw_tab_about(frame: &mut Frame, area: Rect, info: Option<&AboutInfo>, scroll: usize) {
+    let Some(info) = info else {
+        return;
+    };
+    let lines = about_lines(info);
+    let max = lines.len().saturating_sub(area.height as usize);
+    let offset = scroll.min(max).min(u16::MAX as usize) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), area);
+}
+
+/// 全屏「关于 / About」面板：与设置中心「9. 关于」页共用 `about_lines`。
+fn draw_about_panel(frame: &mut Frame, area: Rect, info: &AboutInfo, scroll: usize) {
+    if area.width < 40 || area.height < 6 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(CODE))
+        .title(Line::from(Span::styled(
+            format!(" 关于 / About · Cyber Master V{} ", info.version),
+            Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
+    let lines = about_lines(info);
+    let max = lines.len().saturating_sub(chunks[0].height as usize);
+    let offset = scroll.min(max).min(u16::MAX as usize) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "U/Enter 检查更新 · ↑/↓ · PgUp/PgDn 滚动 · ? 或 Esc 关闭",
+            Style::default().fg(DIM),
+        )),
+        chunks[1],
     );
 }
 
@@ -7141,6 +7961,27 @@ fn draw_memory_detail_modal(
     );
     frame.render_widget(Paragraph::new(hint_line), chunks[1]);
 }
+
+/// CLI 快捷键说明书条目 `(按键, 说明)`：`Panel::Shortcuts` 浮层与「关于」页共用。
+/// 渲染列宽 16。
+const SHORTCUT_KEYS: &[(&str, &str)] = &[
+    ("Enter", "Send / select completion"),
+    ("Alt/Shift+Enter", "New line"),
+    ("Tab · Up/Down", "Complete / choose command"),
+    ("F1", "Open About page"),
+    ("F2 / Ctrl+P", "Cycle mode (manual/auto/unlimited)"),
+    ("F3 / Ctrl+,", "Open Settings center panel"),
+    ("Ctrl+G", "Toggle subagent panel (live transcripts)"),
+    ("Ctrl+B", "Toggle background jobs panel"),
+    ("Up / Down", "History prompts / scroll line"),
+    ("Mouse Wheel", "Scroll chat / approval arguments"),
+    ("Ctrl+O", "Toggle tool details"),
+    ("Ctrl+T", "Toggle CTF challenges panel (when CTF enabled)"),
+    ("Ctrl+C", "Cancel task"),
+    ("Alt+↑ / Alt+↓", "Todo list: expand / collapse (3 states)"),
+    ("PgUp / PgDn", "Scroll conversation"),
+    ("?", "Toggle shortcuts (empty input)"),
+];
 
 fn render_tab_bar(area_width: u16, current_tab: SettingsTab) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
@@ -8576,6 +9417,9 @@ fn draw_settings_panel(
         SettingsTab::EnvMemory => draw_tab_env_memory(frame, chunks[2], settings),
         SettingsTab::StorageSystem => draw_tab_storage_system(frame, chunks[2], settings),
         SettingsTab::Toolbox => draw_tab_toolbox(frame, chunks[2], settings, screen),
+        SettingsTab::About => {
+            draw_tab_about(frame, chunks[2], screen.about.as_ref(), screen.about_scroll)
+        }
     }
 
     let provider_tip;
@@ -8612,13 +9456,14 @@ fn draw_settings_panel(
             if settings.selected_row < env_slots {
                 "💡 环境变量提示: 注入到工具执行子进程 (Bash/Shell/Agent)；标记为脱敏保护的变量在终端与日志中均会打码遮蔽。"
             } else if settings.selected_row < env_slots + mem_slots {
-                "💡 记忆规则提示: 每次交互时自动注入 Agent 顶层 Prompt；按 Space 开关启用，←/→ 轮换作用域 (全局/项目)，Enter/E 编辑。"
+                "💡 记忆规则提示: 每次交互时自动注入 Agent 顶层 Prompt；按 Enter 进入编辑后再用 Space 开关启用、←/→ 轮换作用域 (全局/项目)；E 打开编辑表单。"
             } else {
                 "💡 记忆列表提示: 以下为 memory.md 中已写入的长期记忆条目 (全局/项目级)；按 Enter 查看完整正文，弹窗内 ←/→ 切换上/下一条。"
             }
         }
         SettingsTab::StorageSystem => "💡 提示: 日志级别调整后将在后台日志中实时生效；如需排查详细工具执行流，建议调至 debug 级别。",
-        SettingsTab::Toolbox => "💡 提示: Enter 编辑 · A 添加 · D 删除 · 末行 Enter 运行 AI 扫描；扫描结果输出到对话区。",
+        SettingsTab::Toolbox => "💡 提示: 首行 Enter 打开 AI 扫描表单（可输入路径/提示词并选择模型）· Enter/E 编辑工具 · A 添加 · D 删除；扫描结果输出到对话区。",
+        SettingsTab::About => "💡 提示: 只读页 · ↑/↓ 或滚轮滚动 · U/Enter 检查更新；底部为快捷键与斜杠命令速查（等价于按 ? 打开 Shortcuts 浮层）。",
     };
     frame.render_widget(
         Paragraph::new(Line::styled(tip_text, Style::default().fg(MUTED))),
@@ -8717,6 +9562,16 @@ fn draw_settings_panel(
             Span::raw(" "),
             Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
         ]),
+        SettingsTab::About => Line::from(vec![
+            Span::styled(
+                " [ U 检查更新 ] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(" [ ↑/↓ 滚动 ] ", Style::default().fg(CODE)),
+            Span::raw("  "),
+            Span::styled(" [ Esc 关闭 ] ", Style::default().fg(MUTED)),
+        ]),
         _ => Line::from(vec![
             Span::styled(
                 " [ S 保存生效 (Ctrl+S) ] ",
@@ -8731,36 +9586,41 @@ fn draw_settings_panel(
     frame.render_widget(Paragraph::new(buttons), chunks[4]);
 
     let nav_hint = if screen.setup_mode {
-        " 首次配置向导：↑/↓ 选择 · 选服务商(A) → 填 API Key → Ctrl+S 保存 · Tab/1-8 切换分类 · Esc 完成并退出 "
+        " 首次配置向导：↑/↓ 选择 · Enter 编辑 · ←/→ 切分类 · 选服务商(A) → 填 API Key → Ctrl+S 保存 · Tab/1-9 切换分类 · Esc 完成并退出 "
+    } else if settings.editing {
+        " 编辑中：←/→ 调整数值 · Enter/Esc 完成 · ↑/↓ 移动焦点 "
     } else {
         match settings.tab {
             SettingsTab::Providers if chunks[5].width < 100 => {
-                "操作: ↑/↓ · Enter 设默认 · A 添加 · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
+                "操作: ↑/↓ · Enter 设默认 · A 添加 · T 测活 · M 模型 · E 编辑 · D 删除 · ←/→ 切分类 · Esc 关闭"
             }
             SettingsTab::Providers => {
-                "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
+                "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · ←/→ 切分类 · Esc 关闭"
             }
             SettingsTab::EnvMemory if chunks[5].width < 90 => {
-                "操作: ↑/↓ · Enter 详情/编辑 · A 添加 · Space 切换 · ←/→ 作用域 · D 删除 · Esc 关闭"
+                "操作: ↑/↓ · Enter 编辑 (E 打开表单) · A 添加 · D 删除 · ←/→ 切分类 · Esc 关闭"
             }
             SettingsTab::EnvMemory => {
-                "操作: ↑/↓ 选择项目 · Enter/E 编辑 (记忆列表 Enter 查看详情) · A 添加 · Space 切换脱敏/启用 · ←/→ 作用域 · D 删除 · Esc 关闭"
+                "操作: ↑/↓ 选择项目 · Enter 编辑 (记忆列表 Enter 查看详情 · E 打开表单) · A 添加 · D 删除 · ←/→ 切分类 · Esc 关闭"
             }
             SettingsTab::ToolsMcp if chunks[5].width < 90 => {
-                "操作: ↑/↓ 移动 · Enter 详情/执行 · Tab 切换 · Esc 关闭"
+                "操作: ↑/↓ 移动 · Enter 编辑/打开 · Tab/←/→ 轮换 · Esc 关闭"
             }
             SettingsTab::ToolsMcp => {
                 if settings.selected_row >= 3 {
-                    "操作: ↑/↓ 移动焦点 · Enter/空格/o 查看 Skill 详情 · Tab 轮换标签 · 1-8 直达分类 · Esc 关闭"
+                    "操作: ↑/↓ 移动焦点 · Enter/空格/o 查看 Skill 详情 · Tab/←/→ 轮换标签 · 1-9 直达分类 · Esc 关闭"
                 } else {
-                    "操作: ↑/↓ 选择项目 · ←/→ / 空格 切换开关 · Enter 执行 · Tab 轮换标签 · 1-8 直达分类 · Esc 关闭"
+                    "操作: ↑/↓ 选择项目 · Enter 编辑 · ←/→ 轮换标签 · 1-9 直达分类 · Esc 关闭"
                 }
             }
             SettingsTab::Toolbox => {
-                "操作: ↑/↓ 选择工具 · Enter/E 编辑 · A 添加 · D 删除 (连按两次) · 末行 Enter 运行 AI 扫描 · Tab 轮换 · 1-8 直达 · Esc 关闭"
+                "操作: ↑/↓ 选择行 (首行＝AI 扫描入口) · Enter/E 编辑工具 · A 添加 · D 删除 (连按两次) · ←/→ 轮换 · 1-9 直达 · Esc 关闭"
             }
-            _ if chunks[5].width < 80 => "操作: ↑/↓ · ←/→ 微调 · Tab 轮换 · 1-8 直达 · Esc 关闭",
-            _ => "操作: ↑/↓ 选择项目 · ←/→ 微调数值 · Tab 轮换标签 · 1-8 直达分类 · Esc 关闭",
+            SettingsTab::About => "操作: ↑/↓ · PgUp/PgDn 滚动 · U 检查更新 · ←/→ 或 Tab/1-9 切换分类 · Esc 关闭",
+            _ if chunks[5].width < 80 => {
+                "操作: ↑/↓ 选择 · Enter 编辑 · ←/→ 切分类 · Tab 轮换 · 1-9 直达 · Esc 关闭"
+            }
+            _ => "操作: ↑/↓ 选择项目 · Enter 进入编辑 (再按 Enter/Esc 退出) · ←/→ 切分类 · Tab 轮换标签 · 1-9 直达分类 · Esc 关闭",
         }
     };
     frame.render_widget(
@@ -8858,6 +9718,12 @@ fn save_settings_state(
         }
         return;
     };
+    // 回合进行中 runner 已被 take 走：草稿只能保留，落盘必须等回合结束（不得假成功）。
+    if runner.is_none() {
+        screen.status =
+            "回合进行中：设置面板可查看/编辑，保存将在回合结束后生效（请稍后再按 Ctrl+S）".into();
+        return;
+    }
     let new_mouse = settings.config_draft.ui.mouse;
     let mouse_changed = runner
         .as_ref()
@@ -8904,13 +9770,21 @@ fn save_settings_state(
     }
 }
 
+/// 回合进行中（runner 已被 `take()` 走）需要 runner 的设置操作一律拦下并提示，
+/// 不做静默失效。纯草稿编辑（方向键、开关、枚举切换）不受此限制。
+fn defer_settings_action(status: &mut String, runner: &Option<SessionRunner>) -> bool {
+    if runner.is_none() {
+        *status = "回合进行中：该操作需等回合结束后再执行".into();
+        true
+    } else {
+        false
+    }
+}
+
 fn handle_settings_key(
     screen: &mut CliScreen,
     runner: &mut Option<SessionRunner>,
     permissions: &Arc<PermissionBroker>,
-    events: &mpsc::UnboundedSender<AgentEvent>,
-    active: &mut Option<ActiveTurn>,
-    cancel: &mut Option<oneshot::Sender<()>>,
     key: KeyEvent,
 ) -> color_eyre::Result<bool> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -8920,6 +9794,9 @@ fn handle_settings_key(
         if screen.setup_mode {
             if screen.settings.as_ref().is_some_and(|s| s.dirty) {
                 screen.status = "请先 Ctrl+S 保存配置".into();
+                return Ok(false);
+            }
+            if defer_settings_action(&mut screen.status, runner) {
                 return Ok(false);
             }
             return Ok(setup_finish(screen, runner));
@@ -9117,10 +9994,69 @@ fn handle_settings_key(
         return Ok(false);
     }
 
+    // ── 设置项编辑态 / 只读态 ─────────────────────────────────────────────
+    // 只读态：←/→（h/l）切换标签页；Enter 对「可编辑值行」进入编辑态；值行上的空格被吞掉。
+    // 编辑态：←/→/h/l/空格 落到下方 per-tab 分支改值；Enter/Esc 退出编辑；
+    //         ↑/↓/Home/End/PgUp/PgDn/k/j 退出编辑并继续走下方移动逻辑。
+    {
+        let editing = screen.settings.as_ref().is_some_and(|s| s.editing);
+        let is_value_row = screen
+            .settings
+            .as_ref()
+            .is_some_and(CliSettingsState::focused_row_is_value);
+        if editing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    if let Some(settings) = screen.settings.as_mut() {
+                        settings.editing = false;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Char('k')
+                | KeyCode::Char('j') => {
+                    if let Some(settings) = screen.settings.as_mut() {
+                        settings.editing = false;
+                    }
+                    // 不 return：继续走下方既有移动逻辑
+                }
+                _ => {}
+            }
+        } else if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
+            if let Some(settings) = screen.settings.as_mut() {
+                settings.prev_tab();
+            }
+            screen.sync_about_if_active();
+            return Ok(false);
+        } else if matches!(key.code, KeyCode::Right | KeyCode::Char('l')) {
+            if let Some(settings) = screen.settings.as_mut() {
+                settings.next_tab();
+            }
+            screen.sync_about_if_active();
+            return Ok(false);
+        } else if key.code == KeyCode::Enter && is_value_row {
+            if let Some(settings) = screen.settings.as_mut() {
+                settings.editing = true;
+            }
+            return Ok(false);
+        } else if key.code == KeyCode::Char(' ') && is_value_row {
+            screen.status = "按 Enter 进入编辑后再调整该项".into();
+            return Ok(false);
+        }
+    }
+
     if key.code == KeyCode::Esc {
         if screen.setup_mode {
             if screen.settings.as_ref().is_some_and(|s| s.dirty) {
                 screen.status = "请先 Ctrl+S 保存配置".into();
+                return Ok(false);
+            }
+            if defer_settings_action(&mut screen.status, runner) {
                 return Ok(false);
             }
             return Ok(setup_finish(screen, runner));
@@ -9144,10 +10080,11 @@ fn handle_settings_key(
                 settings.next_tab();
             }
         }
+        screen.sync_about_if_active();
         return Ok(false);
     }
 
-    if let KeyCode::Char(ch @ '1'..='8') = key.code {
+    if let KeyCode::Char(ch @ '1'..='9') = key.code {
         if let Some(settings) = screen.settings.as_mut() {
             let tabs = SettingsTab::all();
             let idx = (ch as usize) - ('1' as usize);
@@ -9155,19 +10092,53 @@ fn handle_settings_key(
                 settings.set_tab(tab);
             }
         }
+        screen.sync_about_if_active();
         return Ok(false);
     }
 
     if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
         if let Some(settings) = screen.settings.as_mut() {
             settings.reset_current_tab();
-            screen.status = format!("已将 {} 恢复为默认配置", settings.tab.title());
+            // 「关于」页只读、无默认值可恢复（`reset_current_tab` 提前返回），不得报假成功。
+            if settings.tab != SettingsTab::About {
+                screen.status = format!("已将 {} 恢复为默认配置", settings.tab.title());
+            }
         }
         return Ok(false);
     }
 
     if key.code == KeyCode::Char('s') || key.code == KeyCode::Char('S') {
         save_settings_state(screen, runner, permissions, false);
+        return Ok(false);
+    }
+
+    // 「关于」页：只读长页。↑/↓/PgUp/PgDn/Home/End 滚动内容，U/Enter 走既有更新检查；
+    // Esc/F3/Tab/数字键/Ctrl+S/←→ 已在上面处理，仍然可用。
+    if screen
+        .settings
+        .as_ref()
+        .is_some_and(|s| s.tab == SettingsTab::About)
+    {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                screen.about_scroll = screen.about_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                screen.about_scroll = screen.about_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                screen.about_scroll = screen.about_scroll.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                screen.about_scroll = screen.about_scroll.saturating_add(5);
+            }
+            KeyCode::Home => screen.about_scroll = 0,
+            KeyCode::End => screen.about_scroll = usize::MAX, // 绘制时按内容高度收敛
+            KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Enter => {
+                screen.begin_update_check(cli_commands::CliUpdate::Check);
+            }
+            _ => {}
+        }
         return Ok(false);
     }
 
@@ -9558,6 +10529,9 @@ fn handle_settings_key(
                 }
             }
             1 => {
+                if defer_settings_action(&mut screen.status, runner) {
+                    return Ok(false);
+                }
                 if matches!(
                     key.code,
                     KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
@@ -9570,19 +10544,29 @@ fn handle_settings_key(
                 }
             }
             2 if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') => {
-                if let Some(owner) = runner.as_ref() {
-                    let config =
+                let (config, path) = match runner.as_ref() {
+                    Some(owner) => (
                         cyber_mcp::McpServersConfig::load(&owner.ctx.paths.mcp_servers_file)
-                            .unwrap_or_default();
-                    let path = owner.ctx.paths.mcp_servers_file.clone();
-                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::new(
-                        config,
-                        owner.registries.mcp.as_deref(),
-                        path,
-                    ));
-                } else {
-                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::default());
-                }
+                            .unwrap_or_default(),
+                        owner.ctx.paths.mcp_servers_file.clone(),
+                    ),
+                    None => (
+                        cyber_mcp::McpServersConfig::load(
+                            &screen.view_snapshot.paths.mcp_servers_file,
+                        )
+                        .unwrap_or_default(),
+                        screen.view_snapshot.paths.mcp_servers_file.clone(),
+                    ),
+                };
+                let mcp = match runner.as_ref() {
+                    Some(owner) => owner.registries.mcp.clone(),
+                    None => screen.view_snapshot.mcp.clone(),
+                };
+                screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::new(
+                    config,
+                    mcp.as_deref(),
+                    path,
+                ));
                 screen.panel = Some(Panel::Mcp);
                 return Ok(false);
             }
@@ -9606,11 +10590,49 @@ fn handle_settings_key(
             _ => {}
         },
         SettingsTab::Toolbox => {
-            let total = settings.custom_tools.len();
-            if settings.selected_row < total {
-                let name = settings.custom_tools[settings.selected_row].name.clone();
+            // A 添加自定义工具：与当前行无关（空清单或停在扫描行上同样可用）。
+            if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
+                if defer_settings_action(&mut screen.status, runner) {
+                    return Ok(false);
+                }
+                if let Some(owner) = runner.as_mut() {
+                    if let Ok(CliAction::Form(form)) = cli_commands::execute(owner, "/toolbox add")
+                    {
+                        settings.tools_pending_delete = None;
+                        screen.settings_return_tab = Some(SettingsTab::Toolbox);
+                        screen.form = Some(FormState::new(form));
+                        screen.panel = None;
+                    }
+                }
+                return Ok(false);
+            }
+            if settings.selected_row == 0 {
+                // 首行：打开 AI 智能扫描表单（目标路径/提示词 + 服务商/模型 + 仅预览）。
+                if key.code == KeyCode::Enter {
+                    if screen.setup_mode {
+                        screen.status =
+                            "请先 Ctrl+S 保存服务商配置；Esc 完成首次配置后即可运行 AI 扫描".into();
+                        return Ok(false);
+                    }
+                    if defer_settings_action(&mut screen.status, runner) {
+                        return Ok(false);
+                    }
+                    settings.tools_pending_delete = None;
+                    let (provider, model) = scan_form_defaults(runner.as_ref());
+                    screen.settings_return_tab = Some(SettingsTab::Toolbox);
+                    screen.form = Some(FormState::new(cli_commands::toolbox_scan_form(
+                        provider, model,
+                    )));
+                    screen.panel = None;
+                    return Ok(false);
+                }
+            } else if let Some(tool_idx) = toolbox_tool_row(settings) {
+                let name = settings.custom_tools[tool_idx].name.clone();
                 match key.code {
                     KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         if let Some(owner) = runner.as_mut() {
                             if let Ok(CliAction::Form(form)) =
                                 cli_commands::execute(owner, &format!("/toolbox edit {name}"))
@@ -9623,7 +10645,10 @@ fn handle_settings_key(
                         }
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') => {
-                        if settings.tools_pending_delete == Some(settings.selected_row) {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
+                        if settings.tools_pending_delete == Some(tool_idx) {
                             if let Some(owner) = runner.as_mut() {
                                 let _ = cli_commands::execute(
                                     owner,
@@ -9647,41 +10672,12 @@ fn handle_settings_key(
                             settings.selected_row =
                                 settings.selected_row.min(settings.custom_tools.len());
                         } else {
-                            settings.tools_pending_delete = Some(settings.selected_row);
+                            settings.tools_pending_delete = Some(tool_idx);
                             screen.status = format!("再次按 D 确认删除自定义工具 {name}");
-                        }
-                    }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        if let Some(owner) = runner.as_mut() {
-                            if let Ok(CliAction::Form(form)) =
-                                cli_commands::execute(owner, "/toolbox add")
-                            {
-                                settings.tools_pending_delete = None;
-                                screen.settings_return_tab = Some(SettingsTab::Toolbox);
-                                screen.form = Some(FormState::new(form));
-                                screen.panel = None;
-                            }
                         }
                     }
                     _ => {}
                 }
-            } else if key.code == KeyCode::Enter {
-                // 末行：运行 AI 智能扫描（结果输出到对话区）。
-                if screen.setup_mode {
-                    screen.status =
-                        "请先 Ctrl+S 保存服务商配置；Esc 完成首次配置后即可运行 /toolbox scan"
-                            .into();
-                    return Ok(false);
-                }
-                settings.tools_pending_delete = None;
-                screen.panel = None;
-                let action = cli_commands::execute(
-                    runner
-                        .as_mut()
-                        .ok_or_else(|| color_eyre::eyre::eyre!("会话不可用"))?,
-                    "/toolbox scan",
-                )?;
-                return apply_action(screen, action, runner, permissions, events, active, cancel);
             }
         }
         SettingsTab::Providers => {
@@ -9693,6 +10689,9 @@ fn handle_settings_key(
                         settings.dirty = true;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         open_provider_wizard(
                             runner,
                             &mut screen.settings_return_tab,
@@ -9783,6 +10782,9 @@ fn handle_settings_key(
                         screen.picker_selected = 0;
                     }
                     KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         if let Some(r) = runner.as_mut() {
                             if let Ok(CliAction::Form(form)) =
                                 cli_commands::execute(r, &format!("/provider edit {name}"))
@@ -9810,6 +10812,9 @@ fn handle_settings_key(
                     _ => {}
                 }
             } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
+                if defer_settings_action(&mut screen.status, runner) {
+                    return Ok(false);
+                }
                 open_provider_wizard(
                     runner,
                     &mut screen.settings_return_tab,
@@ -9828,6 +10833,9 @@ fn handle_settings_key(
             if settings.selected_row < env_slots {
                 match key.code {
                     KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         if let Some(r) = runner.as_mut() {
                             if settings.dirty {
                                 r.ctx.config = settings.config_draft.clone();
@@ -9844,10 +10852,14 @@ fn handle_settings_key(
                             }
                         }
                     }
-                    KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter if env_count > 0 => {
+                    // 只读态 Enter 已被路由层拦截为「进入编辑态」；打开编辑表单保留给 E。
+                    KeyCode::Char('e') | KeyCode::Char('E') if env_count > 0 => {
                         let var_key = settings.config_draft.env.vars[settings.selected_row]
                             .key
                             .clone();
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         if let Some(r) = runner.as_mut() {
                             if settings.dirty {
                                 r.ctx.config = settings.config_draft.clone();
@@ -9895,6 +10907,9 @@ fn handle_settings_key(
                 let rule_idx = settings.selected_row - env_slots;
                 match key.code {
                     KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         if let Some(r) = runner.as_mut() {
                             if settings.dirty {
                                 r.ctx.config = settings.config_draft.clone();
@@ -9912,7 +10927,11 @@ fn handle_settings_key(
                             }
                         }
                     }
-                    KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter if mem_count > 0 => {
+                    // 只读态 Enter 已被路由层拦截为「进入编辑态」；打开编辑表单保留给 E。
+                    KeyCode::Char('e') | KeyCode::Char('E') if mem_count > 0 => {
+                        if defer_settings_action(&mut screen.status, runner) {
+                            return Ok(false);
+                        }
                         if let Some(r) = runner.as_mut() {
                             if settings.dirty {
                                 r.ctx.config = settings.config_draft.clone();
@@ -10031,6 +11050,8 @@ fn handle_settings_key(
             }
             _ => {}
         },
+        // 「关于」页只读，无 per-tab 动作（上游提前 return，实际不可达）。
+        SettingsTab::About => {}
     }
 
     Ok(false)
@@ -10594,11 +11615,15 @@ fn handle_model_picker_key(
                     .cloned();
 
                 if let (Some(prov), Some(model)) = (selected_provider, selected_model) {
-                    if let Some(r) = runner.as_mut() {
-                        if let Err(err) = r.select_model_persisted(&prov, Some(&model)) {
-                            screen.message("Error", &format!("保存模型失败: {err}"), ERROR);
-                            return Ok(false);
-                        }
+                    // runner 已被 take 走（回合进行中）：不得显示未落盘的假成功。
+                    let Some(r) = runner.as_mut() else {
+                        screen.status =
+                            "回合进行中：模型切换需等回合结束后再执行（面板保持打开）".into();
+                        return Ok(false);
+                    };
+                    if let Err(err) = r.select_model_persisted(&prov, Some(&model)) {
+                        screen.message("Error", &format!("保存模型失败: {err}"), ERROR);
+                        return Ok(false);
                     }
                     screen.provider = prov.clone();
                     screen.model = model.clone();
@@ -11127,7 +12152,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
     if start == CliStart::Setup {
         // 首次配置向导：直接落在设置中心的 Providers 页，配置缺失时自动打开预设向导。
         screen.setup_mode = true;
-        let mut settings = CliSettingsState::from_runner(owner);
+        let mut settings = CliSettingsState::from_view(&owner.view());
         settings.tab = SettingsTab::Providers;
         screen.settings = Some(settings);
         screen.panel = Some(Panel::Settings);
@@ -11156,13 +12181,18 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
     if let Some(newer) = screen.new_version.as_deref() {
         screen.message(
             "Notice",
-            &format!("💡 检测到新版本 V{newer}，可运行 cyber update 进行更新"),
+            &format!("💡 检测到新版本 V{newer}，可运行 /update 更新（或退出后 cyber update）"),
             AMBER,
         );
     }
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
     let (models_tx, mut models_rx) = mpsc::unbounded_channel::<ModelFetchResult>();
     screen.model_fetch_tx = Some(models_tx);
+    // `/update` 联网检查通道：`--mock` 下不注入，`/update` 退化为只读本地缓存。
+    let (update_check_tx, mut update_check_rx) = mpsc::unbounded_channel::<UpdateCheckResult>();
+    if !mock {
+        screen.update_check_tx = Some(update_check_tx);
+    }
     if !mock {
         tokio::spawn(async move {
             if let Some(info) = cyber_core::update::check_for_updates(false).await {
@@ -11199,7 +12229,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                         screen.new_version = Some(new_ver.clone());
                         screen.message(
                             "Notice",
-                            &format!("💡 检测到新版本 V{new_ver}，可运行 cyber update 进行更新"),
+                            &format!("💡 检测到新版本 V{new_ver}，可运行 /update 更新（或退出后 cyber update）"),
                             AMBER,
                         );
                     }
@@ -11209,6 +12239,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                         state.deliver_fetch(fetch);
                     }
                 }
+                Some(result) = update_check_rx.recv() => screen.deliver_update(result),
                 _ = tick.tick() => {
                     if !TERMINAL_ACTIVE.load(Ordering::SeqCst) {
                         color_eyre::eyre::bail!("A task panicked; the terminal was restored. See the diagnostic above.");
@@ -11308,17 +12339,15 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                     screen.busy = false;
                     screen.status.clear();
                     screen.active_steering_tx = None;
-                    if let Some(next_prompt) = screen.queued_prompts.pop_front() {
-                        spawn_turn(
-                            &mut screen,
-                            &mut runner,
-                            next_prompt.text,
-                            next_prompt.displayed,
-                            &permissions,
-                            &event_tx,
-                            &mut active,
-                            &mut cancel,
-                        );
+                    if drain_queued_inputs(
+                        &mut screen,
+                        &mut runner,
+                        &permissions,
+                        &event_tx,
+                        &mut active,
+                        &mut cancel,
+                    )? {
+                        break;
                     }
                 }
                 event = events.next() => {
@@ -11376,7 +12405,9 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                         Some(Ok(Event::Mouse(mouse))) => {
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => {
-                                    if screen.panel == Some(Panel::Mcp) {
+                                    if screen.panel == Some(Panel::Settings) {
+                                        screen.settings_scroll(true);
+                                    } else if screen.panel == Some(Panel::Mcp) {
                                         if let Some(mcp) = screen.mcp_panel.as_mut() {
                                             mcp.scroll_up(3);
                                         }
@@ -11401,6 +12432,8 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                         } else if screen.ctf_selected > 0 {
                                             screen.ctf_selected = screen.ctf_selected.saturating_sub(1);
                                         }
+                                    } else if screen.panel == Some(Panel::About) {
+                                        screen.about_scroll = screen.about_scroll.saturating_sub(3);
                                     } else if screen.approval.is_some() {
                                         screen.approval_scroll = screen.approval_scroll.saturating_sub(3);
                                     } else if let Some(view) = screen.subagent_view.as_mut() {
@@ -11416,7 +12449,9 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                     }
                                 }
                                 MouseEventKind::ScrollDown => {
-                                    if screen.panel == Some(Panel::Mcp) {
+                                    if screen.panel == Some(Panel::Settings) {
+                                        screen.settings_scroll(false);
+                                    } else if screen.panel == Some(Panel::Mcp) {
                                         if let Some(mcp) = screen.mcp_panel.as_mut() {
                                             mcp.scroll_down(3);
                                         }
@@ -11447,6 +12482,8 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                                 screen.ctf_selected += 1;
                                             }
                                         }
+                                    } else if screen.panel == Some(Panel::About) {
+                                        screen.about_scroll = screen.about_scroll.saturating_add(3);
                                     } else if screen.approval.is_some() {
                                         screen.approval_scroll = screen
                                             .approval_scroll
@@ -11688,10 +12725,121 @@ fn drain_background_completions(
             screen.queued_prompts.push_back(QueuedPrompt {
                 text: prompt,
                 displayed: true,
+                kind: QueuedKind::Prompt,
             });
         }
     }
     Ok(())
+}
+
+/// busy（thinking/流式/工具执行）期间以 `/` 开头的输入的处置。
+enum BusySlash {
+    /// 立即执行（交 apply_action）
+    Action(CliAction),
+    /// 已在 screen 侧执行完毕（/paste、/bg run 等）
+    Handled,
+    /// 需要 runner：排队到回合结束后按序执行
+    Defer,
+    /// 退出（/quit、/exit）
+    Quit,
+}
+
+/// busy 期间以 `/` 开头输入的分类：先交 `readonly_action`（与空闲同源的只读分派，立即执行），
+/// 其余不触碰 runner 的本地指令就地执行，需要 runner 的按顺序排队。
+fn classify_busy_slash(screen: &mut CliScreen, text: &str) -> BusySlash {
+    // 只读指令（含面板与列表）解析为动作后立即执行；需要 runner 的指令返回 None 继续走
+    // 下面的排队/就地分支。与空闲路径共用 `readonly_action`，输出逐字节一致。
+    let readonly = cli_commands::readonly_action(&screen.view(), text);
+    match readonly {
+        Ok(Some(action)) => return BusySlash::Action(action),
+        Err(error) => return BusySlash::Action(cli_commands::error_action(&error)),
+        Ok(None) => {}
+    }
+    // `/update` 不在 `slash::COMMANDS` 中（TUI 专属入口），由上方 `readonly_action`
+    // 以 `update_action` 分派后立即执行，不再落到 `Unknown` 分支。
+    match crate::slash::parse(text) {
+        crate::slash::SlashCommand::Quit => BusySlash::Quit,
+        crate::slash::SlashCommand::Cancel => BusySlash::Action(CliAction::Cancel),
+        crate::slash::SlashCommand::Todo(args) => {
+            match cli_commands::todo_action(&screen.todos, &args) {
+                Ok((action, _)) => BusySlash::Action(action),
+                Err(error) => BusySlash::Action(cli_commands::error_action(&error)),
+            }
+        }
+        crate::slash::SlashCommand::Image(args) => {
+            let arg = args.trim();
+            if arg.is_empty() || arg.eq_ignore_ascii_case("paste") {
+                if !screen.handle_clipboard_image_or_text() {
+                    screen.message(
+                        "Error",
+                        "剪贴板中未检测到图片。\n提示：\n1. Windows Terminal 会拦截 Ctrl+V，请按 Alt+V 粘贴图片！\n2. 或使用 /image <路径|URL> 指定图片路径。",
+                        ERROR,
+                    );
+                }
+                BusySlash::Handled
+            } else {
+                BusySlash::Defer
+            }
+        }
+        crate::slash::SlashCommand::Bg(args) => match cli_commands::parse_bg(&args) {
+            Ok(cli_commands::CliJobs::Run { .. }) => {
+                screen.message(
+                    "后台任务",
+                    "AI 正在运行，请先 /cancel 或等待完成后再启动后台子代理",
+                    MUTED,
+                );
+                BusySlash::Handled
+            }
+            Ok(jobs) => BusySlash::Action(CliAction::Jobs(jobs)),
+            Err(error) => {
+                screen.message("Error", &error.to_string(), ERROR);
+                BusySlash::Handled
+            }
+        },
+        crate::slash::SlashCommand::Subagents(args) => {
+            let lower = args.trim().to_ascii_lowercase();
+            if lower == "stop" || lower.starts_with("stop ") {
+                let target = lower.strip_prefix("stop").unwrap_or("").trim();
+                let message = match cli_commands::stop_subagents(
+                    &screen.background,
+                    &screen.subagents,
+                    target,
+                ) {
+                    Ok(msg) => msg,
+                    Err(err) => err.to_string(),
+                };
+                screen.message("Subagents", &message, ACCENT);
+                BusySlash::Handled
+            } else {
+                BusySlash::Defer
+            }
+        }
+        crate::slash::SlashCommand::Unknown(_) => {
+            screen.message("Error", "Unknown command; use /help", ERROR);
+            BusySlash::Handled
+        }
+        _ => BusySlash::Defer,
+    }
+}
+
+/// busy 期间需要 runner 的指令入队：回执排队条数，回合收尾由 `drain_queued_inputs`
+/// 依次执行。输入框提交与面板内选中（如会话选择器 Enter）共用，避免静默丢弃。
+fn queue_busy_command(screen: &mut CliScreen, text: &str) {
+    screen.queued_prompts.push_back(QueuedPrompt {
+        text: text.to_owned(),
+        displayed: true,
+        kind: QueuedKind::Command,
+    });
+    let pending = screen
+        .queued_prompts
+        .iter()
+        .filter(|q| q.kind == QueuedKind::Command)
+        .count();
+    screen.message(
+        "已排队",
+        &format!("回合结束后执行：{text}（排队 {pending} 条指令）"),
+        MUTED,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11817,7 +12965,7 @@ fn handle_key(
         }
     }
     if screen.panel == Some(Panel::Settings) {
-        return handle_settings_key(screen, runner, permissions, events, active, cancel, key);
+        return handle_settings_key(screen, runner, permissions, key);
     }
     if screen.panel == Some(Panel::ModelPicker) {
         return handle_model_picker_key(screen, runner, key);
@@ -11842,12 +12990,13 @@ fn handle_key(
                 screen.panel = Some(Panel::Settings);
                 if let Some(settings) = screen.settings.as_mut() {
                     settings.tab = tab;
+                    settings.editing = false;
                     if let Some(owner) = runner.as_ref() {
                         settings.providers_draft = owner.ctx.providers.clone();
                         settings.config_draft = owner.ctx.config.clone();
                     }
-                } else if let Some(owner) = runner.as_ref() {
-                    let mut s = CliSettingsState::from_runner(owner);
+                } else {
+                    let mut s = settings_state(runner, screen);
                     s.tab = tab;
                     screen.settings = Some(s);
                 }
@@ -11895,6 +13044,31 @@ fn handle_key(
         }
         return Ok(false);
     }
+    // 全屏「关于」面板：只读；↑/↓/PgUp/PgDn 滚动，U/Enter 检查更新，? 关闭（Esc 已在上面处理）。
+    if screen.panel == Some(Panel::About) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                screen.about_scroll = screen.about_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                screen.about_scroll = screen.about_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                screen.about_scroll = screen.about_scroll.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                screen.about_scroll = screen.about_scroll.saturating_add(5);
+            }
+            KeyCode::Home => screen.about_scroll = 0,
+            KeyCode::End => screen.about_scroll = usize::MAX,
+            KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Enter => {
+                screen.begin_update_check(cli_commands::CliUpdate::Check);
+            }
+            KeyCode::Char('?') => screen.panel = None,
+            _ => {}
+        }
+        return Ok(false);
+    }
     if control && key.code == KeyCode::Char('t') {
         if screen.panel == Some(Panel::Ctf) {
             screen.panel = None;
@@ -11917,6 +13091,17 @@ fn handle_key(
         }
         return Ok(false);
     }
+    if key.code == KeyCode::F(1)
+        && screen.approval.is_none()
+        && screen.form.is_none()
+        && screen.picker.is_none()
+    {
+        screen.about_scroll = 0;
+        let info = AboutInfo::collect(screen);
+        screen.about = Some(info);
+        screen.panel = Some(Panel::About);
+        return Ok(false);
+    }
     if (control && key.code == KeyCode::Char(',')) || key.code == KeyCode::F(3) {
         if screen.panel == Some(Panel::Settings) {
             if let Some(settings) = screen.settings.as_mut() {
@@ -11928,14 +13113,8 @@ fn handle_key(
             screen.panel = None;
             screen.settings = None;
         } else {
-            if let Some(r) = runner.as_ref() {
-                screen.settings = Some(CliSettingsState::from_runner(r));
-            } else {
-                screen.settings = Some(CliSettingsState::new(
-                    &Config::default(),
-                    &ProvidersConfig::default(),
-                ));
-            }
+            let state = settings_state(runner, screen);
+            screen.settings = Some(state);
             screen.panel = Some(Panel::Settings);
         }
         return Ok(false);
@@ -12165,12 +13344,13 @@ fn handle_key(
                 screen.panel = Some(Panel::Settings);
                 if let Some(settings) = screen.settings.as_mut() {
                     settings.tab = tab;
+                    settings.editing = false;
                     if let Some(owner) = runner.as_ref() {
                         settings.providers_draft = owner.ctx.providers.clone();
                         settings.config_draft = owner.ctx.config.clone();
                     }
-                } else if let Some(owner) = runner.as_ref() {
-                    let mut s = CliSettingsState::from_runner(owner);
+                } else {
+                    let mut s = settings_state(runner, screen);
                     s.tab = tab;
                     screen.settings = Some(s);
                 }
@@ -12200,6 +13380,64 @@ fn handle_key(
             ACCENT,
         );
         return Ok(false);
+    }
+    // todo 清单三态：Alt+↑ 逐级展开（收起→精简→全量），Alt+↓ 逐级收起（全量→精简→收起）。
+    // 裸 ↑/↓ 已被补全菜单/输入历史/滚动占用；小键盘方向键在本 harness 下与主键盘方向键同码
+    // （crossterm 0.28 的 `KeyEventState::KEYPAD` 仅 Unix CSI-u/kitty 路径产生，本项目未启用
+    // 键盘增强标志），故用 Alt 组合键。到顶/到底时按键被消费但状态与提示不变。
+    if (key.code == KeyCode::Up || key.code == KeyCode::Down)
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && screen.approval.is_none()
+        && screen.form.is_none()
+        && screen.picker.is_none()
+        && screen.subagent_view.is_none()
+    {
+        let expand = key.code == KeyCode::Up;
+        let next = match (expand, screen.todo_view) {
+            (true, TodoView::Collapsed) => TodoView::Summary,
+            (true, TodoView::Summary) => TodoView::Full,
+            (true, TodoView::Full) => TodoView::Full,
+            (false, TodoView::Full) => TodoView::Summary,
+            (false, TodoView::Summary) => TodoView::Collapsed,
+            (false, TodoView::Collapsed) => TodoView::Collapsed,
+        };
+        if next != screen.todo_view {
+            screen.todo_view = next;
+            screen.status = match next {
+                TodoView::Collapsed => "任务清单已收起（/todo open 或 Alt+↑ 展开）".into(),
+                TodoView::Summary => "任务清单已展开（Alt+↑ 全展 · Alt+↓ 收起）".into(),
+                TodoView::Full => "任务清单已全量展开（Alt+↓ 收起）".into(),
+            };
+        }
+        return Ok(false);
+    }
+    // `/update` 确认态：y = 用安装脚本更新（可能需要退出），n/其它键取消；面板与表单态不接管。
+    if let Some(pending) = screen
+        .update_pending
+        .as_ref()
+        .map(|info| info.version.clone())
+    {
+        if screen.approval.is_none()
+            && screen.form.is_none()
+            && screen.picker.is_none()
+            && screen.subagent_view.is_none()
+        {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if key.modifiers.is_empty() => {
+                    return Ok(screen.start_update(&pending));
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if key.modifiers.is_empty() => {
+                    screen.update_pending = None;
+                    screen.status = "已取消更新（可按 /update 重新检查）".into();
+                    screen.message("更新", "已取消更新", MUTED);
+                    return Ok(false);
+                }
+                _ => {
+                    screen.update_pending = None;
+                    screen.status = "已取消更新（可按 /update 重新检查）".into();
+                }
+            }
+        }
     }
     if !screen.completion_closed
         && !screen.completions.is_empty()
@@ -12448,12 +13686,12 @@ fn handle_key(
                 }
                 KeyCode::Char('r') => {
                     // 重新拉取：用表单当前值构造临时配置（同步阻塞，与 Settings 的 T 键同模式）。
-                    let cfg = provider_config_from_form(form);
+                    let cfg = provider_config_for_form(form, runner.as_ref());
                     let res = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(cyber_agent::fetch_models(&cfg))
                     })
                     .map_err(|e| e.to_string());
-                    let provider_name = form.input_value("name").trim().to_string();
+                    let provider_name = form_provider_name(form);
                     let models_map = runner
                         .as_ref()
                         .and_then(|r| r.ctx.providers.providers.get(&provider_name))
@@ -12468,7 +13706,7 @@ fn handle_key(
                         .and_then(|p| p.entries.get(p.selected))
                         .map(|e| e.id.clone());
                     if let Some(model) = model {
-                        let cfg = provider_config_from_form(form);
+                        let cfg = provider_config_for_form(form, runner.as_ref());
                         let is_vision = key.code == KeyCode::Char('v');
                         let cap = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
@@ -12483,7 +13721,7 @@ fn handle_key(
                                 }
                             })
                         });
-                        let provider_name = form.input_value("name").trim().to_string();
+                        let provider_name = form_provider_name(form);
                         screen.status = match cap {
                             Ok(ProbeKindLite::Vision(c)) => {
                                 let _ = cyber_core::save_model_vision_capability(
@@ -12550,23 +13788,40 @@ fn handle_key(
                 _ => {}
             }
         }
-        // 3) 光标停在 model 字段：Enter/空格 → 有缓存列表直接打开，否则拉取。
+        // 3) 光标停在 model 字段：Enter（扫描表单仅 Enter）→ 打开模型列表。
+        //    Provider 表单按需联网拉取；扫描表单只列 `providers.toml` 的本地模型（不联网）。
+        let scan_form = matches!(form.form.kind, FormKind::ToolboxScan);
+        let model_open_key =
+            key.code == KeyCode::Enter || (!scan_form && key.code == KeyCode::Char(' '));
         let on_model = form
             .form
             .fields
             .get(form.selected)
             .is_some_and(|f| f.name == "model");
-        if on_model
-            && form.model_picker.is_none()
-            && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
-        {
-            let provider_name = form.input_value("name").trim().to_string();
+        if on_model && form.model_picker.is_none() && model_open_key {
+            let provider_name = form_provider_name(form);
             let models_map = runner
                 .as_ref()
                 .and_then(|r| r.ctx.providers.providers.get(&provider_name))
                 .map(|p| &p.models);
-            if form.last_models.is_empty() {
-                let cfg = provider_config_from_form(form);
+            if scan_form {
+                let mut local: Vec<String> = models_map
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                sort_model_ids(&mut local);
+                if local.is_empty() {
+                    form.open_model_picker(
+                        Err(format!(
+                            "服务商 [{provider_name}] 未在 providers.toml 配置模型清单；请直接手输模型名"
+                        )),
+                        models_map,
+                        &provider_name,
+                    );
+                } else {
+                    form.open_model_picker(Ok(local), models_map, &provider_name);
+                }
+            } else if form.last_models.is_empty() {
+                let cfg = provider_config_for_form(form, runner.as_ref());
                 let res = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(cyber_agent::fetch_models(&cfg))
                 })
@@ -12628,6 +13883,25 @@ fn handle_key(
                     .form
                     .fields
                     .get(form.selected)
+                    .is_some_and(|f| f.name == "provider")
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    let names: Vec<String> = runner
+                        .as_ref()
+                        .map(|r| r.ctx.providers.sorted_names())
+                        .unwrap_or_default();
+                    if !names.is_empty() {
+                        let options: Vec<&str> = names.iter().map(String::as_str).collect();
+                        cycle_field_value(form, &options, key.code == KeyCode::Left);
+                    }
+                }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
                     .is_some_and(|f| f.name == "kind")
                     && matches!(
                         key.code,
@@ -12653,15 +13927,12 @@ fn handle_key(
                     form.inputs[form.selected] = composer();
                     form.inputs[form.selected].insert_str(new_kind);
                 }
-                _ if form
-                    .form
-                    .fields
-                    .get(form.selected)
-                    .is_some_and(|f| matches!(f.name.as_str(), "sensitive" | "enabled"))
-                    && matches!(
-                        key.code,
-                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                    ) =>
+                _ if form.form.fields.get(form.selected).is_some_and(|f| {
+                    matches!(f.name.as_str(), "sensitive" | "enabled" | "preview")
+                }) && matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                ) =>
                 {
                     let cur_val = form.inputs[form.selected]
                         .lines()
@@ -12766,8 +14037,9 @@ fn handle_key(
                         key.code == KeyCode::Left,
                     );
                 }
-                // model / thinking 三行的值不在输入框里自由编辑（model 仅手输模式开放）。
-                _ if !(sel_field_name == "model" && manual_model)
+                // model / thinking 三行的值不在输入框里自由编辑（model 仅手输模式开放；
+                // 工具库扫描表单的 model 直接手输，Enter 打开列表）。
+                _ if !(scan_form || (sel_field_name == "model" && manual_model))
                     && matches!(
                         sel_field_name.as_str(),
                         "model" | "thinking_type" | "thinking_effort"
@@ -12833,6 +14105,7 @@ fn handle_key(
                     screen.panel = Some(Panel::Settings);
                     if let Some(settings) = screen.settings.as_mut() {
                         settings.tab = tab;
+                        settings.editing = false;
                         if let Some(owner) = runner.as_ref() {
                             settings.providers_draft = owner.ctx.providers.clone();
                             settings.config_draft = owner.ctx.config.clone();
@@ -12841,21 +14114,34 @@ fn handle_key(
                 }
                 return Ok(false);
             }
-            if let Some(owner) = runner.as_mut() {
-                match cli_commands::execute(owner, &command) {
-                    Ok(action) => {
-                        return apply_action(
-                            screen,
-                            action,
-                            runner,
-                            permissions,
-                            events,
-                            active,
-                            cancel,
-                        )
+            // 回合进行中（runner 已被 take 走）：与在输入框里敲同一指令等价
+            // （只读立即执行、本地立即执行、需 runner 的入队），不得静默丢弃选中项。
+            let Some(owner) = runner.as_mut() else {
+                return match classify_busy_slash(screen, &command) {
+                    BusySlash::Quit => Ok(true),
+                    BusySlash::Handled => Ok(false),
+                    BusySlash::Action(action) => {
+                        apply_action(screen, action, runner, permissions, events, active, cancel)
                     }
-                    Err(error) => screen.message("Error", &error.to_string(), ERROR),
+                    BusySlash::Defer => {
+                        queue_busy_command(screen, &command);
+                        Ok(false)
+                    }
+                };
+            };
+            match cli_commands::execute(owner, &command) {
+                Ok(action) => {
+                    return apply_action(
+                        screen,
+                        action,
+                        runner,
+                        permissions,
+                        events,
+                        active,
+                        cancel,
+                    )
                 }
+                Err(error) => screen.message("Error", &error.to_string(), ERROR),
             }
         }
         return Ok(false);
@@ -12895,77 +14181,27 @@ fn handle_key(
     }
 
     if screen.busy {
-        if text.eq_ignore_ascii_case("/quit") || text.eq_ignore_ascii_case("/exit") {
-            return Ok(true);
-        }
-        if text.eq_ignore_ascii_case("/cancel") {
-            screen.input = composer();
-            screen.completions.clear();
-            screen.reply(PermissionDecision::Deny);
-            if let Some(tx) = cancel.take() {
-                let _ = tx.send(());
-            }
-            screen.status = "Cancelling".into();
-            return Ok(false);
-        }
+        let text_owned = text.to_owned();
+        screen.input = composer();
+        screen.completions.clear();
         if text.starts_with('/') {
-            // `/bg` 命令族 busy 时可用（shell/list/kill/tail 不触碰 runner；
-            // run 需要 provider 上下文，返回忙碌提示）。
-            let bg_args = text
-                .strip_prefix("/bg")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if text.eq_ignore_ascii_case("/bg") || text.to_ascii_lowercase().starts_with("/bg ") {
-                screen.input = composer();
-                screen.completions.clear();
-                match cli_commands::parse_bg(&bg_args) {
-                    Ok(cli_commands::CliJobs::Run { .. }) => {
-                        screen.message(
-                            "后台任务",
-                            "AI 正在运行，请先 /cancel 或等待完成后再启动后台子代理",
-                            MUTED,
-                        );
-                    }
-                    Ok(jobs) => {
-                        return apply_action(
-                            screen,
-                            CliAction::Jobs(jobs),
-                            runner,
-                            permissions,
-                            events,
-                            active,
-                            cancel,
-                        )
-                    }
-                    Err(error) => screen.message("Error", &error.to_string(), ERROR),
+            // 以 / 开头的输入一律交 classify_busy_slash：本地指令立即执行，
+            // 需要 runner 的指令排队（回合收尾 drain_queued_inputs 执行），不再静默丢弃。
+            return match classify_busy_slash(screen, &text_owned) {
+                BusySlash::Quit => Ok(true),
+                BusySlash::Handled => Ok(false),
+                BusySlash::Action(action) => {
+                    apply_action(screen, action, runner, permissions, events, active, cancel)
                 }
-                return Ok(false);
-            }
-
-            let lower = text.to_ascii_lowercase();
-            if lower == "/subagents stop" || lower.starts_with("/subagents stop ") {
-                screen.input = composer();
-                screen.completions.clear();
-                let target = lower.strip_prefix("/subagents stop").unwrap_or("").trim();
-                let message = match cli_commands::stop_subagents(
-                    &screen.background,
-                    &screen.subagents,
-                    target,
-                ) {
-                    Ok(msg) => msg,
-                    Err(err) => err.to_string(),
-                };
-                screen.message("Subagents", &message, ACCENT);
-                return Ok(false);
-            }
-            return Ok(false);
+                BusySlash::Defer => {
+                    queue_busy_command(screen, &text_owned);
+                    Ok(false)
+                }
+            };
         }
 
         if has_alt_or_ctrl {
             // Alt+Enter / Ctrl+Enter: 即时导向（立刻打断当前生成并读取新指示）
-            screen.input = composer();
-            screen.completions.clear();
             screen.message("You (立刻打断)", text, ACCENT);
             screen.prompt_history.push(text.to_owned());
             screen.history_index = None;
@@ -12980,6 +14216,7 @@ fn handle_key(
             screen.queued_prompts.push_back(QueuedPrompt {
                 text: text.to_owned(),
                 displayed: true,
+                kind: QueuedKind::Prompt,
             });
             return Ok(false);
         } else {
@@ -12999,6 +14236,7 @@ fn handle_key(
             screen.queued_prompts.push_back(QueuedPrompt {
                 text: text.to_owned(),
                 displayed: true,
+                kind: QueuedKind::Prompt,
             });
             return Ok(false);
         }
@@ -13112,6 +14350,83 @@ fn spawn_turn(
     true
 }
 
+/// 回合结束：按输入顺序消费排队输入——指令就地执行，遇到第一个排队提示词即启动新一轮并返回。
+/// 返回 `Ok(true)` 表示某条排队指令要求退出（/quit）。
+fn drain_queued_inputs(
+    screen: &mut CliScreen,
+    runner: &mut Option<SessionRunner>,
+    permissions: &Arc<PermissionBroker>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    active: &mut Option<ActiveTurn>,
+    cancel: &mut Option<oneshot::Sender<()>>,
+) -> color_eyre::Result<bool> {
+    while let Some(next) = screen.queued_prompts.pop_front() {
+        match next.kind {
+            QueuedKind::Command => {
+                let Some(owner) = runner.as_mut() else {
+                    screen.message(
+                        "已排队",
+                        &format!("指令未执行（回合未收尾）：{}", next.text),
+                        ERROR,
+                    );
+                    continue;
+                };
+                match cli_commands::execute(owner, &next.text) {
+                    Ok(action) => {
+                        if apply_action(
+                            screen,
+                            action,
+                            runner,
+                            permissions,
+                            events,
+                            active,
+                            cancel,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    Err(error) => screen.message("Error", &error.to_string(), ERROR),
+                }
+                if screen.busy {
+                    // 该指令自身开启了新回合（如 /compact），剩余队列留待下次收尾
+                    return Ok(false);
+                }
+            }
+            QueuedKind::Prompt => {
+                spawn_turn(
+                    screen,
+                    runner,
+                    next.text,
+                    next.displayed,
+                    permissions,
+                    events,
+                    active,
+                    cancel,
+                );
+                return Ok(false);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// 设置面板状态来源：空闲取 runner，回合进行中取 `CliScreen` 的只读快照
+/// （runner 已被 `take()` 走；不得退化为 `Config::default()` 的空面板）。
+fn settings_state(runner: &Option<SessionRunner>, screen: &CliScreen) -> CliSettingsState {
+    match runner {
+        Some(owner) => CliSettingsState::from_view(&owner.view()),
+        None => CliSettingsState::from_view(&screen.view()),
+    }
+}
+
+/// 模型面板状态来源（同 `settings_state`）。
+fn model_picker_state(runner: &Option<SessionRunner>, screen: &CliScreen) -> CliModelPickerState {
+    match runner {
+        Some(owner) => CliModelPickerState::from_view(&owner.view()),
+        None => CliModelPickerState::from_view(&screen.view()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_action(
     screen: &mut CliScreen,
@@ -13125,30 +14440,36 @@ fn apply_action(
     match action {
         CliAction::Output { title, text } => {
             if title == "Todo" && text.contains("已添加任务") {
-                screen.todo_closed = false;
+                screen.todo_view = TodoView::Summary;
             }
             screen.message(&title, &text, MUTED);
             if let Some(tab) = screen.settings_return_tab.take() {
                 screen.panel = Some(Panel::Settings);
                 if let Some(settings) = screen.settings.as_mut() {
                     settings.tab = tab;
+                    settings.editing = false;
                     if let Some(owner) = runner.as_ref() {
                         settings.providers_draft = owner.ctx.providers.clone();
                         settings.config_draft = owner.ctx.config.clone();
                     }
-                } else if let Some(owner) = runner.as_ref() {
-                    let mut s = CliSettingsState::from_runner(owner);
+                } else {
+                    let mut s = settings_state(runner, screen);
                     s.tab = tab;
                     screen.settings = Some(s);
                 }
             }
         }
         CliAction::TodoVisibility(open) => {
-            screen.todo_closed = !open;
-            if open {
-                screen.status = "任务清单已展开".into();
+            // `/todo open` 语义 = 精简态（与 Alt+↑ 展开一档一致）；全量态只能由 Alt+↑ 第二档到达。
+            screen.todo_view = if open {
+                TodoView::Summary
             } else {
-                screen.status = "任务清单已收起（输入 /todo open 重新展开）".into();
+                TodoView::Collapsed
+            };
+            if open {
+                screen.status = "任务清单已展开（Alt+↑ 全展 · Alt+↓ 收起）".into();
+            } else {
+                screen.status = "任务清单已收起（/todo open 或 Alt+↑ 展开）".into();
             }
         }
         CliAction::Refresh {
@@ -13171,12 +14492,13 @@ fn apply_action(
                 screen.panel = Some(Panel::Settings);
                 if let Some(settings) = screen.settings.as_mut() {
                     settings.tab = tab;
+                    settings.editing = false;
                     if let Some(owner) = runner.as_ref() {
                         settings.providers_draft = owner.ctx.providers.clone();
                         settings.config_draft = owner.ctx.config.clone();
                     }
-                } else if let Some(owner) = runner.as_ref() {
-                    let mut s = CliSettingsState::from_runner(owner);
+                } else {
+                    let mut s = settings_state(runner, screen);
                     s.tab = tab;
                     screen.settings = Some(s);
                 }
@@ -13188,25 +14510,35 @@ fn apply_action(
         }
         CliAction::Panel(panel) => {
             if panel == Panel::ModelPicker {
-                if let Some(owner) = runner.as_ref() {
-                    screen.model_picker = Some(CliModelPickerState::from_runner(owner));
-                }
                 // 打开只显示本地配置清单；接口拉取由左栏 Enter（选定 provider）或 r 触发。
+                let state = model_picker_state(runner, screen);
+                screen.model_picker = Some(state);
                 screen.refresh_model_picker_local();
             } else if panel == Panel::Mcp {
-                if let Some(owner) = runner.as_ref() {
-                    let config =
+                let (config, path) = match runner.as_ref() {
+                    Some(owner) => (
                         cyber_mcp::McpServersConfig::load(&owner.ctx.paths.mcp_servers_file)
-                            .unwrap_or_default();
-                    let path = owner.ctx.paths.mcp_servers_file.clone();
-                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::new(
-                        config,
-                        owner.registries.mcp.as_deref(),
-                        path,
-                    ));
-                } else {
-                    screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::default());
-                }
+                            .unwrap_or_default(),
+                        owner.ctx.paths.mcp_servers_file.clone(),
+                    ),
+                    None => {
+                        let view = screen.view();
+                        (
+                            cyber_mcp::McpServersConfig::load(&view.paths.mcp_servers_file)
+                                .unwrap_or_default(),
+                            view.paths.mcp_servers_file.clone(),
+                        )
+                    }
+                };
+                let mcp = match runner.as_ref() {
+                    Some(owner) => owner.registries.mcp.clone(),
+                    None => screen.view_snapshot.mcp.clone(),
+                };
+                screen.mcp_panel = Some(crate::views::mcp_panel::McpPanelState::new(
+                    config,
+                    mcp.as_deref(),
+                    path,
+                ));
             } else if panel == Panel::Ctf {
                 screen.ctf_enabled = true;
                 if let Some(r) = runner.as_mut() {
@@ -13219,19 +14551,22 @@ fn apply_action(
                 screen.ctf_detail_view = false;
                 screen.ctf_detail_scroll = 0;
                 screen.ctf_list_scroll.set(0);
+            } else if panel == Panel::About {
+                screen.about_scroll = 0;
+                let info = AboutInfo::collect(screen);
+                screen.about = Some(info);
             }
             screen.panel = Some(panel);
         }
         CliAction::Picker(picker) => {
             if matches!(picker.kind, cli_commands::PickerKind::Models) {
-                if let Some(owner) = runner.as_ref() {
-                    screen.model_picker = Some(CliModelPickerState::from_runner(owner));
-                    screen.panel = Some(Panel::ModelPicker);
-                    screen.picker = None;
-                    // 打开只显示本地配置清单；接口拉取由左栏 Enter（选定 provider）或 r 触发。
-                    screen.refresh_model_picker_local();
-                    return Ok(false);
-                }
+                // 打开只显示本地配置清单；接口拉取由左栏 Enter（选定 provider）或 r 触发。
+                let state = model_picker_state(runner, screen);
+                screen.model_picker = Some(state);
+                screen.panel = Some(Panel::ModelPicker);
+                screen.picker = None;
+                screen.refresh_model_picker_local();
+                return Ok(false);
             }
             screen.picker = Some(picker);
             screen.picker_selected = 0;
@@ -13240,6 +14575,10 @@ fn apply_action(
         CliAction::Task(task) => {
             if screen.busy || active.is_some() {
                 return Ok(false);
+            }
+            // 扫描任务接管整个视图（结果输出到对话区），不再回到设置中心。
+            if matches!(task, cli_commands::CliTask::ToolboxScan { .. }) {
+                screen.settings_return_tab = None;
             }
             if let Some(mut owned) = runner.take() {
                 permissions.set_mode(screen.permission_mode);
@@ -13265,6 +14604,7 @@ fn apply_action(
                 screen.status = "Cancelling".into();
             }
         }
+        CliAction::Update(kind) => screen.begin_update_check(kind),
         CliAction::Quit => return Ok(true),
         CliAction::Mode(mode) => {
             screen.permission_mode = mode;
@@ -13276,28 +14616,16 @@ fn apply_action(
             );
         }
         CliAction::Settings => {
-            if let Some(owner) = runner.as_ref() {
-                screen.settings = Some(CliSettingsState::from_runner(owner));
-            } else {
-                screen.settings = Some(CliSettingsState::new(
-                    &Config::default(),
-                    &ProvidersConfig::default(),
-                ));
-            }
+            let state = settings_state(runner, screen);
+            screen.settings = Some(state);
             screen.panel = Some(Panel::Settings);
         }
         CliAction::SettingsTab(tab) => {
-            if let Some(owner) = runner.as_ref() {
-                let mut settings = CliSettingsState::from_runner(owner);
-                settings.tab = tab;
-                screen.settings = Some(settings);
-            } else {
-                let mut settings =
-                    CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
-                settings.tab = tab;
-                screen.settings = Some(settings);
-            }
+            let mut state = settings_state(runner, screen);
+            state.tab = tab;
+            screen.settings = Some(state);
             screen.panel = Some(Panel::Settings);
+            screen.sync_about_if_active();
         }
         CliAction::Jobs(jobs) => match jobs {
             cli_commands::CliJobs::Shell { command } => {
@@ -13397,7 +14725,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                draw_todo_table(frame, Rect::new(0, 0, width, height), &items);
+                draw_todo_table(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    &items,
+                    TodoView::Summary,
+                );
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -13439,7 +14772,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                draw_todo_table(frame, Rect::new(0, 0, width, height), &items);
+                draw_todo_table(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    &items,
+                    TodoView::Summary,
+                );
             })
             .unwrap();
         let content: String = terminal
@@ -13918,6 +15256,7 @@ mod tests {
         let width = 75u16;
         let row = render_setting_row(
             true,
+            false,
             "测试设置标签项 (Test)",
             "当前设定值".into(),
             "这是一段长说明文字：用户在此可以配置核心功能，说明过长时会自动添加省略号，保证不会超出设定的面板宽度。".into(),
@@ -14500,6 +15839,7 @@ mod tests {
         screen.queued_prompts.push_back(QueuedPrompt {
             text: "queued text".into(),
             displayed: true,
+            kind: QueuedKind::Prompt,
         });
         let (tx, mut cancel_rx) = oneshot::channel();
         let mut cancel = Some(tx);
@@ -14781,7 +16121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_commands_cancel_or_quit_without_owner_and_never_spawn_another_turn() {
+    async fn busy_slash_commands_run_locally_or_queue_without_owner_and_never_spawn_another_turn() {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
         screen.busy = true;
@@ -14790,7 +16130,9 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         let mut cancel = Some(tx);
         let mut active = None;
-        for text in ["/new", "/model", "/compact"] {
+        // 需要 runner 的指令（runner 已被 take 走）排队待回合收尾执行，输入框清空。
+        let mut expected = 0;
+        for text in ["/new", "/compact"] {
             screen.input = composer();
             screen.insert_text(text);
             assert!(!handle_key(
@@ -14803,10 +16145,48 @@ mod tests {
                 &mut cancel
             )
             .unwrap());
-            assert_eq!(screen.input.lines().join("\n"), text);
+            assert!(screen.input.lines().join("\n").is_empty());
+            expected += 1;
+            assert_eq!(screen.queued_prompts.len(), expected);
+            assert_eq!(
+                screen.queued_prompts.back().unwrap().kind,
+                QueuedKind::Command
+            );
             assert!(active.is_none());
             assert!(cancel.is_some());
         }
+        let queued: Vec<&str> = screen
+            .queued_prompts
+            .iter()
+            .map(|q| q.text.as_str())
+            .collect();
+        assert_eq!(queued, vec!["/new", "/compact"]);
+
+        // `/model` 空参是只读面板指令：busy 下立即打开模型面板，不入队。
+        screen.input = composer();
+        screen.insert_text("/model");
+        assert!(!handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut None,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel
+        )
+        .unwrap());
+        assert!(screen.input.lines().join("\n").is_empty());
+        assert_eq!(screen.queued_prompts.len(), expected);
+        assert_eq!(screen.panel, Some(Panel::ModelPicker));
+        assert!(active.is_none());
+        assert!(cancel.is_some());
+        // 关闭模型面板，后续按键走普通输入路径。
+        screen.panel = None;
+        screen.model_picker = None;
+
+        // 后段验证普通文本分支：先清空指令队列，保持断言独立。
+        screen.queued_prompts.clear();
+
         // 普通文本在 busy 时按 Enter：平滑追加到 queued_prompts，清空输入框
         screen.input = composer();
         screen.insert_text("ordinary text");
@@ -14876,6 +16256,543 @@ mod tests {
         )
         .unwrap());
         let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn busy_slash_commands_execute_locally_without_runner() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = true;
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx2) = oneshot::channel();
+        let mut cancel = Some(tx);
+        let mut active = None;
+
+        macro_rules! submit {
+            ($text:expr) => {{
+                screen.input = composer();
+                screen.insert_text($text);
+                assert!(!handle_key(
+                    &mut screen,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut None,
+                    &permissions,
+                    &events,
+                    &mut active,
+                    &mut cancel,
+                )
+                .unwrap());
+            }};
+        }
+
+        // 渲染缓冲区内宽字符占两格（第二格为空符号），CJK/带空格断言前先去空白。
+        // （`flat` 为模块级测试辅助函数）
+
+        // `/help` 立即输出命令帮助（与空闲路径同文案），不入队。
+        submit!("/help");
+        let help = history(&screen);
+        assert!(help.contains("/help"), "{help}");
+        assert!(help.contains("显示此帮助"), "{help}");
+        assert!(screen.input.lines().join("\n").is_empty());
+        assert!(screen.queued_prompts.is_empty());
+
+        // `/todo add …` 立即写入共享清单。
+        submit!("/todo add 排队测试");
+        assert_eq!(screen.todos.lock().unwrap().len(), 1);
+        let text = render(&mut screen, 120, 24);
+        assert!(flat(&text).contains("已添加任务#1"), "{text}");
+
+        // `/todo close|open` 只切换可见性，不入队。
+        submit!("/todo close");
+        assert_eq!(screen.todo_view, TodoView::Collapsed);
+        assert!(screen.queued_prompts.is_empty());
+        submit!("/todo open");
+        assert_eq!(screen.todo_view, TodoView::Summary);
+
+        // `/mode manual` 立即切换审批模式。
+        submit!("/mode manual");
+        assert_eq!(screen.permission_mode, PermissionMode::Manual);
+        let text = render(&mut screen, 120, 24);
+        assert!(flat(&text).contains("已切换审批模式为：手动审批"), "{text}");
+
+        // `/mode <非法>` 立即报错且不改变模式。
+        submit!("/mode nope");
+        assert_eq!(screen.permission_mode, PermissionMode::Manual);
+        let text = render(&mut screen, 120, 24);
+        assert!(flat(&text).contains("未知审批模式"), "{text}");
+
+        // `/model` 空参是只读面板指令：立即打开模型面板，不入队。
+        submit!("/model");
+        assert!(screen.queued_prompts.is_empty());
+        assert_eq!(screen.panel, Some(Panel::ModelPicker));
+        assert!(screen.input.lines().join("\n").is_empty());
+        // 关闭模型面板，后续按键走普通输入路径。
+        screen.panel = None;
+        screen.model_picker = None;
+
+        // 未知指令立即报错且不入队。
+        submit!("/nosuchcmd");
+        let text = render(&mut screen, 120, 24);
+        assert!(flat(&text).contains("Unknowncommand;use/help"), "{text}");
+        assert!(screen.queued_prompts.is_empty());
+
+        assert!(active.is_none());
+        assert!(cancel.is_some());
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    /// 回合进行中（runner 已被 take 走）的只读指令必须立即生效，且输出与空闲路径逐字节一致。
+    #[tokio::test]
+    async fn busy_readonly_commands_run_immediately_without_runner() {
+        const READONLY: [&str; 17] = [
+            "/help",
+            "/tools",
+            "/think",
+            "/effort",
+            "/max_steps",
+            "/env list",
+            "/web status",
+            "/vision status",
+            "/skill list",
+            "/mcp status",
+            "/toolbox list",
+            "/memory list",
+            "/subagents status",
+            "/ctf status",
+            "/provider list",
+            "/model",
+            "/sessions",
+        ];
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut busy = CliScreen::new(&owner);
+        busy.busy = true;
+        let mut runner = Some(owner);
+        let mut idle = CliScreen::new(runner.as_ref().unwrap());
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx2) = oneshot::channel();
+        let mut cancel = Some(tx);
+        let mut active = None;
+        let mut no_runner: Option<SessionRunner> = None;
+
+        macro_rules! busy_submit {
+            ($text:expr) => {{
+                busy.panel = None;
+                busy.picker = None;
+                busy.input = composer();
+                busy.insert_text($text);
+                assert!(!handle_key(
+                    &mut busy,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut no_runner,
+                    &permissions,
+                    &events,
+                    &mut active,
+                    &mut cancel,
+                )
+                .unwrap());
+            }};
+        }
+        macro_rules! idle_submit {
+            ($text:expr) => {{
+                idle.panel = None;
+                idle.picker = None;
+                idle.input = composer();
+                idle.insert_text($text);
+                assert!(!handle_key(
+                    &mut idle,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut runner,
+                    &permissions,
+                    &events,
+                    &mut active,
+                    &mut cancel,
+                )
+                .unwrap());
+            }};
+        }
+
+        // 同一指令在 busy 与空闲下必须产生完全相同的历史输出。
+        for text in READONLY {
+            busy_submit!(text);
+            assert!(busy.queued_prompts.is_empty(), "{text} 不应排队");
+            assert!(active.is_none(), "{text} 不应启动新回合");
+            assert!(cancel.is_some(), "{text} 不应取消当前回合");
+            let busy_history = history(&busy);
+
+            idle_submit!(text);
+            let idle_history = history(&idle);
+
+            assert_eq!(
+                busy_history, idle_history,
+                "{text} 的 busy 输出必须与空闲一致"
+            );
+        }
+
+        // 立即输出的内容（不是「已排队」提示）。
+        busy_submit!("/tools");
+        let text = history(&busy);
+        assert!(text.contains("Tools"), "{text}");
+        assert!(text.contains("ctf_challenge"), "{text}");
+
+        busy_submit!("/provider list");
+        let text = history(&busy);
+        let provider = runner
+            .as_ref()
+            .unwrap()
+            .ctx
+            .providers
+            .sorted_names()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(text.contains(&provider), "{text}");
+
+        // `/effort` 经 remap 与 `/think` 输出同一条文案（busy 下不再报 Unknown）。
+        let base = history(&busy);
+        busy_submit!("/think");
+        let after_think = history(&busy);
+        let intensity = runner
+            .as_ref()
+            .unwrap()
+            .ctx
+            .config
+            .agent
+            .thinking_intensity
+            .as_str();
+        let think_delta = after_think
+            .strip_prefix(&base)
+            .expect("历史只追加")
+            .to_string();
+        assert!(think_delta.contains("Thinking"), "{think_delta}");
+        assert!(think_delta.contains(intensity), "{think_delta}");
+        busy_submit!("/effort");
+        let after_effort = history(&busy);
+        let effort_delta = after_effort.strip_prefix(&after_think).expect("历史只追加");
+        assert_eq!(think_delta, effort_delta, "/effort 必须等价于 /think");
+
+        // 面板类只读指令就地打开面板。
+        busy_submit!("/model");
+        assert_eq!(busy.panel, Some(Panel::ModelPicker));
+        assert!(busy.queued_prompts.is_empty());
+        busy_submit!("/sessions");
+        assert_eq!(
+            busy.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Sessions)
+        );
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    /// busy 下 `/settings` 打开的是真实配置快照（而非 `Config::default()` 空面板），
+    /// 且 Ctrl+S 只提示不落盘、不显示假成功。
+    #[tokio::test]
+    async fn busy_settings_opens_populated_panel_and_defers_save() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let config_path = owner.ctx.paths.config_file.display().to_string();
+        let providers_path = owner.ctx.paths.providers_file.display().to_string();
+        let default_provider = owner.ctx.config.agent.default_provider.clone();
+        let sessions_count = owner.index.sessions.len();
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = true;
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx2) = oneshot::channel();
+        let mut cancel = Some(tx);
+        let mut active = None;
+        let mut no_runner: Option<SessionRunner> = None;
+
+        screen.input = composer();
+        screen.insert_text("/settings");
+        assert!(!handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.queued_prompts.is_empty());
+        let settings = screen.settings.as_ref().expect("设置面板已打开");
+        assert_eq!(settings.config_path, config_path);
+        assert_eq!(settings.providers_path, providers_path);
+        assert_eq!(settings.providers_draft.default_provider, default_provider);
+        assert_eq!(settings.sessions_count, sessions_count);
+
+        // 改草稿后 Ctrl+S：只保留草稿并提示延后，不落盘、不显示假成功。
+        let settings = screen.settings.as_mut().unwrap();
+        settings.config_draft.agent.max_steps = 777;
+        settings.dirty = true;
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.status.contains("回合结束后"), "{}", screen.status);
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        let settings = screen.settings.as_ref().unwrap();
+        assert_eq!(settings.config_draft.agent.max_steps, 777);
+        assert!(settings.dirty, "未落盘时 dirty 必须保留");
+        // 真实配置文件不存在（busy 下不得写盘）。
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    /// busy 下需要 runner 的设置操作（编辑表单 / CTF 开关）必须提示延后执行。
+    #[tokio::test]
+    async fn busy_settings_runner_only_actions_report_turn_in_progress() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = true;
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx2) = oneshot::channel();
+        let mut cancel = Some(tx);
+        let mut active = None;
+        let mut no_runner: Option<SessionRunner> = None;
+
+        screen.input = composer();
+        screen.insert_text("/settings");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.settings.is_some());
+
+        // ToolsMcp 第 2 行（CTF 开关）需要 runner：Enter 进入编辑态，Space 才落到开关分支。
+        {
+            let settings = screen.settings.as_mut().unwrap();
+            settings.tab = SettingsTab::ToolsMcp;
+            settings.selected_row = 1;
+        }
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.settings.as_ref().unwrap().editing);
+        assert!(!screen.status.contains("回合结束后"));
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.status.contains("回合结束后"), "{}", screen.status);
+        assert!(screen.settings.is_some());
+        assert!(!screen.ctf_enabled, "busy 下不得改动 CTF 开关");
+
+        // Providers 页 `E`（编辑表单）需要 runner。
+        {
+            let settings = screen.settings.as_mut().unwrap();
+            settings.tab = SettingsTab::Providers;
+            settings.selected_row = 0;
+        }
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.status.contains("回合结束后"), "{}", screen.status);
+        assert!(screen.form.is_none(), "busy 下不得打开 providers 编辑表单");
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    /// busy 期间在面板里选中（会话选择器 Enter / `n`）：等价于在输入框敲同一指令入队，
+    /// 不得静默丢弃。
+    #[tokio::test]
+    async fn busy_picker_selection_queues_instead_of_dropping() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut screen = CliScreen::new(&owner);
+        screen.busy = true;
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx2) = oneshot::channel();
+        let mut cancel = Some(tx);
+        let mut active = None;
+        let mut no_runner: Option<SessionRunner> = None;
+
+        // `/sessions` 在 busy 下立即打开会话选择器（只读面板）。
+        screen.input = composer();
+        screen.insert_text("/sessions");
+        assert!(!handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
+        let selected = screen.picker.as_ref().expect("会话选择器已打开").items[0]
+            .command
+            .clone();
+        assert!(selected.starts_with("/sessions "), "{selected}");
+
+        // Enter 选中：入队并回执，面板关闭。
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert!(screen.picker.is_none());
+        assert_eq!(screen.queued_prompts.len(), 1);
+        assert_eq!(screen.queued_prompts[0].kind, QueuedKind::Command);
+        assert_eq!(screen.queued_prompts[0].text, selected);
+        assert!(history(&screen).contains("已排队"), "{}", history(&screen));
+
+        // `n`（新建会话）同样入队。
+        screen.input = composer();
+        screen.insert_text("/sessions");
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut no_runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.queued_prompts.len(), 2);
+        assert_eq!(screen.queued_prompts[1].text, "/new");
+        assert!(active.is_none());
+        assert!(cancel.is_some());
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn drain_queued_inputs_runs_commands_in_order_and_stops_at_prompt() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut screen = CliScreen::new(&owner);
+        let permissions = Arc::new(PermissionBroker::deny_all());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner = Some(owner);
+
+        let queue_command = |screen: &mut CliScreen, text: &str| {
+            screen.queued_prompts.push_back(QueuedPrompt {
+                text: text.to_string(),
+                displayed: true,
+                kind: QueuedKind::Command,
+            });
+        };
+
+        // 空队列：无操作。
+        assert!(!drain_queued_inputs(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
+        assert!(active.is_none());
+        assert!(!screen.busy);
+
+        // 两条指令按输入顺序执行，均不开启新回合。
+        queue_command(&mut screen, "/mode manual");
+        queue_command(&mut screen, "/todo close");
+        assert!(!drain_queued_inputs(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
+        assert_eq!(screen.permission_mode, PermissionMode::Manual);
+        assert_eq!(screen.todo_view, TodoView::Collapsed);
+        assert!(screen.queued_prompts.is_empty());
+        assert!(active.is_none());
+
+        // 出错（未知指令）不阻断后续队列。
+        queue_command(&mut screen, "/nosuch");
+        queue_command(&mut screen, "/todo open");
+        assert!(!drain_queued_inputs(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
+        let text = render(&mut screen, 120, 24);
+        assert!(text.contains("Unknown command; use /help"), "{text}");
+        assert_eq!(screen.todo_view, TodoView::Summary);
+        assert!(screen.queued_prompts.is_empty());
+
+        // `/quit` 指令要求退出。
+        queue_command(&mut screen, "/quit");
+        assert!(drain_queued_inputs(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
+        assert!(screen.queued_prompts.is_empty());
+
+        let _ = std::fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]
@@ -15188,12 +17105,20 @@ mod tests {
         // Close panel via /todo close
         screen.insert_text("/todo close");
         input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(screen.todo_closed);
+        assert_eq!(screen.todo_view, TodoView::Collapsed);
 
         let snapshot_closed = render(&mut screen, 100, 30);
         assert!(
-            !snapshot_closed.contains("todo close"),
-            "Closed panel should not show header hint: {snapshot_closed}"
+            !flat(&snapshot_closed).contains("输入/todoclose收起"),
+            "Collapsed view should not draw the table title: {snapshot_closed}"
+        );
+        assert!(
+            flat(&snapshot_closed).contains("📋任务清单[0/2]"),
+            "Collapsed view should keep the 1-line progress strip: {snapshot_closed}"
+        );
+        assert!(
+            flat(&snapshot_closed).contains("[Alt+↑]展开"),
+            "Collapsed strip should advertise Alt+↑: {snapshot_closed}"
         );
         assert!(
             snapshot_closed.contains("todo open"),
@@ -15203,12 +17128,16 @@ mod tests {
         // Reopen panel via /todo open
         screen.insert_text("/todo open");
         input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(!screen.todo_closed);
+        assert_eq!(screen.todo_view, TodoView::Summary);
 
         let snapshot_reopened = render(&mut screen, 100, 30);
         assert!(
-            snapshot_reopened.contains("todo close"),
+            flat(&snapshot_reopened).contains("输入/todoclose收起"),
             "Reopened panel should show again: {snapshot_reopened}"
+        );
+        assert!(
+            flat(&snapshot_reopened).contains("[Alt+↑]全展"),
+            "Summary title should advertise full view: {snapshot_reopened}"
         );
 
         // Clear tasks via /todo clear
@@ -15217,9 +17146,72 @@ mod tests {
 
         let snapshot_cleared = render(&mut screen, 100, 30);
         assert!(
-            !snapshot_cleared.contains("todo close"),
-            "Cleared list should remove panel: {snapshot_cleared}"
+            !snapshot_cleared.contains("📋"),
+            "Cleared list should remove both table and strip: {snapshot_cleared}"
         );
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn todo_view_keys_cycle_three_states_with_alt_arrows() {
+        let owner = crate::headless::tests::test_runner().await;
+        let cwd = owner.cwd.clone();
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+
+        // 8 条任务：100x30 下精简态内区 5 行 → 可见 4 条 + 折叠提示。
+        for i in 1..=8 {
+            screen.insert_text(&format!("/todo add 任务 {i}"));
+            input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        }
+        assert_eq!(screen.todo_view, TodoView::Summary);
+
+        let summary = render(&mut screen, 100, 30);
+        assert!(summary.contains("[ ] #4"), "精简态应可见前 4 条: {summary}");
+        assert!(
+            !summary.contains("[ ] #8"),
+            "精简态不应绘制第 8 条: {summary}"
+        );
+        assert!(flat(&summary).contains("[Alt+↑]全展"), "{summary}");
+
+        // Alt+↑ 第二档 → 全量（含「全部 N 项」标题），再按封顶不翻转。
+        assert!(!input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Up,
+            KeyModifiers::ALT
+        ));
+        assert_eq!(screen.todo_view, TodoView::Full);
+        let full = render(&mut screen, 100, 30);
+        assert!(full.contains("[ ] #8"), "全量态应绘制全部: {full}");
+        assert!(flat(&full).contains("全部8项"), "{full}");
+        input_key(&mut screen, &mut runner, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(screen.todo_view, TodoView::Full, "到顶不翻转");
+
+        // Alt+↓ → 精简 → 收起（保留 1 行进度条），再按到底不翻转。
+        input_key(&mut screen, &mut runner, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(screen.todo_view, TodoView::Summary);
+        assert!(!render(&mut screen, 100, 30).contains("[ ] #8"));
+
+        input_key(&mut screen, &mut runner, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(screen.todo_view, TodoView::Collapsed);
+        let collapsed = render(&mut screen, 100, 30);
+        assert!(flat(&collapsed).contains("📋任务清单[0/8]"), "{collapsed}");
+        assert!(flat(&collapsed).contains("[Alt+↑]展开"), "{collapsed}");
+        assert!(
+            !flat(&collapsed).contains("输入/todoclose收起"),
+            "收起态不画表格标题: {collapsed}"
+        );
+        input_key(&mut screen, &mut runner, KeyCode::Down, KeyModifiers::ALT);
+        assert_eq!(screen.todo_view, TodoView::Collapsed, "到底不翻转");
+
+        // 面板态由更早的分支接管：Alt+↑ 不改视图、不写状态提示。
+        screen.panel = Some(Panel::Shortcuts);
+        let status_before = screen.status.clone();
+        input_key(&mut screen, &mut runner, KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(screen.todo_view, TodoView::Collapsed);
+        assert_eq!(screen.status, status_before);
 
         let _ = std::fs::remove_dir_all(cwd);
     }
@@ -15650,6 +17642,156 @@ mod tests {
             .join("\n")
     }
 
+    /// 去空白后的渲染文本：宽字符在缓冲区内占两格（第二格为空白），直接 `contains`
+    /// 会因格子间的空白失败，故 CJK 断言一律先压掉空白。
+    fn flat(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// `/update` 安装脚本调用记录：`(version, wait_for_exit)`。
+    type UpdateCalls = Arc<std::sync::Mutex<Vec<(String, bool)>>>;
+
+    /// `/update` 状态机夹具：安装脚本启动器替换为只记录参数、不落盘的假实现。
+    fn update_test_screen(owner: &SessionRunner) -> (CliScreen, UpdateCalls) {
+        let mut screen = CliScreen::new(owner);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new()));
+        let recorder = Arc::clone(&calls);
+        screen.update_launcher = Arc::new(
+            move |version: &str, wait: bool| -> std::io::Result<std::path::PathBuf> {
+                recorder
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((version.to_string(), wait));
+                Ok(std::path::PathBuf::from("C:/tmp/update.ps1"))
+            },
+        );
+        (screen, calls)
+    }
+
+    fn release_info(version: &str) -> cyber_core::update::ReleaseInfo {
+        cyber_core::update::ReleaseInfo {
+            version: version.to_string(),
+            html_url: format!("https://example.invalid/v{version}"),
+            release_notes: Some("notes".into()),
+            published_at: Some("2026-01-01T00:00:00Z".into()),
+        }
+    }
+
+    fn screen_messages(screen: &CliScreen) -> String {
+        flat(
+            &screen
+                .messages
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<String>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn update_check_reports_the_new_version_without_prompting() {
+        let owner = crate::headless::tests::test_runner().await;
+        let (mut screen, calls) = update_test_screen(&owner);
+        screen.deliver_update(UpdateCheckResult {
+            kind: cli_commands::CliUpdate::Check,
+            info: Some(release_info("9.9.9")),
+        });
+        assert_eq!(screen.new_version.as_deref(), Some("9.9.9"));
+        assert!(screen.update_pending.is_none());
+        assert!(
+            calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "/update check 不得启动安装"
+        );
+        assert!(screen_messages(&screen).contains("9.9.9"));
+        assert!(screen.status.contains("9.9.9"), "{}", screen.status);
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn update_prompt_installs_on_y_and_cancels_otherwise() {
+        let owner = crate::headless::tests::test_runner().await;
+        let (mut screen, calls) = update_test_screen(&owner);
+        let mut runner = None;
+
+        screen.deliver_update(UpdateCheckResult {
+            kind: cli_commands::CliUpdate::Prompt,
+            info: Some(release_info("9.9.9")),
+        });
+        assert!(screen.update_pending.is_some(), "无参数检查必须进入确认态");
+        assert!(screen.status.contains("按 y"), "{}", screen.status);
+
+        input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        );
+        let expected_wait = cyber_core::update::needs_exit_before_install();
+        assert_eq!(
+            calls.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec![("9.9.9".to_string(), expected_wait)]
+        );
+        assert!(screen.update_pending.is_none());
+        let text = screen_messages(&screen);
+        if expected_wait {
+            assert!(text.contains("更新已安排"), "{text}");
+        } else {
+            assert!(text.contains("已开始后台安装"), "{text}");
+        }
+        assert!(
+            screen.input.lines().join("").is_empty(),
+            "确认键不得进入输入框"
+        );
+
+        // 确认态下其它键只取消，不启动安装脚本。
+        screen.deliver_update(UpdateCheckResult {
+            kind: cli_commands::CliUpdate::Prompt,
+            info: Some(release_info("9.9.9")),
+        });
+        assert!(screen.update_pending.is_some());
+        assert!(!input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        ));
+        assert!(screen.update_pending.is_none());
+        assert_eq!(calls.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+        assert!(screen.status.contains("已取消更新"), "{}", screen.status);
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_to_install_while_a_turn_is_running() {
+        let owner = crate::headless::tests::test_runner().await;
+        let (mut screen, calls) = update_test_screen(&owner);
+        let mut runner = None;
+        screen.busy = true;
+        screen.update_pending = Some(release_info("9.9.9"));
+        assert!(!input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE
+        ));
+        assert!(calls.lock().unwrap().is_empty(), "回合进行中不得启动安装");
+        assert!(screen.update_pending.is_none());
+        assert!(screen_messages(&screen).contains("回合进行中"));
+        let _ = std::fs::remove_dir_all(owner.cwd);
+    }
+
+    #[tokio::test]
+    async fn update_without_network_channel_falls_back_to_the_local_cache() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        assert!(screen.update_check_tx.is_none());
+        let mut runner = Some(owner);
+        screen.insert_text("/update check");
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!screen.update_checking && screen.update_check_tx.is_none());
+        assert!(screen_messages(&screen).contains("更新检查"));
+        let _ = std::fs::remove_dir_all(runner.unwrap().cwd);
+    }
+
     /// 打开 `/provider add-with-kind openai-compatible` 的全屏 provider 表单。
     async fn provider_form_screen() -> (CliScreen, Option<SessionRunner>) {
         let mut owner = crate::headless::tests::test_runner().await;
@@ -15802,7 +17944,7 @@ mod tests {
         assert_eq!(labels, vec!["claude-3", "GLM-4.6 (当前使用)", "o3"]);
 
         // 3) `/model` 双栏面板右栏：同一 provider 的模型列表顺序一致。
-        let mut state = CliModelPickerState::from_runner(runner_opt.as_ref().unwrap());
+        let mut state = CliModelPickerState::from_view(&runner_opt.as_ref().unwrap().view());
         state.provider_selected = state
             .providers
             .sorted_names()
@@ -16650,9 +18792,9 @@ mod tests {
         let clean_text = text.replace(' ', "");
         // 顶栏黄色标出新版本
         assert!(clean_text.contains("(新版本V0.9.9)"), "{text}");
-        // 欢迎页提示使用 cyber update
+        // 欢迎页提示使用 /update
         assert!(
-            clean_text.contains("检测到新版本V0.9.9，可运行cyberupdate进行更新"),
+            clean_text.contains("检测到新版本V0.9.9，可运行/update更新（或退出后cyberupdate）"),
             "{text}"
         );
 
@@ -17490,18 +19632,15 @@ mod tests {
         screen.active_steering_tx = None;
 
         // 收尾时从 queued_prompts 取出未消费的指示自动启动下一轮任务
-        if let Some(next_prompt) = screen.queued_prompts.pop_front() {
-            spawn_turn(
-                &mut screen,
-                &mut runner,
-                next_prompt.text,
-                next_prompt.displayed,
-                &permissions,
-                &events,
-                &mut active,
-                &mut cancel,
-            );
-        }
+        assert!(!drain_queued_inputs(
+            &mut screen,
+            &mut runner,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap());
 
         // 验证第二轮任务已自动启动
         assert!(screen.busy);
@@ -17652,6 +19791,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn toolbox_tab_renders_long_description_prefix() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.panel = Some(Panel::Settings);
+        let mut settings = CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
+        settings.tab = SettingsTab::Toolbox;
+        settings.custom_tools = vec![cyber_core::CustomToolConfig {
+            name: "fenjing_crack".into(),
+            description:
+                "Fenjing 攻击指定表单参数:数据中注入点写 PAYLOAD,自动检测 WAF 生成绕过 payload,-e 执行命令。"
+                    .into(),
+            command: "python -m fenjing crack -u {url}".into(),
+            ..Default::default()
+        }];
+        screen.settings = Some(settings);
+
+        let width = 120u16;
+        let height = 30u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| {
+                let settings = screen.settings.as_ref().unwrap();
+                draw_settings_panel(f, f.area(), settings, &screen);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 超长描述必须显示可见前缀，而不是被整段丢掉只剩「…」
+        assert!(
+            text.contains("[fenjing_crack] Fenjing"),
+            "长描述必须显示前缀: {text}"
+        );
+        assert!(text.contains('…'), "超长行必须补省略号: {text}");
+
+        // 回归：AI 扫描入口固定在首行，自定义工具列表在其下方（入口原先在末尾）。
+        // 宽字符在缓冲区内占两格（第二格为空符号），逐行压掉空白后再断言。
+        let compact_lines: Vec<String> = text
+            .lines()
+            .map(|line| line.chars().filter(|c| !c.is_whitespace()).collect())
+            .collect();
+        let scan_line = compact_lines
+            .iter()
+            .position(|line| line.contains("AI智能扫描本地安全工具"))
+            .unwrap_or_else(|| panic!("扫描入口必须可见: {text}"));
+        let tool_line = compact_lines
+            .iter()
+            .position(|line| line.contains("[fenjing_crack]"))
+            .unwrap_or_else(|| panic!("自定义工具行必须可见: {text}"));
+        assert!(scan_line < tool_line, "扫描入口必须在工具列表之上: {text}");
+        assert!(
+            compact_lines[scan_line].contains('▶'),
+            "默认焦点必须落在首行（扫描入口）: {text}"
+        );
+        assert!(
+            !compact_lines[tool_line].contains('▶'),
+            "未选中的工具行不应显示焦点指针: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toolbox_tab_adds_tool_while_the_scan_row_is_selected() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+        screen.panel = Some(Panel::Settings);
+        let mut settings = CliSettingsState::from_view(&runner_opt.as_ref().unwrap().view());
+        settings.tab = SettingsTab::Toolbox;
+        screen.settings = Some(settings);
+
+        // 空清单：整个列表只有 AI 扫描入口一行，A 仍须能录入自定义工具。
+        assert_eq!(
+            SettingsTab::Toolbox.max_row(screen.settings.as_ref().unwrap()),
+            0
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        );
+        assert!(matches!(
+            screen.form.as_ref().map(|state| &state.form.kind),
+            Some(FormKind::CustomTool {
+                original_name: None
+            })
+        ));
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::Toolbox));
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn toolbox_scan_form_renders_fields_and_model_picker() {
+        let owner = crate::headless::tests::test_runner().await;
+        let _screen = CliScreen::new(&owner);
+        let mut form = FormState::new(cli_commands::toolbox_scan_form(
+            "anthropic".into(),
+            "claude-sonnet-4-5".into(),
+        ));
+
+        let width = 120u16;
+        let height = 34u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, form: &FormState| -> (String, String) {
+            terminal
+                .draw(|f| draw_form_dialog(f, f.area(), form, ""))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // 宽字符在缓冲区内占两格（第二格为空符号），CJK 断言前先去掉所有空白。
+            let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            (text, compact)
+        };
+
+        let (text, compact) = render(&mut terminal, &form);
+        assert!(
+            compact.contains("AI智能扫描本地安全工具"),
+            "标题缺失: {text}"
+        );
+        assert!(
+            compact.contains("扫描目标(本地路径或提示词"),
+            "目标标签缺失: {text}"
+        );
+        assert!(compact.contains("扫描服务商"), "服务商标签缺失: {text}");
+        assert!(compact.contains("扫描模型"), "模型标签缺失: {text}");
+        assert!(compact.contains("仅预览不写盘"), "预览标签缺失: {text}");
+        assert!(text.contains("anthropic"), "服务商默认值缺失: {text}");
+        assert!(text.contains("claude-sonnet-4-5"), "模型默认值缺失: {text}");
+
+        // 模型行按 Enter 打开的浮层必须画在表单之上（Provider 表单之外的路径）。
+        form.open_model_picker(
+            Ok(vec!["claude-haiku-4".into(), "claude-opus-4".into()]),
+            None,
+            "anthropic",
+        );
+        let (text, compact) = render(&mut terminal, &form);
+        // 块标题里的宽字符会被边框残留的 ─ 分隔，改为断言浮层图例与列表内容。
+        assert!(
+            compact.contains("↑/↓选择·Enter确认"),
+            "模型浮层图例缺失: {text}"
+        );
+        assert!(
+            text.contains("claude-opus-4"),
+            "模型列表浮层必须渲染: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn settings_toolbox_tab_lists_tools_and_gates_scan_in_setup_mode() {
         let owner = crate::headless::tests::test_runner().await;
         let tools_dir = owner.ctx.paths.tools_dir.clone();
@@ -17669,7 +19972,7 @@ mod tests {
         let mut runner_opt = Some(owner);
 
         screen.panel = Some(Panel::Settings);
-        let mut settings = CliSettingsState::from_runner(runner_opt.as_ref().unwrap());
+        let mut settings = CliSettingsState::from_view(&runner_opt.as_ref().unwrap().view());
         settings.tab = SettingsTab::Toolbox;
         screen.settings = Some(settings);
 
@@ -17703,9 +20006,9 @@ mod tests {
         assert_eq!(screen.panel, Some(Panel::Settings));
         assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::Toolbox);
 
-        // 末行 Enter：向导模式下只提示，不触发扫描
+        // 首行 Enter：向导模式下只提示，不触发扫描
         screen.setup_mode = true;
-        screen.settings.as_mut().unwrap().selected_row = 1;
+        screen.settings.as_mut().unwrap().selected_row = 0;
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
@@ -17718,6 +20021,35 @@ mod tests {
             "status = {}",
             screen.status
         );
+        assert!(screen.form.is_none());
+
+        // 首行 Enter（非向导模式）：打开 AI 扫描表单，默认带出扫描服务商与模型
+        screen.setup_mode = false;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::Toolbox));
+        let form = screen.form.as_ref().expect("扫描表单必须打开");
+        assert!(matches!(form.form.kind, FormKind::ToolboxScan));
+        // 默认 Provider（Config::default = openai）与其配置模型
+        assert_eq!(form.input_value("provider"), "openai");
+        assert_eq!(form.input_value("model"), "gpt-4o");
+        assert_eq!(form.input_value("target"), "");
+        assert_eq!(form.input_value("preview"), "false");
+
+        // Esc 关闭扫描表单 → 回到设置中心工具库页
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::Toolbox);
     }
 
     #[tokio::test]
@@ -17816,6 +20148,7 @@ mod tests {
             SettingsTab::EnvMemory,
             SettingsTab::StorageSystem,
             SettingsTab::Toolbox,
+            SettingsTab::About,
             SettingsTab::AgentModel,
         ];
         for expected in expected_tabs {
@@ -17836,9 +20169,9 @@ mod tests {
             KeyCode::Tab,
             KeyModifiers::SHIFT,
         );
-        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::Toolbox);
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::About);
 
-        // Direct keys 1-8
+        // Direct keys 1-9
         let direct_keys = [
             ('1', SettingsTab::AgentModel),
             ('2', SettingsTab::UiWorkflow),
@@ -17848,6 +20181,7 @@ mod tests {
             ('6', SettingsTab::EnvMemory),
             ('7', SettingsTab::StorageSystem),
             ('8', SettingsTab::Toolbox),
+            ('9', SettingsTab::About),
         ];
         for (ch, expected) in direct_keys {
             settings_key_with_runner(
@@ -17858,6 +20192,485 @@ mod tests {
             );
             assert_eq!(screen.settings.as_ref().unwrap().tab, expected);
         }
+    }
+
+    /// 只读态 ←/→（及 h/l）切换设置标签页，且不改变值。
+    #[tokio::test]
+    async fn settings_arrow_keys_switch_tabs_in_read_only() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+        let orig_theme = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .ui
+            .theme
+            .clone();
+
+        // → 切到下一个标签页
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            assert_eq!(s.tab, SettingsTab::UiWorkflow);
+            assert_eq!(s.selected_row, 0);
+            assert!(!s.editing);
+        }
+        // ← 切回上一个
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+
+        // l / h 与 →/← 同义
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('l'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::UiWorkflow
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+
+        // 首个标签页再 ← 环绕到最后一个
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::About);
+
+        // 只读态切标签不得改动配置值
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .ui
+                .theme
+                .clone(),
+            orig_theme
+        );
+        assert!(!screen.settings.as_ref().unwrap().dirty);
+    }
+
+    /// Enter 进入编辑态；禁则不关闭面板，聚焦行只读；Esc 退出编辑态，再 Esc 才关闭。
+    #[tokio::test]
+    async fn settings_enter_enters_edit_and_esc_exits_without_closing() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        screen
+            .settings
+            .as_mut()
+            .unwrap()
+            .set_tab(SettingsTab::Subagents);
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        let orig_enabled = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .subagents
+            .enabled;
+
+        // Enter 进入编辑态：不立即改值，也不开弹窗
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            assert!(s.editing, "Enter 必须进入编辑态");
+            assert_eq!(s.config_draft.agent.subagents.enabled, orig_enabled);
+        }
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
+        // Esc 退出编辑态，面板保持打开
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(!screen.settings.as_ref().unwrap().editing);
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.settings.is_some());
+
+        // 无改动时再次 Esc 才关闭面板
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None);
+        assert!(screen.settings.is_none());
+    }
+
+    /// 编辑态 ←/→ 改值；Enter 退出后 ←/→ 恢复为切换标签页。
+    #[tokio::test]
+    async fn settings_edit_state_arrows_adjust_and_enter_finishes() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        screen.settings.as_mut().unwrap().selected_row = 5; // max_steps
+        let orig_steps = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .max_steps;
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().editing);
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .max_steps,
+            orig_steps + 10
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::AgentModel
+        );
+
+        // Enter 退出编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(!screen.settings.as_ref().unwrap().editing);
+
+        // 退出后 ←/→ 恢复切标签页语义
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::UiWorkflow
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .max_steps,
+            orig_steps + 10
+        );
+    }
+
+    /// 只读态值行上的空格被吞掉（仅提示），进入编辑态后才生效。
+    #[tokio::test]
+    async fn settings_read_only_space_on_value_row_is_noop() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        screen.settings.as_mut().unwrap().selected_row = 4; // auto_tool_call
+        let orig_tool = screen
+            .settings
+            .as_ref()
+            .unwrap()
+            .config_draft
+            .agent
+            .auto_tool_call;
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            assert_eq!(s.config_draft.agent.auto_tool_call, orig_tool);
+            assert!(!s.editing);
+            assert!(!s.dirty);
+        }
+        assert!(screen.status.contains("按 Enter 进入编辑"));
+
+        // 进入编辑态后空格生效
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen
+                .settings
+                .as_ref()
+                .unwrap()
+                .config_draft
+                .agent
+                .auto_tool_call,
+            !orig_tool
+        );
+    }
+
+    /// 动作行（服务商 / Skill）的 Enter 仍是原行为：设默认 / 开详情弹窗。
+    #[tokio::test]
+    async fn settings_action_row_enter_still_opens_dialog() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.providers_draft.providers.insert(
+                "prov_alpha".into(),
+                cyber_core::ProviderConfig {
+                    kind: "openai".into(),
+                    base_url: "https://api.alpha.com".into(),
+                    api_key: "sk-test".into(),
+                    model: "model-alpha".into(),
+                    max_tokens: 4096,
+                    temperature: 0.7,
+                    price: None,
+                    models: std::collections::HashMap::new(),
+                    chat_endpoint: None,
+                    models_endpoint: None,
+                    thinking: None,
+                },
+            );
+            s.set_tab(SettingsTab::Providers);
+            s.selected_row = 0;
+            // 预设一个错误默认值：Enter 必须把它改成当前高亮行
+            s.config_draft.agent.default_provider = "not_a_provider".into();
+        }
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            let expected = s.providers_draft.sorted_names()[0].clone();
+            assert_eq!(s.config_draft.agent.default_provider, expected);
+            assert!(!s.editing, "动作行 Enter 不得进入编辑态");
+        }
+
+        // ToolsMcp 的 Skill 行：Enter 打开只读详情弹窗
+        {
+            let s = screen.settings.as_mut().unwrap();
+            s.skills = vec![SkillSummary {
+                name: "skill-alpha".into(),
+                ..Default::default()
+            }];
+            s.set_tab(SettingsTab::ToolsMcp);
+            s.selected_row = 3;
+        }
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            assert!(s.skill_detail.is_some());
+            assert!(!s.editing);
+        }
+    }
+
+    /// Tab / 数字键切换标签页时清除编辑态。
+    #[tokio::test]
+    async fn settings_tab_switch_clears_editing() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        screen.settings.as_mut().unwrap().selected_row = 2;
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().editing);
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            assert_eq!(s.tab, SettingsTab::UiWorkflow);
+            assert!(!s.editing);
+        }
+
+        // 数字直达键同样清除编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().editing);
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('3'),
+            KeyModifiers::NONE,
+        );
+        {
+            let s = screen.settings.as_ref().unwrap();
+            assert_eq!(s.tab, SettingsTab::Subagents);
+            assert!(!s.editing);
+        }
+    }
+
+    /// `focused_row_is_value` 的行分区：EnvMemory 前三段判定与 `max_row` 同式。
+    #[test]
+    fn focused_row_is_value_partitions_value_and_action_rows() {
+        let mut state = CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
+        assert!(state.focused_row_is_value()); // AgentModel 行 0
+
+        state.selected_row = 1;
+        assert!(!state.focused_row_is_value()); // 只读展示行（对应模型）
+        state.selected_row = 9;
+        assert!(!state.focused_row_is_value()); // 只读展示行（识图专属模型）
+
+        state.tab = SettingsTab::Providers;
+        assert!(!state.focused_row_is_value());
+        state.tab = SettingsTab::Toolbox;
+        assert!(!state.focused_row_is_value());
+
+        // EnvMemory：env_slots(1) + mem_slots(1) 之前是值行，其后（记忆列表）是动作行
+        state.tab = SettingsTab::EnvMemory;
+        state.selected_row = 0;
+        assert!(state.focused_row_is_value());
+        state.selected_row = 1;
+        assert!(state.focused_row_is_value());
+        state.selected_row = 2;
+        assert!(!state.focused_row_is_value());
+
+        state.config_draft.env.vars = vec![cyber_core::EnvVar {
+            key: "A".into(),
+            value: "1".into(),
+            sensitive: false,
+        }];
+        state.config_draft.memory.rules = vec![cyber_core::MemoryRule {
+            enabled: true,
+            scope: "both".into(),
+            prompt: "p".into(),
+        }];
+        state.selected_row = 1;
+        assert!(state.focused_row_is_value()); // 记忆规则行
+        state.selected_row = 2;
+        assert!(!state.focused_row_is_value()); // 记忆列表行
+
+        // ToolsMcp：0/1 是开关值行，2（MCP 控制台）起是动作行
+        state.tab = SettingsTab::ToolsMcp;
+        state.selected_row = 1;
+        assert!(state.focused_row_is_value());
+        state.selected_row = 2;
+        assert!(!state.focused_row_is_value());
     }
 
     #[tokio::test]
@@ -17883,10 +20696,24 @@ mod tests {
             .config_draft
             .agent
             .thinking_intensity;
+        // 只读态：先 Enter 进入编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
             KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        // 编辑态内改值后 Enter 退出编辑
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
             KeyModifiers::NONE,
         );
         let new_effort = screen
@@ -17908,10 +20735,23 @@ mod tests {
             .config_draft
             .agent
             .auto_tool_call;
+        // 只读态：空格被吞掉，Enter 进入编辑态后才可切换
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
             KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
             KeyModifiers::NONE,
         );
         assert_eq!(
@@ -17934,6 +20774,13 @@ mod tests {
             .config_draft
             .agent
             .max_steps;
+        // 只读态：先 Enter 进入编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
@@ -17967,6 +20814,13 @@ mod tests {
                 .agent
                 .max_steps,
             orig_steps + 60
+        );
+        // 退出编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
         );
 
         // Reset tab via 'r'
@@ -18007,12 +20861,24 @@ mod tests {
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
             KeyCode::Right,
             KeyModifiers::NONE,
         );
         assert_ne!(
             orig_theme,
             screen.settings.as_ref().unwrap().config_draft.ui.theme
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
         );
 
         // Tab 3: Subagents
@@ -18031,6 +20897,19 @@ mod tests {
             .agent
             .subagents
             .enabled;
+        // Enter 进入编辑态，Space 切换开关，Enter 退出编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
@@ -18084,6 +20963,13 @@ mod tests {
                 .retry_attempts,
             5
         );
+        // 只读态：先 Enter 进入编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         // 按 3 次 Right 增加到 8 次
         for _ in 0..3 {
             settings_key_with_runner(
@@ -18093,6 +20979,13 @@ mod tests {
                 KeyModifiers::NONE,
             );
         }
+        // 退出编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         assert_eq!(
             screen
                 .settings
@@ -18116,6 +21009,13 @@ mod tests {
                 .retry_delay_secs,
             3
         );
+        // 只读态：先 Enter 进入编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         // 按 2 次 Right 增加到 5 秒
         for _ in 0..2 {
             settings_key_with_runner(
@@ -18125,6 +21025,13 @@ mod tests {
                 KeyModifiers::NONE,
             );
         }
+        // 退出编辑态
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         assert_eq!(
             screen
                 .settings
@@ -18194,7 +21101,19 @@ mod tests {
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
             KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
             KeyModifiers::NONE,
         );
         assert!(screen.settings.as_ref().unwrap().dirty);
@@ -18334,7 +21253,19 @@ mod tests {
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
             KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
             KeyModifiers::NONE,
         );
         assert!(screen.settings.as_ref().unwrap().dirty);
@@ -18379,7 +21310,19 @@ mod tests {
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
             KeyCode::Right,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
             KeyModifiers::NONE,
         );
         assert!(screen.settings.as_ref().unwrap().dirty);
@@ -20454,7 +23397,7 @@ mod tests {
         let mut screen = CliScreen::new(&owner);
         let (tx, mut rx) = mpsc::unbounded_channel::<ModelFetchResult>();
         screen.model_fetch_tx = Some(tx);
-        screen.model_picker = Some(CliModelPickerState::from_runner(&owner));
+        screen.model_picker = Some(CliModelPickerState::from_view(&owner.view()));
         screen.panel = Some(Panel::ModelPicker);
         screen.refresh_model_picker_local();
 
@@ -20605,7 +23548,7 @@ mod tests {
         let mut screen = CliScreen::new(&owner);
         let (tx, mut rx) = mpsc::unbounded_channel::<ModelFetchResult>();
         screen.model_fetch_tx = Some(tx);
-        screen.model_picker = Some(CliModelPickerState::from_runner(&owner));
+        screen.model_picker = Some(CliModelPickerState::from_view(&owner.view()));
         screen.panel = Some(Panel::ModelPicker);
         screen.refresh_model_picker_local();
 
@@ -20813,6 +23756,7 @@ mod tests {
         assert!(!Panel::Subagents.is_fullscreen());
         assert!(!Panel::Jobs.is_fullscreen());
         assert!(Panel::ModelPicker.is_fullscreen());
+        assert!(Panel::About.is_fullscreen());
     }
 
     #[tokio::test]
@@ -20921,13 +23865,38 @@ mod tests {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
         screen.panel = Some(Panel::Settings);
-        screen.settings = Some(CliSettingsState::from_runner(&owner));
+        screen.settings = Some(CliSettingsState::from_view(&owner.view()));
 
         let rendered = render(&mut screen, 120, 36);
         assert!(rendered.contains("Cyber Master"));
         assert!(rendered.contains("Settings"));
         assert!(rendered.contains("Agent"));
         assert!(rendered.contains("Ctrl+S"));
+    }
+
+    #[tokio::test]
+    async fn settings_mouse_wheel_moves_selection_like_arrow_keys() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.panel = Some(Panel::Settings);
+        let mut s = CliSettingsState::new(&Config::default(), &ProvidersConfig::default());
+        s.tab = SettingsTab::AgentModel; // max_row = 11
+        screen.settings = Some(s);
+
+        // 滚轮向下 = ↓：0 -> 1
+        assert!(screen.settings_scroll(false));
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 1);
+        // 滚轮向上 = ↑：1 -> 0
+        assert!(screen.settings_scroll(true));
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 0);
+        // 顶部继续向上不越界
+        assert!(screen.settings_scroll(true));
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 0);
+        // 底部封顶于 max_row
+        for _ in 0..20 {
+            screen.settings_scroll(false);
+        }
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 11);
     }
 
     #[tokio::test]
@@ -20942,7 +23911,7 @@ mod tests {
         let mut cancel = None;
 
         screen.panel = Some(Panel::Settings);
-        let mut s = CliSettingsState::from_runner(runner_opt.as_ref().unwrap());
+        let mut s = CliSettingsState::from_view(&runner_opt.as_ref().unwrap().view());
         s.tab = SettingsTab::Providers;
         screen.settings = Some(s);
 
@@ -21052,7 +24021,7 @@ mod tests {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
         screen.panel = Some(Panel::Settings);
-        let mut s = CliSettingsState::from_runner(&owner);
+        let mut s = CliSettingsState::from_view(&owner.view());
         s.tab = SettingsTab::Providers;
         s.provider_test_results
             .insert("openai".into(), (true, "发现 12 款可用模型".into(), 42));
@@ -21679,21 +24648,33 @@ mod tests {
             s.selected_row = 0; // Focus on FOO_TOKEN
         }
 
-        // Space on env var toggles sensitive
+        // Space on env var toggles sensitive（只读态空格被吞掉，需先 Enter 进入编辑态）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
             KeyCode::Char(' '),
             KeyModifiers::NONE,
         );
-        assert!(screen.settings.as_ref().unwrap().config_draft.env.vars[0].sensitive);
-        assert!(screen.status.contains("已开启脱敏保护"));
-
-        // Enter on env var opens /env edit form
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
             KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.settings.as_ref().unwrap().config_draft.env.vars[0].sensitive);
+        assert!(screen.status.contains("已开启脱敏保护"));
+
+        // 'E' on env var opens /env edit form（Enter 已被保留为「进入编辑态」）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('e'),
             KeyModifiers::NONE,
         );
         assert!(screen.form.is_some());
@@ -21738,7 +24719,13 @@ mod tests {
         // Move to memory rule partition (selected_row = 1)
         screen.settings.as_mut().unwrap().selected_row = 1;
 
-        // Space on memory rule toggles enabled
+        // Space on memory rule toggles enabled（需先 Enter 进入编辑态）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
@@ -21748,7 +24735,7 @@ mod tests {
         assert!(!screen.settings.as_ref().unwrap().config_draft.memory.rules[0].enabled);
         assert!(screen.status.contains("已关闭"));
 
-        // Right on memory rule cycles scope: "both" -> "project"
+        // Right on memory rule cycles scope: "both" -> "project"（编辑态内）
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
@@ -21771,12 +24758,18 @@ mod tests {
             screen.settings.as_ref().unwrap().config_draft.memory.rules[0].scope,
             "global"
         );
-
-        // Enter on memory rule opens /memory rule edit form
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
             KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+
+        // 'E' on memory rule opens /memory rule edit form（Enter 已被保留为「进入编辑态」）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('e'),
             KeyModifiers::NONE,
         );
         assert!(screen.form.is_some());
@@ -22043,6 +25036,16 @@ mod tests {
     #[tokio::test]
     async fn settings_opened_dialogs_keep_settings_panel_as_background() {
         let mut owner = crate::headless::tests::test_runner().await;
+        cyber_core::custom_tool::save_custom_tool(
+            &owner.ctx.paths.tools_dir,
+            &cyber_core::CustomToolConfig {
+                name: "probe".into(),
+                description: "探测".into(),
+                command: "probe -x".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         owner.ctx.config.env.vars.push(cyber_core::EnvVar {
             key: "DASCTF_ACCESS_KEY".into(),
             value: "demo".into(),
@@ -22073,15 +25076,15 @@ mod tests {
             SettingsTab::EnvMemory
         );
 
-        // 1) 编辑环境变量表单：selected_row = 0 即第一个环境变量
+        // 1) 编辑环境变量表单：selected_row = 0 即第一个环境变量（E 打开表单，Enter 现在是「进入编辑态」）
         screen.settings.as_mut().unwrap().selected_row = 0;
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
-            KeyCode::Enter,
+            KeyCode::Char('e'),
             KeyModifiers::NONE,
         );
-        assert!(screen.form.is_some(), "Enter 应打开编辑环境变量表单");
+        assert!(screen.form.is_some(), "E 应打开编辑环境变量表单");
         let frame = render(&mut screen, 120, 36);
         assert!(
             frame
@@ -22102,15 +25105,15 @@ mod tests {
         assert!(screen.form.is_none());
         assert_eq!(screen.panel, Some(Panel::Settings));
 
-        // 2) 编辑记忆规则表单：env_slots = 1，selected_row = 1 即第一条规则
+        // 2) 编辑记忆规则表单：env_slots = 1，selected_row = 1 即第一条规则（E 打开表单）
         screen.settings.as_mut().unwrap().selected_row = 1;
         settings_key_with_runner(
             &mut screen,
             &mut runner_opt,
-            KeyCode::Enter,
+            KeyCode::Char('e'),
             KeyModifiers::NONE,
         );
-        assert!(screen.form.is_some(), "Enter 应打开编辑记忆规则表单");
+        assert!(screen.form.is_some(), "E 应打开编辑记忆规则表单");
         let frame = render(&mut screen, 120, 36);
         assert!(
             frame
@@ -22178,9 +25181,303 @@ mod tests {
             "{frame}"
         );
 
+        // 4) 工具库 → 编辑自定义工具表单（原先会回落到对话界面）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('8'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::Toolbox);
+        // 行 1 = 第一个自定义工具（行 0 是 AI 扫描入口）。
+        screen.settings.as_mut().unwrap().selected_row = 1;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(
+            matches!(
+                screen.form.as_ref().map(|state| &state.form.kind),
+                Some(FormKind::CustomTool { .. })
+            ),
+            "Enter 应打开编辑自定义工具表单"
+        );
+        let frame = render(&mut screen, 120, 36);
+        let compact = frame.replace(' ', "");
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "编辑自定义工具弹层的背景必须是设置中心，而不是对话界面: {frame}"
+        );
+        assert!(compact.contains("编辑自定义工具"), "{frame}");
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert!(screen.form.is_none());
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
+        // 5) 工具库首行 → AI 智能扫描表单（同一缺陷路径）
+        screen.settings.as_mut().unwrap().selected_row = 0;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(matches!(
+            screen.form.as_ref().map(|state| &state.form.kind),
+            Some(FormKind::ToolboxScan)
+        ));
+        let frame = render(&mut screen, 120, 36);
+        let compact = frame.replace(' ', "");
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "扫描表单弹层的背景必须是设置中心: {frame}"
+        );
+        assert!(compact.contains("AI智能扫描本地安全工具"), "{frame}");
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+
         if let Some(r) = runner_opt {
             let _ = std::fs::remove_dir_all(r.cwd);
         }
+    }
+
+    /// 设置中心「9. 关于」页：设置中心为背景、内容含四段说明、底部说明书滚到底可见，且只读。
+    #[tokio::test]
+    async fn about_tab_renders_manual_sections_with_settings_background() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('9'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::About);
+        assert_eq!(
+            SettingsTab::About.max_row(screen.settings.as_ref().unwrap()),
+            0
+        );
+        assert!(screen.about.is_some(), "进入关于页必须采集内容快照");
+        assert_eq!(screen.about_scroll, 0);
+
+        let frame = render(&mut screen, 120, 40);
+        let compact = frame.replace(' ', "");
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .replace(' ', "")
+                .contains("全局设置中心"),
+            "关于页的背景必须是设置中心面板: {frame}"
+        );
+        assert!(
+            compact.contains(&format!("CyberMasterV{}", env!("CARGO_PKG_VERSION"))),
+            "{frame}"
+        );
+        assert!(
+            compact.contains("关于"),
+            "页签或标题必须出现「关于」: {frame}"
+        );
+        assert!(compact.contains("[版本与更新]"), "{frame}");
+        assert!(compact.contains("可更新版本"), "{frame}");
+        assert!(compact.contains("[项目信息]"), "{frame}");
+        assert!(
+            compact.contains("https://github.com/chuzouX/cyber-master"),
+            "{frame}"
+        );
+        assert!(compact.contains("MIT"), "{frame}");
+        assert!(compact.contains("[运行环境]"), "{frame}");
+        assert!(compact.contains("配置文件"), "{frame}");
+        assert!(compact.contains("[核心能力]"), "{frame}");
+
+        // 页面底部的说明书：滚到底后必须出现快捷键表与斜杠命令速查
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::End,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.about_scroll, usize::MAX);
+        // 内容约 85 行（含 30 条斜杠命令），120x40 一屏只容得下末尾的命令速查，
+        // 故用更高的视口让「快捷键说明书」与「斜杠命令速查」同时落在滚底视图内。
+        let frame = render(&mut screen, 120, 70);
+        let compact = frame.replace(' ', "");
+        assert!(compact.contains("[快捷键说明书]"), "{frame}");
+        assert!(compact.contains("Ctrl+B"), "{frame}");
+        assert!(compact.contains("[斜杠命令速查]"), "{frame}");
+        assert!(compact.contains("/about"), "{frame}");
+
+        // 只读：↑/↓ 只滚动内容，不移动设置焦点行、不切换页签
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().selected_row, 0);
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::About);
+        // R（恢复默认）在只读页不得把页签标记为已修改（否则 Esc 会平白弹出「未保存丢弃确认」）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        );
+        assert!(!screen.settings.as_ref().unwrap().dirty);
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::About);
+    }
+
+    /// `/about` 打开全屏只读面板，可滚动，Esc 关闭。
+    #[tokio::test]
+    async fn about_panel_opens_via_slash_scrolls_and_closes() {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let action = cli_commands::execute(&mut owner, "/about").unwrap();
+        assert!(matches!(action, CliAction::Panel(Panel::About)));
+        assert!(Panel::About.is_fullscreen());
+
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let permissions = Arc::new(permissions);
+        let (events, _rx_ev) = mpsc::unbounded_channel();
+        let mut active = None;
+        let mut cancel = None;
+        let mut runner_opt = Some(owner);
+        apply_action(
+            &mut screen,
+            action,
+            &mut runner_opt,
+            &permissions,
+            &events,
+            &mut active,
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(screen.panel, Some(Panel::About));
+        assert!(screen.about.is_some());
+        assert_eq!(screen.about_scroll, 0);
+
+        let frame = render(&mut screen, 120, 40);
+        let compact = frame.replace(' ', "");
+        assert!(
+            compact.contains(&format!(
+                "关于/About·CyberMasterV{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{frame}"
+        );
+        assert!(
+            compact.contains("检查更新"),
+            "面板底部须有按键提示: {frame}"
+        );
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.about_scroll, 2);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, None, "Esc 必须关闭关于面板");
+    }
+
+    /// 关于页按 U 走既有更新检查（本地缓存路径，不联网），检查结果落地时同步「可更新版本」行。
+    #[tokio::test]
+    async fn about_page_update_check_and_refresh() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('9'),
+            KeyModifiers::NONE,
+        );
+
+        let before = screen.messages.len();
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('u'),
+            KeyModifiers::NONE,
+        );
+        assert!(!screen.update_checking);
+        assert!(screen.messages.len() > before, "U 必须产出更新检查结果提示");
+        assert!(
+            screen
+                .messages
+                .iter()
+                .any(|line| line.to_string().contains("更新检查")),
+            "更新检查结果必须写入对话区"
+        );
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::About);
+
+        // 检查结果落地时必须同步「可更新版本」行
+        screen.deliver_update(UpdateCheckResult {
+            kind: cli_commands::CliUpdate::Check,
+            info: Some(cyber_core::update::ReleaseInfo {
+                version: "9.9.9".into(),
+                html_url: "https://example.invalid/release".into(),
+                release_notes: None,
+                published_at: None,
+            }),
+        });
+        assert_eq!(screen.new_version.as_deref(), Some("9.9.9"));
+        assert_eq!(
+            screen.about.as_ref().unwrap().latest.as_deref(),
+            Some("9.9.9")
+        );
+        let frame = render(&mut screen, 120, 40);
+        assert!(frame.replace(' ', "").contains("V9.9.9"), "{frame}");
     }
 
     fn models_picker(label: &str, detail: &str) -> CommandPicker {
@@ -22316,7 +25613,7 @@ mod tests {
         let mut cancel = None;
 
         screen.panel = Some(Panel::Settings);
-        let mut settings = CliSettingsState::from_runner(runner_opt.as_ref().unwrap());
+        let mut settings = CliSettingsState::from_view(&runner_opt.as_ref().unwrap().view());
         settings.tab = SettingsTab::Providers;
         let providers_before = settings.providers_draft.providers.len();
         assert!(
@@ -22431,7 +25728,7 @@ mod tests {
         }
         runner = Some(owner);
 
-        // busy：输入不经过 slash::parse，必须由 handle_key 的 busy 分支直接退出。
+        // busy：输入经 handle_key 的 busy 分支（classify_busy_slash）解析，/exit 必须直接退出。
         screen.busy = true;
         screen.input = composer();
         screen.insert_text("/exit");

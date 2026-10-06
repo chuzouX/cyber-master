@@ -451,6 +451,34 @@ fn extract_task_summary(answer: &str) -> String {
     }
     "所有操作已顺利执行并返回结果。".into()
 }
+/// 只读视图：不写盘指令所需数据的统一来源。
+///
+/// 空闲时由 `SessionRunner::view()` 构造；回合进行中（runner 已被 `take()` 走）
+/// 由 `CliScreen` 的快照构造。两条路径字段语义一致，保证同一指令的输出逐字节相同。
+pub(crate) struct ViewCtx<'a> {
+    pub config: &'a cyber_core::Config,
+    pub providers: &'a cyber_core::ProvidersConfig,
+    pub paths: &'a cyber_core::Paths,
+    pub cwd: &'a Path,
+    pub sessions: &'a [crate::history::SessionMeta],
+    pub current_session_id: &'a str,
+    pub has_project: bool,
+    pub ctf_enabled: bool,
+    pub ctf_challenges: Option<&'a std::sync::Mutex<Vec<cyber_core::CtfChallenge>>>,
+    pub tools: &'a ToolRegistry,
+    pub skills: &'a cyber_skills::SkillRegistry,
+    pub mcp: Option<&'a cyber_mcp::McpRegistry>,
+}
+
+impl ViewCtx<'_> {
+    /// 当前会话元数据（语义同 `SessionIndex::current_meta`）。
+    pub(crate) fn current_meta(&self) -> Option<&crate::history::SessionMeta> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.current_session_id)
+    }
+}
+
 /// Built once per CLI lifetime; session and provider selections are mutable.
 pub(crate) struct SessionRunner {
     pub ctx: AppContext,
@@ -464,6 +492,24 @@ pub(crate) struct SessionRunner {
 }
 
 impl SessionRunner {
+    /// 只读视图（不克隆、不读盘）。
+    pub(crate) fn view(&self) -> ViewCtx<'_> {
+        ViewCtx {
+            config: &self.ctx.config,
+            providers: &self.ctx.providers,
+            paths: &self.ctx.paths,
+            cwd: &self.cwd,
+            sessions: self.index.sessions.as_slice(),
+            current_session_id: self.index.current.as_str(),
+            has_project: self.ctx.project.is_some(),
+            ctf_enabled: self.ctf_enabled,
+            ctf_challenges: self.registries.ctf_challenges.as_deref(),
+            tools: &self.registry,
+            skills: &self.registries.skills,
+            mcp: self.registries.mcp.as_deref(),
+        }
+    }
+
     pub async fn new(cwd: &Path, mock: bool) -> color_eyre::Result<Self> {
         let ctx = load_app_context(cwd)?;
         let index_path =
@@ -1040,38 +1086,58 @@ impl SessionRunner {
                 }
                 let _ = events.send(AgentEvent::Done);
             }
-            CliTask::ToolboxScan { preview, target } => {
+            CliTask::ToolboxScan {
+                preview,
+                target,
+                provider,
+                model,
+            } => {
                 let _ = events.send(AgentEvent::Started);
-                let provider = self
-                    .ctx
-                    .providers
-                    .providers
-                    .get(&self.ctx.config.agent.default_provider)
-                    .cloned();
-                let report = match provider {
-                    None => Err(color_eyre::eyre::eyre!(
-                        "未配置默认 Provider；请先运行 cyber setup 或 /provider"
-                    )),
-                    Some(cfg)
-                        if cfg.kind != "ollama" && cfg.resolved_api_key().trim().is_empty() =>
-                    {
-                        Err(color_eyre::eyre::eyre!(
-                            "当前 Provider [{}] 缺少有效 API Key",
-                            self.ctx.config.agent.default_provider
-                        ))
-                    }
-                    Some(cfg) => {
-                        crate::toolbox::run_scan(
-                            &cfg,
-                            &self.ctx.paths.tools_dir,
-                            target.as_deref(),
-                            preview,
-                            &events,
-                            &mut cancel,
-                        )
-                        .await
-                    }
-                };
+                let provider_name = provider
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| self.ctx.config.agent.default_provider.clone());
+                let provider = self.ctx.providers.providers.get(&provider_name).cloned();
+                let report =
+                    match provider {
+                        None => Err(color_eyre::eyre::eyre!(
+                            "未配置服务商 [{provider_name}]；请先运行 cyber setup 或 /provider"
+                        )),
+                        Some(cfg)
+                            if cfg.kind != "ollama" && cfg.resolved_api_key().trim().is_empty() =>
+                        {
+                            Err(color_eyre::eyre::eyre!(
+                                "服务商 [{provider_name}] 缺少有效 API Key"
+                            ))
+                        }
+                        Some(mut cfg) => {
+                            let model = model
+                                .map(|name| name.trim().to_string())
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| cfg.model.clone());
+                            if model.is_empty() {
+                                Err(color_eyre::eyre::eyre!(
+                                "服务商 [{provider_name}] 未配置模型；请在表单中选择或手输模型名"
+                            ))
+                            } else {
+                                cfg.model = model.clone();
+                                let _ =
+                                    events.send(AgentEvent::Notice(format!(
+                                "🤖 AI 智能扫描：服务商 [{provider_name}] · 模型 [{model}]{}",
+                                if preview { " · 仅预览不写盘" } else { "" }
+                            )));
+                                crate::toolbox::run_scan(
+                                    &cfg,
+                                    &self.ctx.paths.tools_dir,
+                                    target.as_deref(),
+                                    preview,
+                                    &events,
+                                    &mut cancel,
+                                )
+                                .await
+                            }
+                        }
+                    };
                 match report {
                     Ok(report) => {
                         let text = crate::toolbox::format_report(&report);
@@ -2964,6 +3030,75 @@ pub(crate) mod tests {
         assert!(
             matches!(runner.entries.last(),Some(ChatEntry::TurnSummary { status,.. }) if status == "cancelled")
         );
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn toolbox_scan_task_resolves_selected_provider_and_requires_model() {
+        let mut runner = test_runner().await;
+        // 显式指定的服务商（ollama 无需 API Key）必须优先于默认 openai；
+        // 该服务商未配置模型且表单未选模型 → 明确报错，而不是静默回退默认服务商。
+        runner.ctx.providers.providers.insert(
+            "scan-local".into(),
+            cyber_core::ProviderConfig {
+                kind: "ollama".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                model: String::new(),
+                ..Default::default()
+            },
+        );
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, cancel) = tokio::sync::oneshot::channel();
+        let outcome = runner
+            .run_cli_task(
+                crate::cli_commands::CliTask::ToolboxScan {
+                    preview: true,
+                    target: Some("D:/tools".into()),
+                    provider: Some("scan-local".into()),
+                    model: None,
+                },
+                Arc::new(PermissionBroker::deny_all()),
+                events,
+                cancel,
+            )
+            .await;
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("scan-local"),
+            "error = {:?}",
+            outcome.error
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("未配置模型"));
+
+        // 未知服务商必须报错（不落到默认 Provider）
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, cancel) = tokio::sync::oneshot::channel();
+        let outcome = runner
+            .run_cli_task(
+                crate::cli_commands::CliTask::ToolboxScan {
+                    preview: false,
+                    target: None,
+                    provider: Some("missing".into()),
+                    model: Some("whatever".into()),
+                },
+                Arc::new(PermissionBroker::deny_all()),
+                events,
+                cancel,
+            )
+            .await;
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("未配置服务商 [missing]"));
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 

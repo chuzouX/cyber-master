@@ -88,7 +88,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/toolbox",
-        usage: "/toolbox [list|add|edit <name>|remove <name>|scan [dir|prompt] [--preview]]",
+        usage: "/toolbox [list|add|edit <name>|remove <name>|scan [dir|prompt] [--preview] [--provider <n>] [--model <m>]]",
         desc: "自定义安全工具库：列表 / 录入 / 删除 / AI 智能扫描本地工具",
     },
     CommandSpec {
@@ -325,7 +325,7 @@ pub const HELP_TEXT: &str = "\
   /env [sub]         环境变量：list | set KEY VALUE | set-sensitive KEY VALUE | remove KEY
   /web [status|on|off] 联网搜索：查看状态或开启/禁用 web_fetch 功能
   /tools             列出可用工具
-  /toolbox <sub>     自定义工具库：list | add | edit <name> | remove <name> | scan [--preview]
+  /toolbox <sub>     自定义工具库：list | add | edit <name> | remove <name> | scan [目录|提示词] [--preview] [--provider n] [--model m]
   /skill <name|list> 查看 Skill 详细说明（list 列出全部）
   /mcp [sub]         打开全屏 MCP 管理面板（支持测活、配置与工具查看）
   /cancel            取消当前生成
