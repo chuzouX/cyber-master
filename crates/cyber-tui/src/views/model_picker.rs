@@ -265,12 +265,36 @@ fn render_models(
         lines.push(Line::from(" ⟳ 正在拉取模型列表…").style(Style::default().fg(theme.muted)));
     } else if state.models.is_empty() {
         lines.push(
-            Line::from("（无模型，按 Tab 切到 Providers 栏选择 provider 后自动拉取）")
+            Line::from("（无模型 · 左栏选中 provider 后按 Enter 从接口获取）")
                 .style(Style::default().fg(theme.muted))
                 .alignment(Alignment::Center),
         );
     } else {
-        for (i, m) in state.models.iter().enumerate() {
+        // 只构建可见窗口内的行：长模型列表（数百～数千条）下逐行构建 + 逐行能力查询会让
+        // 每帧成本随列表长度线性增长（旧实现在这里每行调两次 `CapabilityStore::load()`）。
+        let visible_h = inner.height as usize;
+        let total = state.models.len();
+        let prev = state
+            .model_scroll
+            .get()
+            .min(total.saturating_sub(visible_h));
+        let sel = state.model_selected;
+        let scroll = if total <= visible_h {
+            0
+        } else if sel < prev {
+            sel
+        } else if sel >= prev + visible_h {
+            (sel + 1)
+                .saturating_sub(visible_h)
+                .min(total.saturating_sub(visible_h))
+        } else {
+            prev
+        };
+        state.model_scroll.set(scroll);
+        // 能力缓存每帧只读一次（显式 models 配置 → 实测缓存 → 名称规则表）。
+        let store = cyber_core::CapabilityStore::load();
+        for i in scroll..(scroll + visible_h).min(total) {
+            let m = &state.models[i];
             let selected = i == state.model_selected;
             let marker = if selected { "▸ " } else { "  " };
             let style = if selected {
@@ -300,14 +324,12 @@ fn render_models(
             let is_active = current_provider
                 .map(|(_, p)| p.model == *m)
                 .unwrap_or(false);
+            let has_vision = current_provider.is_some_and(|(prov_name, _)| {
+                cyber_core::resolve_vision_capability(model_configs, prov_name, m, &store)
+                    .is_supported()
+            });
 
             let max_model_w = (inner.width as usize).saturating_sub(1);
-            let has_vision = current_provider
-                .map(|(prov_name, prov_cfg)| {
-                    cyber_core::get_model_vision_capability(prov_cfg, prov_name, m, None)
-                        == cyber_core::VisionCapability::Supported
-                })
-                .unwrap_or(false);
             let mut badges_w = 2usize; // marker
             if is_probing || has_vision {
                 badges_w += 8;
@@ -327,17 +349,14 @@ fn render_models(
                     probe_style = probe_style.bg(theme.sel_bg);
                 }
                 spans.push(Span::styled("  ⟳ 探测中", probe_style));
-            } else if let Some((prov_name, prov_cfg)) = current_provider {
-                let cap = cyber_core::get_model_vision_capability(prov_cfg, prov_name, m, None);
-                if cap == cyber_core::VisionCapability::Supported {
-                    let mut vision_style = Style::default()
-                        .fg(ratatui::style::Color::Cyan)
-                        .add_modifier(Modifier::BOLD);
-                    if selected {
-                        vision_style = vision_style.bg(theme.sel_bg);
-                    }
-                    spans.push(Span::styled("  ◈ 视觉", vision_style));
+            } else if has_vision {
+                let mut vision_style = Style::default()
+                    .fg(ratatui::style::Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                if selected {
+                    vision_style = vision_style.bg(theme.sel_bg);
                 }
+                spans.push(Span::styled("  ◈ 视觉", vision_style));
             }
 
             if is_active {
@@ -354,31 +373,8 @@ fn render_models(
         }
     }
 
-    // 粘性滚动：选中项溢出视口时自动调整（每项 1 行）
-    let visible_h = inner.height as usize;
-    let total_lines = lines.len();
-    let prev = state
-        .model_scroll
-        .get()
-        .min(total_lines.saturating_sub(visible_h));
-    let sel = state.model_selected;
-    let scroll = if total_lines <= visible_h {
-        0
-    } else if sel < prev {
-        sel
-    } else if sel >= prev + visible_h {
-        (sel + 1)
-            .saturating_sub(visible_h)
-            .min(total_lines.saturating_sub(visible_h))
-    } else {
-        prev
-    };
-    state.model_scroll.set(scroll);
-
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(theme.bg))
-            .scroll((scroll as u16, 0)),
+        Paragraph::new(lines).style(Style::default().bg(theme.bg)),
         inner,
     );
 }
@@ -390,8 +386,13 @@ fn render_hint(frame: &mut Frame, area: Rect, theme: &Theme, state: &ModelPicker
     };
     let hint = if let Some(probing) = &state.probing_model {
         format!(" ⟳ 正在对模型 [{probing}] 进行识图能力实测中，请稍候...")
+    } else if state.fetching {
+        format!(" ⟳ 正在从接口拉取模型列表… · {confirm_action} · Esc 关闭 ")
+    } else if !state.fetched {
+        " Tab/←/→ 切栏 · ↑/↓ 移动 · 左栏选中 provider 后 Enter 从接口获取模型 · r 重新拉取 · Esc 关闭 "
+            .to_string()
     } else {
-        format!(" Tab/←/→ 切栏 · ↑/↓ 移动 · {confirm_action} · t 探测识图 · Esc 关闭 ")
+        format!(" Tab/←/→ 切栏 · ↑/↓ 移动 · {confirm_action} · r 重新拉取 · t 探测识图 · Esc 关闭 ")
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::default().fg(theme.muted)),
@@ -427,6 +428,54 @@ mod tests {
             },
         );
         cfg
+    }
+
+    #[test]
+    fn render_model_picker_window_bounds_long_list() {
+        // 长模型列表（数千条）只渲染可见窗口：选中项必须可见，远处条目不得被构建/渲染，
+        // 且整帧耗时不随列表长度线性增长（旧实现每行调两次 `CapabilityStore::load()`）。
+        const TOTAL: usize = 8000;
+        let models: Vec<String> = (0..TOTAL).map(|i| format!("model-{i:04}")).collect();
+        let state = ModelPickerState {
+            models,
+            model_selected: TOTAL - 3,
+            focus_models: true,
+            fetched: true,
+            ..Default::default()
+        };
+        let providers = make_providers();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &Theme::resolve("cyberpunk"),
+                    &state,
+                    &providers,
+                    "openai",
+                )
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            text.contains("model-7997"),
+            "选中项必须可见（窗口跟随选中项）: {text}"
+        );
+        assert!(!text.contains("model-0000"), "窗口外条目不得被渲染: {text}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "8000 条模型的单帧渲染耗时 {elapsed:?} 过高（疑似逐行读盘/构建全量行）"
+        );
+        assert!(
+            state.model_scroll.get() > 0,
+            "选中项在末尾时滚动偏移必须跟随"
+        );
     }
 
     #[test]

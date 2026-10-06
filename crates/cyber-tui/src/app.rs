@@ -129,12 +129,27 @@ pub struct FetchResult {
     pub result: std::result::Result<Vec<String>, String>,
 }
 
-/// 模型视觉能力探针实测结果回传。
+/// 探针发起者：`/model` 面板还是 provider 表单。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeScope {
+    Picker,
+    ProviderForm,
+}
+
+/// 探针实测结果。
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    Vision(cyber_core::VisionCapability),
+    Reasoning(cyber_core::ReasoningCapability),
+}
+
+/// 模型能力探针实测结果回传（scope 决定写回范围：面板写 providers.toml，表单只写能力缓存）。
 #[derive(Debug)]
 pub struct ProbeResult {
     pub provider: String,
     pub model: String,
-    pub result: std::result::Result<cyber_core::VisionCapability, String>,
+    pub scope: ProbeScope,
+    pub result: std::result::Result<ProbeOutcome, String>,
 }
 
 /// 统一工具表 + Skill / MCP 注册表。
@@ -331,6 +346,8 @@ pub struct ModelPickerState {
     pub model_scroll: Cell<usize>,
     /// 正在探测识图能力中的模型（若有）。
     pub probing_model: Option<String>,
+    /// 右栏当前列表是否来自接口（false = 仅本地配置，尚未按 Enter 拉取）。
+    pub fetched: bool,
     /// 选择目标（主 Agent 还是识图引擎）。
     pub target: ModelPickerTarget,
 }
@@ -348,17 +365,42 @@ impl Default for ModelPickerState {
             provider_scroll: Cell::new(0),
             model_scroll: Cell::new(0),
             probing_model: None,
+            fetched: false,
             target: ModelPickerTarget::DefaultAgent,
         }
     }
 }
 
 impl ModelPickerState {
+    /// 用本地配置（`providers.toml`）填充右栏：打开面板 / 切换 provider 时的即时内容，
+    /// 不联网。接口结果只在左栏按 Enter（或 `r`）后拉取。
+    pub fn refresh_local_models(&mut self, providers: &ProvidersConfig) {
+        let names = providers.sorted_names();
+        let mut models: Vec<String> = names
+            .get(self.provider_selected)
+            .and_then(|name| providers.providers.get(name))
+            .map(|p| {
+                let mut list: Vec<String> = p.models.keys().cloned().collect();
+                if !p.model.is_empty() && !list.iter().any(|m| m == &p.model) {
+                    list.push(p.model.clone());
+                }
+                list
+            })
+            .unwrap_or_default();
+        models.retain(|m| !m.trim().is_empty());
+        self.models = models;
+        self.model_selected = 0;
+        self.model_scroll = Cell::new(0);
+        self.fetch_error = None;
+        self.fetched = false;
+    }
+
     /// bump fetch_id + 置 fetching + 清空旧结果。返回新 fetch_id 供 App spawn 任务。
     pub fn start_fetch(&mut self) -> u64 {
         self.fetch_id = self.fetch_id.wrapping_add(1);
         self.fetching = true;
         self.fetch_error = None;
+        self.fetched = false;
         self.models.clear();
         self.model_selected = 0;
         self.model_scroll = Cell::new(0);
@@ -379,6 +421,7 @@ impl ModelPickerState {
                     self.models = models;
                     self.model_selected = 0;
                     self.model_scroll = Cell::new(0);
+                    self.fetched = true;
                 }
             }
             Err(e) => {
@@ -1623,6 +1666,10 @@ impl App {
             }
             FormAction::Save => self.save_provider_form(),
             FormAction::Fetch => self.start_provider_fetch(),
+            FormAction::ProbeReasoning => {
+                self.start_provider_form_probe(FormAction::ProbeReasoning)
+            }
+            FormAction::ProbeVision => self.start_provider_form_probe(FormAction::ProbeVision),
             FormAction::Toast(msg) => self.toast = Some(msg),
         }
     }
@@ -1704,24 +1751,47 @@ impl App {
         self.toast = Some(format!("正在探测 [{model}] 识图能力..."));
         let tx = self.probe_tx.clone();
         tokio::spawn(async move {
-            let res = cyber_agent::probe_model_vision(&cfg_snapshot, &model).await;
-            let result = res.map_err(|e| e.to_string());
+            let result = cyber_agent::probe_model_vision(&cfg_snapshot, &model)
+                .await
+                .map(ProbeOutcome::Vision)
+                .map_err(|e| e.to_string());
             let _ = tx.send(ProbeResult {
                 provider: provider_name,
                 model,
+                scope: ProbeScope::Picker,
                 result,
             });
         });
     }
 
-    /// 接收异步模型探针实测结果并持久化写回。
+    /// 接收异步模型探针实测结果并按 (scope, outcome) 分派写回。
+    ///
+    /// - `Picker`：写回 providers.toml 的 per-model 能力字段（面板是主 Agent 的真实配置来源）。
+    /// - `ProviderForm`：只写能力缓存（`providers.toml` 里的表单状态尚未保存，不能提前落盘）。
     fn handle_probe_result(&mut self, pr: ProbeResult) {
-        if self.model_picker.probing_model.as_deref() == Some(&pr.model) {
+        if self.model_picker.probing_model.as_deref() == Some(pr.model.as_str()) {
             self.model_picker.probing_model = None;
         }
+        if let Some(form) = self.provider_form.as_mut() {
+            if form.probing_model.as_deref() == Some(pr.model.as_str()) {
+                form.probing_model = None;
+            }
+        }
 
-        match pr.result {
-            Ok(cap) => {
+        let outcome = match pr.result {
+            Ok(o) => o,
+            Err(err) => {
+                let msg = format!("模型 [{}] 探针实测失败: {err}", pr.model);
+                self.toast = Some(msg.clone());
+                if self.mode == Mode::Chat {
+                    self.chat.entries.push(ChatEntry::System(msg));
+                }
+                return;
+            }
+        };
+
+        let summary = match (pr.scope, outcome) {
+            (ProbeScope::Picker, ProbeOutcome::Vision(cap)) => {
                 let badge = cap.badge_text();
                 let _ = cyber_core::save_model_vision_capability(
                     &pr.provider,
@@ -1730,8 +1800,7 @@ impl App {
                     self.providers.providers.get_mut(&pr.provider),
                 );
                 let _ = cyber_core::save_providers(&self.providers, &self.paths.providers_file);
-
-                let summary = format!(
+                format!(
                     "模型 [{}] 识图能力探测完成：{}",
                     pr.model,
                     if badge.is_empty() {
@@ -1739,18 +1808,118 @@ impl App {
                     } else {
                         badge
                     }
+                )
+            }
+            (ProbeScope::Picker, ProbeOutcome::Reasoning(cap)) => {
+                let _ = cyber_core::save_model_reasoning_capability(
+                    &pr.provider,
+                    &pr.model,
+                    cap,
+                    self.providers.providers.get_mut(&pr.provider),
                 );
-                self.toast = Some(summary.clone());
-                if self.mode == Mode::Chat {
-                    self.chat.entries.push(ChatEntry::System(summary));
+                let _ = cyber_core::save_providers(&self.providers, &self.paths.providers_file);
+                format!(
+                    "模型 [{}] 推理(思考)能力探测完成：{}",
+                    pr.model,
+                    if cap.is_supported() {
+                        "◈ 推理"
+                    } else {
+                        "未测出思考输出"
+                    }
+                )
+            }
+            (ProbeScope::ProviderForm, ProbeOutcome::Vision(cap)) => {
+                let _ =
+                    cyber_core::save_model_vision_capability(&pr.provider, &pr.model, cap, None);
+                format!(
+                    "模型 [{}] 识图能力实测完成：{}",
+                    pr.model,
+                    if cap.is_supported() {
+                        "◈ 视觉"
+                    } else {
+                        "未测出识图输出"
+                    }
+                )
+            }
+            (ProbeScope::ProviderForm, ProbeOutcome::Reasoning(cap)) => {
+                let _ =
+                    cyber_core::save_model_reasoning_capability(&pr.provider, &pr.model, cap, None);
+                format!(
+                    "模型 [{}] 推理(思考)能力实测完成：{}",
+                    pr.model,
+                    if cap.is_supported() {
+                        "◈ 推理"
+                    } else {
+                        "未测出思考输出"
+                    }
+                )
+            }
+        };
+
+        self.toast = Some(summary.clone());
+        if self.mode == Mode::Chat {
+            self.chat.entries.push(ChatEntry::System(summary));
+        }
+    }
+
+    /// provider 表单内发起能力实测探针（`t` = 推理，`v` = 视觉）。
+    ///
+    /// provider 名取表单里的服务商标识；尚未保存的表单不写 `providers.toml`，
+    /// 结果只进能力缓存（见 `handle_probe_result` 的 ProviderForm 分支）。
+    fn start_provider_form_probe(&mut self, kind: FormAction) {
+        enum Prep {
+            Start(String, Box<cyber_core::ProviderConfig>, String),
+            Busy,
+            NoModel,
+        }
+        let prep = {
+            let Some(form) = self.provider_form.as_mut() else {
+                return;
+            };
+            if form.probing_model.is_some() {
+                Prep::Busy
+            } else {
+                let model = form
+                    .fetched_models
+                    .get(form.picker_selected)
+                    .cloned()
+                    .unwrap_or_else(|| form.model.trim().to_string());
+                if model.is_empty() {
+                    Prep::NoModel
+                } else {
+                    form.probing_model = Some(model.clone());
+                    Prep::Start(
+                        model,
+                        Box::new(form.to_provider_config_snapshot()),
+                        form.name.trim().to_string(),
+                    )
                 }
             }
-            Err(err) => {
-                let msg = format!("模型 [{}] 探针实测失败: {err}", pr.model);
-                self.toast = Some(msg.clone());
-                if self.mode == Mode::Chat {
-                    self.chat.entries.push(ChatEntry::System(msg));
-                }
+        };
+
+        match prep {
+            Prep::Busy => self.toast = Some("已有探针正在运行，请稍候...".into()),
+            Prep::NoModel => self.toast = Some("请先选择或输入模型名".into()),
+            Prep::Start(model, cfg, provider_name) => {
+                self.toast = Some(format!("正在实测 [{model}] 能力..."));
+                let tx = self.probe_tx.clone();
+                tokio::spawn(async move {
+                    let result = match kind {
+                        FormAction::ProbeVision => cyber_agent::probe_model_vision(&cfg, &model)
+                            .await
+                            .map(ProbeOutcome::Vision),
+                        _ => cyber_agent::probe_model_reasoning(&cfg, &model)
+                            .await
+                            .map(ProbeOutcome::Reasoning),
+                    }
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(ProbeResult {
+                        provider: provider_name,
+                        model,
+                        scope: ProbeScope::ProviderForm,
+                        result,
+                    });
+                });
             }
         }
     }
@@ -1847,7 +2016,8 @@ impl App {
                     self.model_picker.provider_selected =
                         (self.model_picker.provider_selected + provider_count - 1) % provider_count;
                     self.model_picker.provider_scroll = Cell::new(0);
-                    self.start_model_fetch();
+                    // 仅刷新本地配置列表（不联网）：拉取由左栏 Enter / r 触发。
+                    self.model_picker.refresh_local_models(&self.providers);
                 }
             }
             KeyCode::Down => {
@@ -1859,7 +2029,8 @@ impl App {
                     self.model_picker.provider_selected =
                         (self.model_picker.provider_selected + 1) % provider_count;
                     self.model_picker.provider_scroll = Cell::new(0);
-                    self.start_model_fetch();
+                    // 仅刷新本地配置列表（不联网）：拉取由左栏 Enter / r 触发。
+                    self.model_picker.refresh_local_models(&self.providers);
                 }
             }
             KeyCode::Enter => {
@@ -1870,11 +2041,18 @@ impl App {
                         self.confirm_model_pick();
                     }
                 } else {
-                    // Provider 栏 Enter → 切到 Model 栏（若未拉取则触发拉取）
+                    // Provider 栏 Enter（选定该 provider）→ 切到 Model 栏，并从接口重新拉取
+                    // 其模型列表（已在拉取中则不重复发起；失败/陈旧列表由此获得重试）。
                     self.model_picker.focus_models = true;
-                    if self.model_picker.models.is_empty() && !self.model_picker.fetching {
+                    if !self.model_picker.fetching {
                         self.start_model_fetch();
                     }
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // 手动重新从接口拉取当前 provider 的模型列表。
+                if !self.model_picker.fetching {
+                    self.start_model_fetch();
                 }
             }
             KeyCode::Char('t') | KeyCode::Char('T') if self.model_picker.focus_models => {
@@ -2988,6 +3166,39 @@ impl App {
                 }
                 self.chat.entries.push(ChatEntry::System(lines));
             }
+            SlashCommand::Toolbox(args) => {
+                let sub = args.split_whitespace().next().unwrap_or("");
+                if sub.is_empty() || sub.eq_ignore_ascii_case("list") {
+                    let tools_dir = self
+                        .paths
+                        .config_file
+                        .parent()
+                        .map(|home| home.join("tools"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("tools"));
+                    let (tools, _) = cyber_core::load_custom_tools(&tools_dir);
+                    let body = if tools.is_empty() {
+                        "（暂无自定义工具）".to_string()
+                    } else {
+                        tools
+                            .iter()
+                            .map(|tool| {
+                                format!(
+                                    "  {} — {}  ({})",
+                                    tool.config.name, tool.config.description, tool.config.command
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    self.chat
+                        .entries
+                        .push(ChatEntry::System(format!("自定义工具库：\n{body}")));
+                } else {
+                    self.chat.entries.push(ChatEntry::System(
+                        "自定义工具的录入 / 删除 / AI 扫描请在 CLI（`cyber`）中使用 /toolbox，或打开设置中心「8. 工具库」页。".into(),
+                    ));
+                }
+            }
             SlashCommand::Skill(args) => {
                 self.handle_skill_slash(&args);
             }
@@ -3904,11 +4115,14 @@ impl App {
 
                 let tx = self.probe_tx.clone();
                 tokio::spawn(async move {
-                    let res = cyber_agent::probe_model_vision(&cfg_snapshot, &model).await;
-                    let result = res.map_err(|e| e.to_string());
+                    let result = cyber_agent::probe_model_vision(&cfg_snapshot, &model)
+                        .await
+                        .map(ProbeOutcome::Vision)
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(ProbeResult {
                         provider: current_provider_name,
                         model,
+                        scope: ProbeScope::Picker,
                         result,
                     });
                 });
@@ -4121,7 +4335,9 @@ impl App {
         }
     }
 
-    /// 打开 `/model` 面板：重置状态 → 选中当前 default_provider → 自动拉取其模型列表。
+    /// 打开 `/model` 面板：重置状态 → 选中当前 default_provider → 右栏先显示本地配置模型。
+    ///
+    /// 接口拉取不在打开时进行：用户在左栏选定 provider 后按 Enter（或 `r`）才联网。
     fn open_model_picker(&mut self) {
         self.form_prev_mode = self.mode;
         self.model_picker = ModelPickerState::default();
@@ -4135,13 +4351,12 @@ impl App {
             self.model_picker.provider_selected = idx;
         }
         self.mode = Mode::ModelPicker;
-        // 自动拉取当前 provider 的模型列表
-        if !names.is_empty() {
-            self.start_model_fetch();
-        }
+        self.model_picker.refresh_local_models(&self.providers);
     }
 
-    /// 打开 `/vision model` 面板：重置状态为识图引擎目标 → 选中当前 vision provider（或默认） → 自动拉取模型列表。
+    /// 打开 `/vision model` 面板：重置状态为识图引擎目标 → 选中当前 vision provider（或默认） → 显示本地配置模型。
+    ///
+    /// 同样只在左栏 Enter（或 `r`）后才联网拉取。
     fn open_vision_model_picker(&mut self) {
         self.form_prev_mode = self.mode;
         self.model_picker = ModelPickerState::default();
@@ -4158,9 +4373,7 @@ impl App {
             self.model_picker.provider_selected = idx;
         }
         self.mode = Mode::ModelPicker;
-        if !names.is_empty() {
-            self.start_model_fetch();
-        }
+        self.model_picker.refresh_local_models(&self.providers);
     }
 
     /// 从 Settings Providers 段打开新增表单。
@@ -5577,8 +5790,17 @@ mod tests {
     }
 
     fn make_app(initial: Mode, config_file: PathBuf) -> App {
+        make_app_with_fetch(initial, config_file).0
+    }
+
+    /// 与 `make_app` 相同，但把模型拉取结果通道的接收端交给测试，
+    /// 用于断言真实的「面板开/切 provider → 拉取 → 回填右栏」链路。
+    fn make_app_with_fetch(
+        initial: Mode,
+        config_file: PathBuf,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<FetchResult>) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
-        let (ftx, _frx) = tokio::sync::mpsc::unbounded_channel::<FetchResult>();
+        let (ftx, frx) = tokio::sync::mpsc::unbounded_channel::<FetchResult>();
         // 每个 app 独占 history_dir + cwd，避免并行测试共享 session 文件互相干扰。
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5618,7 +5840,287 @@ mod tests {
         );
         // App::new 不加载历史（由 run() 负责）；测试需 sessions 已初始化才能 save_history。
         app.sessions = crate::history::load_index(&history_dir, &cwd);
-        app
+        (app, frx)
+    }
+
+    /// 极简 HTTP stub：按调用顺序为每次连接返回一个 JSON body（`Connection: close`）。
+    async fn spawn_stub_models(bodies: Vec<&'static str>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for body in bodies {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    fn stub_provider(addr: std::net::SocketAddr, model: &str) -> cyber_core::ProviderConfig {
+        cyber_core::ProviderConfig {
+            kind: "openai".into(),
+            base_url: format!("http://{addr}"),
+            api_key: "test-only-key".into(),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn model_picker_enter_fetches_provider_models_from_api() {
+        let addr = spawn_stub_models(vec![r#"{"data":[{"id":"live-b"},{"id":"live-a"}]}"#]).await;
+        let (mut app, mut fetch_rx) = make_app_with_fetch(Mode::Chat, temp_config_path());
+        app.providers
+            .providers
+            .insert("zz-stub".into(), stub_provider(addr, "cfg-model"));
+        app.config.agent.default_provider = "zz-stub".into();
+
+        // 打开面板：只有本地清单，不联网（stub 一次请求都不会收到）
+        app.open_model_picker();
+        assert!(!app.model_picker.fetching, "打开面板不得联网拉取");
+        assert_eq!(app.model_picker.models, vec!["cfg-model".to_string()]);
+        assert!(!app.model_picker.fetched);
+
+        // 左栏 Enter（选定 provider）→ 联网拉取
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.model_picker.fetching,
+            "左栏 Enter 选定 provider 后必须向接口拉取模型"
+        );
+
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_rx.recv())
+            .await
+            .expect("拉取应在超时前返回")
+            .expect("拉取结果通道不应关闭");
+        app.handle_fetch_result(fetch);
+
+        assert_eq!(
+            app.model_picker.models,
+            vec!["live-b".to_string(), "live-a".to_string()],
+            "接口返回的模型必须回填右栏"
+        );
+        assert!(!app.model_picker.fetching);
+        assert!(app.model_picker.fetch_error.is_none());
+        assert!(app.model_picker.fetched);
+    }
+
+    #[tokio::test]
+    async fn model_picker_switch_provider_then_enter_fetches_from_api() {
+        let addr = spawn_stub_models(vec![
+            r#"{"data":[{"id":"aaa-live"}]}"#,
+            r#"{"data":[{"id":"bbb-live"}]}"#,
+        ])
+        .await;
+        let (mut app, mut fetch_rx) = make_app_with_fetch(Mode::Chat, temp_config_path());
+        app.providers
+            .providers
+            .insert("zz-a".into(), stub_provider(addr, "aaa-cfg"));
+        app.providers
+            .providers
+            .insert("zz-b".into(), stub_provider(addr, "bbb-cfg"));
+        app.config.agent.default_provider = "zz-a".into();
+
+        app.open_model_picker();
+        let fid0 = app.model_picker.fetch_id;
+        // 第一次拉取由 Enter 触发（zz-a）
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_rx.recv())
+            .await
+            .expect("首次拉取应在超时前返回")
+            .expect("通道不应关闭");
+        app.handle_fetch_result(fetch);
+        assert_eq!(app.model_picker.models, vec!["aaa-live".to_string()]);
+
+        // 回到左栏（Enter 已把焦点切到模型栏），再切到下一个 provider → 只换本地清单，不联网
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!app.model_picker.focus_models, "Tab 应回到服务商栏");
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.model_picker.provider_selected, 1);
+        assert!(!app.model_picker.fetching, "切换 provider 不得联网");
+        assert!(!app.model_picker.fetched);
+        assert_eq!(app.model_picker.models, vec!["bbb-cfg".to_string()]);
+
+        // 再 Enter → 才为该 provider 拉取
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_picker.fetching, "Enter 选定后必须拉取");
+        assert_ne!(app.model_picker.fetch_id, fid0);
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_rx.recv())
+            .await
+            .expect("二次拉取应在超时前返回")
+            .expect("通道不应关闭");
+        app.handle_fetch_result(fetch);
+        assert_eq!(app.model_picker.models, vec!["bbb-live".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn model_picker_r_key_refetches_and_repeat_keys_while_fetching_are_noop() {
+        let addr = spawn_stub_models(vec![
+            r#"{"data":[{"id":"first"}]}"#,
+            r#"{"data":[{"id":"second"},{"id":"third"}]}"#,
+        ])
+        .await;
+        let (mut app, mut fetch_rx) = make_app_with_fetch(Mode::Chat, temp_config_path());
+        app.providers
+            .providers
+            .insert("zz-stub".into(), stub_provider(addr, "cfg-model"));
+        app.config.agent.default_provider = "zz-stub".into();
+
+        app.open_model_picker();
+        // 本地清单兜底：未联网前即可选（Enter 只切栏，不拉取）
+        assert_eq!(app.model_picker.models, vec!["cfg-model".to_string()]);
+
+        // 左栏 Enter → 拉取 #1
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let first_id = app.model_picker.fetch_id;
+        assert!(app.model_picker.fetching);
+        // 拉取进行中：Enter / r 都不得重复发起
+        for code in [KeyCode::Enter, KeyCode::Char('r')] {
+            app.handle_model_picker_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.model_picker.fetch_id, first_id,
+            "拉取进行中不得重复发起"
+        );
+        assert!(
+            app.model_picker.focus_models,
+            "拉取中 Enter 仍切到模型栏（但不得重复发起请求）"
+        );
+
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_rx.recv())
+            .await
+            .expect("首次拉取应在超时前返回")
+            .expect("通道不应关闭");
+        app.handle_fetch_result(fetch);
+        assert_eq!(app.model_picker.models, vec!["first".to_string()]);
+
+        // r 手动重新拉取（无需回到左栏）
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.model_picker.fetching, "r 必须触发重新拉取");
+        assert_ne!(app.model_picker.fetch_id, first_id);
+
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_rx.recv())
+            .await
+            .expect("重新拉取应在超时前返回")
+            .expect("通道不应关闭");
+        app.handle_fetch_result(fetch);
+        assert_eq!(
+            app.model_picker.models,
+            vec!["second".to_string(), "third".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_picker_fetch_failure_surfaces_error() {
+        // 指向必然拒绝连接的端口：错误必须冒泡到面板状态而不是静默留空。
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (mut app, mut fetch_rx) = make_app_with_fetch(Mode::Chat, temp_config_path());
+        app.providers
+            .providers
+            .insert("zz-stub".into(), stub_provider(addr, "cfg-model"));
+        app.config.agent.default_provider = "zz-stub".into();
+
+        app.open_model_picker();
+        // 打开不联网：必须由左栏 Enter 触发拉取
+        assert!(!app.model_picker.fetching);
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_picker.fetching);
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), fetch_rx.recv())
+            .await
+            .expect("拉取应在超时前返回")
+            .expect("通道不应关闭");
+        app.handle_fetch_result(fetch);
+
+        assert!(!app.model_picker.fetching);
+        assert!(
+            app.model_picker.fetch_error.is_some(),
+            "拉取失败必须写入 fetch_error"
+        );
+    }
+
+    #[test]
+    fn provider_form_probe_writes_only_capability_cache() {
+        let mut app = make_app(Mode::ProviderForm, temp_config_path());
+        let cfg = cyber_core::ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://probe.test/v1".into(),
+            api_key: "sk-test".into(),
+            model: "app-zz-probe-model".into(),
+            ..Default::default()
+        };
+        let mut form = ProviderFormState::from_provider("app-zz-probe-provider", &cfg);
+        form.probing_model = Some("app-zz-probe-model".into());
+        app.provider_form = Some(form);
+
+        app.handle_probe_result(ProbeResult {
+            provider: "app-zz-probe-provider".into(),
+            model: "app-zz-probe-model".into(),
+            scope: ProbeScope::ProviderForm,
+            result: Ok(ProbeOutcome::Reasoning(
+                cyber_core::ReasoningCapability::Supported,
+            )),
+        });
+
+        let form = app.provider_form.as_ref().unwrap();
+        assert!(
+            form.probing_model.is_none(),
+            "结果到达后必须清除「探测中」标记"
+        );
+        let toast = app.toast.clone().unwrap_or_default();
+        assert!(toast.contains("推理(思考)能力实测完成"), "toast = {toast}");
+        assert!(
+            !app.paths.providers_file.exists(),
+            "表单未保存时探针不得写 providers.toml"
+        );
+    }
+
+    #[test]
+    fn picker_reasoning_probe_persists_to_provider_config() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        let cfg = cyber_core::ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://probe.test/v1".into(),
+            api_key: "sk-test".into(),
+            model: "app-zz-probe-model".into(),
+            ..Default::default()
+        };
+        app.providers
+            .providers
+            .insert("app-zz-picker-p".into(), cfg);
+        app.model_picker.probing_model = Some("app-zz-probe-model".into());
+
+        app.handle_probe_result(ProbeResult {
+            provider: "app-zz-picker-p".into(),
+            model: "app-zz-probe-model".into(),
+            scope: ProbeScope::Picker,
+            result: Ok(ProbeOutcome::Reasoning(
+                cyber_core::ReasoningCapability::Supported,
+            )),
+        });
+
+        assert!(app.model_picker.probing_model.is_none());
+        assert_eq!(
+            app.providers.providers["app-zz-picker-p"].models["app-zz-probe-model"].reasoning,
+            Some(true),
+            "面板探针必须回写 per-model reasoning"
+        );
+        assert!(
+            app.paths.providers_file.exists(),
+            "面板探针必须持久化 providers.toml"
+        );
+        let toast = app.toast.clone().unwrap_or_default();
+        assert!(toast.contains("推理(思考)能力探测完成"), "toast = {toast}");
     }
 
     #[test]
@@ -6462,11 +6964,14 @@ mod tests {
         let names = app.providers.sorted_names();
         let expected_idx = names.iter().position(|n| n == "openai").unwrap();
         assert_eq!(app.model_picker.provider_selected, expected_idx);
-        // 应自动发起拉取
-        assert!(
-            app.model_picker.fetching,
-            "打开面板应自动拉取当前 provider 模型"
+        // 打开面板不联网：只显示 providers.toml 的本地模型，拉取由左栏 Enter 触发
+        assert!(!app.model_picker.fetching, "打开面板不得自动联网拉取模型");
+        assert_eq!(
+            app.model_picker.models,
+            vec!["gpt-4o".to_string()],
+            "应先显示本地配置模型"
         );
+        assert!(!app.model_picker.fetched);
     }
 
     #[test]
@@ -6492,7 +6997,8 @@ mod tests {
             "面板目标应为 VisionEngine"
         );
         assert_eq!(app.form_prev_mode, Mode::Chat);
-        assert!(app.model_picker.fetching);
+        // 打开面板只显示本地清单，不联网；左栏 Enter 才拉取
+        assert!(!app.model_picker.fetching, "打开面板不得自动联网拉取");
 
         // 模拟提供模型列表并确认选择
         let fid = app.model_picker.fetch_id;
@@ -6551,7 +7057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_picker_provider_nav_triggers_fetch() {
+    async fn model_picker_provider_nav_only_switches_local_list() {
         let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
         app.handle_slash_command("/model");
         let fid0 = app.model_picker.fetch_id;
@@ -6563,19 +7069,30 @@ mod tests {
             "Down 应切到 sorted_names[0]"
         );
         assert_eq!(names[0], "anthropic");
-        assert!(app.model_picker.fetching, "切换 provider 应触发拉取");
+        // 切换 provider 只换本地清单，不联网；需再按 Enter 才拉取
+        assert!(!app.model_picker.fetching, "切换 provider 不得自动联网拉取");
+        assert_eq!(app.model_picker.fetch_id, fid0, "fetch_id 不应变化");
+        assert_eq!(
+            app.model_picker.models,
+            vec!["claude-sonnet-4-5".to_string()],
+            "应显示 anthropic 的本地配置模型"
+        );
+
+        // 左栏 Enter（选定）→ 才联网
+        app.handle_model_picker_key(key(crossterm::event::KeyCode::Enter));
+        assert!(app.model_picker.fetching, "Enter 选定 provider 必须拉取");
         assert_ne!(app.model_picker.fetch_id, fid0, "fetch_id 应 bump");
-        // models 应被清空（旧结果清除）
-        assert!(app.model_picker.models.is_empty());
+        assert!(app.model_picker.models.is_empty(), "旧结果应先清空");
     }
 
     #[tokio::test]
     async fn model_picker_enter_on_empty_models_toasts() {
         let mut app = make_app_with_providers(Mode::Chat, temp_config_path());
         app.handle_slash_command("/model");
-        // 模拟拉取失败
+        // 模拟拉取失败且该 provider 无本地兜底模型
         let fid = app.model_picker.fetch_id;
         app.model_picker.deliver_fetch(fid, Err("timeout".into()));
+        app.model_picker.models.clear();
         // 切到 model 栏，Enter 应 toast 而非确认
         app.handle_model_picker_key(key(crossterm::event::KeyCode::Tab));
         app.handle_model_picker_key(key(crossterm::event::KeyCode::Enter));
