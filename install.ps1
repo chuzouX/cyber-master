@@ -27,6 +27,11 @@
 #   - 不是最新：询问是否更新到最新版本（回车 / y 确认，n 取消）；
 #   - $env:CYBER_FORCE=1：跳过版本检查与询问，直接下载并覆盖安装。
 #
+# 确定要更新后、开始下载之前还会检查是否有 cyber 进程正占用目标二进制
+# （Windows 不能覆盖运行中的 exe，否则会白下载一趟再报「being used by another process」）：
+#   - 有占用：列出 PID 并询问「是否终止这些进程并继续更新？[Y/n]」，
+#     回车 / y＝终止后继续，n＝放弃本次更新；非交互环境无法确认时同样放弃更新。
+#
 # 环境变量覆盖：
 #   $env:CYBER_VERSION       指定版本 tag，如 'v0.1.0'
 #   $env:CYBER_INSTALL_DIR   安装目录，默认 $env:USERPROFILE\.local\bin
@@ -70,6 +75,7 @@ $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 if ($InstallDir.Contains(';')) { throw "安装目录不能含 PATH 分隔符 ';'。" }
 $Target = 'x86_64-pc-windows-msvc'
 $Archive = "cyber-$Target.zip"
+$destBinary = Join-Path $InstallDir 'cyber.exe'
 
 # ─── 解析版本（未指定时取 latest）──────────────────────────────────────────
 if (-not $Version) {
@@ -120,17 +126,20 @@ function Compare-CyberVersion([string]$A, [string]$B) {
     return 0
 }
 
-# 询问是否继续；非交互环境下不自动更新。
-function Confirm-CyberUpdate([string]$Prompt) {
+# 询问是否继续；非交互环境下打印 $SkipMessage 并按「否」处理。
+function Confirm-CyberPrompt(
+    [string]$Prompt,
+    [string]$SkipMessage = '非交互环境，已跳过更新（如需强制覆盖安装请运行: cyber update --force）'
+) {
     if ([Console]::IsInputRedirected) {
-        Write-Host '非交互环境，已跳过更新（如需强制覆盖安装请运行: cyber update --force）' -ForegroundColor DarkGray
+        Write-Host $SkipMessage -ForegroundColor DarkGray
         return $false
     }
     $answer = ''
     try {
         $answer = Read-Host $Prompt
     } catch {
-        Write-Host '非交互环境，已跳过更新（如需强制覆盖安装请运行: cyber update --force）' -ForegroundColor DarkGray
+        Write-Host $SkipMessage -ForegroundColor DarkGray
         return $false
     }
     return (-not $answer) -or ($answer -match '^(?i)y(es)?$')
@@ -157,7 +166,7 @@ if ($installedPath) {
     if ($Force) {
         Write-Host "→ CYBER_FORCE 已启用：跳过版本检查与询问，直接下载并覆盖安装。" -ForegroundColor Cyan
     } elseif (-not $installedVersion) {
-        if (-not (Confirm-CyberUpdate "无法确定已安装版本，是否覆盖安装 $Version？[Y/n]")) {
+        if (-not (Confirm-CyberPrompt "无法确定已安装版本，是否覆盖安装 $Version？[Y/n]")) {
             Write-Host '已取消更新。'; return
         }
     } elseif ((Compare-CyberVersion $installedVersion $Version) -eq 0) {
@@ -165,16 +174,63 @@ if ($installedPath) {
         Write-Host '  如需强制覆盖安装，请运行: cyber update --force' -ForegroundColor DarkGray
         return
     } elseif ((Compare-CyberVersion $installedVersion $Version) -lt 0) {
-        if (-not (Confirm-CyberUpdate "是否更新到最新版本 $Version？[Y/n]")) {
+        if (-not (Confirm-CyberPrompt "是否更新到最新版本 $Version？[Y/n]")) {
             Write-Host '已取消更新。'; return
         }
     } else {
-        if (-not (Confirm-CyberUpdate "已安装版本 $installedVersion 高于目标版本 $Version，是否覆盖安装？[Y/n]")) {
+        if (-not (Confirm-CyberPrompt "已安装版本 $installedVersion 高于目标版本 $Version，是否覆盖安装？[Y/n]")) {
             Write-Host '已取消更新。'; return
         }
     }
 } else {
     Write-Host '→ 未检测到已安装的 cyber，将进行全新安装。' -ForegroundColor DarkGray
+}
+
+# ─── 目标二进制被正在运行的 cyber 占用时先询问是否终止 ─────────────────────
+# Windows 不能覆盖正在运行的 exe：直到写盘才发现会白下载一趟并报
+# 「The process cannot access the file ... because it is being used by another process」。
+# 因此确认要更新后、下载之前先找出占用 $destBinary 的 cyber 进程：同意则终止后继续，
+# 拒绝（或非交互环境无法确认）则放弃本次更新。
+function Get-CyberLockingProcess([string]$BinaryPath) {
+    $target = $BinaryPath.TrimEnd('\')
+    $lockers = @()
+    foreach ($p in @(Get-Process -Name 'cyber' -ErrorAction SilentlyContinue)) {
+        $path = $null
+        # 其他用户的进程可能拒绝查询 Path；查不到就不当作占用者（会在写盘失败时提示）。
+        try { $path = $p.Path } catch {}
+        if (-not $path) { continue }
+        if ([string]::Equals($path.TrimEnd('\'), $target, [StringComparison]::OrdinalIgnoreCase)) {
+            $lockers += $p
+        }
+    }
+    return @($lockers)
+}
+
+$locking = Get-CyberLockingProcess $destBinary
+if ($locking.Count -gt 0) {
+    Write-Host "⚠ 检测到正在运行的 cyber 进程正占用 $destBinary：" -ForegroundColor Yellow
+    foreach ($p in $locking) {
+        Write-Host ("     - PID {0}  {1}" -f $p.Id, $p.Path) -ForegroundColor DarkGray
+    }
+    Write-Host "  更新需要替换该文件，必须先终止这些进程（未保存的对话请先在 cyber 内保存）。" -ForegroundColor DarkGray
+    $killSkipMessage = '非交互环境，无法确认是否终止正在运行的 cyber；已放弃本次更新。请关闭 cyber 后重试。'
+    if (-not (Confirm-CyberPrompt '是否终止这些进程并继续更新？[Y/n]' $killSkipMessage)) {
+        Write-Host '已取消更新。'; return
+    }
+    foreach ($p in $locking) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    }
+    # 进程退出后文件句柄可能还要一小会儿才释放；等到占用消失再继续。
+    for ($i = 0; $i -lt 25; $i++) {
+        if ((Get-CyberLockingProcess $destBinary).Count -eq 0) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    $stillLocking = @(Get-CyberLockingProcess $destBinary)
+    if ($stillLocking.Count -gt 0) {
+        Write-Host ("⚠ 终止后仍检测到占用（PID: {0}）；请手动关闭 cyber 后重试。" -f ($stillLocking.Id -join ', ')) -ForegroundColor Yellow
+        Write-Host '已取消更新。'; return
+    }
+    Write-Host '✓ 已终止正在运行的 cyber 进程' -ForegroundColor Green
 }
 
 # ─── 下载源候选列表与多源测速 ──────────────────────────────────────────────
@@ -199,7 +255,6 @@ $tmpDir = Join-Path ([IO.Path]::GetTempPath()) "cyber-install-$([Guid]::NewGuid(
 $zipFile = Join-Path $tmpDir $Archive
 $shaFile = "$zipFile.sha256"
 $extractPath = Join-Path $tmpDir 'extract'
-$destBinary = Join-Path $InstallDir 'cyber.exe'
 try {
     New-Item -ItemType Directory -Path $tmpDir | Out-Null
 
@@ -277,10 +332,20 @@ try {
     }
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     # 不删除正在使用的旧二进制；覆盖失败时提示关闭进程后重试。
-    try {
-        Copy-Item -LiteralPath $srcBinary -Destination $destBinary -Force
-    } catch {
-        throw "无法写入 $destBinary；请关闭正在运行的 cyber 并检查目录权限后重试。$_"
+    # 上面已尽量终止占用进程，这里再做有限重试：进程刚退出时句柄可能尚未释放。
+    $copied = $false
+    $copyError = ''
+    for ($attempt = 1; $attempt -le 10 -and -not $copied; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $srcBinary -Destination $destBinary -Force
+            $copied = $true
+        } catch {
+            $copyError = $_.Exception.Message
+            Start-Sleep -Milliseconds 300
+        }
+    }
+    if (-not $copied) {
+        throw "无法写入 $destBinary；请关闭正在运行的 cyber 并检查目录权限后重试。$copyError"
     }
 } finally {
     Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
