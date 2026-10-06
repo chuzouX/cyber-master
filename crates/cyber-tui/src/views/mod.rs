@@ -79,13 +79,18 @@ pub(crate) fn clipped_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Spa
             };
             if used + w > limit {
                 truncated = true;
-                break 'outer;
+                break;
             }
             used += w;
             text.push(ch);
         }
+        // 预算耗尽发生在某个 span 内部时，必须保留该 span 已放下的前缀，
+        // 否则整段（如超长描述）会连同其后所有 span 一起消失，只剩「…」。
         if !text.is_empty() {
             out.push(Span::styled(text, span.style));
+        }
+        if truncated {
+            break 'outer;
         }
     }
     if truncated {
@@ -285,5 +290,51 @@ mod tests {
             (w.start, w.len, w.hidden_above, w.hidden_below),
             (0, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn clipped_spans_keeps_truncated_span_prefix() {
+        use unicode_width::UnicodeWidthStr;
+        // 首个长字段（工具描述）超出预算时必须保留其可见前缀：
+        // 旧实现 break 出整个循环，把该字段与后续字段（命令行）一起丢掉，只剩「…」。
+        let out = clipped_spans(
+            vec![
+                Span::raw("▶ "),
+                Span::raw("[fenjing_crack] "),
+                Span::raw("Fenjing 攻击指定表单参数:数据中注入点写 PAYLOAD,自动检测 WAF"),
+                Span::raw("  · cd /d D:\\CTF && python -m fenjing crack"),
+            ],
+            60,
+        );
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.starts_with("▶ [fenjing_crack] Fenjing"),
+            "截断字段的已放下前缀必须保留: {text}"
+        );
+        assert!(text.ends_with('…'), "截断必须补省略号: {text}");
+        assert_eq!(
+            UnicodeWidthStr::width(text.as_str()),
+            60,
+            "可见宽度必须恰好等于预算: {text}"
+        );
+    }
+
+    #[test]
+    fn clipped_spans_returns_input_when_it_fits() {
+        let spans = vec![Span::raw("ab"), Span::raw("cd")];
+        let out = clipped_spans(spans, 4);
+        assert_eq!(out.len(), 2);
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "abcd");
+    }
+
+    #[test]
+    fn clipped_spans_truncates_at_span_boundary() {
+        use unicode_width::UnicodeWidthStr;
+        // 第一个 span 恰好用尽预算：后续 span 整体剔除并补省略号，不产生半个宽字符。
+        let out = clipped_spans(vec![Span::raw("abcd"), Span::raw("中文内容")], 4);
+        let text: String = out.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "abc…");
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 4);
     }
 }
