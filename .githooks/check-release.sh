@@ -41,7 +41,7 @@ TARGET_TAG="${1:-}"
 
 # 1. 解析 Cargo.toml 中的工作区版本号
 echo ""
-echo "${BLUE}[1/7] 检查 Cargo.toml 版本号配置...${NC}"
+echo "${BLUE}[1/8] 检查 Cargo.toml 版本号配置...${NC}"
 if [ ! -f "Cargo.toml" ]; then
     echo "${RED}[ERROR] 当前目录下未找到 Cargo.toml，请在项目根目录运行。${NC}"
     exit 1
@@ -57,7 +57,7 @@ echo "${GREEN}✓ 检出工作区版本号: ${BOLD}${WORKSPACE_VERSION}${NC}"
 
 # 2. 校验 Tag 与 Cargo.toml 版本一致性
 echo ""
-echo "${BLUE}[2/7] 校验 Tag 与版本号匹配...${NC}"
+echo "${BLUE}[2/8] 校验 Tag 与版本号匹配...${NC}"
 if [ -n "$TARGET_TAG" ]; then
     NORM_TAG=$(echo "$TARGET_TAG" | sed -E 's/^[vV]//')
     if [ "$NORM_TAG" != "$WORKSPACE_VERSION" ]; then
@@ -75,7 +75,7 @@ fi
 
 # 3. 校验 CHANGELOG.md 日志记录
 echo ""
-echo "${BLUE}[3/7] 检查 CHANGELOG.md 更新记录...${NC}"
+echo "${BLUE}[3/8] 检查 CHANGELOG.md 更新记录...${NC}"
 if [ ! -f "CHANGELOG.md" ]; then
     echo "${RED}[ERROR] 未找到 CHANGELOG.md 文件！${NC}"
     exit 1
@@ -91,7 +91,7 @@ fi
 
 # 4. 检查工作区代码与依赖锁定状态
 echo ""
-echo "${BLUE}[4/7] 检查 Cargo.toml 与 Cargo.lock 提交状态...${NC}"
+echo "${BLUE}[4/8] 检查 Cargo.toml 与 Cargo.lock 提交状态...${NC}"
 MODIFIED_CARGO=$(git status --porcelain Cargo.toml Cargo.lock 2>/dev/null || true)
 if [ -n "$MODIFIED_CARGO" ]; then
     echo "${RED}[ERROR] 检测到 Cargo.toml 或 Cargo.lock 存在未提交修改：${NC}"
@@ -102,6 +102,17 @@ if [ -n "$MODIFIED_CARGO" ]; then
 fi
 echo "${GREEN}✓ Cargo.toml 与 Cargo.lock 已处于干净提交状态${NC}"
 
+# 5. 安装脚本版本解析（install.sh / cyber update 共用的 release JSON 解析）
+echo ""
+echo "${BLUE}[5/8] 检查 install.sh 版本解析（minified release JSON 回归）...${NC}"
+if sh "$(dirname -- "$0")/check-install.sh"; then
+    echo "${GREEN}✓ install.sh 版本解析检查通过${NC}"
+else
+    echo "${RED}[ERROR] install.sh 版本解析检查失败！${NC}"
+    echo "${YELLOW}用户经 curl | sh 安装与 cyber update 都会受此影响，请先修复再发布。${NC}"
+    exit 1
+fi
+
 # Windows 平台安全清理：杀死可能锁定 cyber.exe 的残留进程
 if command -v taskkill >/dev/null 2>&1; then
     taskkill //F //IM cyber.exe >/dev/null 2>&1 || true
@@ -109,7 +120,7 @@ fi
 
 # 5. 代码格式检查 (对应 GHA: Check formatting)
 echo ""
-echo "${BLUE}[5/7] 执行代码格式校验 (cargo fmt --all -- --check)...${NC}"
+echo "${BLUE}[6/8] 执行代码格式校验 (cargo fmt --all -- --check)...${NC}"
 if cargo fmt --all -- --check; then
     echo "${GREEN}✓ 代码格式符合规范${NC}"
 else
@@ -120,7 +131,7 @@ fi
 
 # 6. Clippy 静态检查 (对应 GHA: Clippy)
 echo ""
-echo "${BLUE}[6/7] 执行 Clippy 静态分析 (cargo clippy --workspace --all-targets --locked -- -D warnings)...${NC}"
+echo "${BLUE}[7/8] 执行 Clippy 静态分析 (cargo clippy --workspace --all-targets --locked -- -D warnings)...${NC}"
 if cargo clippy --workspace --all-targets --locked -- -D warnings; then
     echo "${GREEN}✓ Clippy 检查通过，无警告${NC}"
 else
@@ -130,7 +141,7 @@ fi
 
 # 7. 全量单元/集成测试 (对应 GHA: Test workspace)
 echo ""
-echo "${BLUE}[7/7] 执行全量测试套件 (cargo test --workspace --locked)...${NC}"
+echo "${BLUE}[8/8] 执行全量测试套件 (cargo test --workspace --locked)...${NC}"
 if cargo test --workspace --locked; then
     echo "${GREEN}✓ 全量工作区测试通过${NC}"
 else

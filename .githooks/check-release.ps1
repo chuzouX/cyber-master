@@ -19,7 +19,7 @@ Write-Host "  Cyber Master - 发布前置检查 (Release Pre-Flight Verification
 Write-Host "=================================================================" -ForegroundColor Cyan
 
 # 1. 解析 Cargo.toml
-Write-Host "`n[1/8] 检查 Cargo.toml 版本号配置..." -ForegroundColor Blue
+Write-Host "`n[1/9] 检查 Cargo.toml 版本号配置..." -ForegroundColor Blue
 if (-not (Test-Path "Cargo.toml")) {
     Write-Host "[ERROR] 当前目录下未找到 Cargo.toml，请在项目根目录运行。" -ForegroundColor Red
     exit 1
@@ -50,7 +50,7 @@ if ([string]::IsNullOrWhiteSpace($workspaceVersion)) {
 Write-Host "✓ 检出工作区版本号: $workspaceVersion" -ForegroundColor Green
 
 # 2. 校验 Tag
-Write-Host "`n[2/8] 校验 Tag 与版本号匹配..." -ForegroundColor Blue
+Write-Host "`n[2/9] 校验 Tag 与版本号匹配..." -ForegroundColor Blue
 if ($Tag -ne "") {
     $normTag = $Tag.TrimStart("v").TrimStart("V")
     if ($normTag -ne $workspaceVersion) {
@@ -64,7 +64,7 @@ if ($Tag -ne "") {
 }
 
 # 3. 校验 CHANGELOG.md
-Write-Host "`n[3/8] 检查 CHANGELOG.md 更新记录..." -ForegroundColor Blue
+Write-Host "`n[3/9] 检查 CHANGELOG.md 更新记录..." -ForegroundColor Blue
 if (-not (Test-Path "CHANGELOG.md")) {
     Write-Host "[ERROR] 未找到 CHANGELOG.md 文件！" -ForegroundColor Red
     exit 1
@@ -79,7 +79,7 @@ if (-not ($changelogContent -match "(?m)^## \[[vV]?$escapedVer\]")) {
 Write-Host "✓ CHANGELOG.md 已包含版本 $workspaceVersion 的发版记录" -ForegroundColor Green
 
 # 4. 检查未提交文件
-Write-Host "`n[4/8] 检查 Cargo.toml 与 Cargo.lock 提交状态..." -ForegroundColor Blue
+Write-Host "`n[4/9] 检查 Cargo.toml 与 Cargo.lock 提交状态..." -ForegroundColor Blue
 $diffCargo = git status --porcelain Cargo.toml Cargo.lock 2>$null
 if ($diffCargo) {
     Write-Host "[ERROR] 检测到 Cargo.toml 或 Cargo.lock 存在未提交修改：" -ForegroundColor Red
@@ -92,8 +92,34 @@ Write-Host "✓ Cargo.toml 与 Cargo.lock 已处于干净提交状态" -Foregrou
 # 清理占用
 Get-Process "cyber" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-# 5. 代码格式
-Write-Host "`n[5/8] 执行代码格式校验 (cargo fmt --all -- --check)..." -ForegroundColor Blue
+# 5. install.sh 版本解析（离线回归检查）
+
+Write-Host "`n[5/9] 检查 install.sh 版本解析（minified release JSON 回归）..." -ForegroundColor Blue
+
+$shPath = Get-Command sh -ErrorAction SilentlyContinue
+
+if ($shPath) {
+
+    & sh .githooks/check-install.sh
+
+    if ($LASTEXITCODE -ne 0) {
+
+        Write-Host "[ERROR] install.sh 版本解析检查失败！用户 curl | sh 安装与 cyber update 均受影响。" -ForegroundColor Red
+
+        exit 1
+
+    }
+
+    Write-Host "✓ install.sh 版本解析检查通过" -ForegroundColor Green
+
+} else {
+
+    Write-Host "ℹ 未找到 sh（Git for Windows 提供），跳过 install.sh 解析检查。" -ForegroundColor Yellow
+
+}
+
+# 6. 代码格式
+Write-Host "`n[6/9] 执行代码格式校验 (cargo fmt --all -- --check)..." -ForegroundColor Blue
 & cargo fmt --all -- --check
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] 代码格式检查失败！请运行 'cargo fmt --all' 格式化代码后再提交。" -ForegroundColor Red
@@ -102,7 +128,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "✓ 代码格式符合规范" -ForegroundColor Green
 
 # 6. Clippy
-Write-Host "`n[6/8] 执行 Clippy 静态分析 (cargo clippy --workspace --all-targets --locked -- -D warnings)..." -ForegroundColor Blue
+Write-Host "`n[7/9] 执行 Clippy 静态分析 (cargo clippy --workspace --all-targets --locked -- -D warnings)..." -ForegroundColor Blue
 & cargo clippy --workspace --all-targets --locked -- -D warnings
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Clippy 静态检查发现告警！" -ForegroundColor Red
@@ -111,7 +137,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "✓ Clippy 检查通过，无警告" -ForegroundColor Green
 
 # 7. 测试
-Write-Host "`n[7/8] 执行全量测试套件 (cargo test --workspace --locked)..." -ForegroundColor Blue
+Write-Host "`n[8/9] 执行全量测试套件 (cargo test --workspace --locked)..." -ForegroundColor Blue
 & cargo test --workspace --locked
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] 单元测试或集成测试未通过！" -ForegroundColor Red
@@ -120,7 +146,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "✓ 全量工作区测试通过" -ForegroundColor Green
 
 # 8. Release 构建
-Write-Host "`n[8/8] 验证 Release 模式编译 (cargo build --release --locked -p cyber-app)..." -ForegroundColor Blue
+Write-Host "`n[9/9] 验证 Release 模式编译 (cargo build --release --locked -p cyber-app)..." -ForegroundColor Blue
 & cargo build --release --locked -p cyber-app
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Release 编译失败！" -ForegroundColor Red

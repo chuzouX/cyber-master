@@ -121,31 +121,54 @@ else
 fi
 
 # ─── 解析版本（未指定时取 latest）──────────────────────────────────────────
+# release 接口可能返回单行（minified）JSON；此时 `sed -E 's/.*"([^"]+)".*/\1/'`
+# 的贪婪匹配会一路吃到 `"body"`（发布说明）的尾部，把整段 CHANGELOG 当成版本号。
+# 这里锚定 `"tag_name"` 键抽取，并用 `is_version_tag` 过滤，任何脏值都不会流入
+# 版本比较与下载 URL。
+extract_tag_name() {
+  sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# 版本号形态校验：vX.Y.Z（Y/Z 可省略，允许 -pre / +build 后缀）。
+is_version_tag() {
+  printf '%s' "$1" | grep -Eq '^[vV]?[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.]+)?$'
+}
+
+# 依次尝试各源的 release 接口，返回第一个解析成功且形态合法的 tag；全部失败返回非 0。
+resolve_latest_version() {
+  _cands=""
+  if [ "$USE_CNB" = "1" ]; then
+    _cands="https://api.cnb.cool/$CNB_REPO/-/releases"
+  fi
+  _cands="$_cands https://api.github.com/repos/$REPO/releases/latest https://api.cnb.cool/$CNB_REPO/-/releases"
+  for _url in $_cands; do
+    _body=$(curl -fsSL --connect-timeout 4 --max-time 6 "$_url" 2>/dev/null || true)
+    _tag=$(printf '%s' "$_body" | extract_tag_name || true)
+    if is_version_tag "$_tag"; then
+      printf '%s' "$_tag"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [ -z "$VERSION" ]; then
   echo "→ 查询最新版本…"
-  if [ "$USE_CNB" = "1" ]; then
-    VERSION=$(curl -fsSL --connect-timeout 4 --max-time 6 "https://api.cnb.cool/$CNB_REPO/-/releases" 2>/dev/null \
-              | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
-  fi
-  if [ -z "$VERSION" ]; then
-    VERSION=$(curl -fsSL --connect-timeout 4 --max-time 6 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-              | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
-  fi
-  if [ -z "$VERSION" ]; then
-    VERSION=$(curl -fsSL --connect-timeout 4 --max-time 6 "https://api.cnb.cool/$CNB_REPO/-/releases" 2>/dev/null \
-              | grep -E '"tag_name"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
-  fi
-  if [ -z "$VERSION" ]; then
+  if ! VERSION=$(resolve_latest_version); then
     echo "无法获取最新版本。请用 --version <tag> 显式指定，或检查网络。" >&2
     exit 1
   fi
+fi
+if ! is_version_tag "$VERSION"; then
+  echo "版本号无效: $VERSION（期望形如 v1.2.3；请用 --version <tag> 指定正确 tag）" >&2
+  exit 1
 fi
 
 # ─── 已安装版本检测、版本对比与更新确认 ────────────────────────────────────
 # 版本号比较：ver_lt A B，当 A 严格小于 B 时返回 0（忽略 v/V 前缀，按数字段比较）。
 ver_lt() {
-  awk -v a="$(printf '%s' "$1" | sed 's/^[vV]//')" \
-      -v b="$(printf '%s' "$2" | sed 's/^[vV]//')" 'BEGIN {
+  awk -v a="$(printf '%s' "$1" | sed 's/^[vV]//; s/[-+].*$//')" \
+      -v b="$(printf '%s' "$2" | sed 's/^[vV]//; s/[-+].*$//')" 'BEGIN {
     na = split(a, x, "."); nb = split(b, y, ".");
     n = (na > nb) ? na : nb;
     for (i = 1; i <= n; i++) {
@@ -192,8 +215,8 @@ fi
 
 if [ -n "$installed_bin" ]; then
   installed_version="$("$installed_bin" --version 2>/dev/null | head -n 1 | awk '{ print $NF }' || true)"
-  installed_norm="$(printf '%s' "$installed_version" | sed 's/^[vV]//')"
-  target_norm="$(printf '%s' "$VERSION" | sed 's/^[vV]//')"
+  installed_norm="$(printf '%s' "$installed_version" | sed 's/^[vV]//; s/[-+].*$//')"
+  target_norm="$(printf '%s' "$VERSION" | sed 's/^[vV]//; s/[-+].*$//')"
   echo "→ 检测到已安装的 cyber: $installed_bin"
   echo "  已安装版本: ${installed_version:-未知}"
   echo "  云端最新版本: $VERSION"

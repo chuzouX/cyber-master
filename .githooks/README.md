@@ -14,10 +14,10 @@
 | **2** | Tag 与版本号一致性 | `softprops/action-gh-release` | 防止打错 Tag（如本地版本为 `0.5.0` 却推送了 `v0.4.0`），避免 GHA 构建出错误版本的二进制产物 |
 | **3** | CHANGELOG.md 日志检查 | `generate_release_notes` | 确保当前版本在 `CHANGELOG.md` 中已有更新摘要记录 |
 | **4** | 关键配置与锁文件提交状态 | `actions/checkout@v4` | 检查 `Cargo.toml` 与 `Cargo.lock` 是否存在未提交修改（GHA 仅检出已提交代码，本地未提交的修改会导致远程依赖锁失败） |
-| **5** | 代码格式校验 | `cargo fmt --all -- --check` | 100% 对齐 CI 代码规范要求 |
-| **6** | Clippy 静态代码检查 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | 严格禁止任何 clippy 告警进入主干及 Release 构建 |
-| **7** | 全量单元/集成测试 | `cargo test --workspace --locked` | 全工作区测试套件验证，采用 `--locked` 保证依赖一致性 |
-| **8** | Release 模式构建验证 | `cargo build --release --locked` | 预先在本地验证 Release 优化级别与编译器选项下的完整编译 |
+| **5** | 安装脚本版本解析 | `install.sh` / `cyber update` 共用 | 离线回归检查（`.githooks/check-install.sh`）：release 接口返回**单行 JSON** 时，`install.sh` 必须只取 `"tag_name"`，不得把发布说明 `body` 当版本号；同时校验非法 `--version` 快速失败 |
+| **6** | 代码格式校验 | `cargo fmt --all -- --check` | 100% 对齐 CI 代码规范要求 |
+| **7** | Clippy 静态代码检查 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | 严格禁止任何 clippy 告警进入主干及 Release 构建 |
+| **8** | 全量单元/集成测试 | `cargo test --workspace --locked` | 全工作区测试套件验证，采用 `--locked` 保证依赖一致性 |
 
 ---
 
@@ -26,6 +26,7 @@
 - **`.githooks/pre-push`**：Git 预推送 Hook 脚本。拦截 `git push`，分析推送引用，精准检测 Release Tag。
 - **`.githooks/check-release.sh`**：POSIX Shell 规范的独立预检脚本（兼容 Linux、macOS、Git Bash / MSYS2）。
 - **`.githooks/check-release.ps1`**：PowerShell 独立预检脚本（带 UTF-8 BOM，专为 Windows 本地开发者优化）。
+- **`.githooks/check-install.sh`**：`install.sh` 版本解析离线回归检查（curl/uname/getconf 替身 + 合成 release JSON 与安装包，无需网络与 tty），由 `check-release.sh` 第 5 步调用。
 - **`.githooks/install.sh`**：一键安装配置脚本（设置 `git config core.hooksPath .githooks`）。
 
 ---
