@@ -15053,7 +15053,7 @@ mod tests {
                 name: "commands-recon".into(),
                 status: cyber_agent::SubagentStatus::Running,
                 lines: vec![
-                    format!("tool commands args: {{\"action\":\"list\"}}"),
+                    "tool commands args: {\"action\":\"list\"}".to_string(),
                     hostile_commands_line(),
                     hostile_commands_line(),
                 ],
