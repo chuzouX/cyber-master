@@ -16,6 +16,7 @@
 - [x] 修复 MCP HTTP/SSE 测试夹具的 TCP framing 与连接生命周期问题。
 - [x] 最新 release build、workspace 测试（874 项）、fmt、Clippy 全部通过；安装脚本语法检查通过。测试使用独立 target 目录，未终止用户正在运行的旧程序。
 - [x] CLI/headless 默认不自动启动 MCP；CLI `/mcp connect` 已接入 nonce 显式启动授权，UI deny 不会 start。
+- [x] `CLI /update` 联网检查 + 应用内升级：`/update [check|apply]` 绕过 1 小时缓存检查版本，无参数进入 `y` 确认态后用 `cyber update` 同一份安装脚本后台升级（运行中的二进制即安装目标时先生成等待退出的脚本再退出安装）；安装命令/目标判定抽为 `cyber_core::update` 共享 API，`cyber update --check/--apply` 行为不变。
 - [ ] 原 TUI 接入新审批机制与 MCP 可信启动策略（原面板仍保持原行为）。
 - [ ] 会话存储迁入 `cyber-storage`、独立 runtime crate 与跨前端并发会话写保护。
 - [x] Windows ConPTY 真实终端启动、审批、任务完成、正常退出与会话保存；120x30 和 80x12 resize 验收。

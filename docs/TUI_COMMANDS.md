@@ -2,7 +2,7 @@
 
 本页区分默认 `cyber` coding CLI 与 `cyber tui` 原 Chat 面板。CLI 依据 [cli_commands.rs](../crates/cyber-tui/src/cli_commands.rs) 的目录、补全和执行 handler，以及 [cli.rs](../crates/cyber-tui/src/cli.rs) / [headless.rs](../crates/cyber-tui/src/headless.rs) 的 UI 和任务处理核对；原 TUI 依据 [slash.rs](../crates/cyber-tui/src/slash.rs) / [app.rs](../crates/cyber-tui/src/app.rs)。目录、补全或帮助列出某参数，不等于所有参数组合均已实现。
 
-CLI 支持原 TUI 主命令目录中除 `/mode` 外的全部命令，并增加 `/effort`、`/bg`、`/toolbox`：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/toolbox`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/todo`、`/bg`、`/quit`（别名 `/exit`）、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
+CLI 支持原 TUI 主命令目录中除 `/mode` 外的全部命令，并增加 `/effort`、`/bg`、`/toolbox`、`/about`、`/update`：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/toolbox`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/todo`、`/bg`、`/quit`（别名 `/exit`）、`/effort`、`/about`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
 
 ## CLI 输入与交互
 
@@ -10,7 +10,8 @@ CLI 支持原 TUI 主命令目录中除 `/mode` 外的全部命令，并增加 `
 - `Up/Down` 选择候选，`Tab` 接受补全；`Enter` 在有未接受候选时先补全，再按 Enter 执行。接受补全后仍可继续输入参数。`Esc` 关闭候选并保留原输入，不清空命令。
 - 主命令及实现支持的子命令大小写不敏感；provider/题目等名称按实际数据匹配。按空白切分参数，不解析 shell 引号，不支持一行执行多个命令。
 表单直接编辑当前字段，以 Tab/Shift+Tab 切换，Enter 到下一字段、末字段 Enter 或 Ctrl+S 保存，Esc 取消；picker 用方向键选择、Enter 确认、Esc 返回。`Permission Required` 审批框采用居中按钮卡片设计：`[1 Allow once]`、`[2 Session]`、`[3 Deny]`，支持 `1`/`2`/`3` 直达或 Left/Right/Tab/Shift+Tab 切换高亮按钮，再按 Enter 确认；也可按 Esc 直接拒绝。粘贴内容在审批状态下自动忽略，不触发选择或确认。支持鼠标滚轮滑动浏览历史对话；在输入区按方向键上/下键可翻看/切换历史已发送的对话内容，scrolled 状态下上/下键逐行滚动视图。按 F2 或使用 `/mode [auto|manual|unlimited]` 切换三种审批模式（手动审批/自动审批/无限制）。自动审批（Auto）模式下常见只读与环境查看命令（如 `cat`、`grep`、`rg`、`git`、`cargo`、`pwd` 等）直接放行，高风险操作弹出确认。经会话授权（Session）的工具在后续使用相同命令主干或常见安全命令且无破坏性重定向时自动放行，无需因参数微调而重复确认。
-- 生成中命令受 UI 状态限制，须先取消再进行配置/会话操作；不能据静态目录推断任何任务状态下均可执行。例外：`/bg shell|list|kill|tail` 与 `Ctrl+G`/`Ctrl+B` 面板在 AI 回合运行中同样可用（数据来自后台注册表，不触碰回合持有的 runner）；`/bg run` 需要空闲（busy 时返回忙碌提示）。
+- 任务清单三态视图（仅 `cyber` 对话页）：`Alt+↑` 逐级展开（收起 → 精简 → 全量），`Alt+↓` 逐级收起（全量 → 精简 → 收起），到顶/到底按键被消费但不翻转。完整收起时不再画表格，只在对话区底部保留 1 行进度条 `  📋 任务清单 [c/t] (▶ 当前任务) · [Alt+↑] 展开 `；精简态表格高度 `clamp(3, 7)`（与改动前一致），全量态按内容要高度并以可用空间为上限，放不下时仍由既有「... 还有 N 项任务」提示行承接（无翻页）。`/todo close`（或 `hide`）等价于「收起」，`/todo open`（或 `show`）等价于「精简」；**全量态只能由 `Alt+↑` 第二档到达**。`cyber tui` 原 Chat 面板仍是二元展开/收起，不受影响。
+- 生成中（`busy`：流式输出 / 工具执行 / 等待审批）输入以 `/` 开头的命令按是否需要 runner 分派：**只读查看类指令与面板立即可用**——不写盘、不改会话的 `/help`、`/tools`、`/skill [list|<name>]`、`/think`（无参）、`/effort`（无参）、`/max_steps`（无参）、`/env [list]`、`/web [status]`、`/vision [status]`、`/subagents [status]`、`/ctf status|list`、`/toolbox [list]`、`/memory [list]`、`/memory rule list`、`/mcp [panel|list|status|add|edit|delete]`、`/provider [panel|dashboard|list|models [name]]`、`/model`（无参）、`/sessions [list]`、`/mode …`、`/update …`、`/about` 以及本来就本地执行的 `/todo …`、`/paste` 与无参 `/image`、`/bg …`（`/bg run` 除外）、`/subagents stop …`、`/cancel`、`/quit` 全部**立即生效**（与空闲路径同实现、输出一致）；**写盘/改会话命令**（`/new`、`/clear`、`/compact`、`/think <level>`、`/provider use|add|edit|remove|wizard`、`/env add|edit|set|remove`、`/toolbox add|edit|remove|scan`、`/ctf enable|disable|add|writeup|panel`、`/memory add|edit|delete`、`/sessions read|new|delete` 等）**按输入顺序排队，回合收尾时自动依次执行**（入队即回执「已排队：回合结束后执行…」，输入框清空），不再被静默丢弃；面板内选中（`/sessions` 选择器的 `Enter`/`n`/`d`）与在输入框敲同一指令等价；未知命令立即报 `Error: Unknown command; use /help` 且不入队。排队命令与排队提示词共用同一 `VecDeque` 保序，指令条目**绝不**写入 steering 通道（模型看不到 `/model` 等文本）；`/cancel`/`Esc` 取消不清空队列，`Ctrl+C` 清空整条队列（含已排队命令）。`/settings` 立即打开并显示回合前的真实配置快照，可浏览/编辑草稿，但保存与需要 runner 的设置操作提示延后到回合结束（不落盘、不显示假成功）。`/bg shell|list|kill|tail` 与 `Ctrl+G`/`Ctrl+B` 面板在 AI 回合运行中同样可用（数据来自后台注册表，不触碰回合持有的 runner）；`/bg run` 需要空闲（busy 时返回忙碌提示）。`cyber tui`（原 Chat 面板）不适用本条，生成中仍须先取消再进行配置/会话操作。
 
 ## CLI 已实现行为
 
@@ -27,7 +28,7 @@ CLI 支持原 TUI 主命令目录中除 `/mode` 外的全部命令，并增加 `
 | `/web [status\|on\|off\|enable\|disable]` | 查询或持久化 `[tools].web_search`；开启或禁用联网搜索与抓取（web_fetch），实时生效并持久化到配置。 |
 | `/tools` | 查询实际注册工具 schema，不执行工具，不把工具数据算成令牌 Usage。直接打开模式（coding CLI）下，工具调用、调用请求、Edit、Read、Downloading、Shell 等工具统一以轻量小卡片形式呈现，支持 Ctrl+O 展开/折叠。 |
 | `/skill [list\|name]` | 查询目录或显示正文；通知不入模型历史，模型须调用 `skill_<name>` 获取正文。 |
-| `/toolbox [list\|add\|edit name\|remove name\|scan [目录\|提示词] [--preview]]` | 自定义工具库（`~/.cyber/tools/*.toml`）。`list` 只读列出；`add`/`edit` 打开表单（`params` 语法 `名称\|r或o\|说明\|默认值`，分号分隔多个；`tags` 逗号分隔）；`remove` 直接删除文件；`scan` 让当前默认 Provider 分类本机已发现工具并写盘，`--preview` 只预览不写。工具注册表在启动时装配，因此保存/删除后需重启生效。原 TUI 面板只实现 `list`。 |
+| `/toolbox [list\|add\|edit name\|remove name\|scan [目录\|提示词] [--preview] [--provider <名>] [--model <名>]]` | 自定义工具库（`~/.cyber/tools/*.toml`）。`list` 只读列出；`add`/`edit` 打开表单（`params` 语法 `名称\|r或o\|说明\|默认值`，分号分隔多个；`tags` 逗号分隔）；`remove` 直接删除文件；`scan` 让指定服务商（默认当前默认 Provider）分类本机已发现工具并写盘，`--preview` 只预览不写，`--provider`/`--model` 指定扫描所用服务商与模型。设置中心「8. 工具库」页末行 Enter 会打开同一套扫描表单：可填扫描目标（本地目录 / 单文件 / 提示词，留空=自动探测本机工具）、用 ←/→ 切换服务商、在模型行按 Enter 打开模型列表（仅列 `providers.toml` 本地清单，不联网），并用 ←/→ 切换「仅预览不写盘」。工具注册表在启动时装配，因此保存/删除后需重启生效。原 TUI 面板只实现 `list`。 |
 | `/mcp [list\|status]` | 展示配置 server、transport 与 connected/not connected；查询不会连接。 |
 | `/mcp connect` | 重新连接配置的 MCP servers（若未在启动时连接或需重试）；显式任务须在 `Permission Required` 框批准才发起连接，deny 不启动。 |
 | `/compact [instructions]` | 真实模型摘要任务，成功后替换模型历史并持久化；空历史拒绝，失败/取消不提交排队摘要，不等于清屏。 |
@@ -53,6 +54,7 @@ CLI 支持原 TUI 主命令目录中除 `/mode` 外的全部命令，并增加 `
 | `/bg shell <cmd>` | 后台启动脚本（denylist 护栏先行），立即返回 job id，不阻塞 AI 回合；busy 时同样可用。 |
 | `/bg run <prompt>` | 后台启动子代理（复用当前 provider/工具/记忆上下文，无外层超时），仅空闲时可用；完成后结果以 System 消息注入当前会话。 |
 | `/bg list` / `/bg kill <id>` / `/bg tail <id>` | 纯文本查看全部任务 / 请求终止运行中任务 / 查看某任务日志最后 20 行。 |
+| `/about` | 打开全屏只读「关于 / About」面板（`Panel::About`，`Esc`/`?` 关闭），内容与设置中心第 9 页签「9. 关于」逐字相同（共用 `about_lines`）：版本与更新、项目信息、运行环境、核心能力，页尾为快捷键说明书与斜杠命令速查。`↑/↓`/`PgUp`/`PgDn`/`Home`/`End` 或滚轮滚动，`U`/`Enter` 等价 `/update check`；按 `F1` 同样打开。内容快照 `AboutInfo` 在进入页面时采集一次，渲染期不读盘。 |
 
 Provider 表单包含 name/kind/endpoint/apikey/model/maxtokens/temperature/context_length；API key 和可能包含凭据的 endpoint 均掩码显示，取消不保存。保存使用私有文件权限和同目录原子发布，不生成公开凭据备份；不宣称 CLI 表单支持原 TUI 的联网「拉取模型」按钮。
 

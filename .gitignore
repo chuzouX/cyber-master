@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/target-omp/
 **/target/
 **/*.rs.bk
 

@@ -114,7 +114,19 @@ irm https://raw.githubusercontent.com/chuzouX/cyber-master/main/install.ps1 | ie
 支持 Linux（glibc）与 macOS 的 x86_64 / aarch64，以及 Windows x86_64；其他系统或架构会拒绝安装。默认下载最新 Release，必须成功下载并通过对应 `.sha256` 校验，否则中止。SHA256 用于检查文件完整性，不替代对发布来源的信任。
 
 Unix 默认安装到 `~/.local/bin/cyber`，Windows 默认安装到 `%USERPROFILE%\.local\bin\cyber.exe`。可用 `CYBER_VERSION` 指定 tag，`CYBER_INSTALL_DIR` 指定安装目录，`CYBER_REPO` 指定仓库；`install.sh` 支持 `--cnb` 参数强制优先选用 CNB 源；Windows 可设置 `$env:CYBER_USE_CNB=1`。网络受限时自动按序回退 CNB 及各大镜像（SHA256 校验始终强制生效）。
+安装脚本会先检测本机已安装的 `cyber`（`command -v cyber`，Windows 为 `Get-Command cyber`），输出已安装版本与云端最新版本：已是最新则直接退出，落后则询问是否更新到最新版本（回车 / `y` 确认，`n` 取消）。`install.sh --force`（或 `CYBER_FORCE=1`）、Windows `$env:CYBER_FORCE=1` 可跳过检测与询问，直接下载并覆盖安装。
 安装器保留已有 shell 配置，幂等添加用户 PATH：Bash 写入 `.bashrc` 和生效的登录 profile，Zsh 写入 `${ZDOTDIR:-$HOME}/.zshrc`，Fish 写入用户配置目录的 `fish/conf.d/cyber-path.fish`，POSIX shell 写入 `.profile`。未知 shell 只给出手动配置提示。**Unix 安装后需重新打开终端**（POSIX shell 需重新登录）；也可立即用完整二进制路径启动。Windows 持久更新用户 PATH，并独立同步当前 PowerShell 会话；其他已打开的终端需重开。
+
+### 更新
+
+```bash
+cyber update          # 检查是否有新版本，发现后询问是否升级
+cyber update --check  # 仅检查版本号，不升级
+cyber update --apply  # 发现新版本后免交互直接升级
+cyber update --force  # 跳过版本检查与确认，直接下载并覆盖安装最新版本
+```
+
+升级统一交给官方安装脚本（走 CNB 极速源、强制 SHA256 校验、多源回退）；直接重跑安装脚本同样会先检测已安装版本并在落后时询问，详见上文。
 
 ### 从源码构建（需 Rust 1.75+）
 
@@ -348,6 +360,7 @@ provider · model │ [1/3] tasks │ ctx 剩余% │ cache 命中率 │ ↑inp
 | `Ctrl+O` | 展开/折叠工具与子任务卡片详情 |
 | `Ctrl+T` | 打开/切换 CTF 题目面板 |
 | `Alt+Enter` / `Shift+Enter` | 换行 |
+| `Alt+↑` / `Alt+↓` | 任务清单视图逐级展开 / 收起（收起 → 精简 → 全量，到顶到底不翻转；仅 CLI 对话页） |
 | `PgUp` / `PgDown` | 滚动对话历史 |
 | `Ctrl+C` | 任务中取消；当前空闲且空输入时也可退出 |
 
