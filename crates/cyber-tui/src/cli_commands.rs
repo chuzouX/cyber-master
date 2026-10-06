@@ -59,6 +59,9 @@ pub enum FormKind {
         index: Option<usize>,
         original_key: Option<String>,
     },
+    CustomTool {
+        original_name: Option<String>,
+    },
 }
 pub struct CommandPicker {
     pub title: String,
@@ -77,9 +80,19 @@ pub struct PickerItem {
     pub command: String,
 }
 pub enum CliTask {
-    Compact { instructions: Option<String> },
-    Writeup { challenge: Box<CtfChallenge> },
-    McpConnect { config: McpServersConfig },
+    Compact {
+        instructions: Option<String>,
+    },
+    Writeup {
+        challenge: Box<CtfChallenge>,
+    },
+    McpConnect {
+        config: McpServersConfig,
+    },
+    ToolboxScan {
+        preview: bool,
+        target: Option<String>,
+    },
 }
 /// `/bg` 命令族（用户级后台任务入口）。
 /// `Shell` 在 busy 时同样可用（数据来自 CliScreen 快照，不触碰 runner）。
@@ -307,6 +320,14 @@ fn provider_configuration_bytes(
             if provider.models_endpoint.is_none() && previous.models_endpoint.is_some() {
                 if let Some(table) = provider_table_mut(&mut raw, name) {
                     table.remove("models_endpoint");
+                }
+            }
+            // thinking 同理：显式清空（enabled→未设置，即 Some→None）时必须删除原始键，
+            // 否则 merge_table 会保留陈旧值，下次启动又被读回来。
+            // 注意顺序：本循环在 merge_table 之后运行，因此只能在「新值为 None」时删除。
+            if provider.thinking.is_none() && previous.thinking.is_some() {
+                if let Some(table) = provider_table_mut(&mut raw, name) {
+                    table.remove("thinking");
                 }
             }
         }
@@ -803,6 +824,131 @@ fn web(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     Ok(refresh(message, false))
 }
 
+/// `/toolbox`：自定义安全工具库（列表 / 录入 / 编辑 / 删除 / AI 智能扫描）。
+fn toolbox(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
+    let (command, rest) = split(args);
+    match command.to_ascii_lowercase().as_str() {
+        "" | "list" => {
+            let (tools, _) = cyber_core::load_custom_tools(&runner.ctx.paths.tools_dir);
+            let text = if tools.is_empty() {
+                "（暂无自定义工具；/toolbox add 手动录入，/toolbox scan 自动扫描）".to_string()
+            } else {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        format!(
+                            "{} — {}  ({})",
+                            tool.config.name, tool.config.description, tool.config.command
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(output("自定义工具库", text))
+        }
+        "add" => Ok(CliAction::Form(custom_tool_form(
+            None,
+            cyber_core::CustomToolConfig::default(),
+        ))),
+        "edit" => {
+            if rest.is_empty() {
+                bail!("用法: /toolbox edit <name>");
+            }
+            let (tools, _) = cyber_core::load_custom_tools(&runner.ctx.paths.tools_dir);
+            let target = tools
+                .iter()
+                .find(|tool| {
+                    tool.config.name == rest || tool.config.name.eq_ignore_ascii_case(rest)
+                })
+                .ok_or_else(|| eyre!("未找到自定义工具 '{rest}'"))?;
+            let name = target.config.name.clone();
+            Ok(CliAction::Form(custom_tool_form(
+                Some(name),
+                target.config.clone(),
+            )))
+        }
+        "remove" => {
+            if rest.is_empty() {
+                bail!("用法: /toolbox remove <name>");
+            }
+            let (tools, _) = cyber_core::load_custom_tools(&runner.ctx.paths.tools_dir);
+            let target = tools
+                .iter()
+                .find(|tool| {
+                    tool.config.name == rest || tool.config.name.eq_ignore_ascii_case(rest)
+                })
+                .ok_or_else(|| eyre!("未找到自定义工具 '{rest}'"))?;
+            let name = target.config.name.clone();
+            let path = runner.ctx.paths.tools_dir.join(format!("{name}.toml"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(refresh(
+                &format!("已删除自定义工具 {name}（重启后从工具表移除）"),
+                false,
+            ))
+        }
+        "scan" => {
+            let preview = rest.split_whitespace().any(|token| token == "--preview");
+            let target = rest
+                .split_whitespace()
+                .filter(|token| *token != "--preview")
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(CliAction::Task(CliTask::ToolboxScan {
+                preview,
+                target: (!target.is_empty()).then_some(target),
+            }))
+        }
+        other => {
+            bail!("未知子命令：{other}（用法：/toolbox [list|add|edit <name>|remove <name>|scan]）")
+        }
+    }
+}
+
+fn custom_tool_form(
+    original_name: Option<String>,
+    tool: cyber_core::CustomToolConfig,
+) -> CommandForm {
+    let title = match &original_name {
+        Some(name) => format!("编辑自定义工具 ({name})"),
+        None => "添加自定义工具 (Custom Tool)".to_string(),
+    };
+    CommandForm {
+        title,
+        fields: vec![
+            FormField {
+                name: "tool_name".into(),
+                value: tool.name.clone(),
+                secret: false,
+            },
+            FormField {
+                name: "tool_description".into(),
+                value: tool.description.clone(),
+                secret: false,
+            },
+            FormField {
+                name: "tool_command".into(),
+                value: tool.command.clone(),
+                secret: false,
+            },
+            FormField {
+                name: "tool_tags".into(),
+                value: crate::toolbox::format_tags_field(&tool.tags),
+                secret: false,
+            },
+            FormField {
+                name: "tool_params".into(),
+                value: crate::toolbox::format_params_field(&tool.parameters),
+                secret: false,
+            },
+        ],
+        kind: FormKind::CustomTool { original_name },
+    }
+}
+
 fn vision(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
     let mut parts = args.trim().splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("").to_lowercase();
@@ -1136,6 +1282,7 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
+        SlashCommand::Toolbox(args) => toolbox(runner, &args)?,
         SlashCommand::Skill(args) => {
             if args.is_empty() || args.eq_ignore_ascii_case("list") {
                 output(
@@ -1450,6 +1597,22 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     p.models_endpoint.clone().unwrap_or_default(),
                     false,
                 ),
+                (
+                    "thinking_type",
+                    p.thinking
+                        .as_ref()
+                        .and_then(|t| t.r#type.clone())
+                        .unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "thinking_effort",
+                    p.thinking
+                        .as_ref()
+                        .and_then(|t| t.effort.clone())
+                        .unwrap_or_default(),
+                    false,
+                ),
             ];
             Ok(CliAction::Form(CommandForm {
                 title: format!("Add Provider ({})", preset.name),
@@ -1514,6 +1677,22 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                     p.models_endpoint.clone().unwrap_or_default(),
                     false,
                 ),
+                (
+                    "thinking_type",
+                    p.thinking
+                        .as_ref()
+                        .and_then(|t| t.r#type.clone())
+                        .unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "thinking_effort",
+                    p.thinking
+                        .as_ref()
+                        .and_then(|t| t.effort.clone())
+                        .unwrap_or_default(),
+                    false,
+                ),
             ];
             Ok(CliAction::Form(CommandForm {
                 title: "Add Custom Provider".into(),
@@ -1567,6 +1746,22 @@ fn provider(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
                 (
                     "models_endpoint",
                     p.models_endpoint.clone().unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "thinking_type",
+                    p.thinking
+                        .as_ref()
+                        .and_then(|t| t.r#type.clone())
+                        .unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "thinking_effort",
+                    p.thinking
+                        .as_ref()
+                        .and_then(|t| t.effort.clone())
+                        .unwrap_or_default(),
                     false,
                 ),
             ];
@@ -2139,6 +2334,26 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
             } else {
                 Some(models_ep.to_string())
             };
+            let thinking_type = field("thinking_type")?.trim().to_ascii_lowercase();
+            if !thinking_type.is_empty()
+                && !matches!(thinking_type.as_str(), "enabled" | "disabled")
+            {
+                bail!("Invalid thinking type (expected enabled/disabled)");
+            }
+            let thinking_effort = field("thinking_effort")?.trim().to_ascii_lowercase();
+            if !thinking_effort.is_empty()
+                && !matches!(thinking_effort.as_str(), "low" | "medium" | "high")
+            {
+                bail!("Invalid thinking effort (expected low/medium/high)");
+            }
+            p.thinking = if thinking_type.is_empty() && thinking_effort.is_empty() {
+                None
+            } else {
+                Some(cyber_core::ThinkingConfig {
+                    r#type: (!thinking_type.is_empty()).then_some(thinking_type),
+                    effort: (!thinking_effort.is_empty()).then_some(thinking_effort),
+                })
+            };
             let mut providers = runner.ctx.providers.clone();
             let mut config = runner.ctx.config.clone();
             if let Some(old) = original_name {
@@ -2151,6 +2366,17 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
                 config.agent.default_provider = name.into();
             }
             providers.upsert(name, p);
+            // 首次向导/新机器：默认服务商没有可用凭据时，直接采用刚配置好的这一个，
+            // 否则用户填完 API Key 仍会因默认项不可用而无法离开向导。
+            if config.agent.default_provider != name
+                && !cyber_core::setup::configured(&config, &providers)
+            {
+                let mut candidate = config.clone();
+                candidate.agent.default_provider = name.into();
+                if cyber_core::setup::configured(&candidate, &providers) {
+                    config.agent.default_provider = name.into();
+                }
+            }
             providers.default_provider = config.agent.default_provider.clone();
             save_selection_renamed(
                 runner,
@@ -2242,6 +2468,37 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
 
             save_config(runner, config, "env", "vars")?;
             Ok(refresh("Environment variable saved", false))
+        }
+        FormKind::CustomTool { original_name } => {
+            let name = field("tool_name")?.to_string();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                bail!("自定义工具名只能包含字母、数字、下划线、连字符");
+            }
+            let command = field("tool_command")?.to_string();
+            if command.is_empty() {
+                bail!("自定义工具命令不能为空");
+            }
+            let path = runner.ctx.paths.tools_dir.join(format!("{name}.toml"));
+            if original_name.as_deref() != Some(name.as_str()) && path.exists() {
+                bail!("自定义工具 {name} 已存在");
+            }
+            let config = cyber_core::CustomToolConfig {
+                name: name.clone(),
+                description: field("tool_description")?.to_string(),
+                command,
+                tags: crate::toolbox::parse_tags_field(field("tool_tags")?),
+                parameters: crate::toolbox::parse_params_field(field("tool_params")?)?,
+            };
+            cyber_core::custom_tool::save_custom_tool(&runner.ctx.paths.tools_dir, &config)
+                .map_err(|error| eyre!("{error}"))?;
+            Ok(CliAction::Refresh {
+                message: Some(format!("已保存自定义工具 {name}（重启后生效）")),
+                reset_usage: false,
+            })
         }
     }
 }
@@ -2538,9 +2795,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_a_provider_adopts_it_as_default_only_when_the_current_default_is_unusable() {
+        let mut runner = test_runner().await;
+        runner
+            .ctx
+            .providers
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .api_key
+            .clear();
+        assert!(!cyber_core::setup::configured(
+            &runner.ctx.config,
+            &runner.ctx.providers
+        ));
+
+        let mut add = form(execute(&mut runner, "/provider add local").unwrap());
+        set(&mut add, "endpoint", "http://localhost:11434");
+        set(&mut add, "model", "test");
+        set(&mut add, "kind", "ollama");
+        submit_form(&mut runner, &add).unwrap();
+        assert_eq!(runner.ctx.config.agent.default_provider, "local");
+        assert!(cyber_core::setup::configured(
+            &runner.ctx.config,
+            &runner.ctx.providers
+        ));
+
+        // 默认项已可用时，新增其他服务商不得抢走默认。
+        let mut extra = form(execute(&mut runner, "/provider add extra").unwrap());
+        set(&mut extra, "endpoint", "http://localhost:11435");
+        set(&mut extra, "model", "test2");
+        set(&mut extra, "kind", "ollama");
+        submit_form(&mut runner, &extra).unwrap();
+        assert_eq!(runner.ctx.config.agent.default_provider, "local");
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn toolbox_forms_save_edit_list_and_remove_custom_tools() {
+        let mut runner = test_runner().await;
+        let tools_dir = runner.ctx.paths.tools_dir.clone();
+
+        // add → 表单落盘（params / tags 编解码）
+        let mut add_form = form(execute(&mut runner, "/toolbox add").unwrap());
+        set(&mut add_form, "tool_name", "myprobe");
+        set(&mut add_form, "tool_description", "自定义探测");
+        set(
+            &mut add_form,
+            "tool_command",
+            "myprobe -u {target} -p {port}",
+        );
+        set(&mut add_form, "tool_tags", "custom, web ,");
+        set(
+            &mut add_form,
+            "tool_params",
+            "target|r|目标|127.0.0.1;port|o||80",
+        );
+        assert!(matches!(
+            submit_form(&mut runner, &add_form).unwrap(),
+            CliAction::Refresh {
+                reset_usage: false,
+                ..
+            }
+        ));
+        let path = tools_dir.join("myprobe.toml");
+        assert!(path.exists());
+        let (tools, errors) = cyber_core::load_custom_tools(&tools_dir);
+        assert!(errors.is_empty());
+        let saved = tools
+            .iter()
+            .find(|tool| tool.config.name == "myprobe")
+            .unwrap();
+        assert_eq!(saved.config.parameters.len(), 2);
+        assert_eq!(saved.config.parameters[0].name, "target");
+        assert!(saved.config.parameters[0].required);
+        assert_eq!(
+            saved.config.parameters[0].default.as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(saved.config.parameters[1].name, "port");
+        assert!(!saved.config.parameters[1].required);
+        assert_eq!(saved.config.parameters[1].default.as_deref(), Some("80"));
+        assert_eq!(saved.config.tags, vec!["custom", "web"]);
+
+        // edit → 字段初值回填为等价格式
+        let edit = form(execute(&mut runner, "/toolbox edit myprobe").unwrap());
+        assert_eq!(
+            edit.fields
+                .iter()
+                .find(|field| field.name == "tool_params")
+                .unwrap()
+                .value,
+            "target|r|目标|127.0.0.1;port|o||80"
+        );
+        assert_eq!(
+            edit.fields
+                .iter()
+                .find(|field| field.name == "tool_tags")
+                .unwrap()
+                .value,
+            "custom,web"
+        );
+
+        // list → 列出名称与命令
+        let listing = match execute(&mut runner, "/toolbox list").unwrap() {
+            CliAction::Output { text, .. } => text,
+            _ => panic!("expected output"),
+        };
+        assert!(listing.contains("myprobe"));
+        assert!(listing.contains("myprobe -u {target} -p {port}"));
+
+        // 重名 / 非法名 / 空命令必须被拒绝
+        let mut duplicate = form(execute(&mut runner, "/toolbox add").unwrap());
+        set(&mut duplicate, "tool_name", "myprobe");
+        set(&mut duplicate, "tool_command", "x");
+        assert!(submit_form(&mut runner, &duplicate).is_err());
+        let mut traversal = form(execute(&mut runner, "/toolbox add").unwrap());
+        set(&mut traversal, "tool_name", "../evil");
+        set(&mut traversal, "tool_command", "x");
+        assert!(submit_form(&mut runner, &traversal).is_err());
+        let mut empty_command = form(execute(&mut runner, "/toolbox add").unwrap());
+        set(&mut empty_command, "tool_name", "other");
+        assert!(submit_form(&mut runner, &empty_command).is_err());
+
+        // scan 解析为任务（--preview + 目标）
+        match execute(&mut runner, "/toolbox scan --preview D:/tools").unwrap() {
+            CliAction::Task(CliTask::ToolboxScan { preview, target }) => {
+                assert!(preview);
+                assert_eq!(target.as_deref(), Some("D:/tools"));
+            }
+            _ => panic!("expected toolbox scan task"),
+        }
+        match execute(&mut runner, "/toolbox scan").unwrap() {
+            CliAction::Task(CliTask::ToolboxScan { preview, target }) => {
+                assert!(!preview);
+                assert!(target.is_none());
+            }
+            _ => panic!("expected toolbox scan task"),
+        }
+        assert!(execute(&mut runner, "/toolbox bogus").is_err());
+
+        // remove → 文件删除
+        assert!(matches!(
+            execute(&mut runner, "/toolbox remove myprobe").unwrap(),
+            CliAction::Refresh { .. }
+        ));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn toolbox_list_reports_empty_library() {
+        let mut runner = test_runner().await;
+        let text = match execute(&mut runner, "/toolbox").unwrap() {
+            CliAction::Output { text, .. } => text,
+            _ => panic!("expected output"),
+        };
+        assert!(text.contains("暂无自定义工具"));
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
     async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 27);
+        assert_eq!(commands().len(), 28);
         assert!(commands().iter().any(|c| c.name == "/settings"));
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
@@ -3008,6 +3426,83 @@ notes = "model named notes"
         assert!(reloaded.chat_endpoint.is_none());
         assert!(reloaded.models_endpoint.is_none());
 
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn provider_form_exposes_and_persists_thinking_config() {
+        let mut runner = test_runner().await;
+
+        // 1. edit 表单必须包含两个 thinking 字段（非密钥字段）
+        let mut edit = form(execute(&mut runner, "/provider edit openai").unwrap());
+        for name in ["thinking_type", "thinking_effort"] {
+            let f = edit
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("missing field {name}"));
+            assert!(!f.secret, "{name} must render as plain text");
+        }
+        assert_eq!(
+            runner.ctx.providers.providers["openai"].thinking, None,
+            "默认未设置时不得下发思考参数"
+        );
+
+        // 2. 设置后提交 → 运行时与磁盘都必须生效
+        set(&mut edit, "thinking_type", "enabled");
+        set(&mut edit, "thinking_effort", "low");
+        submit_form(&mut runner, &edit).unwrap();
+        assert_eq!(
+            runner.ctx.providers.providers["openai"].thinking,
+            Some(cyber_core::ThinkingConfig {
+                r#type: Some("enabled".into()),
+                effort: Some("low".into()),
+            })
+        );
+        let saved = std::fs::read_to_string(&runner.ctx.paths.providers_file).unwrap();
+        assert!(saved.contains("[providers.openai.thinking]"), "{saved}");
+        assert!(saved.contains("type = \"enabled\""), "{saved}");
+        assert!(saved.contains("effort = \"low\""), "{saved}");
+
+        // 3. 两项都清空 → None，且磁盘上的陈旧键必须被删除
+        let mut cleared = form(execute(&mut runner, "/provider edit openai").unwrap());
+        assert_eq!(
+            cleared
+                .fields
+                .iter()
+                .find(|f| f.name == "thinking_type")
+                .unwrap()
+                .value,
+            "enabled"
+        );
+        set(&mut cleared, "thinking_type", "");
+        set(&mut cleared, "thinking_effort", "  ");
+        submit_form(&mut runner, &cleared).unwrap();
+        assert!(runner.ctx.providers.providers["openai"].thinking.is_none());
+        let saved = std::fs::read_to_string(&runner.ctx.paths.providers_file).unwrap();
+        assert!(
+            !saved.contains("thinking"),
+            "陈旧 thinking 必须删除: {saved}"
+        );
+        let reparsed: ProvidersConfig = toml::from_str(&saved).unwrap();
+        assert!(reparsed.providers["openai"].thinking.is_none());
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn invalid_thinking_values_are_rejected() {
+        let mut runner = test_runner().await;
+        let mut edit = form(execute(&mut runner, "/provider edit openai").unwrap());
+        set(&mut edit, "thinking_type", "yes");
+        assert!(submit_form(&mut runner, &edit).is_err());
+
+        let mut edit = form(execute(&mut runner, "/provider edit openai").unwrap());
+        set(&mut edit, "thinking_effort", "extreme");
+        assert!(submit_form(&mut runner, &edit).is_err());
+
+        // 非法值不得污染运行时配置
+        assert!(runner.ctx.providers.providers["openai"].thinking.is_none());
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 

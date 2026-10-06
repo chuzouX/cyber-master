@@ -87,6 +87,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "列出可用工具",
     },
     CommandSpec {
+        name: "/toolbox",
+        usage: "/toolbox [list|add|edit <name>|remove <name>|scan [dir|prompt] [--preview]]",
+        desc: "自定义安全工具库：列表 / 录入 / 删除 / AI 智能扫描本地工具",
+    },
+    CommandSpec {
         name: "/skill",
         usage: "/skill <name|list>",
         desc: "查看 Skill 详细说明（list 列出全部）",
@@ -196,6 +201,7 @@ pub fn param_suggestions(cmd: &str) -> Vec<&'static str> {
         "/mcp" => vec!["list", "status"],
         "/skill" => vec!["list"],
         "/todo" => vec!["list", "add", "done", "clear", "close", "open"],
+        "/toolbox" => vec!["list", "add", "edit", "remove", "scan"],
         "/bg" => vec!["run", "shell", "list", "kill", "tail"],
         _ => Vec::new(),
     }
@@ -225,6 +231,9 @@ pub enum SlashCommand {
     Vision(String),
     /// `/tools` — 列出可用工具。
     Tools,
+    /// `/toolbox [list|add|edit <name>|remove <name>|scan ...]` — 自定义安全工具库。
+    /// 空串 = list；子命令参数由 App 层解析。
+    Toolbox(String),
     /// `/skill <name|list>` — 查看 Skill 详细说明（list 列出全部）。
     /// 空串 = list；非空 = 注入指定 skill 的 body 为 System 条目。
     Skill(String),
@@ -258,7 +267,7 @@ pub enum SlashCommand {
     Bg(String),
     /// `/settings` — 打开设置中心面板。
     Settings,
-    /// `/quit` — 退出。
+    /// `/quit`（别名 `/exit`）— 退出。
     Quit,
     /// 未知命令（含原始命令名）。
     Unknown(String),
@@ -283,6 +292,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/web" => SlashCommand::Web(args.to_string()),
         "/vision" => SlashCommand::Vision(args.to_string()),
         "/tools" => SlashCommand::Tools,
+        "/toolbox" => SlashCommand::Toolbox(args.to_string()),
         "/skill" => SlashCommand::Skill(args.to_string()),
         "/mcp" => SlashCommand::Mcp(args.to_string()),
         "/cancel" => SlashCommand::Cancel,
@@ -296,7 +306,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/todo" => SlashCommand::Todo(args.to_string()),
         "/bg" => SlashCommand::Bg(args.to_string()),
         "/settings" => SlashCommand::Settings,
-        "/quit" => SlashCommand::Quit,
+        "/quit" | "/exit" => SlashCommand::Quit,
         "/image" => SlashCommand::Image(args.to_string()),
         "/paste" => SlashCommand::Image("paste".into()),
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
@@ -315,6 +325,7 @@ pub const HELP_TEXT: &str = "\
   /env [sub]         环境变量：list | set KEY VALUE | set-sensitive KEY VALUE | remove KEY
   /web [status|on|off] 联网搜索：查看状态或开启/禁用 web_fetch 功能
   /tools             列出可用工具
+  /toolbox <sub>     自定义工具库：list | add | edit <name> | remove <name> | scan [--preview]
   /skill <name|list> 查看 Skill 详细说明（list 列出全部）
   /mcp [sub]         打开全屏 MCP 管理面板（支持测活、配置与工具查看）
   /cancel            取消当前生成
@@ -351,6 +362,7 @@ mod tests {
         assert_eq!(parse("/HELP"), SlashCommand::Help);
         assert_eq!(parse("/Clear"), SlashCommand::Clear);
         assert_eq!(parse("/QUIT"), SlashCommand::Quit);
+        assert_eq!(parse("/Exit"), SlashCommand::Quit);
     }
 
     #[test]
@@ -409,6 +421,7 @@ mod tests {
         assert_eq!(parse("/tools"), SlashCommand::Tools);
         assert_eq!(parse("/cancel"), SlashCommand::Cancel);
         assert_eq!(parse("/quit"), SlashCommand::Quit);
+        assert_eq!(parse("/exit"), SlashCommand::Quit);
         assert_eq!(parse("/new"), SlashCommand::New);
     }
 
