@@ -12,7 +12,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
@@ -45,7 +45,7 @@ const CURRENCIES: &[(&str, &str)] = &[("usd", "美元"), ("cny", "人民币")];
 
 /// 字段顺序即焦点导航顺序（Up/Down 循环）。
 /// 0-4 provider 基本字段，5-13 为当前 model 的个性化参数（含价格及单位），
-/// 14-15 高级选项，16=拉取模型，17=保存，18=取消。
+/// 14-17 高级选项（端点覆盖 + thinking），18=拉取模型，19=保存，20=取消。
 const FIELDS: &[FieldDef] = &[
     FieldDef {
         label: "名称 name",
@@ -112,6 +112,14 @@ const FIELDS: &[FieldDef] = &[
         kind: FieldKind::Text,
     },
     FieldDef {
+        label: "思考模式 thinking.type（未设置 / enabled / disabled）",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
+        label: "思考强度 thinking.effort（未设置 / low / medium / high）",
+        kind: FieldKind::Enum,
+    },
+    FieldDef {
         label: "拉取模型",
         kind: FieldKind::Button,
     },
@@ -128,9 +136,16 @@ const IDX_KIND: usize = 1;
 const IDX_MODEL: usize = 4;
 const IDX_CONTEXT_LENGTH: usize = 6;
 const IDX_CURRENCY: usize = 12;
-const IDX_FETCH: usize = 16;
-const IDX_SAVE: usize = 17;
-const IDX_CANCEL: usize = 18;
+const IDX_THINKING_TYPE: usize = 16;
+const IDX_THINKING_EFFORT: usize = 17;
+const IDX_FETCH: usize = 18;
+const IDX_SAVE: usize = 19;
+const IDX_CANCEL: usize = 20;
+
+/// `thinking.type` 可选项（索引 0 = 未设置 → 不下发）。
+const THINKING_TYPES: &[&str] = &["", "enabled", "disabled"];
+/// `thinking.effort` 可选项（索引 0 = 未设置 → 不下发）。
+const THINKING_EFFORTS: &[&str] = &["", "low", "medium", "high"];
 
 /// 表单按键的副作用意图，由 App 解释执行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +155,10 @@ pub enum FormAction {
     Cancel,
     Fetch,
     Toast(String),
+    /// 对选中模型发起推理能力实测探针。
+    ProbeReasoning,
+    /// 对选中模型发起视觉能力实测探针。
+    ProbeVision,
 }
 
 /// Provider 表单状态。
@@ -169,6 +188,10 @@ pub struct ProviderFormState {
     pub chat_endpoint: String,
     /// 自定义模型列表端点（高级选项）。空 = 使用默认。
     pub models_endpoint: String,
+    /// `thinking.type` 索引（THINKING_TYPES）。
+    pub thinking_type_idx: usize,
+    /// `thinking.effort` 索引（THINKING_EFFORTS）。
+    pub thinking_effort_idx: usize,
     // ── 工作副本 ──
     /// provider 的 models map 工作副本（编辑期间维护，保存时写回）。
     pub models: std::collections::HashMap<String, ModelConfig>,
@@ -190,6 +213,8 @@ pub struct ProviderFormState {
     pub fetched_models: Vec<String>,
     pub picker_open: bool,
     pub picker_selected: usize,
+    /// 正在实测能力探针的模型 id（`Some` = 该行渲染「探测中」）。
+    pub probing_model: Option<String>,
     /// Picker 滚动偏移（render 时按选中项自动调整，Cell 供 &self render 写回）。
     pub picker_scroll: Cell<usize>,
 }
@@ -217,6 +242,8 @@ impl ProviderFormState {
             notes: String::new(),
             chat_endpoint: String::new(),
             models_endpoint: String::new(),
+            thinking_type_idx: 0,
+            thinking_effort_idx: 0,
             models: std::collections::HashMap::new(),
             known_models: Vec::new(),
             provider_max_tokens: cyber_core::DEFAULT_MAX_TOKENS,
@@ -232,6 +259,7 @@ impl ProviderFormState {
             fetched_models: Vec::new(),
             picker_open: false,
             picker_selected: 0,
+            probing_model: None,
             picker_scroll: Cell::new(0),
         }
     }
@@ -263,6 +291,26 @@ impl ProviderFormState {
             provider_price: cfg.price.clone(),
             chat_endpoint: cfg.chat_endpoint.clone().unwrap_or_default(),
             models_endpoint: cfg.models_endpoint.clone().unwrap_or_default(),
+            thinking_type_idx: THINKING_TYPES
+                .iter()
+                .position(|v| {
+                    *v == cfg
+                        .thinking
+                        .as_ref()
+                        .and_then(|t| t.r#type.as_deref())
+                        .unwrap_or("")
+                })
+                .unwrap_or(0),
+            thinking_effort_idx: THINKING_EFFORTS
+                .iter()
+                .position(|v| {
+                    *v == cfg
+                        .thinking
+                        .as_ref()
+                        .and_then(|t| t.effort.as_deref())
+                        .unwrap_or("")
+                })
+                .unwrap_or(0),
             original_name: Some(name.to_string()),
             ..Self::empty()
         };
@@ -334,6 +382,7 @@ impl ProviderFormState {
                 Some(self.notes.trim().to_string())
             },
             vision: self.models.get(model).and_then(|m| m.vision),
+            reasoning: self.models.get(model).and_then(|m| m.reasoning),
         };
         self.models.insert(model.trim().to_string(), mc);
     }
@@ -447,6 +496,29 @@ impl ProviderFormState {
         }
     }
 
+    /// 当前 `thinking.type` 文本（空串 = 未设置）。
+    pub fn thinking_type(&self) -> &'static str {
+        THINKING_TYPES[self.thinking_type_idx.min(THINKING_TYPES.len() - 1)]
+    }
+
+    /// 当前 `thinking.effort` 文本（空串 = 未设置）。
+    pub fn thinking_effort(&self) -> &'static str {
+        THINKING_EFFORTS[self.thinking_effort_idx.min(THINKING_EFFORTS.len() - 1)]
+    }
+
+    /// 由两个索引构造 `Option<ThinkingConfig>`：都为「未设置」时返回 None（不下发任何参数）。
+    fn thinking_config(&self) -> Option<cyber_core::ThinkingConfig> {
+        let ty = self.thinking_type();
+        let effort = self.thinking_effort();
+        if ty.is_empty() && effort.is_empty() {
+            return None;
+        }
+        Some(cyber_core::ThinkingConfig {
+            r#type: (!ty.is_empty()).then(|| ty.to_string()),
+            effort: (!effort.is_empty()).then(|| effort.to_string()),
+        })
+    }
+
     /// 当前表单值的快照（用于 fetch，即使未校验通过也能拉取）。
     pub fn to_provider_config_snapshot(&self) -> ProviderConfig {
         ProviderConfig {
@@ -464,6 +536,7 @@ impl ProviderFormState {
             models: self.models.clone(),
             chat_endpoint: self.chat_endpoint_opt(),
             models_endpoint: self.models_endpoint_opt(),
+            thinking: self.thinking_config(),
         }
     }
 
@@ -536,6 +609,7 @@ impl ProviderFormState {
                 models: self.build_models_map(max_tokens, temperature),
                 chat_endpoint: self.chat_endpoint_opt(),
                 models_endpoint: self.models_endpoint_opt(),
+                thinking: self.thinking_config(),
             },
         ))
     }
@@ -566,6 +640,7 @@ impl ProviderFormState {
                     Some(self.notes.trim().to_string())
                 },
                 vision: self.models.get(model_id).and_then(|m| m.vision),
+                reasoning: self.models.get(model_id).and_then(|m| m.reasoning),
             };
             models.insert(model_id.to_string(), mc);
         }
@@ -590,6 +665,8 @@ impl ProviderFormState {
             13 => self.notes.clone(),
             14 => self.chat_endpoint.clone(),
             15 => self.models_endpoint.clone(),
+            16 => self.thinking_type().to_string(),
+            17 => self.thinking_effort().to_string(),
             _ => String::new(),
         }
     }
@@ -613,15 +690,21 @@ impl ProviderFormState {
             13 => self.notes = val,
             14 => self.chat_endpoint = val,
             15 => self.models_endpoint = val,
+            16 => {
+                let v = val.trim().to_ascii_lowercase();
+                self.thinking_type_idx = THINKING_TYPES.iter().position(|t| *t == v).unwrap_or(0);
+            }
+            17 => {
+                let v = val.trim().to_ascii_lowercase();
+                self.thinking_effort_idx =
+                    THINKING_EFFORTS.iter().position(|t| *t == v).unwrap_or(0);
+            }
             _ => {}
         }
     }
 
     fn is_text_field(idx: usize) -> bool {
-        matches!(
-            idx,
-            0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 13 | 14 | 15
-        )
+        matches!(idx, 0 | 2 | 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 13 | 14 | 15)
     }
 
     fn start_editing(&mut self, idx: usize) {
@@ -706,6 +789,13 @@ impl ProviderFormState {
                         (self.currency_idx + CURRENCIES.len() - 1) % CURRENCIES.len();
                 } else if self.focused == IDX_CONTEXT_LENGTH {
                     self.cycle_context(-1);
+                } else if self.focused == IDX_THINKING_TYPE {
+                    self.thinking_type_idx =
+                        (self.thinking_type_idx + THINKING_TYPES.len() - 1) % THINKING_TYPES.len();
+                } else if self.focused == IDX_THINKING_EFFORT {
+                    self.thinking_effort_idx = (self.thinking_effort_idx + THINKING_EFFORTS.len()
+                        - 1)
+                        % THINKING_EFFORTS.len();
                 }
                 FormAction::None
             }
@@ -718,6 +808,11 @@ impl ProviderFormState {
                     self.currency_idx = (self.currency_idx + 1) % CURRENCIES.len();
                 } else if self.focused == IDX_CONTEXT_LENGTH {
                     self.cycle_context(1);
+                } else if self.focused == IDX_THINKING_TYPE {
+                    self.thinking_type_idx = (self.thinking_type_idx + 1) % THINKING_TYPES.len();
+                } else if self.focused == IDX_THINKING_EFFORT {
+                    self.thinking_effort_idx =
+                        (self.thinking_effort_idx + 1) % THINKING_EFFORTS.len();
                 }
                 FormAction::None
             }
@@ -731,12 +826,22 @@ impl ProviderFormState {
                 }
                 IDX_SAVE => FormAction::Save,
                 IDX_CANCEL => FormAction::Cancel,
+                IDX_MODEL => self.open_model_picker(),
                 IDX_KIND => {
                     self.kind_idx = (self.kind_idx + 1) % PROVIDER_KINDS.len();
                     FormAction::None
                 }
                 IDX_CURRENCY => {
                     self.currency_idx = (self.currency_idx + 1) % CURRENCIES.len();
+                    FormAction::None
+                }
+                IDX_THINKING_TYPE => {
+                    self.thinking_type_idx = (self.thinking_type_idx + 1) % THINKING_TYPES.len();
+                    FormAction::None
+                }
+                IDX_THINKING_EFFORT => {
+                    self.thinking_effort_idx =
+                        (self.thinking_effort_idx + 1) % THINKING_EFFORTS.len();
                     FormAction::None
                 }
                 IDX_CONTEXT_LENGTH => {
@@ -759,6 +864,15 @@ impl ProviderFormState {
             {
                 if self.focused == IDX_KIND && c == ' ' {
                     self.kind_idx = (self.kind_idx + 1) % PROVIDER_KINDS.len();
+                    FormAction::None
+                } else if self.focused == IDX_MODEL && c == ' ' {
+                    self.open_model_picker()
+                } else if self.focused == IDX_THINKING_TYPE && c == ' ' {
+                    self.thinking_type_idx = (self.thinking_type_idx + 1) % THINKING_TYPES.len();
+                    FormAction::None
+                } else if self.focused == IDX_THINKING_EFFORT && c == ' ' {
+                    self.thinking_effort_idx =
+                        (self.thinking_effort_idx + 1) % THINKING_EFFORTS.len();
                     FormAction::None
                 } else if self.focused == IDX_CONTEXT_LENGTH && c == ' ' {
                     if self.context_idx == CONTEXT_LENGTH_PRESETS.len() {
@@ -835,42 +949,74 @@ impl ProviderFormState {
 
     fn handle_picker_key(&mut self, k: KeyEvent) -> FormAction {
         if self.fetched_models.is_empty() {
-            self.picker_open = false;
-            return FormAction::None;
-        }
-        let n = self.fetched_models.len();
-        match k.code {
-            KeyCode::Up => {
-                self.picker_selected = (self.picker_selected + n - 1) % n;
-                FormAction::None
-            }
-            KeyCode::Down => {
-                self.picker_selected = (self.picker_selected + 1) % n;
-                FormAction::None
-            }
-            KeyCode::Enter => {
-                let m = self.fetched_models[self.picker_selected].clone();
-                // 保存旧 model 参数，再装载新 model 参数
-                let old_model = self.model.clone();
-                if !old_model.is_empty() && old_model != m {
-                    self.save_model_params(&old_model);
+            // 空列表（拉取失败 / 未返回模型）→ 只提供手输兜底与重试。
+            match k.code {
+                KeyCode::Esc => {
+                    self.picker_open = false;
+                    FormAction::None
                 }
-                self.model = m.clone();
-                if old_model != m {
-                    if self.models.contains_key(&m) {
-                        self.load_model_params(&m);
-                    } else if !m.is_empty() {
-                        self.save_model_params(&m);
+                KeyCode::Char('m') | KeyCode::Char('f') => {
+                    self.picker_open = false;
+                    self.start_editing(IDX_MODEL);
+                    FormAction::None
+                }
+                KeyCode::Char('r') => FormAction::Fetch,
+                _ => FormAction::None,
+            }
+        } else {
+            let n = self.fetched_models.len();
+            match k.code {
+                KeyCode::Up => {
+                    self.picker_selected = (self.picker_selected + n - 1) % n;
+                    FormAction::None
+                }
+                KeyCode::Down => {
+                    self.picker_selected = (self.picker_selected + 1) % n;
+                    FormAction::None
+                }
+                KeyCode::Enter => {
+                    let m = self.fetched_models[self.picker_selected].clone();
+                    // 保存旧 model 参数，再装载新 model 参数
+                    let old_model = self.model.clone();
+                    if !old_model.is_empty() && old_model != m {
+                        self.save_model_params(&old_model);
                     }
+                    self.model = m.clone();
+                    if old_model != m {
+                        if self.models.contains_key(&m) {
+                            self.load_model_params(&m);
+                        } else if !m.is_empty() {
+                            self.save_model_params(&m);
+                        }
+                    }
+                    self.picker_open = false;
+                    self.probing_model = None;
+                    FormAction::None
                 }
-                self.picker_open = false;
-                FormAction::None
+                KeyCode::Esc => {
+                    self.picker_open = false;
+                    FormAction::None
+                }
+                KeyCode::Char('m') | KeyCode::Char('f') => {
+                    self.picker_open = false;
+                    self.start_editing(IDX_MODEL);
+                    FormAction::None
+                }
+                KeyCode::Char('r') => FormAction::Fetch,
+                KeyCode::Char('t') => FormAction::ProbeReasoning,
+                KeyCode::Char('v') => FormAction::ProbeVision,
+                _ => FormAction::None,
             }
-            KeyCode::Esc => {
-                self.picker_open = false;
-                FormAction::None
-            }
-            _ => FormAction::None,
+        }
+    }
+
+    /// 在 model 字段上按 Enter/空格：已有列表 → 打开选择面板；否则发起拉取。
+    fn open_model_picker(&mut self) -> FormAction {
+        if self.fetched_models.is_empty() {
+            FormAction::Fetch
+        } else {
+            self.picker_open = true;
+            FormAction::None
         }
     }
 
@@ -894,6 +1040,7 @@ impl ProviderFormState {
             Ok(models) => {
                 if models.is_empty() {
                     self.fetch_error = Some("未返回任何模型".into());
+                    self.picker_open = true;
                 } else {
                     self.fetched_models = models;
                     // 将拉取到的 model 加入 known_models（去重 + 排序）
@@ -910,6 +1057,8 @@ impl ProviderFormState {
             }
             Err(e) => {
                 self.fetch_error = Some(e);
+                // 让错误信息与手输兜底（m）可被触达。
+                self.picker_open = true;
             }
         }
     }
@@ -962,8 +1111,9 @@ pub fn render_form(frame: &mut Frame, area: Rect, theme: &Theme, state: &Provide
     frame.render_widget(block, modal);
 
     let chunks = Layout::vertical([
-        Constraint::Min(0),    // 字段列表
-        Constraint::Length(3), // 编辑器 / picker / hint
+        Constraint::Min(0), // 字段列表
+        // 模型选择面板需要多行展示能力标签；非 picker 状态保持原有 3 行编辑器。
+        Constraint::Length(if state.picker_open { 12 } else { 3 }),
         Constraint::Length(1), // 状态行
         Constraint::Length(1), // 按钮行
     ])
@@ -1036,6 +1186,11 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                 PROVIDER_KINDS.join(" · ")
             )
         } else if i == IDX_MODEL {
+            let list_note = if state.fetched_models.is_empty() {
+                "按 Enter 拉取模型列表"
+            } else {
+                "按 Enter 打开模型列表"
+            };
             if state.known_models.len() > 1 {
                 let cur = state
                     .known_models
@@ -1044,15 +1199,16 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                     .map(|p| p + 1)
                     .unwrap_or(1);
                 format!(
-                    "◀ {} ▶ [{}/{} 按 ←/→ 切换]",
+                    "◀ {} ▶ [{}/{} ←/→ 切换 · {}]",
                     state.model,
                     cur,
-                    state.known_models.len()
+                    state.known_models.len(),
+                    list_note
                 )
             } else if state.model.is_empty() {
-                "[直接输入模型名，或在下方按回车拉取列表]".to_string()
+                format!("[未选择 · {list_note} · 列表内按 m 手输]")
             } else {
-                state.model.clone()
+                format!("{}  [{list_note} · 列表内按 m 手输]", state.model)
             }
         } else if i == IDX_CURRENCY {
             format!("{}  [←→ 切换]", state.currency_label())
@@ -1061,6 +1217,14 @@ fn render_fields(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
                 "◀ {} ▶  [←/→/空格 切换；选「自定义」后按 Enter 手输]",
                 state.context_label()
             )
+        } else if i == IDX_THINKING_TYPE {
+            let v = state.thinking_type();
+            let v = if v.is_empty() { "（未设置）" } else { v };
+            format!("◀ {v} ▶  [←/→/空格 切换：未设置 · enabled · disabled]")
+        } else if i == IDX_THINKING_EFFORT {
+            let v = state.thinking_effort();
+            let v = if v.is_empty() { "（未设置）" } else { v };
+            format!("◀ {v} ▶  [←/→/空格 切换：未设置 · low · medium · high]")
         } else if i == 3 {
             // api_key 脱敏显示
             mask_key(&state.api_key)
@@ -1116,11 +1280,41 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
         frame.render_widget(&state.textarea, area);
         return;
     }
-    if state.picker_open && !state.fetched_models.is_empty() {
+    if state.picker_open {
+        if state.fetched_models.is_empty() {
+            // 拉取失败 / 未返回模型：只提供手输兜底与重试入口。
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(
+                Line::from(" 无法获取模型列表 · m/f 手输模型名 · r 重新拉取 · Esc 关闭")
+                    .style(Style::default().fg(theme.accent)),
+            );
+            if let Some(err) = &state.fetch_error {
+                lines.push(
+                    Line::from(format!(" ⚠ {err}"))
+                        .style(Style::default().fg(Color::Rgb(252, 58, 75))),
+                );
+            } else {
+                lines.push(
+                    Line::from("（列表为空，按 m 手动输入模型名）")
+                        .style(Style::default().fg(theme.muted)),
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(theme.bg)),
+                area,
+            );
+            return;
+        }
         let mut lines: Vec<Line> = Vec::new();
         lines.push(
-            Line::from(" 选择模型 (Enter 选中 / Esc 关闭)").style(Style::default().fg(theme.muted)),
+            Line::from(
+                " 选择模型 (↑/↓ · Enter 选中 · m/f 手输 · r 重取 · t 推理 · v 视觉 · Esc 关闭)",
+            )
+            .style(Style::default().fg(theme.muted)),
         );
+        // 每帧只读一次能力缓存；能力来源：显式 models 配置 → 持久化实测缓存 → 名称规则表。
+        let store = cyber_core::CapabilityStore::load();
+        let models_map = Some(&state.models);
         for (i, m) in state.fetched_models.iter().enumerate() {
             let selected = i == state.picker_selected;
             let marker = if selected { "▸ " } else { "  " };
@@ -1129,7 +1323,34 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
             } else {
                 Style::default().fg(theme.fg)
             };
-            lines.push(Line::from(format!("{marker}{m}")).style(style));
+            let mut spans = vec![Span::styled(format!("{marker}{m}"), style)];
+            if state.probing_model.as_deref() == Some(m.as_str()) {
+                let mut probe_style = Style::default().fg(Color::Rgb(254, 188, 56));
+                if selected {
+                    probe_style = probe_style.bg(theme.sel_bg);
+                }
+                spans.push(Span::styled("  ⟳ 探测中", probe_style));
+            } else {
+                let vision =
+                    cyber_core::resolve_vision_capability(models_map, &state.name, m, &store);
+                let reasoning =
+                    cyber_core::resolve_reasoning_capability(models_map, &state.name, m, &store);
+                if vision.is_supported() {
+                    let mut s = Style::default().fg(Color::Cyan);
+                    if selected {
+                        s = s.bg(theme.sel_bg);
+                    }
+                    spans.push(Span::styled("  ◈ 视觉", s));
+                }
+                if reasoning.is_supported() {
+                    let mut s = Style::default().fg(Color::LightGreen);
+                    if selected {
+                        s = s.bg(theme.sel_bg);
+                    }
+                    spans.push(Span::styled("  ◈ 推理", s));
+                }
+            }
+            lines.push(Line::from(spans));
         }
         // 粘性滚动：选中项溢出视口时自动调整（首行是标题，故 +1 偏移）
         let visible_h = area.height.saturating_sub(1) as usize; // 标题占 1 行
@@ -1165,10 +1386,10 @@ fn render_editor(frame: &mut Frame, area: Rect, theme: &Theme, state: &ProviderF
     }
     let hint = if state.fetching {
         " 拉取中…"
-    } else if state.focused == IDX_MODEL && !state.model.is_empty() {
-        " ←→ 切换模型（自动保存/装载参数） · Enter 手动输入 · Esc 取消"
+    } else if state.focused == IDX_MODEL {
+        " Enter 打开模型列表（未拉取过则先拉取）· ←→ 切换已有模型 · 列表内 m 可手输"
     } else {
-        " Enter 编辑字段 · ←→ 切换 kind/model/currency · Esc 取消"
+        " Enter 编辑字段 · ←→ 切换 kind/model/currency/thinking · Esc 取消"
     };
     frame.render_widget(
         Paragraph::new(Line::from(hint)).style(Style::default().fg(theme.muted)),
@@ -1523,7 +1744,7 @@ mod tests {
         s.deliver_fetch(id, Err("timeout".into()));
         assert!(!s.fetching);
         assert_eq!(s.fetch_error.as_deref(), Some("timeout"));
-        assert!(!s.picker_open);
+        assert!(s.picker_open, "拉取失败仍须打开面板以提供手输兜底");
     }
 
     #[test]
@@ -1869,10 +2090,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        // 进入编辑 model 字段
-        s.focused = IDX_MODEL;
-        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
-        assert!(s.editing);
+        // 进入手输模式（列表拉取失败 → 面板 → m）
+        enter_manual_model_mode(&mut s);
         // 清空 textarea（"gpt-4o" 有 6 个字符）
         for _ in 0..6 {
             s.handle_key(key(KeyCode::Backspace), &ProvidersConfig::default());
@@ -2063,8 +2282,7 @@ mod tests {
     #[test]
     fn manual_model_entry_adds_to_known_models() {
         let mut s = ProviderFormState::empty();
-        s.focused = IDX_MODEL;
-        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        enter_manual_model_mode(&mut s);
         for ch in "new-model".chars() {
             s.handle_key(key(KeyCode::Char(ch)), &ProvidersConfig::default());
         }
@@ -2267,8 +2485,7 @@ mod tests {
         s.max_tokens = "16384".into();
         s.temperature = "0.2".into();
         s.price_input = "1.5".into();
-        s.focused = IDX_MODEL;
-        s.start_editing(IDX_MODEL);
+        enter_manual_model_mode(&mut s);
         s.textarea.clear();
         s.textarea.insert_str("claude-3-7-sonnet");
 
@@ -2282,5 +2499,144 @@ mod tests {
         let mc = s.models.get("claude-3-7-sonnet").unwrap();
         assert_eq!(mc.alias.as_deref(), Some("my-fast-alias"));
         assert_eq!(mc.max_tokens, Some(16384));
+    }
+
+    /// 进入手输 mode：模拟列表拉取失败 → 面板打开 → 按 m。
+    fn enter_manual_model_mode(s: &mut ProviderFormState) {
+        s.focused = IDX_MODEL;
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Err("offline".into()));
+        assert!(s.picker_open, "拉取失败必须打开面板");
+        s.handle_key(key(KeyCode::Char('m')), &ProvidersConfig::default());
+        assert!(s.editing && !s.picker_open);
+    }
+
+    #[test]
+    fn model_field_enter_requests_fetch_then_opens_picker() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_MODEL;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::Fetch
+        );
+        let id = s.fetch_id;
+        s.deliver_fetch(id, Ok(vec!["m1".into()]));
+        assert!(s.picker_open);
+
+        // 关闭后再按 Enter：已有列表 → 直接打开，不重复拉取
+        s.handle_key(key(KeyCode::Esc), &ProvidersConfig::default());
+        assert!(!s.picker_open);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default()),
+            FormAction::None
+        );
+        assert!(s.picker_open);
+    }
+
+    #[test]
+    fn model_field_rejects_manual_typing_until_manual_mode() {
+        let mut s = ProviderFormState::empty();
+        s.focused = IDX_MODEL;
+        s.handle_key(key(KeyCode::Char('x')), &ProvidersConfig::default());
+        assert!(!s.editing, "未进入手输模式时 model 字段不接受直接键入");
+        assert!(s.model.is_empty());
+
+        enter_manual_model_mode(&mut s);
+        for ch in "abc".chars() {
+            s.handle_key(key(KeyCode::Char(ch)), &ProvidersConfig::default());
+        }
+        s.handle_key(key(KeyCode::Enter), &ProvidersConfig::default());
+        assert_eq!(s.model, "abc");
+    }
+
+    #[test]
+    fn fetch_failure_opens_picker_for_manual_fallback() {
+        let mut s = ProviderFormState::empty();
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Err("timeout".into()));
+        assert!(s.picker_open);
+        assert_eq!(s.fetch_error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn thinking_rows_cycle_and_persist() {
+        let mut s = ProviderFormState::empty();
+        s.name = "p".into();
+        s.base_url = "https://x".into();
+        s.model = "m".into();
+
+        // 初始「未设置」→ 不下发任何思考参数
+        assert_eq!(s.thinking_type(), "");
+        assert_eq!(s.thinking_effort(), "");
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert!(cfg.thinking.is_none());
+
+        s.focused = IDX_THINKING_TYPE;
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.get_field(IDX_THINKING_TYPE), "enabled");
+        s.focused = IDX_THINKING_EFFORT;
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        s.handle_key(key(KeyCode::Right), &ProvidersConfig::default());
+        assert_eq!(s.get_field(IDX_THINKING_EFFORT), "medium");
+
+        let (_, cfg) = s.into_provider(&ProvidersConfig::default()).unwrap();
+        assert_eq!(
+            cfg.thinking,
+            Some(cyber_core::ThinkingConfig {
+                r#type: Some("enabled".into()),
+                effort: Some("medium".into()),
+            })
+        );
+        // 快照（拉取/探针用）同样携带 thinking
+        assert_eq!(s.to_provider_config_snapshot().thinking, cfg.thinking);
+
+        // 回填：from_provider 必须还原两个索引
+        let back = ProviderFormState::from_provider("p", &cfg);
+        assert_eq!(back.thinking_type(), "enabled");
+        assert_eq!(back.thinking_effort(), "medium");
+    }
+
+    #[test]
+    fn render_picker_shows_capability_badges() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = crate::theme::Theme::resolve("cyberpunk");
+        let mut s = ProviderFormState::empty();
+        // 唯一名字避免命中真实用户缓存（capabilities.json）。
+        s.name = "cyber-test-provider-zz9".into();
+        s.model = "glm-5.3".into();
+        let id = s.start_fetch();
+        s.deliver_fetch(id, Ok(vec!["glm-5.3".into(), "plain-unprobed-zz9".into()]));
+        assert!(s.picker_open);
+        s.prepare_render(&theme);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_form(f, f.area(), &theme, &s))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = (0..40u16)
+            .map(|y| {
+                (0..120u16)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let compact = text.replace(' ', "");
+        assert!(
+            compact.contains("glm-5.3◈推理"),
+            "glm-5.3 行必须带推理标签: {text}"
+        );
+        let plain_line = text
+            .lines()
+            .find(|l| l.contains("plain-unprobed-zz9"))
+            .unwrap_or_else(|| panic!("列表中必须有 plain 行: {text}"));
+        assert!(
+            !plain_line.contains('◈'),
+            "无能力模型不得带标签: {plain_line}"
+        );
     }
 }

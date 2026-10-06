@@ -34,6 +34,7 @@ pub struct ResponsesProvider {
     model: String,
     max_tokens: u32,
     temperature: f32,
+    thinking: Option<cyber_core::ThinkingConfig>,
 }
 
 impl ResponsesProvider {
@@ -53,7 +54,32 @@ impl ResponsesProvider {
             model: cfg.model.clone(),
             max_tokens: cfg.effective_max_tokens(),
             temperature: cfg.effective_temperature(),
+            thinking: cfg.thinking.clone(),
         })
+    }
+
+    /// 构造流式请求体（`system` → 顶层 `instructions`；tools 由调用方追加）。
+    ///
+    /// `thinking.effort` → `reasoning.effort`；仅设 `type=enabled` 而未设 effort 时
+    /// 用 `"medium"` 兜底。`disabled` 与未设置都不下发。
+    fn build_body(&self, input: Vec<Value>, system: Option<String>) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "input": input,
+            "max_output_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": true,
+        });
+        if let Some(s) = system {
+            body["instructions"] = json!(s);
+        }
+        let t = self.thinking.as_ref();
+        if let Some(effort) = t.and_then(|t| t.effort.as_deref()) {
+            body["reasoning"] = json!({ "effort": effort });
+        } else if t.and_then(|t| t.r#type.as_deref()) == Some("enabled") {
+            body["reasoning"] = json!({ "effort": "medium" });
+        }
+        body
     }
 }
 
@@ -104,22 +130,12 @@ impl Provider for ResponsesProvider {
         req: StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // system → 顶层 instructions（Responses API 约定）
-        let mut body = json!({
-            "model": self.model,
-            "input": [],
-            "max_output_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "stream": true,
-        });
-        if let Some(s) = req.system {
-            body["instructions"] = json!(s);
-        }
         let input: Vec<Value> = req
             .messages
             .into_iter()
             .flat_map(message_to_responses)
             .collect();
-        body["input"] = json!(input);
+        let mut body = self.build_body(input, req.system);
         if !req.tools.is_empty() {
             let mut tools: Vec<Value> = req
                 .tools
@@ -215,6 +231,7 @@ mod tests {
             model: "grok-4.5".into(),
             max_tokens: 128,
             temperature: 0.0,
+            thinking: None,
         };
         let req = StreamRequest::new(vec![Message::user("hi")])
             .with_system("sys")
@@ -226,5 +243,50 @@ mod tests {
             }]);
         // stream 不被驱动，仅构造（HttpStream::Init 状态，未发请求）
         let _stream = p.stream(req);
+    }
+
+    #[test]
+    fn responses_body_sets_reasoning_effort() {
+        let provider = |ty: Option<&str>, effort: Option<&str>| {
+            ResponsesProvider::new(&ProviderConfig {
+                kind: "responses".into(),
+                base_url: "https://a".into(),
+                api_key: "k".into(),
+                model: "m".into(),
+                thinking: Some(cyber_core::ThinkingConfig {
+                    r#type: ty.map(|s| s.to_string()),
+                    effort: effort.map(|s| s.to_string()),
+                }),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            provider(Some("enabled"), Some("low")).build_body(vec![], None)["reasoning"]["effort"],
+            "low"
+        );
+        // 仅 enabled 未设 effort → medium 兜底
+        assert_eq!(
+            provider(Some("enabled"), None).build_body(vec![], None)["reasoning"]["effort"],
+            "medium"
+        );
+        // disabled / 未设置 → 不下发
+        assert!(provider(Some("disabled"), None)
+            .build_body(vec![], None)
+            .get("reasoning")
+            .is_none());
+        let cfg = ProviderConfig {
+            kind: "responses".into(),
+            base_url: "https://a".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        assert!(ResponsesProvider::new(&cfg)
+            .unwrap()
+            .build_body(vec![], None)
+            .get("reasoning")
+            .is_none());
     }
 }

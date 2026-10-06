@@ -22,6 +22,7 @@ pub struct OllamaProvider {
     model: String,
     max_tokens: u32,
     temperature: f32,
+    thinking: Option<cyber_core::ThinkingConfig>,
 }
 
 impl OllamaProvider {
@@ -41,7 +42,28 @@ impl OllamaProvider {
             model: cfg.model.clone(),
             max_tokens: cfg.effective_max_tokens(),
             temperature: cfg.effective_temperature(),
+            thinking: cfg.thinking.clone(),
         })
+    }
+
+    /// 构造流式请求体。`thinking.type` 映射为 Ollama 原生 `think` 布尔字段；
+    /// `effort` 在 Ollama 无对应参数 → 忽略。
+    fn build_body(&self, msgs: Vec<Value>) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": msgs,
+            "stream": true,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+            }
+        });
+        match self.thinking.as_ref().and_then(|t| t.r#type.as_deref()) {
+            Some("enabled") => body["think"] = json!(true),
+            Some("disabled") => body["think"] = json!(false),
+            _ => {}
+        }
+        body
     }
 }
 
@@ -102,15 +124,7 @@ impl Provider for OllamaProvider {
         for m in req.messages {
             msgs.push(message_to_ollama(m));
         }
-        let mut body = json!({
-            "model": self.model,
-            "messages": msgs,
-            "stream": true,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            }
-        });
+        let mut body = self.build_body(msgs);
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
                 .tools
@@ -219,6 +233,7 @@ mod tests {
             model: "m".into(),
             max_tokens: 128,
             temperature: 0.0,
+            thinking: None,
         };
         let req = StreamRequest::new(vec![Message::user("hi")])
             .with_system("sys")
@@ -229,5 +244,37 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }]);
         let _stream = p.stream(req);
+    }
+
+    #[test]
+    fn ollama_body_sets_think_flag() {
+        let provider = |ty: Option<&str>| {
+            OllamaProvider::new(&ProviderConfig {
+                kind: "ollama".into(),
+                base_url: "https://a".into(),
+                model: "m".into(),
+                thinking: Some(cyber_core::ThinkingConfig {
+                    r#type: ty.map(|s| s.to_string()),
+                    effort: Some("high".into()), // ollama 忽略 effort
+                }),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        assert_eq!(provider(Some("enabled")).build_body(vec![])["think"], true);
+        assert_eq!(
+            provider(Some("disabled")).build_body(vec![])["think"],
+            false
+        );
+        // 未设置 → 不下发
+        let cfg = ProviderConfig {
+            kind: "ollama".into(),
+            base_url: "https://a".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let body = OllamaProvider::new(&cfg).unwrap().build_body(vec![]);
+        assert!(body.get("think").is_none(), "{body}");
     }
 }

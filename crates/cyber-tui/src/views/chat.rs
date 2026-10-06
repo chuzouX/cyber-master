@@ -235,16 +235,11 @@ fn render_todo_table(frame: &mut Frame, area: Rect, theme: &Theme, items: &[cybe
         return;
     }
 
-    let will_truncate = items.len() > max_lines;
-    let display_count = if will_truncate {
-        max_lines.saturating_sub(1)
-    } else {
-        items.len().min(max_lines)
-    };
+    let window = super::todo_visible_window(items, max_lines);
 
     let max_row_w = (inner.width as usize).saturating_sub(1);
     let mut lines = Vec::with_capacity(max_lines);
-    for item in items.iter().take(display_count) {
+    for item in &items[window.start..window.start + window.len] {
         let (symbol, color) = match item.status {
             cyber_core::TodoStatus::Pending => ("[ ]", theme.muted),
             cyber_core::TodoStatus::InProgress => ("[>]", theme.accent),
@@ -315,9 +310,14 @@ fn render_todo_table(frame: &mut Frame, area: Rect, theme: &Theme, items: &[cybe
         lines.push(Line::from(spans));
     }
 
-    if will_truncate {
-        let remaining = items.len().saturating_sub(display_count);
-        let trunc_msg = format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）");
+    if window.hidden_above > 0 || window.hidden_below > 0 {
+        let trunc_msg = match (window.hidden_above, window.hidden_below) {
+            (0, below) => format!("   ... 还有 {below} 项任务（输入 /todo list 查看全部）"),
+            (above, 0) => format!("   ↑ 上方还有 {above} 项任务（输入 /todo list 查看全部）"),
+            (above, below) => {
+                format!("   ↑ 上方还有 {above} 项 · 下方 {below} 项（输入 /todo list 查看全部）")
+            }
+        };
         lines.push(Line::from(vec![Span::styled(
             clip_cells_ellipsis(&trunc_msg, max_row_w),
             Style::default()
@@ -1318,6 +1318,63 @@ mod tests {
             "收起后不应包含 close 提示: {content2}"
         );
     }
+
+    #[test]
+    fn chat_pinned_todos_follow_in_progress_item_with_long_list() {
+        use cyber_core::{TodoItem, TodoStatus};
+        let theme = Theme::resolve("cyberpunk");
+        let state = ChatState::new();
+        // 8 条：1-4 Completed，第 5 条 InProgress，6-8 Pending
+        let todos: Vec<TodoItem> = (1..=8)
+            .map(|i| {
+                let status = if i <= 4 {
+                    TodoStatus::Completed
+                } else if i == 5 {
+                    TodoStatus::InProgress
+                } else {
+                    TodoStatus::Pending
+                };
+                TodoItem::new(i.to_string(), format!("任务 {i}"), status)
+            })
+            .collect();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    f.area(),
+                    &theme,
+                    &state,
+                    None,
+                    "mock",
+                    &empty_usage(),
+                    None,
+                    &ContextUsage::default(),
+                    &todos,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        // 面板高 6 → 内区 4 行 → visible 3、focus 下标 4 → start 2、hidden_above 2、hidden_below 3
+        assert!(content.contains("[4/8]"), "应包含进度 4/8: {content}");
+        assert!(content.contains("[>] #5"), "进行中任务必须可见: {content}");
+        assert!(
+            content.contains("[x] #3"),
+            "折叠边界后首条应可见: {content}"
+        );
+        assert!(!content.contains("[x] #1"), "首条应已滚出视口: {content}");
+        // 宽字符在缓冲区内占两格，第二格为空符号，直接 contains 会失败：先去掉所有空白再断言
+        let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("上方还有2项"),
+            "应提示上方折叠数: {content}"
+        );
+        assert!(compact.contains("下方3项"), "应提示下方折叠数: {content}");
+    }
+
     #[test]
     fn chat_scrollbar_renders_when_overflowing_and_updates_on_click() {
         let theme = Theme::resolve("cyberpunk");

@@ -38,6 +38,20 @@ pub struct ProvidersConfig {
     pub providers: HashMap<String, ProviderConfig>,
 }
 
+/// Provider 级思考（思维链）配置。
+///
+/// 两个字段互相独立：`type` 控制是否开启 think，`effort` 控制思考强度（OpenAI 风格
+/// `reasoning_effort`）。都为 `None` 时**不下发任何思考参数**（与旧行为完全一致）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThinkingConfig {
+    /// `thinking.type`：`"enabled"` 或 `"disabled"`。`None` = 不下发 `thinking` 参数。
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// 思考强度：`"low"` / `"medium"` / `"high"`。`None` = 不下发 `reasoning_effort`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
@@ -60,6 +74,9 @@ pub struct ProviderConfig {
     /// 自定义模型列表端点（高级选项）。为空时使用默认逻辑（`{base_url}/models`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_endpoint: Option<String>,
+    /// Provider 级思考配置（高级选项）。`None` = 不下发任何思考参数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 /// 单个 model 的专属配置（覆盖 provider 级默认值）。
@@ -89,6 +106,9 @@ pub struct ModelConfig {
     /// 视觉/识图多模态能力。Some(true) = 支持, Some(false) = 不支持, None = 未知/未探测。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// 思考/推理能力。Some(true)=支持, Some(false)=不支持, None=未知/未探测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
 }
 
 /// token 单价配置（每百万 token）。
@@ -118,6 +138,7 @@ impl Default for ProviderConfig {
             models: HashMap::new(),
             chat_endpoint: None,
             models_endpoint: None,
+            thinking: None,
         }
     }
 }
@@ -192,6 +213,21 @@ impl ProviderConfig {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         self.api_key = self.api_key.trim().to_string();
         self.model = self.model.trim().to_string();
+        if let Some(t) = self.thinking.as_mut() {
+            t.r#type = t
+                .r#type
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+            t.effort = t
+                .effort
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+            if t.r#type.is_none() && t.effort.is_none() {
+                self.thinking = None;
+            }
+        }
     }
 
     /// 当前 model 的专属配置（若存在）。
@@ -278,6 +314,46 @@ impl ProviderConfig {
     }
 }
 
+/// 判定 base_url 的 path 中是否已含 API 版本段（`/v1`、`/v1beta`、`/v2`、`/api-v1` …）。
+///
+/// 只检查 path，忽略 `scheme://host`，避免把 `v1.example.com` 这类主机名误判为版本段。
+fn has_api_version_path(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let path = after_scheme
+        .split_once('/')
+        .map(|(_, p)| p)
+        .unwrap_or_default();
+    let is_version_segment = |s: &str| {
+        let b = s.as_bytes();
+        b.len() >= 2 && b[0] == b'v' && b[1].is_ascii_digit()
+    };
+    path.split('/').any(|seg| {
+        let seg = seg.trim().to_ascii_lowercase();
+        // `v1` / `v1beta` / `v2…`，或 `api-v1` 这类以 `-v<数字>` 结尾的版本段。
+        is_version_segment(&seg)
+            || seg
+                .rsplit_once('-')
+                .is_some_and(|(_, tail)| is_version_segment(tail))
+    })
+}
+
+/// 把 API 版本段拼进 base_url：已含版本段（`/v1`、`/v1beta`、`/v2`…）则原样返回（仅去尾 `/`），
+/// 否则追加 `/v1`。
+///
+/// 用于 anthropic `/v1/messages`、`/v1/models` 等固定带版本段的路径拼接：
+/// 用户把 base_url 配成 `https://api.anthropic.com/v1` 时不得再拼成 `/v1/v1/messages`。
+pub fn with_api_version(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if has_api_version_path(base) {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    }
+}
+
 /// 展开 `${ENV_VAR}` 引用；无 `${}` 包裹的明文原样返回。
 ///
 /// - `${OPENAI_API_KEY}` → `std::env::var("OPENAI_API_KEY")`，未设置则返回空串
@@ -303,6 +379,77 @@ pub fn is_deepseek_vision_model(model: &str) -> bool {
         || m.contains("flash-vision")
         || m.contains("deepseek-vl")
         || m.contains("deepseek-v4-flash")
+}
+
+/// 依据模型 id 判定是否具备思考/推理能力（规则表，非实测；仅用于列表打标）。
+pub fn is_reasoning_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return false;
+    }
+    const SUBSTR: &[&str] = &[
+        "reasoner",
+        "reasoning",
+        "thinking",
+        "-think",
+        "think-",
+        "qwq",
+        "-r1",
+        "r1-",
+        "gpt-5",
+        "glm-5",
+        "glm-4.5",
+        "qwen3",
+        "magistral",
+        "deepseek-v4",
+        "kimi-k2",
+        "grok-4",
+        "claude-sonnet-4",
+        "claude-opus-4",
+    ];
+    if SUBSTR.iter().any(|p| m.contains(p)) {
+        return true;
+    }
+    // OpenAI o 系列：必须出现在开头或路径/连字符边界，避免误判随机 id。
+    ["o1", "o3", "o4"].iter().any(|p| {
+        m.starts_with(p)
+            || m.contains(&format!("/{p}"))
+            || m.contains(&format!("-{p}"))
+            || m.contains(&format!("{p}-"))
+    })
+}
+
+/// 依据模型 id 判定是否具备视觉能力（规则表，非实测；仅用于列表打标）。
+pub fn is_vision_model_by_name(model: &str) -> bool {
+    const SUBSTR: &[&str] = &[
+        "vision",
+        "-vl",
+        "vl-",
+        "vl2",
+        "multimodal",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "claude-3",
+        "claude-4",
+        "claude-sonnet",
+        "claude-opus",
+        "gemini",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "llava",
+        "pixtral",
+        "internvl",
+        "glm-4v",
+        "deepseek-vl",
+        "deepseek-flash",
+        "flash-vision",
+        "deepseek-v4-flash",
+    ];
+    let m = model.trim().to_ascii_lowercase();
+    !m.is_empty() && SUBSTR.iter().any(|p| m.contains(p))
 }
 
 /// 判定服务商配置是否为 DeepSeek 服务商（官方或包含 DeepSeek 模型的第三方服务）。
@@ -391,17 +538,69 @@ impl VisionCapability {
     }
 }
 
+/// 模型思考/推理支持状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningCapability {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+impl ReasoningCapability {
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Unsupported)
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    pub fn from_bool(val: bool) -> Self {
+        if val {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Supported => Some(true),
+            Self::Unsupported => Some(false),
+            Self::Unknown => None,
+        }
+    }
+
+    /// 用于 UI 或 CLI 展示的状态文本。
+    pub fn badge_text(&self) -> &'static str {
+        match self {
+            Self::Supported => "◈ 推理",
+            Self::Unsupported => "",
+            Self::Unknown => "",
+        }
+    }
+}
+
 /// 模型能力本地持久化缓存（存放在 `~/.cyber/cache/capabilities.json`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapabilityStore {
     #[serde(default)]
     pub capabilities: HashMap<String, VisionCapability>,
+    #[serde(default)]
+    pub reasoning: HashMap<String, ReasoningCapability>,
 }
 
 impl CapabilityStore {
     pub fn new() -> Self {
         Self {
             capabilities: HashMap::new(),
+            reasoning: HashMap::new(),
         }
     }
 
@@ -436,6 +635,29 @@ impl CapabilityStore {
         let m = model.trim().to_string();
         if !provider.trim().is_empty() {
             self.capabilities.entry(m).or_insert(cap);
+        }
+    }
+
+    /// 获取模型思考/推理能力。支持以 `{provider}:{model}` 或 `{model}` 查询。
+    pub fn get_reasoning(&self, provider: &str, model: &str) -> ReasoningCapability {
+        let key = Self::cache_key(provider, model);
+        if let Some(&cap) = self.reasoning.get(&key) {
+            return cap;
+        }
+        let m = model.trim();
+        if let Some(&cap) = self.reasoning.get(m) {
+            return cap;
+        }
+        ReasoningCapability::Unknown
+    }
+
+    /// 设置模型思考/推理能力。
+    pub fn set_reasoning(&mut self, provider: &str, model: &str, cap: ReasoningCapability) {
+        let key = Self::cache_key(provider, model);
+        self.reasoning.insert(key, cap);
+        let m = model.trim().to_string();
+        if !provider.trim().is_empty() {
+            self.reasoning.entry(m).or_insert(cap);
         }
     }
 
@@ -536,6 +758,67 @@ pub fn save_model_vision_capability(
         mc.vision = capability.as_bool();
     }
     Ok(())
+}
+
+/// 保存模型思考/推理能力实测结果到持久化缓存，并同步回写至 `ProviderConfig::models`。
+pub fn save_model_reasoning_capability(
+    provider_name: &str,
+    model: &str,
+    capability: ReasoningCapability,
+    provider_cfg: Option<&mut ProviderConfig>,
+) -> std::io::Result<()> {
+    let mut store = CapabilityStore::load();
+    store.set_reasoning(provider_name, model, capability);
+    let _ = store.save();
+
+    if let Some(cfg) = provider_cfg {
+        let mc = cfg.models.entry(model.to_string()).or_default();
+        mc.reasoning = capability.as_bool();
+    }
+    Ok(())
+}
+
+/// 视觉能力：显式 `models` 配置 → 持久化实测缓存 → 名称规则表 → `Unknown`。
+pub fn resolve_vision_capability(
+    models: Option<&HashMap<String, ModelConfig>>,
+    provider: &str,
+    model: &str,
+    store: &CapabilityStore,
+) -> VisionCapability {
+    if let Some(v) = models.and_then(|m| m.get(model)).and_then(|mc| mc.vision) {
+        return VisionCapability::from_bool(v);
+    }
+    let cached = store.get(provider, model);
+    if !cached.is_unknown() {
+        return cached;
+    }
+    if is_vision_model_by_name(model) {
+        return VisionCapability::Supported;
+    }
+    VisionCapability::Unknown
+}
+
+/// 推理能力：显式 `models` 配置 → 持久化实测缓存 → 名称规则表 → `Unknown`。
+pub fn resolve_reasoning_capability(
+    models: Option<&HashMap<String, ModelConfig>>,
+    provider: &str,
+    model: &str,
+    store: &CapabilityStore,
+) -> ReasoningCapability {
+    if let Some(v) = models
+        .and_then(|m| m.get(model))
+        .and_then(|mc| mc.reasoning)
+    {
+        return ReasoningCapability::from_bool(v);
+    }
+    let cached = store.get_reasoning(provider, model);
+    if !cached.is_unknown() {
+        return cached;
+    }
+    if is_reasoning_model(model) {
+        return ReasoningCapability::Supported;
+    }
+    ReasoningCapability::Unknown
 }
 
 /// 常见的大模型厂商预设列表。
@@ -1042,6 +1325,7 @@ mod tests {
             }),
             notes: Some("测试备注".into()),
             vision: Some(true),
+            reasoning: Some(true),
         };
         let json = serde_json::to_string(&mc).unwrap();
         let mc2: ModelConfig = serde_json::from_str(&json).unwrap();
@@ -1049,6 +1333,7 @@ mod tests {
         assert_eq!(mc2.context_length, Some(128000));
         assert_eq!(mc2.notes, Some("测试备注".into()));
         assert_eq!(mc2.vision, Some(true));
+        assert_eq!(mc2.reasoning, Some(true));
     }
 
     #[test]
@@ -1207,5 +1492,199 @@ temperature = 0.7
         assert_eq!(VisionCapability::Supported.badge_text(), "◈ 视觉");
         assert_eq!(VisionCapability::Unsupported.badge_text(), "");
         assert_eq!(VisionCapability::Unknown.badge_text(), "");
+    }
+
+    #[test]
+    fn thinking_config_serde_roundtrip() {
+        let cfg: ProvidersConfig = toml::from_str(
+            r#"
+default_provider = "x"
+[providers.x]
+kind = "openai"
+[providers.x.thinking]
+type = "enabled"
+effort = "high"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.providers["x"].thinking,
+            Some(ThinkingConfig {
+                r#type: Some("enabled".into()),
+                effort: Some("high".into()),
+            })
+        );
+        let text = toml::to_string(&cfg.providers["x"]).unwrap();
+        assert!(text.contains("type = \"enabled\""), "{text}");
+        assert!(text.contains("effort = \"high\""), "{text}");
+        // 两个字段均未设置时不落盘任何键。
+        assert!(toml::to_string(&ThinkingConfig::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn thinking_normalize_trims_and_drops_empty() {
+        let mut cfg = ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            thinking: Some(ThinkingConfig {
+                r#type: Some("  ENABLED ".into()),
+                effort: Some(" High ".into()),
+            }),
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(
+            cfg.thinking,
+            Some(ThinkingConfig {
+                r#type: Some("enabled".into()),
+                effort: Some("high".into()),
+            })
+        );
+
+        cfg.thinking = Some(ThinkingConfig {
+            r#type: Some("  ".into()),
+            effort: Some(String::new()),
+        });
+        cfg.normalize();
+        assert!(cfg.thinking.is_none(), "全空 thinking 应归一为 None");
+    }
+
+    #[test]
+    fn is_reasoning_model_matches_known_families() {
+        for m in [
+            "cline-pass/glm-5.3-flash",
+            "deepseek-v4.1-flash",
+            "qwq-32b",
+            "o3-mini",
+            "deepseek-reasoner",
+            "glm-4.5-air",
+        ] {
+            assert!(is_reasoning_model(m), "{m} 应判为推理模型");
+        }
+        for m in ["gpt-4o", "qwen2.5:32b", "", "llama3.3:70b"] {
+            assert!(!is_reasoning_model(m), "{m} 不应判为推理模型");
+        }
+    }
+
+    #[test]
+    fn vision_rule_table_matches_known_families() {
+        for m in [
+            "qwen3-vl-32b",
+            "gpt-4o",
+            "deepseek-vl2",
+            "deepseek-v4-flash-free",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert!(is_vision_model_by_name(m), "{m} 应判为视觉模型");
+        }
+        assert!(!is_vision_model_by_name("plain-text-model"));
+    }
+
+    #[test]
+    fn resolve_reasoning_capability_precedence() {
+        let mut store = CapabilityStore::new();
+        store.set_reasoning("p", "glm-5", ReasoningCapability::Supported);
+        store.set_reasoning("p", "explicit-model", ReasoningCapability::Supported);
+
+        let mut cfg = ProviderConfig::default();
+        cfg.models.insert(
+            "explicit-model".into(),
+            ModelConfig {
+                reasoning: Some(false),
+                ..Default::default()
+            },
+        );
+
+        // 1. 显式配置压过缓存与规则表
+        assert_eq!(
+            resolve_reasoning_capability(Some(&cfg.models), "p", "explicit-model", &store),
+            ReasoningCapability::Unsupported
+        );
+        // 2. 缓存压过规则表
+        assert_eq!(
+            resolve_reasoning_capability(Some(&cfg.models), "p", "glm-5", &store),
+            ReasoningCapability::Supported
+        );
+        // 3. 仅规则表命中
+        assert_eq!(
+            resolve_reasoning_capability(Some(&cfg.models), "p", "deepseek-v4-flash", &store),
+            ReasoningCapability::Supported
+        );
+        // 4. 三者皆无 → Unknown
+        assert_eq!(
+            resolve_reasoning_capability(Some(&cfg.models), "p", "llama3.3:70b", &store),
+            ReasoningCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn resolve_vision_capability_falls_back_to_rule_table() {
+        let store = CapabilityStore::new();
+        assert_eq!(
+            resolve_vision_capability(None, "p", "qwen3-vl-32b", &store),
+            VisionCapability::Supported
+        );
+        assert_eq!(
+            resolve_vision_capability(None, "p", "plain-text-model", &store),
+            VisionCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn with_api_version_appends_only_when_missing() {
+        // 未含版本段 → 补 /v1
+        assert_eq!(
+            with_api_version("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            with_api_version("  http://localhost:11434/  "),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            with_api_version("https://gw.test/openai"),
+            "https://gw.test/openai/v1"
+        );
+        // 已含版本段 → 原样（仅去尾 /），绝不重复
+        assert_eq!(
+            with_api_version("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            with_api_version("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            with_api_version("https://api.cline.bot/api/v1"),
+            "https://api.cline.bot/api/v1"
+        );
+        assert_eq!(
+            with_api_version("https://gw.test/api/v1beta"),
+            "https://gw.test/api/v1beta"
+        );
+        assert_eq!(
+            with_api_version("https://gw.test/api/v2"),
+            "https://gw.test/api/v2"
+        );
+        assert_eq!(
+            with_api_version("https://gw.test/api-v1"),
+            "https://gw.test/api-v1"
+        );
+        // 主机名里的 v1 不算版本段（只看 path）
+        assert_eq!(
+            with_api_version("https://v1.example.com"),
+            "https://v1.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn reasoning_cache_serde_backwards_compatible() {
+        // 旧 capabilities.json（无 reasoning 字段）必须可读。
+        let store: CapabilityStore =
+            serde_json::from_str(r#"{"capabilities":{"p:m":"supported"}}"#).unwrap();
+        assert_eq!(store.get("p", "m"), VisionCapability::Supported);
+        assert_eq!(store.get_reasoning("p", "m"), ReasoningCapability::Unknown);
     }
 }

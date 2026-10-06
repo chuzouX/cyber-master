@@ -48,7 +48,13 @@ pub const BASE_PROMPT_STATIC: &str = "你是 Cyber Master，一个网络安全�
 - 同一个文件不要重复读取：你已经读过的内容在上方对话历史中，直接引用即可。\n\
 - 如果发现自己陷入循环（反复调用相似的工具），立即停下，总结当前进度，向用户说明情况或换一个完全不同的思路。\n\n\
 # 任务执行\n\
-- 结构化任务管理：遇到 3 步以上的多步骤复杂任务、重构任务或渗透测试时，优先调用 `todo` 工具（action=\"add\"）初始化任务清单；开始执行子步骤时将状态更新为 `in_progress`，完成后立即更新为 `completed`；遇到卡点更新为 `failed` 并说明原因，保持任务进度透明。\n\
+- 结构化任务管理（实时更新，必须遵守）：遇到 3 步以上的多步骤复杂任务、重构任务或渗透测试时，先调用 `todo`（action=\"add\", items=[...]）一次性初始化任务清单；随后在执行过程中**实时**同步状态，严禁「全部做完再回头补记」：\n\
+  * 开工即标记：开始某个子步骤的同一响应内，先调用 `todo`（action=\"update\", id=\"<id>\", status=\"in_progress\"），再执行该步骤的工具调用。\n\
+  * 收工即更新：子步骤一经完成并验证，立即在同一响应的工具调用批次里改为 completed（可在 notes 记下关键结论）；一次响应内连续完成多步时，并行发出多个 update 调用。\n\
+  * 单点推进：任何时刻最多一个 in_progress；切换子步骤前先把上一步置为 completed/failed，再开始下一步。\n\
+  * 卡点与改道：被拦截、失败或发现新分支时，把该步置为 failed 并在 notes 写明原因，同时用 action=\"add\" 补充新步骤，不要闷头硬试。\n\
+  * 如实反映：未经验证不得标记 completed；只有明显瞬时完成的步骤才允许不经过 in_progress 直接置为 completed。\n\
+  * 不要为汇报进度而反复调用 action=\"list\"：清单已实时显示在用户界面上，状态更新本身即是汇报，更新时不要附带大段解释。\n\
 - 先读后改：不要对没读过的文件提出修改建议。修改代码前先读取文件，理解现有代码再动手。\n\
 - 不要过度工程：只做被要求的事，不添加多余功能、配置、注释、错误处理或抽象。修 bug 不需要顺便重构周边代码。\n\
 - 不要创建不必要的文件：优先编辑现有文件而非新建文件。\n\
@@ -266,6 +272,11 @@ mod tests {
         let s = build_system_prompt(None, ThinkingIntensity::Middle, &[], "");
         assert!(s.contains("Cyber Master"));
         assert!(!s.contains("项目上下文"));
+        assert!(
+            s.contains("开工即标记"),
+            "组装后的系统提示词必须包含实时更新规则"
+        );
+        assert!(s.contains("结构化任务管理"));
     }
 
     #[test]
@@ -370,6 +381,12 @@ mod tests {
     fn base_prompt_contains_todo_guidance() {
         assert!(BASE_PROMPT_STATIC.contains("todo"));
         assert!(BASE_PROMPT_STATIC.contains("结构化任务管理"));
+        assert!(BASE_PROMPT_STATIC.contains("实时更新，必须遵守"));
+        assert!(BASE_PROMPT_STATIC.contains("开工即标记"));
+        assert!(BASE_PROMPT_STATIC.contains("收工即更新"));
+        assert!(BASE_PROMPT_STATIC.contains("任何时刻最多一个 in_progress"));
+        assert!(BASE_PROMPT_STATIC.contains("未经验证不得标记 completed"));
+        assert!(BASE_PROMPT_STATIC.contains("同一响应的工具调用批次"));
     }
 
     #[test]

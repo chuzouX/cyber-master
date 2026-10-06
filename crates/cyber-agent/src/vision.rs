@@ -15,7 +15,9 @@ use crate::types::ImageContent;
 
 pub use cyber_core::{
     get_model_vision_capability, is_deepseek_provider, is_deepseek_vision_model,
-    save_model_vision_capability, CapabilityStore, VisionCapability, VisionConfig,
+    is_reasoning_model, is_vision_model_by_name, resolve_reasoning_capability,
+    resolve_vision_capability, save_model_reasoning_capability, save_model_vision_capability,
+    CapabilityStore, ReasoningCapability, VisionCapability, VisionConfig,
 };
 
 /// 最小有效 1x1 RGBA PNG Data URI（仅 92 字节，格式标准且经所有厂商网关兼容校验）。
@@ -333,7 +335,7 @@ pub async fn probe_model_vision(
         .timeout(std::time::Duration::from_secs(6))
         .build()?;
 
-    let endpoint = cfg.chat_endpoint();
+    let endpoint = crate::models::probe_endpoint(cfg);
     let headers = crate::models::fetch_headers(cfg);
 
     let payload = match cfg.kind.as_str() {
@@ -418,6 +420,140 @@ pub async fn probe_model_vision(
     Err(AgentError::Provider(format!(
         "探针返回异常状态 {status}: {err_body}"
     )))
+}
+
+/// 实测模型是否支持思考（reasoning）：发一次带思考参数的最小非流式请求，
+/// 依据响应中是否出现思考内容判定。
+///
+/// 不同 kind 的下发参数与判定字段各不相同（见各分支）。HTTP 400/404/422 且错误体
+/// 明确提到思考参数时判为 `Unsupported`；其余异常状态与网络错误返回 `Err`。
+pub async fn probe_model_reasoning(
+    cfg: &cyber_core::ProviderConfig,
+    model: &str,
+) -> Result<ReasoningCapability> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()?;
+
+    let endpoint = crate::models::probe_endpoint(cfg);
+    let headers = crate::models::fetch_headers(cfg);
+
+    let payload = match cfg.kind.as_str() {
+        "anthropic" => serde_json::json!({
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "1" }],
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "stream": false
+        }),
+        "ollama" => serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "1" }],
+            "think": true,
+            "options": { "num_predict": 1 },
+            "stream": false
+        }),
+        "responses" => serde_json::json!({
+            "model": model,
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "1" }] }],
+            "reasoning": { "effort": "low" },
+            "max_output_tokens": 64,
+            "stream": false
+        }),
+        _ => serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "1" }],
+            "thinking": { "type": "enabled" },
+            "max_tokens": 64,
+            "stream": false
+        }),
+    };
+
+    let resp = match client
+        .post(&endpoint)
+        .headers(headers)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Err(AgentError::Provider(format!("探针请求网络错误: {e}"))),
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        return Ok(detect_reasoning_output(&cfg.kind, &body));
+    }
+
+    let code = status.as_u16();
+    let err_body = resp.text().await.unwrap_or_default().to_ascii_lowercase();
+    if matches!(code, 400 | 404 | 422)
+        && [
+            "thinking",
+            "reasoning",
+            "unsupported",
+            "unknown",
+            "not support",
+            "invalid",
+        ]
+        .iter()
+        .any(|k| err_body.contains(k))
+    {
+        return Ok(ReasoningCapability::Unsupported);
+    }
+
+    Err(AgentError::Provider(format!(
+        "探针返回异常状态 {status}: {err_body}"
+    )))
+}
+
+/// 从探针响应体中提取思考输出是否为非空（按 kind 分派字段）。
+fn detect_reasoning_output(kind: &str, body: &serde_json::Value) -> ReasoningCapability {
+    let non_empty_str = |v: Option<&serde_json::Value>| {
+        v.and_then(|x| x.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let supported = match kind {
+        "anthropic" => body
+            .get("content")
+            .and_then(|c| c.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|b| {
+                    b.get("type").and_then(|t| t.as_str()) == Some("thinking")
+                        && non_empty_str(b.get("thinking"))
+                })
+            }),
+        "ollama" => non_empty_str(body.get("message").and_then(|m| m.get("thinking"))),
+        "responses" => body
+            .get("output")
+            .and_then(|o| o.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("reasoning"))
+            }),
+        _ => {
+            let msg = body
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("message"));
+            non_empty_str(msg.and_then(|m| m.get("reasoning_content")))
+                || non_empty_str(msg.and_then(|m| m.get("reasoning")))
+                || msg
+                    .and_then(|m| m.get("thinking"))
+                    .is_some_and(|t| match t {
+                        serde_json::Value::Null => false,
+                        serde_json::Value::String(s) => !s.trim().is_empty(),
+                        _ => true,
+                    })
+        }
+    };
+    if supported {
+        ReasoningCapability::Supported
+    } else {
+        ReasoningCapability::Unsupported
+    }
 }
 
 /// 从 Data URI 或 URL 提取纯 Base64 数据串。
@@ -890,5 +1026,68 @@ mod tests {
         let (resolved_cfg, model) = engine.resolve_provider(&providers).unwrap();
         assert_eq!(model, "deepseek-flash");
         assert_eq!(resolved_cfg.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn test_detect_reasoning_output_per_kind() {
+        // anthropic：thinking 块且内容非空
+        let anthropic = serde_json::json!({"content": [
+            {"type": "thinking", "thinking": "推理过程"},
+            {"type": "text", "text": "1"}
+        ]});
+        assert_eq!(
+            detect_reasoning_output("anthropic", &anthropic),
+            ReasoningCapability::Supported
+        );
+        let anthropic_empty = serde_json::json!({"content": [{"type": "text", "text": "1"}]});
+        assert_eq!(
+            detect_reasoning_output("anthropic", &anthropic_empty),
+            ReasoningCapability::Unsupported
+        );
+
+        // ollama：message.thinking 非空
+        let ollama = serde_json::json!({"message": {"content": "1", "thinking": "推理"}});
+        assert_eq!(
+            detect_reasoning_output("ollama", &ollama),
+            ReasoningCapability::Supported
+        );
+        assert_eq!(
+            detect_reasoning_output("ollama", &serde_json::json!({"message": {"thinking": ""}})),
+            ReasoningCapability::Unsupported
+        );
+
+        // responses：output[] 中存在 reasoning 条目
+        let responses = serde_json::json!({"output": [{"type": "reasoning"}, {"type": "message"}]});
+        assert_eq!(
+            detect_reasoning_output("responses", &responses),
+            ReasoningCapability::Supported
+        );
+        assert_eq!(
+            detect_reasoning_output(
+                "responses",
+                &serde_json::json!({"output": [{"type": "message"}]})
+            ),
+            ReasoningCapability::Unsupported
+        );
+
+        // openai 家族：reasoning_content / reasoning / thinking 三种字段
+        for body in [
+            serde_json::json!({"choices": [{"message": {"reasoning_content": "思考"}}]}),
+            serde_json::json!({"choices": [{"message": {"reasoning": "思考"}}]}),
+            serde_json::json!({"choices": [{"message": {"thinking": "思考"}}]}),
+        ] {
+            assert_eq!(
+                detect_reasoning_output("openai", &body),
+                ReasoningCapability::Supported,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            detect_reasoning_output(
+                "openai",
+                &serde_json::json!({"choices": [{"message": {"content": "1"}}]})
+            ),
+            ReasoningCapability::Unsupported
+        );
     }
 }

@@ -36,7 +36,7 @@ pub use compact::{
     AUTOCOMPACT_BUFFER_TOKENS, COMPACT_MAX_OUTPUT_TOKENS,
 };
 pub use error::{AgentError, Result};
-pub use models::{extract_model_ids, fetch_models};
+pub use models::{extract_model_ids, fetch_models, probe_endpoint};
 pub use permission::{
     assess_tool_safety, check_extreme_danger, is_high_risk_tool, ApprovalChoice, PermissionBroker,
     PermissionDecision, PermissionMode, PermissionRequest, SafetyAssessment,
@@ -57,8 +57,10 @@ pub use types::{
 };
 pub use vision::{
     detect_image_mime, format_injected_vision_description, get_model_vision_capability,
-    is_deepseek_provider, is_deepseek_vision_model, is_image_extension, prepare_image_for_deepseek,
-    probe_model_vision, resolve_prompt_placeholders, save_model_vision_capability, AttachedImage,
-    CapabilityStore, VisionCapability, VisionConfig, VisionEngine, DEFAULT_IMAGE_TOKENS,
+    is_deepseek_provider, is_deepseek_vision_model, is_image_extension, is_reasoning_model,
+    is_vision_model_by_name, prepare_image_for_deepseek, probe_model_reasoning, probe_model_vision,
+    resolve_prompt_placeholders, resolve_reasoning_capability, resolve_vision_capability,
+    save_model_reasoning_capability, save_model_vision_capability, AttachedImage, CapabilityStore,
+    ReasoningCapability, VisionCapability, VisionConfig, VisionEngine, DEFAULT_IMAGE_TOKENS,
     MAX_IMAGE_BYTES, TINY_PROBE_PNG_BASE64, TINY_PROBE_PNG_DATA_URI,
 };

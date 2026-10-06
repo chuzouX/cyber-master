@@ -82,7 +82,8 @@ fn extract_sse_error(v: &serde_json::Value) -> Option<String> {
 
 /// OpenAI SSE 行解析。返回 0..N 个事件：
 /// - `delta.content` → `Delta`
-/// - `delta.reasoning_content` → `Reasoning`（DeepSeek 思考过程）
+/// - `delta.reasoning_content` / `delta.reasoning` / `delta.reasoning_details[].text`
+///   → `Reasoning`（DeepSeek 官方、Cline Pass / OpenRouter 等聚合网关的思考过程）
 /// - `delta.tool_calls[]` → 每项一个 `ToolCallDelta`（首片带 id+name，后续只带 arguments 片段）
 /// - `data: [DONE]` → `Done`
 ///
@@ -141,11 +142,10 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
         out.push(StreamEvent::Delta(content.to_string()));
     }
-    // DeepSeek reasoning_content（思考过程增量）
-    if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-        if !reasoning.is_empty() {
-            out.push(StreamEvent::Reasoning(reasoning.to_string()));
-        }
+    // 思考过程增量：DeepSeek 官方为 `reasoning_content`；Cline Pass / OpenRouter 等
+    // 聚合网关为 `reasoning`（并在 `reasoning_details[].text` 重复同一段文本）。
+    if let Some(reasoning) = delta_reasoning(delta) {
+        out.push(StreamEvent::Reasoning(reasoning));
     }
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
@@ -170,6 +170,29 @@ pub fn parse_openai_line(line: &str) -> Vec<StreamEvent> {
         }
     }
     out
+}
+
+/// 从 OpenAI 兼容 `delta` 中提取思考过程增量（只取一个来源，避免重复）。
+///
+/// 优先级：`reasoning_content`（DeepSeek 官方）→ `reasoning`（OpenRouter / Cline Pass
+/// 等聚合网关，`null` 或空串视为缺席）→ `reasoning_details[].text`（同一内容以明细
+/// 数组形态出现时拼接）。
+fn delta_reasoning(delta: &serde_json::Value) -> Option<String> {
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(text) = delta.get(key).and_then(|value| value.as_str()) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    let details = delta.get("reasoning_details").and_then(|d| d.as_array())?;
+    let mut joined = String::new();
+    for detail in details {
+        if let Some(text) = detail.get("text").and_then(|t| t.as_str()) {
+            joined.push_str(text);
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// 从 OpenAI/DeepSeek usage JSON 对象提取 token 用量。
@@ -705,6 +728,40 @@ mod tests {
             }
             other => panic!("应为 ToolCallDelta，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_parses_every_reasoning_field_without_duplicating() {
+        fn reasoning(event: &str) -> Vec<String> {
+            parse_openai_line(event)
+                .into_iter()
+                .filter_map(|event| match event {
+                    StreamEvent::Reasoning(text) => Some(text),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // DeepSeek 官方字段
+        let deepseek =
+            r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"先算乘法"}}]}"#;
+        assert_eq!(reasoning(deepseek), vec!["先算乘法".to_string()]);
+
+        // Cline Pass / OpenRouter：reasoning 与 reasoning_details 内容相同 → 只发一次
+        let aggregator = r#"data: {"choices":[{"delta":{"content":"","reasoning":"3 ×","reasoning_details":[{"type":"reasoning.text","text":"3 ×","format":"unknown"}]}}]}"#;
+        assert_eq!(reasoning(aggregator), vec!["3 ×".to_string()]);
+
+        // 只有 details 的形态：拼接 text 片段
+        let details_only = r#"data: {"choices":[{"delta":{"content":"","reasoning_details":[{"type":"reasoning.text","text":"a"},{"type":"reasoning.text","text":"b"}]}}]}"#;
+        assert_eq!(reasoning(details_only), vec!["ab".to_string()]);
+
+        // null / 空串视为缺席：不产生空的 Reasoning 事件
+        let absent = r#"data: {"choices":[{"delta":{"content":"hi","reasoning":null,"reasoning_content":""}}]}"#;
+        assert!(reasoning(absent).is_empty());
+        assert!(matches!(
+            parse_openai_line(absent).as_slice(),
+            [StreamEvent::Delta(t)] if t == "hi"
+        ));
     }
 
     #[test]

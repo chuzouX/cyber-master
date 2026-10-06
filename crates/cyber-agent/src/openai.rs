@@ -24,6 +24,7 @@ pub struct OpenAiProvider {
     model: String,
     max_tokens: u32,
     temperature: f32,
+    thinking: Option<cyber_core::ThinkingConfig>,
 }
 
 impl OpenAiProvider {
@@ -42,7 +43,31 @@ impl OpenAiProvider {
             model: cfg.model.clone(),
             max_tokens: cfg.effective_max_tokens(),
             temperature: cfg.effective_temperature(),
+            thinking: cfg.thinking.clone(),
         })
+    }
+
+    /// 构造流式请求体（`thinking` / `reasoning_effort` 按配置条件下发；
+    /// 两者独立，可只出现一个）。
+    fn build_body(&self, msgs: Vec<Value>) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": msgs,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let t = self.thinking.as_ref();
+        match t.and_then(|t| t.r#type.as_deref()) {
+            Some("enabled") => body["thinking"] = json!({"type": "enabled"}),
+            Some("disabled") => body["thinking"] = json!({"type": "disabled"}),
+            _ => {}
+        }
+        if let Some(effort) = t.and_then(|t| t.effort.as_deref()) {
+            body["reasoning_effort"] = json!(effort);
+        }
+        body
     }
 }
 
@@ -110,14 +135,7 @@ impl Provider for OpenAiProvider {
         for m in req.messages {
             msgs.push(message_to_openai(m));
         }
-        let mut body = json!({
-            "model": self.model,
-            "messages": msgs,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
+        let mut body = self.build_body(msgs);
         if !req.tools.is_empty() {
             let mut tools: Vec<Value> = req
                 .tools
@@ -211,6 +229,7 @@ mod tests {
             model: "m".into(),
             max_tokens: 128,
             temperature: 0.0,
+            thinking: None,
         };
         let req = StreamRequest::new(vec![Message::user("hi")])
             .with_system("sys")
@@ -222,6 +241,54 @@ mod tests {
             }]);
         // stream 不被驱动，仅构造（HttpStream::Init 状态，未发请求）
         let _stream = p.stream(req);
+    }
+
+    #[test]
+    fn openai_body_omits_thinking_when_unset() {
+        let p = provider_with(None);
+        let body = p.build_body(vec![json!({"role": "user", "content": "1"})]);
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn openai_body_carries_thinking_and_effort() {
+        let p = provider_with(Some(cyber_core::ThinkingConfig {
+            r#type: Some("enabled".into()),
+            effort: Some("high".into()),
+        }));
+        let body = p.build_body(vec![json!({"role": "user", "content": "1"})]);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // 只设 effort：thinking 键缺席
+        let p = provider_with(Some(cyber_core::ThinkingConfig {
+            r#type: None,
+            effort: Some("low".into()),
+        }));
+        let body = p.build_body(vec![]);
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert_eq!(body["reasoning_effort"], "low");
+
+        // disabled 下发关闭值
+        let p = provider_with(Some(cyber_core::ThinkingConfig {
+            r#type: Some("disabled".into()),
+            effort: None,
+        }));
+        let body = p.build_body(vec![]);
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    fn provider_with(thinking: Option<cyber_core::ThinkingConfig>) -> OpenAiProvider {
+        OpenAiProvider::new(&ProviderConfig {
+            kind: "openai".into(),
+            base_url: "https://x".into(),
+            api_key: "sk-test".into(),
+            model: "m".into(),
+            thinking,
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     #[test]

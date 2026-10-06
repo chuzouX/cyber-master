@@ -75,26 +75,55 @@ pub async fn fetch_models(cfg: &ProviderConfig) -> Result<Vec<String>> {
 
 /// 按 kind 返回候选端点（已规范化 base_url 去尾 `/`）。
 ///
-/// - anthropic：先 `/v1/models`（Anthropic 标准），后 `/models`
-/// - ollama：先 `/api/tags`（Ollama 原生端点），后 `/v1/models`（Ollama 的 OpenAI 兼容端点）
-/// - 其余（openai / openai-compatible）：先 `/models`，后 `/v1/models`
+/// - anthropic：先 `{base}/v1/models`（Anthropic 标准），后 `{base}/models`
+/// - ollama：先 `{base}/api/tags`（Ollama 原生端点），后 `{base}/v1/models`（Ollama 的 OpenAI 兼容端点）
+/// - 其余（openai / openai-compatible）：先 `{base}/models`，后 `{base}/v1/models`
+///
+/// base_url 已含版本段（`/v1`、`/v1beta`…）时不再重复追加（`with_api_version`），
+/// 重复候选会去重（例如 `https://host/v1` 只产生 `https://host/v1/models`）。
 pub fn fetch_endpoints(kind: &str, base_url: &str) -> Vec<String> {
     let normalized = base_url.trim().trim_end_matches('/');
-    if kind == "anthropic" {
+    let versioned = cyber_core::with_api_version(normalized);
+    let mut endpoints = if kind == "anthropic" {
         vec![
-            format!("{normalized}/v1/models"),
+            format!("{versioned}/models"),
             format!("{normalized}/models"),
         ]
     } else if kind == "ollama" {
         vec![
             format!("{normalized}/api/tags"),
-            format!("{normalized}/v1/models"),
+            format!("{versioned}/models"),
         ]
     } else {
         vec![
             format!("{normalized}/models"),
-            format!("{normalized}/v1/models"),
+            format!("{versioned}/models"),
         ]
+    };
+    endpoints.dedup();
+    endpoints
+}
+
+/// 探针请求应使用的端点（按 kind 修正 anthropic / responses 的非 chat 路径）。
+///
+/// `ProviderConfig::chat_endpoint()` 只为 ollama 特判，anthropic 会误落到
+/// `{base}/chat/completions`；探针必须打到各家真正接受的最小请求路径：
+/// - 用户显式配置了 `chat_endpoint` → 一律优先使用它
+/// - anthropic → `{base}/v1/messages`（base_url 已含版本段时不再重复追加 `v1`）
+/// - responses → `{base}/responses`
+/// - 其余（openai / openai-compatible / ollama）→ `cfg.chat_endpoint()`
+pub fn probe_endpoint(cfg: &ProviderConfig) -> String {
+    if cfg
+        .chat_endpoint
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return cfg.chat_endpoint();
+    }
+    match cfg.kind.as_str() {
+        "anthropic" => format!("{}/messages", cyber_core::with_api_version(&cfg.base_url)),
+        "responses" => format!("{}/responses", cfg.base_url.trim().trim_end_matches('/')),
+        _ => cfg.chat_endpoint(),
     }
 }
 
@@ -209,6 +238,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_endpoint_per_kind() {
+        let cfg = |kind: &str| ProviderConfig {
+            kind: kind.into(),
+            base_url: "https://a".into(),
+            ..Default::default()
+        };
+        assert_eq!(probe_endpoint(&cfg("anthropic")), "https://a/v1/messages");
+        assert_eq!(probe_endpoint(&cfg("responses")), "https://a/responses");
+        assert_eq!(probe_endpoint(&cfg("ollama")), "https://a/api/chat");
+        assert_eq!(probe_endpoint(&cfg("openai")), "https://a/chat/completions");
+        assert_eq!(
+            probe_endpoint(&cfg("openai-compatible")),
+            "https://a/chat/completions"
+        );
+
+        // 显式 chat_endpoint 覆盖全部 kind
+        let mut explicit = cfg("anthropic");
+        explicit.chat_endpoint = Some("https://gw/custom".into());
+        assert_eq!(probe_endpoint(&explicit), "https://gw/custom");
+
+        // base_url 已含 /v1 → anthropic 探针不得拼成 /v1/v1/messages
+        let versioned = ProviderConfig {
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_endpoint(&versioned),
+            "https://api.anthropic.com/v1/messages"
+        );
+        let beta = ProviderConfig {
+            kind: "anthropic".into(),
+            base_url: "https://gw.test/v1beta".into(),
+            ..Default::default()
+        };
+        assert_eq!(probe_endpoint(&beta), "https://gw.test/v1beta/messages");
+    }
+
+    #[test]
     fn extract_openai_data_array() {
         let p = serde_json::json!({
             "data": [{"id": "gpt-4o"}, {"id": "gpt-4o-mini"}]
@@ -266,8 +334,38 @@ mod tests {
     #[test]
     fn fetch_endpoints_openai_models_first() {
         let eps = fetch_endpoints("openai", "https://api.openai.com/v1");
-        assert_eq!(eps[0], "https://api.openai.com/v1/models");
-        assert_eq!(eps[1], "https://api.openai.com/v1/v1/models");
+        assert_eq!(eps, vec!["https://api.openai.com/v1/models"]);
+
+        let eps = fetch_endpoints("openai", "https://api.openai.com");
+        assert_eq!(
+            eps,
+            vec![
+                "https://api.openai.com/models",
+                "https://api.openai.com/v1/models"
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_endpoints_never_duplicates_version_segment() {
+        // base_url 已含 /v1 → 不得出现 /v1/v1
+        for kind in ["openai", "openai-compatible", "anthropic", "responses"] {
+            let eps = fetch_endpoints(kind, "https://gw.test/api/v1");
+            assert!(eps.iter().all(|e| !e.contains("/v1/v1")), "{kind}: {eps:?}");
+            assert!(
+                eps.contains(&"https://gw.test/api/v1/models".to_string()),
+                "{kind}: {eps:?}"
+            );
+        }
+        // 未含版本段的 anthropic 仍走 v1 优先
+        let eps = fetch_endpoints("anthropic", "https://gw.test/api");
+        assert_eq!(
+            eps,
+            vec![
+                "https://gw.test/api/v1/models",
+                "https://gw.test/api/models"
+            ]
+        );
     }
 
     #[test]
