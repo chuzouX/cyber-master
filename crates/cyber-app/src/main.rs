@@ -105,12 +105,14 @@ enum Command {
     /// 检查并升级 Cyber Master 到最新版本
     #[command(
         about = "检查并升级 Cyber Master 到最新版本",
-        long_about = "检查 GitHub 仓库的最新发布版本。如发现新版本，可显示更新日志并提供升级命令；\n\
-                     支持传入 `--check` 仅检查新版本信息，或 `--apply` 自动在当前源码仓库下拉取编译。",
+        long_about = "检查 GitHub / CNB 仓库的最新发布版本。如发现新版本，可显示更新日志并确认是否升级；\n\
+                     支持传入 `--check` 仅检查新版本信息、`--apply` 免交互确认直接升级，\n\
+                     或 `--force` 跳过版本检查与交互确认，直接下载并覆盖安装最新版本。",
         after_help = "示例:\n  \
                       cyber update          # 检查更新并提示升级指南\n  \
                       cyber update --check  # 仅检查是否有新版本并输出版本号\n  \
-                      cyber update --apply  # 检查并在当前 git 仓库下自动执行 git pull && cargo build --release"
+                      cyber update --apply  # 检查到新版本后免交互直接升级\n  \
+                      cyber update --force  # 跳过版本检查，直接覆盖安装最新版本"
     )]
     Update(UpdateArgs),
 }
@@ -163,12 +165,16 @@ struct RunArgs {
 #[derive(clap::Args, Debug, Clone)]
 struct UpdateArgs {
     /// 仅检查更新，不执行升级操作
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long, conflicts_with = "force")]
     check: bool,
 
     /// 免交互确认直接使用安装脚本执行升级 (同 -y / --yes)
     #[arg(short = 'a', short_alias = 'y', long, alias = "yes")]
     apply: bool,
+
+    /// 跳过版本检查与交互确认，直接下载并覆盖安装最新版本
+    #[arg(short = 'f', long)]
+    force: bool,
 }
 /// 输出格式。
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
@@ -521,6 +527,22 @@ async fn run_update(args: UpdateArgs, _cwd: &Path) -> color_eyre::Result<()> {
     println!("Cyber Master 版本更新检查");
     println!("───────────────────────────────────────────────");
     println!("当前安装版本: v{}", cyber_core::update::CURRENT_VERSION);
+
+    // --force：跳过版本检查与交互确认，直接下载并覆盖安装最新版本。
+    if args.force {
+        println!();
+        println!("→ --force：跳过版本检查，直接下载并覆盖安装最新版本…");
+        println!("正在通过 CNB 国内极速源执行强制覆盖更新...");
+        let (program, args) = cyber_core::update::install_script_command(None);
+        let status = std::process::Command::new(program).args(args).status()?;
+        if status.success() {
+            println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
+        } else {
+            eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
+        }
+        return Ok(());
+    }
+
     print!("正在连接版本源检查最新版本 (GitHub / CNB)... ");
     let _ = std::io::stdout().flush();
 
@@ -569,56 +591,17 @@ async fn run_update(args: UpdateArgs, _cwd: &Path) -> color_eyre::Result<()> {
                     "正在通过 CNB 国内极速源执行一键更新升级 (v{})...",
                     info.version
                 );
-                #[cfg(windows)]
-                {
-                    let script = format!(
-                        "$env:CYBER_VERSION='v{}'; $env:CYBER_USE_CNB='1'; irm https://cnb.cool/{}/-/git/raw/main/install.ps1 | iex",
-                        info.version,
-                        cyber_core::update::CNB_REPO
-                    );
-                    let status = std::process::Command::new("powershell")
-                        .args([
-                            "-NoProfile",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-Command",
-                            &script,
-                        ])
-                        .status()?;
-                    if status.success() {
-                        println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
-                    } else {
-                        eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    let script = format!(
-                        "curl -fsSL https://cnb.cool/{}/-/git/raw/main/install.sh | sh -s -- --cnb --version v{}",
-                        cyber_core::update::CNB_REPO,
-                        info.version
-                    );
-                    let status = std::process::Command::new("sh")
-                        .args(["-c", &script])
-                        .status()?;
-                    if status.success() {
-                        println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
-                    } else {
-                        eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
-                    }
+                let (program, args) =
+                    cyber_core::update::install_script_command(Some(&info.version));
+                let status = std::process::Command::new(program).args(args).status()?;
+                if status.success() {
+                    println!("🎉 升级成功！请重新打开终端或直接运行 cyber 查看最新版本。");
+                } else {
+                    eprintln!("一键升级执行失败，请尝试手动运行安装命令。");
                 }
             } else {
                 println!("已取消更新。您也可以随时手动执行以下命令进行升级：");
-                #[cfg(windows)]
-                println!(
-                    "  irm https://cnb.cool/{}/-/git/raw/main/install.ps1 | iex",
-                    cyber_core::update::CNB_REPO
-                );
-                #[cfg(not(windows))]
-                println!(
-                    "  curl -fsSL https://cnb.cool/{}/-/git/raw/main/install.sh | sh",
-                    cyber_core::update::CNB_REPO
-                );
+                println!("  {}", cyber_core::update::install_script_hint(None));
             }
         }
         Some(_info) => {
@@ -694,18 +677,32 @@ mod tests {
     #[test]
     fn update_command_parses_flags() {
         let cli = Cli::try_parse_from(["cyber", "update"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update(ref a)) if !a.check && !a.apply));
+        assert!(matches!(
+            &cli.command,
+            Some(Command::Update(a)) if !a.check && !a.apply && !a.force
+        ));
 
         let cli = Cli::try_parse_from(["cyber", "update", "--check"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update(ref a)) if a.check && !a.apply));
+        assert!(matches!(&cli.command, Some(Command::Update(a)) if a.check && !a.force));
 
         let cli = Cli::try_parse_from(["cyber", "update", "-a"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update(ref a)) if !a.check && a.apply));
+        assert!(matches!(&cli.command, Some(Command::Update(a)) if !a.check && a.apply));
 
         let cli = Cli::try_parse_from(["cyber", "update", "-y"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update(ref a)) if !a.check && a.apply));
+        assert!(matches!(&cli.command, Some(Command::Update(a)) if !a.check && a.apply));
 
         let cli = Cli::try_parse_from(["cyber", "update", "--yes"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update(ref a)) if !a.check && a.apply));
+        assert!(matches!(&cli.command, Some(Command::Update(a)) if !a.check && a.apply));
+
+        let cli = Cli::try_parse_from(["cyber", "update", "--force"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Some(Command::Update(a)) if a.force && !a.check && !a.apply
+        ));
+
+        let cli = Cli::try_parse_from(["cyber", "update", "-f"]).unwrap();
+        assert!(matches!(&cli.command, Some(Command::Update(a)) if a.force));
+
+        assert!(Cli::try_parse_from(["cyber", "update", "--force", "--check"]).is_err());
     }
 }

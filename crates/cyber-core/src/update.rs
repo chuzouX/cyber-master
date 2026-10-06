@@ -4,7 +4,7 @@
 //! 2. 缓存结果于 `~/.cyber/update_check.json`（默认 1 小时内不重复请求，避免限频与启动延迟）；
 //! 3. 提供语义化版本比较 `is_newer(current, remote)`。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -195,6 +195,198 @@ pub async fn check_for_updates(force: bool) -> Option<ReleaseInfo> {
     release
 }
 
+/// install.ps1 的调用片段（`CYBER_FORCE=1` 让脚本跳过自检与确认，直接覆盖安装；
+/// `version = None` 时由脚本自行解析最新版本）。
+#[cfg(windows)]
+fn powershell_invocation(version: Option<&str>) -> String {
+    let version_env = version
+        .map(|v| format!("$env:CYBER_VERSION='v{v}'; "))
+        .unwrap_or_default();
+    format!(
+        "{version_env}$env:CYBER_USE_CNB='1'; $env:CYBER_FORCE='1'; irm https://cnb.cool/{CNB_REPO}/-/git/raw/main/install.ps1 | iex"
+    )
+}
+
+/// install.sh 的调用片段（`--force` 让脚本跳过自检与确认，直接覆盖安装；
+/// `version = None` 时由脚本自行解析最新版本）。
+#[cfg(not(windows))]
+fn shell_invocation(version: Option<&str>) -> String {
+    let version_arg = version
+        .map(|v| format!(" --version v{v}"))
+        .unwrap_or_default();
+    format!("curl -fsSL https://cnb.cool/{CNB_REPO}/-/git/raw/main/install.sh | sh -s -- --cnb --force{version_arg}")
+}
+
+/// 前台执行的安装脚本命令 `(program, args)`：`cyber update`（阻塞、继承 stdio）用。
+/// `version = None`（即 `cyber update --force`）交由安装脚本自行解析最新版本并覆盖安装。
+pub fn install_script_command(version: Option<&str>) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+                powershell_invocation(version),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), shell_invocation(version)],
+        )
+    }
+}
+
+/// 面向用户的手动升级命令（单行，与 install 脚本 README 用法一致）；`version = None` 装最新。
+pub fn install_script_hint(version: Option<&str>) -> String {
+    #[cfg(windows)]
+    {
+        // install.ps1 无版本参数形式，版本经 CYBER_VERSION 传入。
+        let _ = version;
+        format!("irm https://cnb.cool/{CNB_REPO}/-/git/raw/main/install.ps1 | iex")
+    }
+    #[cfg(not(windows))]
+    {
+        match version {
+            Some(v) => format!(
+                "curl -fsSL https://cnb.cool/{CNB_REPO}/-/git/raw/main/install.sh | sh -s -- --cnb --version v{v}"
+            ),
+            None => format!(
+                "curl -fsSL https://cnb.cool/{CNB_REPO}/-/git/raw/main/install.sh | sh"
+            ),
+        }
+    }
+}
+
+/// 安装目标路径的纯计算部分（`CYBER_INSTALL_DIR` 优先，否则 `<home>/.local/bin`；
+/// 目录为空白串视为未设置）。与 install.ps1 / install.sh 的默认目录逐字一致。
+fn install_target_path(install_dir: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let file = if cfg!(windows) { "cyber.exe" } else { "cyber" };
+    if let Some(dir) = install_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir).join(file));
+    }
+    let home = home.map(str::trim).filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(".local").join("bin").join(file))
+}
+
+/// 安装脚本的目标二进制路径（读环境变量）。
+pub fn installed_binary_path() -> Option<PathBuf> {
+    let install_dir = std::env::var("CYBER_INSTALL_DIR").ok();
+    let home = if cfg!(windows) {
+        std::env::var("USERPROFILE").ok()
+    } else {
+        std::env::var("HOME").ok()
+    };
+    install_target_path(install_dir.as_deref(), home.as_deref())
+}
+
+/// 两个路径是否指向同一文件：先规范化（失败则原样比较），Windows 不区分大小写。
+fn same_binary(a: &Path, b: &Path) -> bool {
+    let a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    if cfg!(windows) {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    }
+}
+
+/// 当前进程是否就是安装脚本的目标二进制。
+pub fn is_self_install_target() -> bool {
+    let (Some(target), Ok(current)) = (installed_binary_path(), std::env::current_exe()) else {
+        return false;
+    };
+    same_binary(&current, &target)
+}
+
+/// 是否需要「先退出再安装」：Windows 无法覆盖运行中的 exe（install.ps1 的 `Copy-Item -Force`
+/// 会以「请关闭正在运行的 cyber」失败），Unix 的 `mv -f` 可原地替换运行中的文件。
+pub fn needs_exit_before_install() -> bool {
+    cfg!(windows) && is_self_install_target()
+}
+
+/// 分离执行的安装脚本内容（Windows PowerShell / 其它 sh）。
+pub fn detached_script(version: &str, wait_for_exit: bool) -> String {
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        let wait = if wait_for_exit {
+            format!("while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 400 }}\n")
+        } else {
+            String::new()
+        };
+        format!(
+            "$ErrorActionPreference = 'Stop'\n{wait}{}\n",
+            powershell_invocation(Some(version))
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let wait = if wait_for_exit {
+            format!("while kill -0 {pid} 2>/dev/null; do sleep 0.4; done\n")
+        } else {
+            String::new()
+        };
+        format!(
+            "#!/bin/sh\nset -u\n{wait}{}\n",
+            shell_invocation(Some(version))
+        )
+    }
+}
+
+/// 写脚本到 `~/.cyber/logs/update-v<version>.ps1|sh` 并分离启动，返回脚本路径。
+///
+/// Windows 走 `cmd /c start "" powershell … -File <脚本>`：新控制台窗口，安装进度可见，
+/// 且不阻塞本进程；Unix 直接 `sh <脚本>`，stdout/stderr 追加到同目录 `update.log`。
+pub fn launch_detached_install(version: &str, wait_for_exit: bool) -> std::io::Result<PathBuf> {
+    use std::process::Stdio;
+    let paths = Paths::detect().map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::create_dir_all(&paths.logs_dir)?;
+    #[cfg(windows)]
+    let script = paths.logs_dir.join(format!("update-v{version}.ps1"));
+    #[cfg(not(windows))]
+    let script = paths.logs_dir.join(format!("update-v{version}.sh"));
+    std::fs::write(&script, detached_script(version, wait_for_exit))?;
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "start",
+                "",
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .stdin(Stdio::null())
+            .spawn()?;
+    }
+    #[cfg(not(windows))]
+    {
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.logs_dir.join("update.log"))?;
+        let err = out.try_clone()?;
+        std::process::Command::new("sh")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .spawn()?;
+    }
+    Ok(script)
+}
+
 fn parse_cargo_toml_version(content: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(content).ok()?;
     value
@@ -241,6 +433,128 @@ edition = "2021"
             parse_cargo_toml_version(toml_str),
             Some("0.4.9".to_string())
         );
+    }
+
+    #[test]
+    fn install_script_command_forces_and_targets_requested_version() {
+        let (program, args) = install_script_command(Some("0.9.9"));
+        let command = args.last().unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "powershell");
+            assert!(command.contains("$env:CYBER_FORCE='1'"), "{command}");
+            assert!(command.contains("$env:CYBER_VERSION='v0.9.9'"), "{command}");
+            assert!(command.contains("install.ps1 | iex"), "{command}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program, "sh");
+            assert!(command.contains("--force"), "{command}");
+            assert!(command.contains("--version v0.9.9"), "{command}");
+            assert!(command.contains("install.sh | sh -s"), "{command}");
+        }
+    }
+
+    #[test]
+    fn install_script_command_without_version_lets_installer_resolve_latest() {
+        let (program, args) = install_script_command(None);
+        let command = args.last().unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "powershell");
+            assert!(command.contains("$env:CYBER_FORCE='1'"), "{command}");
+            assert!(!command.contains("CYBER_VERSION"), "{command}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program, "sh");
+            assert!(command.contains("--force"), "{command}");
+            assert!(!command.contains("--version"), "{command}");
+        }
+    }
+
+    #[test]
+    fn install_target_path_prefers_env_dir_then_home_default() {
+        let file = if cfg!(windows) { "cyber.exe" } else { "cyber" };
+        assert_eq!(
+            install_target_path(Some(" D:/b "), None),
+            Some(PathBuf::from("D:/b").join(file))
+        );
+        assert_eq!(
+            install_target_path(None, Some("/home/x")),
+            Some(
+                PathBuf::from("/home/x")
+                    .join(".local")
+                    .join("bin")
+                    .join(file)
+            )
+        );
+        assert_eq!(install_target_path(Some("   "), None), None);
+        assert_eq!(install_target_path(None, Some(" ")), None);
+        assert_eq!(install_target_path(None, None), None);
+    }
+
+    #[test]
+    fn same_binary_compares_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(same_binary(&file, &dir.path().join(".").join("a")));
+        let other = dir.path().join("b");
+        std::fs::write(&other, b"y").unwrap();
+        assert!(!same_binary(&file, &other));
+        #[cfg(windows)]
+        assert!(same_binary(
+            Path::new("C:/X/Cyber.exe"),
+            Path::new("c:/x/cyber.exe")
+        ));
+    }
+
+    #[test]
+    fn detached_script_includes_wait_when_requested() {
+        let waiting = detached_script("0.9.9", true);
+        assert!(waiting.contains("0.9.9"), "{waiting}");
+        let pid = std::process::id().to_string();
+        #[cfg(windows)]
+        {
+            assert!(
+                waiting.contains(&format!("Get-Process -Id {pid}")),
+                "{waiting}"
+            );
+            assert!(
+                waiting.starts_with("$ErrorActionPreference = 'Stop'"),
+                "{waiting}"
+            );
+            assert!(waiting.contains("CYBER_FORCE='1'"), "{waiting}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(waiting.contains(&format!("kill -0 {pid}")), "{waiting}");
+            assert!(waiting.starts_with("#!/bin/sh"), "{waiting}");
+            assert!(waiting.contains("--force"), "{waiting}");
+        }
+
+        let immediate = detached_script("0.9.9", false);
+        assert!(immediate.contains("0.9.9"), "{immediate}");
+        #[cfg(windows)]
+        assert!(!immediate.contains("Get-Process"), "{immediate}");
+        #[cfg(not(windows))]
+        assert!(!immediate.contains("kill -0"), "{immediate}");
+    }
+
+    #[test]
+    fn install_script_hint_matches_installer_docs() {
+        #[cfg(windows)]
+        {
+            assert!(install_script_hint(None).contains("install.ps1 | iex"));
+            assert!(install_script_hint(Some("0.9.9")).contains("install.ps1 | iex"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(install_script_hint(None).contains("install.sh | sh"));
+            assert!(!install_script_hint(None).contains("--version"));
+            assert!(install_script_hint(Some("0.9.9")).contains("--version v0.9.9"));
+        }
     }
 
     #[test]
