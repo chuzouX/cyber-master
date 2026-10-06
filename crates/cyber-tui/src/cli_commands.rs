@@ -910,7 +910,7 @@ fn toolbox(runner: &mut SessionRunner, args: &str) -> Result<CliAction> {
             }))
         }
         other => {
-            bail!("未知子命令：{other}（用法：/toolbox [list|add|edit <name>|remove <name>|scan [目录|提示词] [--preview] [--provider <n>] [--model <m>]]）")
+            bail!("未知子命令：{other}（用法：/toolbox [list|add|edit <name>|remove <name>|scan [目录|提示词] [--preview] [--provider <n>] [--model <m>]]）");
         }
     }
 }
@@ -2677,7 +2677,9 @@ pub fn submit_form(runner: &mut SessionRunner, form: &CommandForm) -> Result<Cli
             let preview = match field("preview")?.to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" => true,
                 "false" | "0" | "no" | "" => false,
-                _ => bail!("仅预览 (preview) 只能是 true / false"),
+                _ => {
+                    bail!("仅预览 (preview) 只能是 true / false");
+                }
             };
             let target = field("target")?.to_string();
             Ok(CliAction::Task(CliTask::ToolboxScan {

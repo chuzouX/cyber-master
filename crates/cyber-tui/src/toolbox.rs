@@ -37,7 +37,9 @@ pub(crate) fn parse_params_field(raw: &str) -> Result<Vec<CustomToolParam>> {
         let required = match kind.as_str() {
             "r" | "required" | "必填" => true,
             "" | "o" | "optional" | "选填" => false,
-            other => bail!("参数 {name} 的必填标记只能是 r 或 o，得到 {other}"),
+            other => {
+                bail!("参数 {name} 的必填标记只能是 r 或 o，得到 {other}");
+            }
         };
         let description = parts.next().unwrap_or("").to_string();
         let default = parts
@@ -595,8 +597,12 @@ async fn ask_llm_cancellable(
 ) -> Result<String> {
     tokio::select! {
         biased;
-        _ = &mut *cancel => bail!("已取消工具扫描"),
-        _ = events.closed() => bail!("已取消工具扫描"),
+        _ = &mut *cancel => {
+            bail!("已取消工具扫描");
+        }
+        _ = events.closed() => {
+            bail!("已取消工具扫描");
+        }
         reply = ask_llm(cfg, system_prompt, user_prompt) => reply,
     }
 }
@@ -610,7 +616,9 @@ async fn ask_llm(cfg: &ProviderConfig, system_prompt: &str, user_prompt: &str) -
     while let Some(event) = stream.next().await {
         match event {
             cyber_agent::StreamEvent::Delta(text) => output.push_str(&text),
-            cyber_agent::StreamEvent::Error(err) => bail!("模型返回错误: {err}"),
+            cyber_agent::StreamEvent::Error(err) => {
+                bail!("模型返回错误: {err}");
+            }
             _ => {}
         }
     }
