@@ -13,6 +13,7 @@ pub mod memory;
 pub mod paths;
 pub mod project;
 pub mod providers;
+pub mod setup;
 pub mod todo;
 pub mod update;
 
@@ -31,10 +32,12 @@ pub use memory::{MemoryEntry, MemoryScope, MemoryStore};
 pub use paths::Paths;
 pub use project::{ProjectContext, ProjectFrontmatter};
 pub use providers::{
-    get_model_vision_capability, is_deepseek_provider, is_deepseek_vision_model, resolve_api_key,
-    save_model_vision_capability, CapabilityStore, ModelConfig, PriceConfig, ProviderConfig,
-    ProviderPreset, ProvidersConfig, VisionCapability, CONTEXT_LENGTH_PRESETS, DEFAULT_MAX_TOKENS,
-    DEFAULT_OUTPUT_TOKEN_CAP, PROVIDER_KINDS, PROVIDER_PRESETS,
+    get_model_vision_capability, is_deepseek_provider, is_deepseek_vision_model,
+    is_reasoning_model, is_vision_model_by_name, resolve_api_key, resolve_reasoning_capability,
+    resolve_vision_capability, save_model_reasoning_capability, save_model_vision_capability,
+    with_api_version, CapabilityStore, ModelConfig, PriceConfig, ProviderConfig, ProviderPreset,
+    ProvidersConfig, ReasoningCapability, ThinkingConfig, VisionCapability, CONTEXT_LENGTH_PRESETS,
+    DEFAULT_MAX_TOKENS, DEFAULT_OUTPUT_TOKEN_CAP, PROVIDER_KINDS, PROVIDER_PRESETS,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use update::{

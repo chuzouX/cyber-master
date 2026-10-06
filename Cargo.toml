@@ -33,6 +33,8 @@ color-eyre = "0.6"
 anyhow = "1"
 # 系统
 dirs = "5"
+tempfile = "3"
+url = "2"
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

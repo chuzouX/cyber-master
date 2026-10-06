@@ -3,7 +3,7 @@
 //! 运行模式：
 //! 1. `cyber`（无子命令）：启动全屏 coding CLI
 //! 2. `cyber run "<prompt>"`：headless 非交互执行一次 agent 任务，可被外部 agent/脚本接管
-//! 3. `cyber tui`：启动全屏 TUI；`cyber setup`：配置向导
+//! 3. `cyber tui`：启动全屏 TUI；`cyber setup`：全屏设置向导（服务商 / 工具库）
 //!
 //! TUI 启动流程（对应 DESIGN §2.3 启动状态机）：
 //! 1. clap 解析 CLI 参数
@@ -38,13 +38,13 @@ use tokio::sync::mpsc;
                  工具调用（Shell/文件/搜索等）、Todo 任务拆解与子 Agent 并行委派\n  \
                  cyber tui               全屏多面板模式：包含 CTF 题目协作、系统设置与多视图切换\n  \
                  cyber run \"<prompt>\"    Headless 非交互模式：单次执行任务（支持流式文本或结构化 JSON）\n  \
-                 cyber setup             交互式向导：配置模型服务商、API 凭据与默认模型\n  \
+                 cyber setup             全屏设置向导：服务商 / API Key / 模型 / 工具库（Ctrl+S 保存，Esc 完成）\n  \
                  cyber update            检查并升级 Cyber Master 到最新版本",
     after_help = "常用示例:\n  \
                   cyber                         # 启动默认交互式 Coding CLI\n  \
                   cyber --mock                  # 以离线模拟模式启动（免配置 API 密钥快速体验）\n  \
                   cyber tui                     # 启动全屏 TUI 面板（CTF 题目/设置/多视图）\n  \
-                  cyber setup                   # 运行或重新配置模型服务商向导\n  \
+                  cyber setup                   # 打开全屏设置向导（服务商 / 模型 / 工具库）\n  \
                   cyber update                  # 检查是否有新版本及升级指南\n  \
                   cyber run \"总结当前目录结构\" # 单次执行任务并流式输出结果到终端\n  \
                   cyber run \"检查代码\" --format json --allow-tool list_dir,read_file\n  \
@@ -87,7 +87,7 @@ struct Cli {
 enum Command {
     /// 启动全屏 TUI 多面板模式（包含 CTF 题目协作、系统设置、模型管理等）
     Tui,
-    /// 运行交互式配置向导（设置模型服务商、API 凭据和默认模型）
+    /// 打开全屏设置向导（服务商 / API Key / 模型 / 工具库；Ctrl+S 保存，Esc 完成）
     Setup,
     /// 单次非交互执行 agent 任务（headless 自动化模式，支持流式文本或 JSON 输出）
     #[command(
@@ -220,10 +220,14 @@ async fn main() -> color_eyre::Result<()> {
             }
         }
         Some(Command::Setup) => {
-            let res = setup::run_setup(&cwd).await;
+            let res = cyber_tui::run_setup(&cwd, mock).await;
             cyber_tui::restore_terminal();
             match res {
-                Ok(()) => std::process::exit(0),
+                Ok(true) => std::process::exit(0),
+                Ok(false) => {
+                    eprintln!("Provider configuration is missing or unusable. Run `cyber setup`; check the selected provider, endpoint, model and credential environment variable (including project overrides).");
+                    std::process::exit(1);
+                }
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(1);

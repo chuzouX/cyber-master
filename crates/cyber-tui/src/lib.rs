@@ -23,13 +23,14 @@ pub mod question_ui;
 pub mod selection;
 pub mod slash;
 pub mod theme;
+pub(crate) mod toolbox;
 pub mod views;
 pub mod win_paste;
 
 pub use app::{App, AppPaths, AppRegistries, FetchResult, Mode};
 pub use bootstrap::build_registries;
 pub use chat::ChatState;
-pub use cli::{restore_terminal, run_cli};
+pub use cli::{restore_terminal, run_cli, run_setup, run_setup_blocking};
 pub use cyber_mcp::McpServersConfig;
 pub use headless::{outcome_to_json, run_headless, HeadlessArgs, HeadlessOutcome};
 pub use question_ui::{render_question_box, QuestionUiResult, QuestionUiState};

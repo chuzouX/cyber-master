@@ -51,7 +51,7 @@ use crate::headless::{HeadlessOutcome, SessionRunner};
 use crate::selection::default_selection_style;
 use crate::selection::{ContentCoord, TextSelection};
 use crate::theme::Theme;
-use crate::views::clipped_spans;
+use crate::views::{clipped_spans, todo_visible_window};
 
 const CY_LOGO: [&str; 5] = [
     "  ___       ",
@@ -149,7 +149,7 @@ impl Panel {
     }
 }
 
-/// 设置面板标签页（共 7 个大类，全面覆盖所有设置）
+/// 设置面板标签页（共 8 个大类，全面覆盖所有设置）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SettingsTab {
     #[default]
@@ -160,6 +160,7 @@ pub enum SettingsTab {
     Providers,     // 5. 服务商管理
     EnvMemory,     // 6. 环境变量与记忆
     StorageSystem, // 7. 系统与存储日志
+    Toolbox,       // 8. 自定义工具库
 }
 
 impl SettingsTab {
@@ -172,6 +173,7 @@ impl SettingsTab {
             SettingsTab::Providers,
             SettingsTab::EnvMemory,
             SettingsTab::StorageSystem,
+            SettingsTab::Toolbox,
         ]
     }
 
@@ -184,6 +186,7 @@ impl SettingsTab {
             Self::Providers => "5. 服务商管理",
             Self::EnvMemory => "6. 环境与记忆",
             Self::StorageSystem => "7. 系统与存储",
+            Self::Toolbox => "8. 工具库",
         }
     }
 
@@ -196,6 +199,7 @@ impl SettingsTab {
             Self::Providers => "5.服务商",
             Self::EnvMemory => "6.环境记忆",
             Self::StorageSystem => "7.系统存储",
+            Self::Toolbox => "8.工具库",
         }
     }
 
@@ -208,6 +212,7 @@ impl SettingsTab {
             Self::Providers => "5.服务商",
             Self::EnvMemory => "6.环境",
             Self::StorageSystem => "7.存储",
+            Self::Toolbox => "8.工具",
         }
     }
 
@@ -226,6 +231,8 @@ impl SettingsTab {
                 env_slots + mem_slots - 1 + state.total_memories()
             }
             Self::StorageSystem => 1, // 0..=1 (2 rows: retention, log_level)
+            // N 个工具行 + 1 个 AI 扫描行
+            Self::Toolbox => state.custom_tools.len(),
         }
     }
 }
@@ -292,6 +299,10 @@ pub struct CliSettingsState {
     pub pending_discard_confirm: bool,
     pub mcp_servers: Vec<McpServerSummary>,
     pub skills: Vec<SkillSummary>,
+    /// 自定义安全工具库（`~/.cyber/tools/*.toml`，启动时快照）。
+    pub custom_tools: Vec<cyber_core::CustomToolConfig>,
+    /// 「工具库」页连按两次 D 删除确认的待删行下标。
+    pub tools_pending_delete: Option<usize>,
     pub skill_detail: Option<SkillDetailModal>,
     /// 全局记忆条目（~/.cyber/memory.md）。
     pub memories_global: Vec<MemoryEntry>,
@@ -324,6 +335,8 @@ impl CliSettingsState {
             provider_test_results: std::collections::HashMap::new(),
             mcp_servers: Vec::new(),
             skills: Vec::new(),
+            custom_tools: Vec::new(),
+            tools_pending_delete: None,
             skill_detail: None,
             memories_global: Vec::new(),
             memories_project: Vec::new(),
@@ -374,6 +387,11 @@ impl CliSettingsState {
                 })
                 .collect();
         }
+        state.custom_tools = cyber_core::load_custom_tools(&runner.ctx.paths.tools_dir)
+            .0
+            .into_iter()
+            .map(|tool| tool.config)
+            .collect();
         state.skills = runner
             .registries
             .skills
@@ -480,6 +498,8 @@ impl CliSettingsState {
             SettingsTab::StorageSystem => {
                 self.config_draft.storage = default.storage;
             }
+            // 工具是磁盘上的文件，不是 config 草稿，无法“恢复默认”。
+            SettingsTab::Toolbox => {}
         }
         self.dirty = true;
     }
@@ -580,6 +600,14 @@ pub struct CliModelPickerState {
     pub model_scroll: usize,
     /// 是否正在实测识图能力探针
     pub probing_model: Option<String>,
+    /// 正在从接口拉取模型列表的服务商名（None = 空闲）
+    pub fetching: Option<String>,
+    /// 最近一次拉取失败原因（成功/未拉取为 None）
+    pub fetch_error: Option<String>,
+    /// 右栏当前列表是否来自接口（false = 仅本地配置，尚未按 Enter 拉取）。
+    pub fetched: bool,
+    /// 拉取序号：仅接受与当前序号一致的结果，防止切换服务商后旧结果串台
+    fetch_id: u64,
 }
 
 impl CliModelPickerState {
@@ -598,38 +626,139 @@ impl CliModelPickerState {
             provider_scroll: 0,
             model_scroll: 0,
             probing_model: None,
+            fetching: None,
+            fetch_error: None,
+            fetched: false,
+            fetch_id: 0,
         };
         state.refresh_models();
         state
     }
 
-    pub fn refresh_models(&mut self) {
+    /// 本地配置（providers 快照）中当前服务商的模型清单：`models` 映射键 + 当前 `model`。
+    fn config_models(&self) -> Vec<String> {
         let names = self.providers.sorted_names();
-        if self.provider_selected >= names.len() {
-            self.models.clear();
-            self.model_selected = 0;
+        let Some(cfg) = names
+            .get(self.provider_selected)
+            .and_then(|name| self.providers.providers.get(name))
+        else {
+            return Vec::new();
+        };
+        let mut list: Vec<String> = cfg.models.keys().cloned().collect();
+        if !cfg.model.is_empty() && !list.contains(&cfg.model) {
+            list.push(cfg.model.clone());
+        }
+        list
+    }
+
+    /// 当前服务商在配置里指定的模型（`providers[name].model`）。
+    fn configured_model(&self) -> Option<String> {
+        let names = self.providers.sorted_names();
+        names
+            .get(self.provider_selected)
+            .and_then(|name| self.providers.providers.get(name))
+            .map(|cfg| cfg.model.clone())
+            .filter(|m| !m.is_empty())
+    }
+
+    /// 本地配置刷新：切换/打开服务商时的即时列表（接口结果到达前的兜底）。
+    pub fn refresh_models(&mut self) {
+        let list = self.config_models();
+        self.apply_models(list, false);
+        self.fetched = false;
+        self.fetch_error = None;
+    }
+
+    /// 写入模型列表：trim + 去重 + 排序；`keep_selection` 为真时优先保持当前选中项
+    /// （接口结果到达时不打断用户移动光标），否则回落到配置指定的模型。
+    fn apply_models(&mut self, list: Vec<String>, keep_selection: bool) {
+        let previous = if keep_selection {
+            self.models.get(self.model_selected).cloned()
+        } else {
+            None
+        };
+        let configured = self.configured_model();
+        let mut models: Vec<String> = Vec::new();
+        for model in list {
+            let model = model.trim();
+            if !model.is_empty() && !models.iter().any(|m| m == model) {
+                models.push(model.to_string());
+            }
+        }
+        sort_model_ids(&mut models);
+        self.models = models;
+        self.model_scroll = 0;
+        let mut target = previous
+            .as_deref()
+            .and_then(|m| self.models.iter().position(|x| x == m));
+        if target.is_none() {
+            target = configured
+                .as_deref()
+                .and_then(|m| self.models.iter().position(|x| x == m));
+        }
+        self.model_selected = target.unwrap_or(0);
+    }
+
+    /// 异步拉取当前服务商的模型列表（端点构造见 `cyber_agent::fetch_models`，已含版本段的
+    /// base_url 不会再补 `/v1`）。
+    ///
+    /// 结果经 `tx` 回传 CLI 主循环，由 `deliver_fetch` 归并；期间（以及失败后）右栏
+    /// 仍显示 `refresh_models` 提供的本地配置清单。
+    fn begin_fetch(&mut self, tx: &mpsc::UnboundedSender<ModelFetchResult>) {
+        let names = self.providers.sorted_names();
+        let Some(name) = names.get(self.provider_selected).cloned() else {
+            return;
+        };
+        let Some(cfg) = self.providers.providers.get(&name).cloned() else {
+            return;
+        };
+        self.fetch_id = self.fetch_id.wrapping_add(1);
+        let fetch_id = self.fetch_id;
+        self.fetching = Some(name.clone());
+        self.fetch_error = None;
+        self.fetched = false;
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result = cyber_agent::fetch_models(&cfg)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(ModelFetchResult {
+                fetch_id,
+                provider: name,
+                result,
+            });
+        });
+    }
+
+    /// 接收拉取结果：`fetch_id` / 服务商与当前状态不符（已切换服务商或面板重开）则丢弃。
+    fn deliver_fetch(&mut self, fetch: ModelFetchResult) {
+        if fetch.fetch_id != self.fetch_id
+            || self.fetching.as_deref() != Some(fetch.provider.as_str())
+        {
             return;
         }
-        let prov_name = &names[self.provider_selected];
-        if let Some(prov_cfg) = self.providers.providers.get(prov_name) {
-            let mut list: Vec<String> = prov_cfg.models.keys().cloned().collect();
-            if !prov_cfg.model.is_empty() && !list.contains(&prov_cfg.model) {
-                list.push(prov_cfg.model.clone());
+        self.fetching = None;
+        match fetch.result {
+            Ok(models) if !models.is_empty() => {
+                self.fetch_error = None;
+                self.fetched = true;
+                // 接口结果为基准，本地已配置的模型（别名/手写清单）一并保留：
+                // 接口不可用或未覆盖时列表不会退化成空。
+                let mut merged = models;
+                merged.extend(self.config_models());
+                self.apply_models(merged, true);
             }
-            list.sort();
-            list.dedup();
-            self.models = list;
-            if let Some(idx) = self.models.iter().position(|m| m == &prov_cfg.model) {
-                self.model_selected = idx;
-            } else {
-                self.model_selected = 0;
-            }
-        } else {
-            self.models.clear();
-            self.model_selected = 0;
+            Ok(_) => self.fetch_error = Some("接口未返回任何模型".into()),
+            Err(err) => self.fetch_error = Some(err),
         }
-        self.model_scroll = 0;
     }
+}
+
+/// 模型列表异步拉取结果：`fetch_models` 任务 → CLI 主循环（`CliScreen::model_fetch_tx`）。
+struct ModelFetchResult {
+    fetch_id: u64,
+    provider: String,
+    result: Result<Vec<String>, String>,
 }
 
 struct CliScreen {
@@ -668,6 +797,8 @@ struct CliScreen {
     approval_visible: bool,
     panel: Option<Panel>,
     pub settings: Option<CliSettingsState>,
+    /// 首次配置向导模式（`cyber setup`）：Esc 只在配置可用后允许退出。
+    setup_mode: bool,
     pub settings_return_tab: Option<SettingsTab>,
     pub model_picker: Option<CliModelPickerState>,
     pub mcp_panel: Option<crate::views::mcp_panel::McpPanelState>,
@@ -702,6 +833,8 @@ struct CliScreen {
     pub needs_clear: bool,
     pub queued_prompts: std::collections::VecDeque<QueuedPrompt>,
     pub active_steering_tx: Option<cyber_agent::SteeringSender>,
+    /// 模型列表异步拉取结果通道。仅 `run_cli` 注入（测试为 `None` → 不发网络请求）。
+    model_fetch_tx: Option<mpsc::UnboundedSender<ModelFetchResult>>,
     /// 子代理转录注册表（Ctrl+G 面板数据源）。
     subagents: Arc<cyber_agent::SubagentArchive>,
     /// 后台任务注册表（Ctrl+B 面板 + /bg 命令数据源）。
@@ -734,6 +867,82 @@ struct FormState {
     form: CommandForm,
     inputs: Vec<TextArea<'static>>,
     selected: usize,
+    /// 模型列表浮层（`Some` = 打开；`manual` = 手输兜底模式）。
+    model_picker: Option<FormModelPicker>,
+    /// 最近一次成功拉取到的模型 id 列表（关闭浮层后再按 Enter 无需重新拉取）。
+    last_models: Vec<String>,
+}
+
+/// CLI 全屏 provider 表单的模型列表面板状态。
+struct FormModelPicker {
+    /// 带能力标签的模型条目（打开面板时一次性解析，避免渲染期读盘）。
+    entries: Vec<FormModelEntry>,
+    selected: usize,
+    /// 拉取失败/端点缺失时的错误信息。
+    error: Option<String>,
+    /// 手输兜底模式：true = 不画列表浮层，model 字段恢复可编辑。
+    manual: bool,
+}
+
+/// 模型列表条目：id + 已解析出的能力标签。
+struct FormModelEntry {
+    id: String,
+    vision: cyber_core::VisionCapability,
+    reasoning: cyber_core::ReasoningCapability,
+}
+
+/// 同步探针实测结果的局部统一类型（vision / reasoning 返回类型不同，无法直接共用）。
+enum ProbeKindLite {
+    Vision(cyber_core::VisionCapability),
+    Reasoning(cyber_core::ReasoningCapability),
+}
+
+/// 在给定候选值上循环 provider 表单当前选中字段（候选索引 0 表示「未设置」）。
+///
+/// 与 model/kind 等字段的循环共用；`backwards` = 按了 ←。
+fn cycle_field_value(form: &mut FormState, options: &[&str], backwards: bool) {
+    let Some(name) = form.form.fields.get(form.selected).map(|f| f.name.clone()) else {
+        return;
+    };
+    let cur = form.input_value(&name).trim().to_ascii_lowercase();
+    let cur_idx = options.iter().position(|o| *o == cur).unwrap_or(0);
+    let next = if backwards {
+        (cur_idx + options.len() - 1) % options.len()
+    } else {
+        (cur_idx + 1) % options.len()
+    };
+    let value = options[next];
+    form.set_input(&name, value);
+}
+
+/// 由 CLI 表单当前值构造临时 `ProviderConfig`（拉取模型 / 探针用；不落盘）。
+///
+/// 以输入框文本为准（`inputs` 是用户正在编辑的真值；`form.fields[].value` 只在保存前 `capture` 时同步）。
+fn provider_config_from_form(form: &FormState) -> cyber_core::ProviderConfig {
+    let opt = |n: &str| {
+        let v = form.input_value(n);
+        let v = v.trim();
+        (!v.is_empty()).then(|| v.to_string())
+    };
+    cyber_core::ProviderConfig {
+        kind: form.input_value("kind").trim().to_ascii_lowercase(),
+        base_url: form.input_value("endpoint").trim().to_string(),
+        api_key: form.input_value("apikey").trim().to_string(),
+        model: form.input_value("model").trim().to_string(),
+        max_tokens: form
+            .input_value("maxtokens")
+            .trim()
+            .parse()
+            .unwrap_or(cyber_core::DEFAULT_MAX_TOKENS),
+        temperature: form
+            .input_value("temperature")
+            .trim()
+            .parse()
+            .unwrap_or(0.7),
+        chat_endpoint: opt("chat_endpoint"),
+        models_endpoint: opt("models_endpoint"),
+        ..Default::default()
+    }
 }
 
 impl FormState {
@@ -752,6 +961,8 @@ impl FormState {
             form,
             inputs,
             selected: 0,
+            model_picker: None,
+            last_models: Vec::new(),
         }
     }
 
@@ -759,6 +970,87 @@ impl FormState {
         for (field, input) in self.form.fields.iter_mut().zip(&self.inputs) {
             field.value = input.lines().join("\n");
         }
+    }
+
+    /// 按字段名读取输入框文本（不存在则空串）。
+    fn input_value(&self, name: &str) -> String {
+        self.form
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .and_then(|idx| self.inputs.get(idx))
+            .map(|input| input.lines().join("\n"))
+            .unwrap_or_default()
+    }
+
+    /// 当前 `model` 字段文本。
+    fn model_input(&self) -> String {
+        self.input_value("model")
+    }
+
+    /// 写回指定字段的输入框文本（同步 `form.fields`，保证随后 `capture`/`submit_form` 一致）。
+    fn set_input(&mut self, name: &str, value: &str) {
+        if let Some(idx) = self.form.fields.iter().position(|f| f.name == name) {
+            if let Some(input) = self.inputs.get_mut(idx) {
+                *input = composer();
+                input.insert_str(value);
+            }
+            self.form.fields[idx].value = value.to_string();
+        }
+    }
+
+    /// 写回 `model` 字段。
+    fn set_model_input(&mut self, value: &str) {
+        self.set_input("model", value);
+    }
+
+    /// 以拉取结果打开模型选择浮层；`Err` / 空列表进入手输兜底模式。
+    ///
+    /// 能力标签在此一次性解析（显式 models 配置 → 持久化实测缓存 → 名称规则表），
+    /// 渲染期不再读盘。`models_map` 取自当前已保存的 provider 配置（未保存时传 `None`）。
+    fn open_model_picker(
+        &mut self,
+        result: Result<Vec<String>, String>,
+        models_map: Option<&std::collections::HashMap<String, cyber_core::ModelConfig>>,
+        provider_name: &str,
+    ) {
+        let (mut ids, error, manual) = match result {
+            Ok(list) if !list.is_empty() => (list, None, false),
+            Ok(_) => (Vec::new(), Some("未返回任何模型".to_string()), true),
+            Err(e) => (Vec::new(), Some(e), true),
+        };
+        // 接口返回顺序不保证有序，按名称首字母排序，避免列表看起来乱序。
+        sort_model_ids(&mut ids);
+        let store = cyber_core::CapabilityStore::load();
+        let entries: Vec<FormModelEntry> = ids
+            .iter()
+            .map(|id| FormModelEntry {
+                id: id.clone(),
+                vision: cyber_core::resolve_vision_capability(
+                    models_map,
+                    provider_name,
+                    id,
+                    &store,
+                ),
+                reasoning: cyber_core::resolve_reasoning_capability(
+                    models_map,
+                    provider_name,
+                    id,
+                    &store,
+                ),
+            })
+            .collect();
+        let current = self.model_input();
+        let selected = entries.iter().position(|e| e.id == current).unwrap_or(0);
+        if !ids.is_empty() {
+            self.last_models = ids;
+        }
+        self.model_picker = Some(FormModelPicker {
+            entries,
+            selected,
+            error,
+            manual,
+        });
     }
 }
 
@@ -930,6 +1222,7 @@ impl CliScreen {
             approval_visible: false,
             panel: None,
             settings: None,
+            setup_mode: false,
             settings_return_tab: None,
             model_picker: None,
             mcp_panel: None,
@@ -979,6 +1272,7 @@ impl CliScreen {
             needs_clear: false,
             queued_prompts: std::collections::VecDeque::new(),
             active_steering_tx: None,
+            model_fetch_tx: None,
             subagents: Arc::clone(&runner.registries.subagents),
             background: Arc::clone(&runner.registries.background),
             background_env: Some((
@@ -2380,6 +2674,29 @@ impl CliScreen {
         }
     }
 
+    /// 模型选择面板：左栏服务商变化（打开面板 / 切换选中）后刷新右栏模型列表。
+    ///
+    /// 先用本地配置立即刷新（离线可用），再异步从接口拉取该服务商的模型列表
+    /// （结果经 `model_fetch_tx` 回传；未注入通道时——如单元测试——只做本地刷新）。
+    /// 只刷新右栏的本地配置清单（不联网）。用于打开面板与左栏切换 provider。
+    fn refresh_model_picker_local(&mut self) {
+        if let Some(state) = self.model_picker.as_mut() {
+            state.refresh_models();
+        }
+    }
+
+    /// 从接口拉取当前 provider 的模型列表（联网）。仅在左栏 `Enter`（选定 provider）或 `r` 时调用。
+    fn fetch_model_picker_models(&mut self) {
+        let tx = self.model_fetch_tx.clone();
+        let Some(state) = self.model_picker.as_mut() else {
+            return;
+        };
+        state.refresh_models();
+        if let Some(tx) = tx {
+            state.begin_fetch(&tx);
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let win_title = crate::history::terminal_window_title(
             self.busy,
@@ -3286,6 +3603,14 @@ fn clip_cells_ellipsis(text: &str, width: usize) -> String {
     result
 }
 
+/// 模型 id 列表排序：按名称首字母（不区分大小写）升序；仅大小写不同的条目按原串稳定排序。
+///
+/// 用于所有「选择模型」列表（`/model` 双栏面板、设置中心 Providers 的 `M` 模型选择、
+/// Provider 表单的「选择默认模型」浮层），保证同一份模型清单在任意入口顺序一致。
+fn sort_model_ids(ids: &mut [String]) {
+    ids.sort_by_cached_key(|id| (id.to_ascii_lowercase(), id.clone()));
+}
+
 fn select_row(main: &str, detail: &str, selected: bool, width: u16) -> Line<'static> {
     let available = width.saturating_sub(2) as usize;
     let primary_width = if available >= 44 { 32 } else { available };
@@ -4006,16 +4331,11 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
         return;
     }
 
-    let will_truncate = items.len() > max_lines;
-    let display_count = if will_truncate {
-        max_lines.saturating_sub(1)
-    } else {
-        items.len().min(max_lines)
-    };
+    let window = todo_visible_window(items, max_lines);
 
     let max_row_w = (inner.width as usize).saturating_sub(1);
     let mut lines = Vec::with_capacity(max_lines);
-    for item in items.iter().take(display_count) {
+    for item in &items[window.start..window.start + window.len] {
         let (symbol, color) = match item.status {
             cyber_core::TodoStatus::Pending => ("[ ]", MUTED),
             cyber_core::TodoStatus::InProgress => ("[>]", ACCENT),
@@ -4086,9 +4406,14 @@ fn draw_todo_table(frame: &mut Frame, area: Rect, items: &[cyber_core::TodoItem]
         lines.push(Line::from(spans));
     }
 
-    if will_truncate {
-        let remaining = items.len().saturating_sub(display_count);
-        let trunc_msg = format!("   ... 还有 {remaining} 项任务（输入 /todo list 查看全部）");
+    if window.hidden_above > 0 || window.hidden_below > 0 {
+        let trunc_msg = match (window.hidden_above, window.hidden_below) {
+            (0, below) => format!("   ... 还有 {below} 项任务（输入 /todo list 查看全部）"),
+            (above, 0) => format!("   ↑ 上方还有 {above} 项任务（输入 /todo list 查看全部）"),
+            (above, below) => {
+                format!("   ↑ 上方还有 {above} 项 · 下方 {below} 项（输入 /todo list 查看全部）")
+            }
+        };
         lines.push(Line::from(vec![Span::styled(
             clip_cells_ellipsis(&trunc_msg, max_row_w),
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
@@ -5980,6 +6305,111 @@ fn draw_tab_providers(frame: &mut Frame, area: Rect, settings: &CliSettingsState
     render_scrollable_content(frame, area, lines, focused_start, focused_end);
 }
 
+/// 「8. 工具库」页：自定义工具列表 + AI 智能扫描入口行。
+fn draw_tab_toolbox(
+    frame: &mut Frame,
+    area: Rect,
+    settings: &CliSettingsState,
+    _screen: &CliScreen,
+) {
+    let total = settings.custom_tools.len();
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "  自定义安全工具 (Custom Tools) [{} 项] · 手动录入 / 删除 / AI 智能扫描",
+                total
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+    ];
+
+    let mut focused_start = 0;
+    let mut focused_end = 0;
+
+    if total == 0 {
+        lines.push(Line::styled(
+            "    （暂无自定义工具：按 A 手动录入，或选中末行运行 AI 智能扫描）",
+            Style::default().fg(DIM),
+        ));
+    }
+
+    for (i, tool) in settings.custom_tools.iter().enumerate() {
+        let is_sel = settings.selected_row == i;
+        let start_line = lines.len();
+        let pointer = if is_sel { "▶ " } else { "  " };
+        let ptr_style = if is_sel {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let name_style = if is_sel {
+            Style::default().fg(FG).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(FG)
+        };
+        let delete_tag = if settings.tools_pending_delete == Some(i) {
+            Span::styled(
+                "  [待删除!]",
+                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        };
+
+        let spans = crate::views::clipped_spans(
+            vec![
+                Span::styled(pointer, ptr_style),
+                Span::styled(format!("[{}] ", tool.name), name_style),
+                Span::styled(tool.description.clone(), Style::default().fg(MUTED)),
+                Span::styled(format!("  · {}", tool.command), Style::default().fg(DIM)),
+                delete_tag,
+            ],
+            area.width as usize,
+        );
+        lines.push(Line::from(spans));
+        lines.push(Line::raw(""));
+
+        if is_sel {
+            focused_start = start_line;
+            focused_end = lines.len();
+        }
+    }
+
+    let scan_sel = settings.selected_row >= total;
+    let scan_start = lines.len();
+    let scan_pointer = if scan_sel { "▶ " } else { "  " };
+    let scan_style = if scan_sel {
+        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    lines.push(Line::from(crate::views::clipped_spans(
+        vec![
+            Span::styled(
+                scan_pointer,
+                if scan_sel {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                },
+            ),
+            Span::styled("🤖 AI 智能扫描本地安全工具", scan_style),
+            Span::styled(
+                " (Enter 运行；按 --preview 只预览)",
+                Style::default().fg(DIM),
+            ),
+        ],
+        area.width as usize,
+    )));
+    if scan_sel {
+        focused_start = scan_start;
+        focused_end = lines.len();
+    }
+
+    render_scrollable_content(frame, area, lines, focused_start, focused_end);
+}
+
 fn draw_tab_env_memory(frame: &mut Frame, area: Rect, settings: &CliSettingsState) {
     let mut lines = Vec::new();
     let env_count = settings.config_draft.env.vars.len();
@@ -7417,7 +7847,7 @@ fn draw_fullscreen_provider_form(
             "kind" => ("协议类型 (kind)", true),
             "endpoint" => ("端点地址 (endpoint)", true),
             "apikey" => ("访问密钥 (apikey)", false),
-            "model" => ("默认模型 (model)", true),
+            "model" => ("默认模型 (model)（Enter 打开模型列表）", true),
             "maxtokens" => ("最大 Token (maxtokens)", true),
             "temperature" => ("采样温度 (temperature)", true),
             "context_length" => ("上下文窗口 (context_length)", false),
@@ -7429,6 +7859,19 @@ fn draw_fullscreen_provider_form(
                 "自定义模型列表端点 models_endpoint（留空默认 {base_url}/models）",
                 false,
             ),
+            "thinking_type" => (
+                "思考模式 thinking.type（未设置 / enabled / disabled；未设置=不下发）",
+                false,
+            ),
+            "thinking_effort" => (
+                "思考强度 thinking.effort（未设置 / low / medium / high；未设置=不下发）",
+                false,
+            ),
+            "tool_name" => ("工具标识 (name，仅字母数字下划线连字符)", true),
+            "tool_description" => ("工具说明 (description)", false),
+            "tool_command" => ("执行命令 (command，用 {param} 引用参数)", true),
+            "tool_tags" => ("标签 (tags，逗号分隔)", false),
+            "tool_params" => ("参数 (params：名称|r或o|说明|默认值，分号分隔多个)", false),
             _ => (field.name.as_str(), false),
         };
 
@@ -7594,6 +8037,8 @@ fn draw_fullscreen_provider_form(
                     "temperature" => "0.7",
                     "chat_endpoint" => "留空默认 {base_url}/chat/completions",
                     "models_endpoint" => "留空默认 {base_url}/models",
+                    "thinking_type" => "未设置 / enabled / disabled",
+                    "thinking_effort" => "未设置 / low / medium / high",
                     _ => "",
                 };
                 Span::styled(format!("({placeholder})"), Style::default().fg(DIM))
@@ -7613,7 +8058,11 @@ fn draw_fullscreen_provider_form(
             } else {
                 Style::default()
             };
-            field_lines.push(Line::from(vec![Span::raw("    "), display_val]).style(line_style));
+            let mut spans = vec![Span::raw("    "), display_val];
+            if field.name == "model" && form.model_picker.as_ref().is_some_and(|p| p.manual) {
+                spans.push(Span::styled("  [✎ 手输模式]", Style::default().fg(ACCENT)));
+            }
+            field_lines.push(Line::from(spans).style(line_style));
         }
     }
 
@@ -7769,7 +8218,15 @@ fn draw_fullscreen_provider_form(
             guide_lines.push(Line::from(
                 "  • 请求时默认调用的模型 ID，必须与平台实际模型标识一致。",
             ));
-            guide_lines.push(Line::from("  • 不可包含空格。"));
+            guide_lines.push(Line::from(
+                "  • 在本行按 Enter（或空格）拉取 {base_url}/models 模型列表并在浮层中选择；列表内 m/f 手输模型名。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 浮层内 t 实测推理能力、v 实测视觉能力（只写能力缓存，不落盘 providers.toml）。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 列表拉取失败时自动进入手输兜底模式（model 字段恢复可编辑）；Enter 退出该模式。",
+            ));
             guide_lines.push(Line::from(
                 "  • 常见模型: deepseek-chat, gpt-4o, claude-3-7-sonnet-20250219, qwen2.5:32b",
             ));
@@ -7842,6 +8299,48 @@ fn draw_fullscreen_provider_form(
                 "  • 适用于拉取端点与对话端点不在同一子路径的自建代理服务。",
             ));
         }
+        "thinking_type" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 思考模式 (thinking.type):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 未设置 = 不下发任何思考参数（与旧行为完全一致）。",
+            ));
+            guide_lines.push(Line::from(
+                "  • enabled = 按协议下发开启参数: openai/openai-compatible → thinking={\"type\":\"enabled\"}；",
+            ));
+            guide_lines.push(Line::from(
+                "    anthropic → thinking={\"type\":\"enabled\",\"budget_tokens\":max_tokens/2} 且 temperature 固定为 1；",
+            ));
+            guide_lines.push(Line::from(
+                "    ollama → think=true；responses → reasoning={\"effort\":\"medium\"}。",
+            ));
+            guide_lines.push(Line::from(
+                "  • disabled = openai 家族与 ollama 下发关闭值；anthropic 无对应字段故不下发。",
+            ));
+            guide_lines.push(Line::from(
+                "  • 仅对支持思考的模型有意义；可用模型列表浮层内的 t 键实测。",
+            ));
+        }
+        "thinking_effort" => {
+            guide_lines.push(Line::from(vec![Span::styled(
+                "▸ 思考强度 (thinking.effort):",
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )]));
+            guide_lines.push(Line::from(
+                "  • 未设置 = 不下发 reasoning_effort / reasoning.effort。",
+            ));
+            guide_lines.push(Line::from(
+                "  • openai / openai-compatible → 请求体顶层 reasoning_effort = low|medium|high。",
+            ));
+            guide_lines.push(Line::from(
+                "  • responses → reasoning = {\"effort\": low|medium|high}（未设 effort 但 type=enabled 时用 medium）。",
+            ));
+            guide_lines.push(Line::from(
+                "  • anthropic / ollama 无对应参数，设置后被忽略（不会报错）。",
+            ));
+        }
         _ => {
             guide_lines.push(Line::from("  • 填写对应字段内容后，按 Tab 切换至下一项。"));
         }
@@ -7882,11 +8381,15 @@ fn draw_fullscreen_provider_form(
         ))
     };
 
-    let hint_line = Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" [ Tab/Shift+Tab 切换字段 ] ", Style::default().fg(MUTED)),
         Span::styled(" [ ↑/↓ 上下行 ] ", Style::default().fg(MUTED)),
         Span::styled(
-            " [ ←/→ 或 Space 切换协议 ] ",
+            " [ ←/→ 或 Space 切换协议/思考 ] ",
+            Style::default().fg(CODE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " [ Enter 选择模型 ] ",
             Style::default().fg(CODE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -7894,11 +8397,109 @@ fn draw_fullscreen_provider_form(
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" [ Esc 取消返回 ] ", Style::default().fg(MUTED)),
-    ])
-    .alignment(ratatui::layout::Alignment::Center);
+    ];
+    if form.model_picker.as_ref().is_some_and(|p| p.manual) {
+        hint_spans.push(Span::styled(
+            " 手输模式: 直接编辑 model 字段，Enter 退出 ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let hint_line = Line::from(hint_spans).alignment(ratatui::layout::Alignment::Center);
 
     let footer_p = Paragraph::new(vec![status_line, hint_line]);
     frame.render_widget(footer_p, footer_area);
+
+    // 4. 模型列表浮层（手输模式不画）。
+    if let Some(p) = form.model_picker.as_ref().filter(|p| !p.manual) {
+        draw_form_model_picker(frame, area, p);
+    }
+}
+
+/// 绘制 /provider 表单的模型选择浮层（居中，带能力标签与粘性滚动）。
+fn draw_form_model_picker(frame: &mut Frame, area: Rect, picker: &FormModelPicker) {
+    let width = (area.width * 70 / 100).max(50).min(area.width);
+    let height = (area.height * 60 / 100).max(8).min(area.height);
+    let rect = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    if rect.width < 20 || rect.height < 4 {
+        return;
+    }
+    frame.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(" 🤖 选择默认模型 / Select Model ")
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        );
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),                                             // 列表
+        Constraint::Length(if picker.error.is_some() { 2 } else { 1 }), // 提示 + 错误
+    ])
+    .split(inner);
+    let list_area = chunks[0];
+    let footer_area = chunks[1];
+
+    let sel_bg = Color::Rgb(38, 79, 120);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, e) in picker.entries.iter().enumerate() {
+        let selected = i == picker.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let row_style = if selected {
+            Style::default()
+                .bg(sel_bg)
+                .fg(FG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(FG)
+        };
+        let mut spans = vec![Span::styled(format!("{marker}{}", e.id), row_style)];
+        if e.vision.is_supported() {
+            spans.push(Span::styled("  ◈ 视觉", Style::default().fg(Color::Cyan)));
+        }
+        if e.reasoning.is_supported() {
+            spans.push(Span::styled(
+                "  ◈ 推理",
+                Style::default().fg(Color::LightGreen),
+            ));
+        }
+        lines.push(Line::from(clipped_spans(spans, list_area.width as usize)));
+    }
+
+    // 粘性滚动：选中项溢出视口时自动调整。
+    let visible_h = list_area.height as usize;
+    let total = lines.len();
+    let scroll = if total <= visible_h || picker.selected < visible_h {
+        0
+    } else {
+        (picker.selected + 1 - visible_h).min(total.saturating_sub(visible_h))
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(FG))
+            .scroll((scroll as u16, 0)),
+        list_area,
+    );
+
+    let mut footer: Vec<Line> = vec![Line::from(Span::styled(
+        " ↑/↓ 选择 · Enter 确认 · r 重新拉取 · m/f 手输模型名 · t 实测推理 · v 实测视觉 · Esc 关闭 ",
+        Style::default().fg(DIM),
+    ))];
+    if let Some(err) = &picker.error {
+        footer.push(Line::from(Span::styled(
+            format!(" ⚠ {err}"),
+            Style::default().fg(ERROR),
+        )));
+    }
+    frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
 fn draw_settings_panel(
@@ -7927,13 +8528,20 @@ fn draw_settings_panel(
             Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
         )
     };
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(
             " ⚙ Cyber Master 全局设置中心 (Settings) ",
             Style::default().fg(CODE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(dirty_badge, badge_style),
-    ]);
+    ];
+    if screen.setup_mode {
+        title_spans.push(Span::styled(
+            " · Setup ",
+            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let title = Line::from(title_spans);
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
         .title(title);
@@ -7967,6 +8575,7 @@ fn draw_settings_panel(
         SettingsTab::Providers => draw_tab_providers(frame, chunks[2], settings),
         SettingsTab::EnvMemory => draw_tab_env_memory(frame, chunks[2], settings),
         SettingsTab::StorageSystem => draw_tab_storage_system(frame, chunks[2], settings),
+        SettingsTab::Toolbox => draw_tab_toolbox(frame, chunks[2], settings, screen),
     }
 
     let provider_tip;
@@ -8009,6 +8618,7 @@ fn draw_settings_panel(
             }
         }
         SettingsTab::StorageSystem => "💡 提示: 日志级别调整后将在后台日志中实时生效；如需排查详细工具执行流，建议调至 debug 级别。",
+        SettingsTab::Toolbox => "💡 提示: Enter 编辑 · A 添加 · D 删除 · 末行 Enter 运行 AI 扫描；扫描结果输出到对话区。",
     };
     frame.render_widget(
         Paragraph::new(Line::styled(tip_text, Style::default().fg(MUTED))),
@@ -8120,31 +8730,38 @@ fn draw_settings_panel(
     };
     frame.render_widget(Paragraph::new(buttons), chunks[4]);
 
-    let nav_hint = match settings.tab {
-        SettingsTab::Providers if chunks[5].width < 100 => {
-            "操作: ↑/↓ · Enter 设默认 · A 添加 · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
-        }
-        SettingsTab::Providers => {
-            "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
-        }
-        SettingsTab::EnvMemory if chunks[5].width < 90 => {
-            "操作: ↑/↓ · Enter 详情/编辑 · A 添加 · Space 切换 · ←/→ 作用域 · D 删除 · Esc 关闭"
-        }
-        SettingsTab::EnvMemory => {
-            "操作: ↑/↓ 选择项目 · Enter/E 编辑 (记忆列表 Enter 查看详情) · A 添加 · Space 切换脱敏/启用 · ←/→ 作用域 · D 删除 · Esc 关闭"
-        }
-        SettingsTab::ToolsMcp if chunks[5].width < 90 => {
-            "操作: ↑/↓ 移动 · Enter 详情/执行 · Tab 切换 · Esc 关闭"
-        }
-        SettingsTab::ToolsMcp => {
-            if settings.selected_row >= 3 {
-                "操作: ↑/↓ 移动焦点 · Enter/空格/o 查看 Skill 详情 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭"
-            } else {
-                "操作: ↑/↓ 选择项目 · ←/→ / 空格 切换开关 · Enter 执行 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭"
+    let nav_hint = if screen.setup_mode {
+        " 首次配置向导：↑/↓ 选择 · 选服务商(A) → 填 API Key → Ctrl+S 保存 · Tab/1-8 切换分类 · Esc 完成并退出 "
+    } else {
+        match settings.tab {
+            SettingsTab::Providers if chunks[5].width < 100 => {
+                "操作: ↑/↓ · Enter 设默认 · A 添加 · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
             }
+            SettingsTab::Providers => {
+                "操作: ↑/↓ 选择 · Enter 设为默认 · A 添加 (预设/自定义协议) · T 测活 · M 模型 · E 编辑 · D 删除 · Esc 关闭"
+            }
+            SettingsTab::EnvMemory if chunks[5].width < 90 => {
+                "操作: ↑/↓ · Enter 详情/编辑 · A 添加 · Space 切换 · ←/→ 作用域 · D 删除 · Esc 关闭"
+            }
+            SettingsTab::EnvMemory => {
+                "操作: ↑/↓ 选择项目 · Enter/E 编辑 (记忆列表 Enter 查看详情) · A 添加 · Space 切换脱敏/启用 · ←/→ 作用域 · D 删除 · Esc 关闭"
+            }
+            SettingsTab::ToolsMcp if chunks[5].width < 90 => {
+                "操作: ↑/↓ 移动 · Enter 详情/执行 · Tab 切换 · Esc 关闭"
+            }
+            SettingsTab::ToolsMcp => {
+                if settings.selected_row >= 3 {
+                    "操作: ↑/↓ 移动焦点 · Enter/空格/o 查看 Skill 详情 · Tab 轮换标签 · 1-8 直达分类 · Esc 关闭"
+                } else {
+                    "操作: ↑/↓ 选择项目 · ←/→ / 空格 切换开关 · Enter 执行 · Tab 轮换标签 · 1-8 直达分类 · Esc 关闭"
+                }
+            }
+            SettingsTab::Toolbox => {
+                "操作: ↑/↓ 选择工具 · Enter/E 编辑 · A 添加 · D 删除 (连按两次) · 末行 Enter 运行 AI 扫描 · Tab 轮换 · 1-8 直达 · Esc 关闭"
+            }
+            _ if chunks[5].width < 80 => "操作: ↑/↓ · ←/→ 微调 · Tab 轮换 · 1-8 直达 · Esc 关闭",
+            _ => "操作: ↑/↓ 选择项目 · ←/→ 微调数值 · Tab 轮换标签 · 1-8 直达分类 · Esc 关闭",
         }
-        _ if chunks[5].width < 80 => "操作: ↑/↓ · ←/→ 微调 · Tab 轮换 · 1-7 直达 · Esc 关闭",
-        _ => "操作: ↑/↓ 选择项目 · ←/→ 微调数值 · Tab 轮换标签 · 1-7 直达分类 · Esc 关闭",
     };
     frame.render_widget(
         Paragraph::new(Line::styled(nav_hint, Style::default().fg(DIM))),
@@ -8164,45 +8781,105 @@ fn draw_settings_panel(
     }
 }
 
+/// 打开 Provider 预设/自定义向导（设置中心 Providers 页 `A` 键与首次配置向导共用）。
+///
+/// 只接收 `CliScreen` 中与 `settings` 不重叠的字段，便于在持有 `settings` 可变借用
+/// 的调用点直接调用。
+fn open_provider_wizard(
+    runner: &mut Option<SessionRunner>,
+    settings_return_tab: &mut Option<SettingsTab>,
+    panel: &mut Option<Panel>,
+    picker: &mut Option<CommandPicker>,
+    picker_selected: &mut usize,
+) {
+    let Some(owner) = runner.as_mut() else {
+        return;
+    };
+    if let Ok(CliAction::Picker(next)) = cli_commands::execute(owner, "/provider wizard") {
+        *settings_return_tab = Some(SettingsTab::Providers);
+        *panel = None;
+        *picker = Some(next);
+        *picker_selected = 0;
+    }
+}
+
+/// 向导模式的退出判定：配置可用才允许离开，否则留在面板并给出提示。
+fn setup_finish(screen: &mut CliScreen, runner: &Option<SessionRunner>) -> bool {
+    let usable = runner.as_ref().is_some_and(|owner| {
+        cyber_core::setup::configured(&owner.ctx.config, &owner.ctx.providers)
+    });
+    if usable {
+        return true;
+    }
+    screen.status = "尚未完成配置：请先选择服务商并填写 API Key（Ctrl+S 保存）".into();
+    false
+}
+
+/// 落盘设置草稿并立即生效。
+///
+/// setup 模式走 `cyber_core::setup::commit`（两阶段原子提交 + 完成标记，写盘失败必须上报）；
+/// 普通模式沿用 `save_config` / `save_providers`（providers 写盘失败与现状一致被忽略）。
+fn persist_settings(
+    screen: &CliScreen,
+    runner: &mut Option<SessionRunner>,
+) -> std::result::Result<(), String> {
+    let Some(settings) = screen.settings.as_ref() else {
+        return Ok(());
+    };
+    let (config_draft, providers_draft) = (
+        settings.config_draft.clone(),
+        settings.providers_draft.clone(),
+    );
+    let Some(owner) = runner.as_mut() else {
+        return Ok(());
+    };
+    if screen.setup_mode {
+        cyber_core::setup::commit(&owner.ctx.paths, &config_draft, &providers_draft)
+            .map_err(|error| error.to_string())?;
+    } else {
+        cyber_core::save_config(&config_draft, &owner.ctx.paths.config_file)
+            .map_err(|error| error.to_string())?;
+        let _ = cyber_core::save_providers(&providers_draft, &owner.ctx.paths.providers_file);
+    }
+    owner.ctx.providers = providers_draft;
+    owner.ctx.config = config_draft;
+    Ok(())
+}
+
 fn save_settings_state(
     screen: &mut CliScreen,
     runner: &mut Option<SessionRunner>,
     permissions: &Arc<PermissionBroker>,
     exit: bool,
 ) {
-    let (config_draft, providers_draft) = match screen.settings.as_ref() {
-        Some(s) => (s.config_draft.clone(), s.providers_draft.clone()),
-        None => {
-            if exit {
-                screen.panel = None;
-            }
-            return;
+    let Some(settings) = screen.settings.as_ref() else {
+        if exit && !screen.setup_mode {
+            screen.panel = None;
         }
+        return;
     };
-    if let Some(r) = runner.as_mut() {
-        let mouse_changed = config_draft.ui.mouse != r.ctx.config.ui.mouse;
-        let new_mouse = config_draft.ui.mouse;
+    let new_mouse = settings.config_draft.ui.mouse;
+    let mouse_changed = runner
+        .as_ref()
+        .is_some_and(|owner| owner.ctx.config.ui.mouse != new_mouse);
 
-        if let Err(e) = cyber_core::save_config(&config_draft, &r.ctx.paths.config_file) {
-            screen.status = format!("保存配置失败: {e}");
-            if exit {
-                screen.panel = None;
-                screen.settings = None;
-            }
-            return;
+    if let Err(error) = persist_settings(screen, runner) {
+        screen.status = format!("保存配置失败: {error}");
+        if exit && !screen.setup_mode {
+            screen.panel = None;
+            screen.settings = None;
         }
+        return;
+    }
 
-        let _ = cyber_core::save_providers(&providers_draft, &r.ctx.paths.providers_file);
-        r.ctx.providers = providers_draft;
-        r.ctx.config = config_draft;
-
-        if let Some(mode_str) = &r.ctx.config.agent.permission_mode {
+    if let Some(owner) = runner.as_mut() {
+        if let Some(mode_str) = &owner.ctx.config.agent.permission_mode {
             if let Some(mode) = PermissionMode::parse(mode_str) {
                 screen.permission_mode = mode;
                 permissions.set_mode(mode);
             }
         }
-        screen.effort = r.ctx.config.agent.thinking_intensity;
+        screen.effort = owner.ctx.config.agent.thinking_intensity;
 
         if mouse_changed {
             if new_mouse {
@@ -8212,7 +8889,7 @@ fn save_settings_state(
             }
         }
 
-        screen.sync(r);
+        screen.sync(owner);
     }
     if let Some(settings) = screen.settings.as_mut() {
         settings.dirty = false;
@@ -8220,7 +8897,8 @@ fn save_settings_state(
     }
     screen.status = "✔ 设置已保存并立即生效".into();
 
-    if exit {
+    // 向导模式必须由 Esc 显式完成退出，保存本身不关面板。
+    if exit && !screen.setup_mode {
         screen.panel = None;
         screen.settings = None;
     }
@@ -8230,12 +8908,22 @@ fn handle_settings_key(
     screen: &mut CliScreen,
     runner: &mut Option<SessionRunner>,
     permissions: &Arc<PermissionBroker>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    active: &mut Option<ActiveTurn>,
+    cancel: &mut Option<oneshot::Sender<()>>,
     key: KeyEvent,
 ) -> color_eyre::Result<bool> {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // F3 or Ctrl+, toggles settings close (with discard protection)
     if key.code == KeyCode::F(3) || (control && key.code == KeyCode::Char(',')) {
+        if screen.setup_mode {
+            if screen.settings.as_ref().is_some_and(|s| s.dirty) {
+                screen.status = "请先 Ctrl+S 保存配置".into();
+                return Ok(false);
+            }
+            return Ok(setup_finish(screen, runner));
+        }
         if let Some(settings) = screen.settings.as_mut() {
             if settings.dirty {
                 settings.pending_discard_confirm = true;
@@ -8430,6 +9118,13 @@ fn handle_settings_key(
     }
 
     if key.code == KeyCode::Esc {
+        if screen.setup_mode {
+            if screen.settings.as_ref().is_some_and(|s| s.dirty) {
+                screen.status = "请先 Ctrl+S 保存配置".into();
+                return Ok(false);
+            }
+            return Ok(setup_finish(screen, runner));
+        }
         if let Some(settings) = screen.settings.as_mut() {
             if settings.dirty {
                 settings.pending_discard_confirm = true;
@@ -8452,7 +9147,7 @@ fn handle_settings_key(
         return Ok(false);
     }
 
-    if let KeyCode::Char(ch @ '1'..='7') = key.code {
+    if let KeyCode::Char(ch @ '1'..='8') = key.code {
         if let Some(settings) = screen.settings.as_mut() {
             let tabs = SettingsTab::all();
             let idx = (ch as usize) - ('1' as usize);
@@ -8910,6 +9605,85 @@ fn handle_settings_key(
             }
             _ => {}
         },
+        SettingsTab::Toolbox => {
+            let total = settings.custom_tools.len();
+            if settings.selected_row < total {
+                let name = settings.custom_tools[settings.selected_row].name.clone();
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if let Some(owner) = runner.as_mut() {
+                            if let Ok(CliAction::Form(form)) =
+                                cli_commands::execute(owner, &format!("/toolbox edit {name}"))
+                            {
+                                settings.tools_pending_delete = None;
+                                screen.settings_return_tab = Some(SettingsTab::Toolbox);
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if settings.tools_pending_delete == Some(settings.selected_row) {
+                            if let Some(owner) = runner.as_mut() {
+                                let _ = cli_commands::execute(
+                                    owner,
+                                    &format!("/toolbox remove {name}"),
+                                );
+                            }
+                            screen.status =
+                                format!("已删除自定义工具 {name}（重启后从工具表移除）");
+                            let tools: Vec<cyber_core::CustomToolConfig> = runner
+                                .as_ref()
+                                .map(|owner| {
+                                    cyber_core::load_custom_tools(&owner.ctx.paths.tools_dir)
+                                        .0
+                                        .into_iter()
+                                        .map(|tool| tool.config)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            settings.custom_tools = tools;
+                            settings.tools_pending_delete = None;
+                            settings.selected_row =
+                                settings.selected_row.min(settings.custom_tools.len());
+                        } else {
+                            settings.tools_pending_delete = Some(settings.selected_row);
+                            screen.status = format!("再次按 D 确认删除自定义工具 {name}");
+                        }
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if let Some(owner) = runner.as_mut() {
+                            if let Ok(CliAction::Form(form)) =
+                                cli_commands::execute(owner, "/toolbox add")
+                            {
+                                settings.tools_pending_delete = None;
+                                screen.settings_return_tab = Some(SettingsTab::Toolbox);
+                                screen.form = Some(FormState::new(form));
+                                screen.panel = None;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if key.code == KeyCode::Enter {
+                // 末行：运行 AI 智能扫描（结果输出到对话区）。
+                if screen.setup_mode {
+                    screen.status =
+                        "请先 Ctrl+S 保存服务商配置；Esc 完成首次配置后即可运行 /toolbox scan"
+                            .into();
+                    return Ok(false);
+                }
+                settings.tools_pending_delete = None;
+                screen.panel = None;
+                let action = cli_commands::execute(
+                    runner
+                        .as_mut()
+                        .ok_or_else(|| color_eyre::eyre::eyre!("会话不可用"))?,
+                    "/toolbox scan",
+                )?;
+                return apply_action(screen, action, runner, permissions, events, active, cancel);
+            }
+        }
         SettingsTab::Providers => {
             let names = settings.providers_draft.sorted_names();
             if let Some(name) = names.get(settings.selected_row) {
@@ -8919,16 +9693,13 @@ fn handle_settings_key(
                         settings.dirty = true;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        if let Some(r) = runner.as_mut() {
-                            if let Ok(CliAction::Picker(p)) =
-                                cli_commands::execute(r, "/provider wizard")
-                            {
-                                screen.settings_return_tab = Some(SettingsTab::Providers);
-                                screen.panel = None;
-                                screen.picker = Some(p);
-                                screen.picker_selected = 0;
-                            }
-                        }
+                        open_provider_wizard(
+                            runner,
+                            &mut screen.settings_return_tab,
+                            &mut screen.panel,
+                            &mut screen.picker,
+                            &mut screen.picker_selected,
+                        );
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
                         if let Some(cfg) = settings.providers_draft.providers.get(name).cloned() {
@@ -8980,7 +9751,7 @@ fn handle_settings_key(
                             if !p.model.is_empty() && !models.contains(&p.model) {
                                 models.push(p.model.clone());
                             }
-                            models.sort();
+                            sort_model_ids(&mut models);
                             for m in models {
                                 let is_curr = m == p.model;
                                 let label = if is_curr {
@@ -9039,14 +9810,13 @@ fn handle_settings_key(
                     _ => {}
                 }
             } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
-                if let Some(r) = runner.as_mut() {
-                    if let Ok(CliAction::Picker(p)) = cli_commands::execute(r, "/provider wizard") {
-                        screen.settings_return_tab = Some(SettingsTab::Providers);
-                        screen.panel = None;
-                        screen.picker = Some(p);
-                        screen.picker_selected = 0;
-                    }
-                }
+                open_provider_wizard(
+                    runner,
+                    &mut screen.settings_return_tab,
+                    &mut screen.panel,
+                    &mut screen.picker,
+                    &mut screen.picker_selected,
+                );
             }
         }
         SettingsTab::EnvMemory => {
@@ -9345,6 +10115,21 @@ fn handle_mcp_key(
     }
 }
 
+/// 模型面板状态条文案（`None` = 不显示）：拉取中 / 拉取失败 / 尚未按 Enter 拉取。
+///
+/// 与 `draw_model_picker` 的脚注高度计算同源：存在状态条时脚注占 2 行。
+fn model_picker_fetch_status(state: &CliModelPickerState) -> Option<(String, Color)> {
+    match (&state.fetching, &state.fetch_error) {
+        (Some(provider), _) => Some((format!("⟳ 正在从接口拉取 [{provider}] 的模型列表…"), ACCENT)),
+        (None, Some(err)) => Some((format!("⚠ 模型列表拉取失败：{err}（显示本地配置）"), ERROR)),
+        (None, None) if !state.fetched => Some((
+            "当前显示 providers.toml 的本地模型 · 按 Enter 选定 provider 并从接口拉取".to_string(),
+            MUTED,
+        )),
+        (None, None) => None,
+    }
+}
+
 fn draw_model_picker(
     frame: &mut Frame,
     bounds: Rect,
@@ -9369,9 +10154,12 @@ fn draw_model_picker(
     let inner = outer_block.inner(popup_area);
     frame.render_widget(outer_block, popup_area);
 
+    // 拉取状态条（拉取中/失败/尚未拉取时占一行）：接口结果的可见进度与失败原因。
+    let fetch_status = model_picker_fetch_status(state);
+
     let chunks = Layout::vertical([
-        Constraint::Min(0),    // 双栏
-        Constraint::Length(1), // 底部状态提示条
+        Constraint::Min(0),                                             // 双栏
+        Constraint::Length(if fetch_status.is_some() { 2 } else { 1 }), // 状态条 + 快捷键条
     ])
     .split(inner);
     let body = chunks[0];
@@ -9527,12 +10315,42 @@ fn draw_model_picker(
     let cur_prov_cfg = state.providers.providers.get(&current_prov_name);
     if state.models.is_empty() {
         model_lines.push(
-            Line::from("（无可用模型）")
-                .style(Style::default().fg(MUTED))
-                .alignment(ratatui::layout::Alignment::Center),
+            Line::from(format!(
+                "（无可用模型{})",
+                if state.fetched {
+                    ""
+                } else {
+                    " · 按 Enter 从接口获取"
+                }
+            ))
+            .style(Style::default().fg(MUTED))
+            .alignment(ratatui::layout::Alignment::Center),
         );
     } else {
-        for (i, m) in state.models.iter().enumerate() {
+        // 先算粘性滚动（只依赖选中项/总数/视口高度），再只构建可见窗口内的行：
+        // 长模型列表（数百～数千条）下逐行构建 + 逐行能力查询会让每帧成本线性增长
+        // （旧实现在这里每行调一次 `CapabilityStore::load()`）。
+        let visible_h = model_inner.height as usize;
+        let total = state.models.len();
+        let sel = state.model_selected;
+        let prev = state.model_scroll.min(total.saturating_sub(visible_h));
+        let model_scroll = if total <= visible_h {
+            0
+        } else if sel < prev {
+            sel
+        } else if sel >= prev + visible_h {
+            (sel + 1)
+                .saturating_sub(visible_h)
+                .min(total.saturating_sub(visible_h))
+        } else {
+            prev
+        };
+        state.model_scroll = model_scroll;
+        // 能力缓存每帧只读一次（显式 models 配置 → 实测缓存 → 名称规则表）。
+        let store = cyber_core::CapabilityStore::load();
+        let cur_prov_models = cur_prov_cfg.map(|p| &p.models);
+        for i in model_scroll..(model_scroll + visible_h).min(total) {
+            let m = &state.models[i];
             let selected = i == state.model_selected;
             let marker = if selected { "▸ " } else { "  " };
             let is_probing = state.probing_model.as_deref() == Some(m.as_str());
@@ -9558,12 +10376,17 @@ fn draw_model_picker(
             };
 
             let max_model_w = (model_inner.width as usize).saturating_sub(1);
-            let has_vision = cur_prov_cfg
-                .map(|p_cfg| {
-                    cyber_core::get_model_vision_capability(p_cfg, &current_prov_name, m, None)
-                        == cyber_core::VisionCapability::Supported
-                })
-                .unwrap_or(false);
+            let has_vision = if cur_prov_cfg.is_some() {
+                cyber_core::resolve_vision_capability(
+                    cur_prov_models,
+                    &current_prov_name,
+                    m,
+                    &store,
+                )
+                .is_supported()
+            } else {
+                false
+            };
             let mut badges_w = 2usize; // marker
             if is_probing || has_vision {
                 badges_w += 8;
@@ -9616,26 +10439,32 @@ fn draw_model_picker(
         }
     }
 
-    // 粘性滚动计算（右栏每项 1 行）
-    let model_h = model_inner.height as usize;
-    let model_total = model_lines.len();
-    let sel = state.model_selected;
-    let mut model_scroll = state.model_scroll;
-    if model_total <= model_h {
-        model_scroll = 0;
-    } else if sel < model_scroll {
-        model_scroll = sel;
-    } else if sel >= model_scroll + model_h {
-        model_scroll = (sel + 1).saturating_sub(model_h);
-    }
-    state.model_scroll = model_scroll;
-
-    frame.render_widget(
-        Paragraph::new(model_lines).scroll((model_scroll as u16, 0)),
-        model_inner,
-    );
+    frame.render_widget(Paragraph::new(model_lines), model_inner);
 
     // 3. 底部状态与快捷键条
+    let (status_area, hint_area) = if fetch_status.is_some() {
+        (
+            Some(Rect {
+                height: 1,
+                ..footer_area
+            }),
+            Rect {
+                y: footer_area.y + 1,
+                height: 1,
+                ..footer_area
+            },
+        )
+    } else {
+        (None, footer_area)
+    };
+    if let (Some(status_area), Some((text, color))) = (status_area, fetch_status) {
+        let status_line = Line::styled(
+            clip_cells_ellipsis(&text, status_area.width as usize),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(Paragraph::new(status_line), status_area);
+    }
     let hint_line = Line::from(vec![
         Span::styled(
             " Tab/←/→",
@@ -9653,6 +10482,11 @@ fn draw_model_picker(
         ),
         Span::styled(" 确认选择 · ", Style::default().fg(MUTED)),
         Span::styled(
+            "r",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 重新拉取 · ", Style::default().fg(MUTED)),
+        Span::styled(
             "t",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
@@ -9665,7 +10499,7 @@ fn draw_model_picker(
     ])
     .alignment(ratatui::layout::Alignment::Center);
 
-    frame.render_widget(Paragraph::new(hint_line), footer_area);
+    frame.render_widget(Paragraph::new(hint_line), hint_area);
 }
 
 fn handle_model_picker_key(
@@ -9677,6 +10511,11 @@ fn handle_model_picker_key(
         screen.panel = None;
         return Ok(false);
     };
+
+    // 左栏移动只换本地清单；左栏 Enter（选定）/ `r` 才联网拉取。
+    // 两者都在借用结束后统一处理（此处的 state 借用尚未释放）。
+    let mut provider_changed = false;
+    let mut refetch_from_api = false;
 
     match key.code {
         KeyCode::Esc => {
@@ -9713,7 +10552,7 @@ fn handle_model_picker_key(
                     } else {
                         state.provider_selected = total - 1;
                     }
-                    state.refresh_models();
+                    provider_changed = true;
                 }
             }
         }
@@ -9734,13 +10573,18 @@ fn handle_model_picker_key(
                     } else {
                         state.provider_selected = 0;
                     }
-                    state.refresh_models();
+                    provider_changed = true;
                 }
             }
         }
         KeyCode::Enter => {
             if !state.focus_models {
                 state.focus_models = true;
+                // 选定该 provider → 从接口拉取其模型列表（已在拉取中则不重复发起；
+                // 失败/陈旧列表由此获得重试）。
+                if state.fetching.is_none() {
+                    refetch_from_api = true;
+                }
             } else {
                 let selected_model = state.models.get(state.model_selected).cloned();
                 let selected_provider = state
@@ -9767,6 +10611,12 @@ fn handle_model_picker_key(
                     screen.panel = None;
                     screen.model_picker = None;
                 }
+            }
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // 手动重新从接口拉取当前 provider 的模型列表。
+            if state.fetching.is_none() {
+                refetch_from_api = true;
             }
         }
         KeyCode::Char('t') | KeyCode::Char('T') if state.focus_models => {
@@ -9805,6 +10655,15 @@ fn handle_model_picker_key(
             }
         }
         _ => {}
+    }
+
+    if provider_changed {
+        // 切换 provider：只换本地配置清单，不联网。
+        screen.refresh_model_picker_local();
+    }
+    if refetch_from_api {
+        // 左栏 Enter 选定 / r 手动重取：联网拉取。
+        screen.fetch_model_picker_models();
     }
 
     Ok(false)
@@ -10215,21 +11074,74 @@ impl WrappedViewport {
 
 type ActiveTurn = tokio::task::JoinHandle<(SessionRunner, HeadlessOutcome)>;
 
+/// 全屏 CLI 的启动模式：聊天（`cyber`）或首次配置向导（`cyber setup`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliStart {
+    Chat,
+    Setup,
+}
+
 pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
+    match run_cli_inner(cwd, mock, CliStart::Chat).await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            eprintln!("[error] {error}");
+            Err(error)
+        }
+    }
+}
+
+/// 全屏设置向导入口（`cyber setup`）。返回 `true` = 退出时配置可用。
+pub async fn run_setup(cwd: &Path, mock: bool) -> color_eyre::Result<bool> {
+    run_cli_inner(cwd, mock, CliStart::Setup).await
+}
+
+/// `run_setup` 的同步包装：启动闸门在同步上下文中拉起向导。
+pub fn run_setup_blocking(cwd: &Path, mock: bool) -> color_eyre::Result<bool> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(run_setup(cwd, mock))),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_setup(cwd, mock))
+        }
+    }
+}
+
+async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::Result<bool> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         color_eyre::eyre::bail!(
             "Interactive CLI requires a terminal; use `cyber run` for scripts."
         );
     }
-    let runner = SessionRunner::new(cwd, mock).await?;
-    let mut screen = CliScreen::new(&runner);
-    let mut question_rx = runner
+    let mut runner = Some(SessionRunner::new(cwd, mock).await?);
+    let owner = runner.as_ref().expect("runner just constructed");
+    let mut screen = CliScreen::new(owner);
+    let mut question_rx = owner
         .registries
         .question_rx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    let mut runner = Some(runner);
+    if start == CliStart::Setup {
+        // 首次配置向导：直接落在设置中心的 Providers 页，配置缺失时自动打开预设向导。
+        screen.setup_mode = true;
+        let mut settings = CliSettingsState::from_runner(owner);
+        settings.tab = SettingsTab::Providers;
+        screen.settings = Some(settings);
+        screen.panel = Some(Panel::Settings);
+        let usable = cyber_core::setup::configured(&owner.ctx.config, &owner.ctx.providers);
+        if !usable {
+            open_provider_wizard(
+                &mut runner,
+                &mut screen.settings_return_tab,
+                &mut screen.panel,
+                &mut screen.picker,
+                &mut screen.picker_selected,
+            );
+        }
+    }
     let (broker, mut requests) = PermissionBroker::interactive();
     broker.set_mode(screen.permission_mode);
     let permissions = Arc::new(broker);
@@ -10249,6 +11161,8 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
         );
     }
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
+    let (models_tx, mut models_rx) = mpsc::unbounded_channel::<ModelFetchResult>();
+    screen.model_fetch_tx = Some(models_tx);
     if !mock {
         tokio::spawn(async move {
             if let Some(info) = cyber_core::update::check_for_updates(false).await {
@@ -10288,6 +11202,11 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                             &format!("💡 检测到新版本 V{new_ver}，可运行 cyber update 进行更新"),
                             AMBER,
                         );
+                    }
+                }
+                Some(fetch) = models_rx.recv() => {
+                    if let Some(state) = screen.model_picker.as_mut() {
+                        state.deliver_fetch(fetch);
                     }
                 }
                 _ = tick.tick() => {
@@ -10462,6 +11381,7 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                             mcp.scroll_up(3);
                                         }
                                     } else if screen.panel == Some(Panel::ModelPicker) {
+                                        let mut provider_changed = false;
                                         if let Some(state) = screen.model_picker.as_mut() {
                                             if state.focus_models {
                                                 if state.model_selected > 0 {
@@ -10469,8 +11389,11 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                                 }
                                             } else if state.provider_selected > 0 {
                                                 state.provider_selected -= 1;
-                                                state.refresh_models();
+                                                provider_changed = true;
                                             }
+                                        }
+                                        if provider_changed {
+                                            screen.refresh_model_picker_local();
                                         }
                                     } else if screen.panel == Some(Panel::Ctf) {
                                         if screen.ctf_detail_view {
@@ -10498,6 +11421,7 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                             mcp.scroll_down(3);
                                         }
                                     } else if screen.panel == Some(Panel::ModelPicker) {
+                                        let mut provider_changed = false;
                                         if let Some(state) = screen.model_picker.as_mut() {
                                             if state.focus_models {
                                                 if state.model_selected + 1 < state.models.len() {
@@ -10507,9 +11431,12 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
                                                 let total = state.providers.sorted_names().len();
                                                 if state.provider_selected + 1 < total {
                                                     state.provider_selected += 1;
-                                                    state.refresh_models();
+                                                    provider_changed = true;
                                                 }
                                             }
+                                        }
+                                        if provider_changed {
+                                            screen.refresh_model_picker_local();
                                         }
                                     } else if screen.panel == Some(Panel::Ctf) {
                                         if screen.ctf_detail_view {
@@ -10583,11 +11510,16 @@ pub async fn run_cli(cwd: &Path, mock: bool) -> color_eyre::Result<()> {
     // 后台任务 detached 持有 registry clone：进程退出前显式终止运行中任务。
     screen.background.kill_all();
     restore_terminal();
-    if let Err(e) = result {
-        eprintln!("[error] {e}");
-        std::process::exit(1);
-    }
-    std::process::exit(0);
+    result?;
+    let configured_at_exit = match runner.as_ref() {
+        Some(owner) => cyber_core::setup::configured(&owner.ctx.config, &owner.ctx.providers),
+        None => {
+            let paths = cyber_core::Paths::detect()?;
+            let (config, providers) = cyber_core::setup::effective_config(&paths, cwd)?;
+            cyber_core::setup::configured(&config, &providers)
+        }
+    };
+    Ok(configured_at_exit)
 }
 
 /// 把后台任务（子代理或命令）的完成状态格式化为：
@@ -10885,7 +11817,7 @@ fn handle_key(
         }
     }
     if screen.panel == Some(Panel::Settings) {
-        return handle_settings_key(screen, runner, permissions, key);
+        return handle_settings_key(screen, runner, permissions, events, active, cancel, key);
     }
     if screen.panel == Some(Panel::ModelPicker) {
         return handle_model_picker_key(screen, runner, key);
@@ -10896,7 +11828,14 @@ fn handle_key(
     if screen.panel == Some(Panel::Ctf) || screen.ctf_edit_form.is_some() {
         return handle_ctf_key(screen, runner, permissions, events, active, cancel, key);
     }
-    if screen.approval.is_none() && key.code == KeyCode::Esc {
+    // provider 表单里的模型列表面板打开时，Esc 只关面板、不关表单（见下方表单分支的
+    // 面板按键拦截）。这里必须先放行，否则 form 会被整体 take 掉，用户看到的是
+    // 「Esc 关面板的同时把 Provider 编辑界面也关了」。
+    let form_model_picker_open = screen
+        .form
+        .as_ref()
+        .is_some_and(|form| form.model_picker.is_some());
+    if screen.approval.is_none() && key.code == KeyCode::Esc && !form_model_picker_open {
         if screen.form.take().is_some() || screen.picker.take().is_some() {
             screen.delete_pending = None;
             if let Some(tab) = screen.settings_return_tab.take() {
@@ -11215,7 +12154,9 @@ fn handle_key(
         }
     }
     let is_esc = key.code == KeyCode::Esc;
-    if is_esc {
+    // 表单里的模型列表面板打开时，Esc 只关面板：整段 Esc 处理都跳过，
+    // 交给下方表单分支的面板按键拦截。
+    if is_esc && !form_model_picker_open {
         if screen.approval.is_none() && (screen.form.is_some() || screen.picker.is_some()) {
             screen.form = None;
             screen.picker = None;
@@ -11469,11 +12410,187 @@ fn handle_key(
         return Ok(false);
     }
     if let Some(form) = &mut screen.form {
+        // 1) 模型列表面板优先接管按键（手输模式除外）。
+        if form.model_picker.as_ref().is_some_and(|p| !p.manual) {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(p) = form.model_picker.as_mut() {
+                        let n = p.entries.len();
+                        if n > 0 {
+                            p.selected = (p.selected + n - 1) % n;
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(p) = form.model_picker.as_mut() {
+                        let n = p.entries.len();
+                        if n > 0 {
+                            p.selected = (p.selected + 1) % n;
+                        }
+                    }
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    let chosen = form
+                        .model_picker
+                        .as_ref()
+                        .and_then(|p| p.entries.get(p.selected))
+                        .map(|e| e.id.clone());
+                    if let Some(m) = chosen {
+                        form.model_picker = None;
+                        form.set_model_input(&m);
+                    }
+                }
+                KeyCode::Esc => form.model_picker = None,
+                KeyCode::Char('m') | KeyCode::Char('f') => {
+                    if let Some(p) = form.model_picker.as_mut() {
+                        p.manual = true;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    // 重新拉取：用表单当前值构造临时配置（同步阻塞，与 Settings 的 T 键同模式）。
+                    let cfg = provider_config_from_form(form);
+                    let res = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(cyber_agent::fetch_models(&cfg))
+                    })
+                    .map_err(|e| e.to_string());
+                    let provider_name = form.input_value("name").trim().to_string();
+                    let models_map = runner
+                        .as_ref()
+                        .and_then(|r| r.ctx.providers.providers.get(&provider_name))
+                        .map(|p| &p.models);
+                    form.open_model_picker(res, models_map, &provider_name);
+                }
+                KeyCode::Char('t') | KeyCode::Char('v') => {
+                    // 实测能力：只写能力缓存，不写 providers.toml（表单尚未保存）。
+                    let model = form
+                        .model_picker
+                        .as_ref()
+                        .and_then(|p| p.entries.get(p.selected))
+                        .map(|e| e.id.clone());
+                    if let Some(model) = model {
+                        let cfg = provider_config_from_form(form);
+                        let is_vision = key.code == KeyCode::Char('v');
+                        let cap = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                if is_vision {
+                                    cyber_agent::probe_model_vision(&cfg, &model)
+                                        .await
+                                        .map(ProbeKindLite::Vision)
+                                } else {
+                                    cyber_agent::probe_model_reasoning(&cfg, &model)
+                                        .await
+                                        .map(ProbeKindLite::Reasoning)
+                                }
+                            })
+                        });
+                        let provider_name = form.input_value("name").trim().to_string();
+                        screen.status = match cap {
+                            Ok(ProbeKindLite::Vision(c)) => {
+                                let _ = cyber_core::save_model_vision_capability(
+                                    &provider_name,
+                                    &model,
+                                    c,
+                                    None,
+                                );
+                                format!(
+                                    "模型 [{model}] 视觉实测完成：{}",
+                                    if c.is_supported() {
+                                        "◈ 视觉"
+                                    } else {
+                                        "未测出识图输出"
+                                    }
+                                )
+                            }
+                            Ok(ProbeKindLite::Reasoning(c)) => {
+                                let _ = cyber_core::save_model_reasoning_capability(
+                                    &provider_name,
+                                    &model,
+                                    c,
+                                    None,
+                                );
+                                format!(
+                                    "模型 [{model}] 推理实测完成：{}",
+                                    if c.is_supported() {
+                                        "◈ 推理"
+                                    } else {
+                                        "未测出思考输出"
+                                    }
+                                )
+                            }
+                            Err(e) => format!("模型 [{model}] 探针失败: {e}"),
+                        };
+                        // 重算能力标签（探针结果刚写入缓存）。
+                        let ids: Vec<String> = form
+                            .model_picker
+                            .as_ref()
+                            .map(|p| p.entries.iter().map(|e| e.id.clone()).collect())
+                            .unwrap_or_default();
+                        let models_map = runner
+                            .as_ref()
+                            .and_then(|r| r.ctx.providers.providers.get(&provider_name))
+                            .map(|p| &p.models);
+                        form.open_model_picker(Ok(ids), models_map, &provider_name);
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        // 2) 手输模式：Esc / Enter 退出浮层（保留已输入内容）。
+        if form.model_picker.as_ref().is_some_and(|p| p.manual) {
+            match key.code {
+                KeyCode::Esc => {
+                    form.model_picker = None;
+                    return Ok(false);
+                }
+                KeyCode::Enter if !form.model_input().trim().is_empty() => {
+                    form.model_picker = None;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        // 3) 光标停在 model 字段：Enter/空格 → 有缓存列表直接打开，否则拉取。
+        let on_model = form
+            .form
+            .fields
+            .get(form.selected)
+            .is_some_and(|f| f.name == "model");
+        if on_model
+            && form.model_picker.is_none()
+            && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+        {
+            let provider_name = form.input_value("name").trim().to_string();
+            let models_map = runner
+                .as_ref()
+                .and_then(|r| r.ctx.providers.providers.get(&provider_name))
+                .map(|p| &p.models);
+            if form.last_models.is_empty() {
+                let cfg = provider_config_from_form(form);
+                let res = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(cyber_agent::fetch_models(&cfg))
+                })
+                .map_err(|e| e.to_string());
+                form.open_model_picker(res, models_map, &provider_name);
+            } else {
+                let list = form.last_models.clone();
+                form.open_model_picker(Ok(list), models_map, &provider_name);
+            }
+            return Ok(false);
+        }
         let count = form.inputs.len();
         let save = (control && key.code == KeyCode::Char('s'))
             || (key.code == KeyCode::Enter
                 && key.modifiers.is_empty()
                 && form.selected + 1 >= count);
+        // 当前选中字段名 + 手输兜底是否生效（model 字段只在手输模式下可编辑）。
+        let sel_field_name = form
+            .form
+            .fields
+            .get(form.selected)
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        let manual_model = form.model_picker.as_ref().is_some_and(|p| p.manual);
         if save {
             form.capture();
             if let Some(owner) = runner.as_mut() {
@@ -11617,6 +12734,47 @@ fn handle_key(
                         form.inputs[form.selected].insert_str(value);
                     }
                 }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
+                    .is_some_and(|f| matches!(f.name.as_str(), "thinking_type"))
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    cycle_field_value(
+                        form,
+                        &["", "enabled", "disabled"],
+                        key.code == KeyCode::Left,
+                    );
+                }
+                _ if form
+                    .form
+                    .fields
+                    .get(form.selected)
+                    .is_some_and(|f| matches!(f.name.as_str(), "thinking_effort"))
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    ) =>
+                {
+                    cycle_field_value(
+                        form,
+                        &["", "low", "medium", "high"],
+                        key.code == KeyCode::Left,
+                    );
+                }
+                // model / thinking 三行的值不在输入框里自由编辑（model 仅手输模式开放）。
+                _ if !(sel_field_name == "model" && manual_model)
+                    && matches!(
+                        sel_field_name.as_str(),
+                        "model" | "thinking_type" | "thinking_effort"
+                    )
+                    && matches!(key.code, KeyCode::Char(_))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) => {}
                 _ => {
                     form.inputs[form.selected].input(key);
                 }
@@ -11737,7 +12895,7 @@ fn handle_key(
     }
 
     if screen.busy {
-        if text.eq_ignore_ascii_case("/quit") {
+        if text.eq_ignore_ascii_case("/quit") || text.eq_ignore_ascii_case("/exit") {
             return Ok(true);
         }
         if text.eq_ignore_ascii_case("/cancel") {
@@ -12033,6 +13191,8 @@ fn apply_action(
                 if let Some(owner) = runner.as_ref() {
                     screen.model_picker = Some(CliModelPickerState::from_runner(owner));
                 }
+                // 打开只显示本地配置清单；接口拉取由左栏 Enter（选定 provider）或 r 触发。
+                screen.refresh_model_picker_local();
             } else if panel == Panel::Mcp {
                 if let Some(owner) = runner.as_ref() {
                     let config =
@@ -12068,6 +13228,8 @@ fn apply_action(
                     screen.model_picker = Some(CliModelPickerState::from_runner(owner));
                     screen.panel = Some(Panel::ModelPicker);
                     screen.picker = None;
+                    // 打开只显示本地配置清单；接口拉取由左栏 Enter（选定 provider）或 r 触发。
+                    screen.refresh_model_picker_local();
                     return Ok(false);
                 }
             }
@@ -12253,6 +13415,55 @@ mod tests {
             let ch = buffer[(width - 1, y)].symbol();
             assert_eq!(ch, "│", "第 {y} 行右边框被内容挤压覆盖或损坏: '{ch}'");
         }
+    }
+
+    #[test]
+    fn todo_table_scrolls_to_keep_in_progress_item_visible() {
+        use cyber_core::{TodoItem, TodoStatus};
+        // 8 条：1-4 Completed，第 5 条 InProgress，6-8 Pending
+        let items: Vec<TodoItem> = (1..=8)
+            .map(|i| {
+                let (id, status) = if i <= 4 {
+                    (i.to_string(), TodoStatus::Completed)
+                } else if i == 5 {
+                    (i.to_string(), TodoStatus::InProgress)
+                } else {
+                    (i.to_string(), TodoStatus::Pending)
+                };
+                TodoItem::new(id, format!("任务 {i}"), status)
+            })
+            .collect();
+
+        let width = 60u16;
+        let height = 7u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_todo_table(frame, Rect::new(0, 0, width, height), &items);
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        // 内区 5 行 → visible 4、focus 下标 4 → start 1、hidden_above 1、hidden_below 3
+        assert!(content.contains("[>] #5"), "进行中任务必须可见: {content}");
+        assert!(
+            content.contains("[x] #2"),
+            "折叠边界后首条应可见: {content}"
+        );
+        assert!(!content.contains("[x] #1"), "首条应已滚出视口: {content}");
+        // 宽字符在缓冲区内占两格，第二格为空符号，直接 contains 会失败：先去掉所有空白再断言
+        let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("上方还有1项"),
+            "应提示上方折叠数: {content}"
+        );
+        assert!(compact.contains("下方3项"), "应提示下方折叠数: {content}");
     }
 
     #[test]
@@ -12552,6 +13763,10 @@ mod tests {
             provider_scroll: 0,
             model_scroll: 0,
             probing_model: None,
+            fetching: None,
+            fetch_error: None,
+            fetched: false,
+            fetch_id: 0,
         };
 
         for (w, h) in [(120u16, 40u16), (90, 26), (80, 22)] {
@@ -12571,9 +13786,14 @@ mod tests {
             // 复算面板几何：外层 + 左右分栏，逐个校验边框完整性。
             let outer = Rect::new(0, 0, w, h);
             let inner = Block::bordered().inner(outer);
+            let status_h = if model_picker_fetch_status(&state).is_some() {
+                2
+            } else {
+                1
+            };
             let chunks = Layout::vertical([
                 ratatui::layout::Constraint::Min(0),
-                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Length(status_h),
             ])
             .split(inner);
             let panes = Layout::horizontal([
@@ -12610,6 +13830,86 @@ mod tests {
             }
             assert!(bad.is_empty(), "model picker w={w} 边框损坏: {bad:#?}");
         }
+    }
+
+    #[tokio::test]
+    async fn model_picker_window_bounds_long_list_and_nav() {
+        // 长模型列表只渲染可见窗口：选中项必须可见、远处条目不得渲染、
+        // 整帧耗时不随列表长度线性增长（旧实现每行调一次 `CapabilityStore::load()`）。
+        const TOTAL: usize = 8000;
+        let mut state = CliModelPickerState {
+            focus_models: true,
+            provider_selected: 0,
+            model_selected: TOTAL - 3,
+            providers: cyber_core::ProvidersConfig::default(),
+            default_provider: String::new(),
+            models: (0..TOTAL).map(|i| format!("model-{i:04}")).collect(),
+            provider_scroll: 0,
+            model_scroll: 0,
+            probing_model: None,
+            fetching: None,
+            fetch_error: None,
+            fetched: true,
+            fetch_id: 0,
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|f| {
+                draw_model_picker(f, f.area(), &mut state, "");
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..30u16)
+            .map(|y| {
+                (0..120u16)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("model-7997"),
+            "选中项必须可见（窗口跟随选中项）: {text}"
+        );
+        assert!(!text.contains("model-0000"), "窗口外条目不得被渲染: {text}");
+        assert!(state.model_scroll > 0, "选中项在末尾时滚动偏移必须跟随");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "8000 条模型的单帧渲染耗时 {elapsed:?} 过高（疑似逐行读盘/构建全量行）"
+        );
+
+        // 模型栏 ↑/↓ 在长列表下照常移动选中项（窗口随之滚动）
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        screen.model_picker = Some(CliModelPickerState {
+            model_selected: 10,
+            models: (0..TOTAL).map(|i| format!("model-{i:04}")).collect(),
+            focus_models: true,
+            ..Default::default()
+        });
+        screen.panel = Some(Panel::ModelPicker);
+        handle_model_picker_key(
+            &mut screen,
+            &mut None,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            screen.model_picker.as_ref().unwrap().model_selected,
+            11,
+            "模型栏 Down 必须移动选中项"
+        );
+        handle_model_picker_key(
+            &mut screen,
+            &mut None,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(screen.model_picker.as_ref().unwrap().model_selected, 10);
     }
 
     #[test]
@@ -14350,6 +15650,351 @@ mod tests {
             .join("\n")
     }
 
+    /// 打开 `/provider add-with-kind openai-compatible` 的全屏 provider 表单。
+    async fn provider_form_screen() -> (CliScreen, Option<SessionRunner>) {
+        let mut owner = crate::headless::tests::test_runner().await;
+        let action =
+            cli_commands::execute(&mut owner, "/provider add-with-kind openai-compatible").unwrap();
+        let CliAction::Form(form) = action else {
+            panic!("expected provider form");
+        };
+        let screen = CliScreen::new(&owner);
+        let mut screen = screen;
+        screen.form = Some(FormState::new(form));
+        (screen, Some(owner))
+    }
+
+    #[tokio::test]
+    async fn form_model_picker_selects_and_writes_back() {
+        let (mut screen, mut runner) = provider_form_screen().await;
+        let idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "model")
+            .unwrap();
+        screen.form.as_mut().unwrap().selected = idx;
+
+        screen.form.as_mut().unwrap().open_model_picker(
+            Ok(vec!["a".into(), "b".into()]),
+            None,
+            "p",
+        );
+        let picker = screen.form.as_ref().unwrap().model_picker.as_ref().unwrap();
+        assert!(!picker.manual);
+        assert_eq!(picker.entries.len(), 2);
+        assert!(picker.error.is_none());
+
+        input_key(&mut screen, &mut runner, KeyCode::Down, KeyModifiers::NONE);
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        let form = screen.form.as_ref().unwrap();
+        assert!(form.model_picker.is_none(), "确认后必须关闭浮层");
+        assert_eq!(form.model_input(), "b");
+    }
+
+    /// 模型列表统一按名称首字母（不区分大小写）升序：Provider 表单「选择默认模型」浮层、
+    /// 设置中心 Providers 的 `M` 模型选择、`/model` 双栏面板右栏。
+    #[tokio::test]
+    async fn model_lists_sort_alphabetically_by_name() {
+        // 1) Provider 表单「选择默认模型」：接口返回顺序不保证有序 → 列表按首字母排序，
+        //    光标仍停在当前 model 字段值对应的条目上。
+        let (mut screen, runner) = provider_form_screen().await;
+        let idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "model")
+            .unwrap();
+        screen.form.as_mut().unwrap().selected = idx;
+        screen.form.as_mut().unwrap().set_input("model", "GLM-4.6");
+        screen.form.as_mut().unwrap().open_model_picker(
+            Ok(vec![
+                "o3-mini".into(),
+                "deepseek-v3".into(),
+                "GLM-4.6".into(),
+                "claude-sonnet-4-5".into(),
+                "Llama-3".into(),
+            ]),
+            None,
+            "p",
+        );
+        let picker = screen.form.as_ref().unwrap().model_picker.as_ref().unwrap();
+        let ids: Vec<&str> = picker.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "claude-sonnet-4-5",
+                "deepseek-v3",
+                "GLM-4.6",
+                "Llama-3",
+                "o3-mini"
+            ]
+        );
+        assert_eq!(picker.entries[picker.selected].id, "GLM-4.6");
+
+        // 浮层按 entries 顺序逐行渲染；把 model 字段换成不在列表中的值，
+        // 使列表项在帧中唯一出现，从而校验可见顺序。
+        screen.form.as_mut().unwrap().model_picker = None;
+        screen
+            .form
+            .as_mut()
+            .unwrap()
+            .set_input("model", "zzz-manual");
+        screen.form.as_mut().unwrap().open_model_picker(
+            Ok(vec!["o3-mini".into(), "GLM-4.6".into(), "claude-3".into()]),
+            None,
+            "p",
+        );
+        let rendered = render(&mut screen, 120, 40);
+        let pos = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("缺少 {needle}: {rendered}"))
+        };
+        assert!(pos("claude-3") < pos("GLM-4.6"), "{rendered}");
+        assert!(pos("GLM-4.6") < pos("o3-mini"), "{rendered}");
+        if let Some(r) = runner {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+
+        // 2) 设置中心 Providers 的 `M` 模型选择（配置内模型映射乱序）。
+        let mut owner = crate::headless::tests::test_runner().await;
+        {
+            let p = owner.ctx.providers.providers.get_mut("anthropic").unwrap();
+            for id in ["GLM-4.6", "claude-3", "o3"] {
+                p.models
+                    .insert(id.into(), cyber_core::ModelConfig::default());
+            }
+            p.model = "GLM-4.6".into();
+        }
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::F(3),
+            KeyModifiers::NONE,
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            screen.settings.as_ref().unwrap().tab,
+            SettingsTab::Providers
+        );
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('m'),
+            KeyModifiers::NONE,
+        );
+        let picker = screen.picker.as_ref().expect("M 应打开模型选择");
+        let labels: Vec<&str> = picker.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["claude-3", "GLM-4.6 (当前使用)", "o3"]);
+
+        // 3) `/model` 双栏面板右栏：同一 provider 的模型列表顺序一致。
+        let mut state = CliModelPickerState::from_runner(runner_opt.as_ref().unwrap());
+        state.provider_selected = state
+            .providers
+            .sorted_names()
+            .iter()
+            .position(|n| n == "anthropic")
+            .unwrap();
+        state.refresh_models();
+        assert_eq!(state.models, vec!["claude-3", "GLM-4.6", "o3"]);
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn form_model_picker_manual_fallback_on_error() {
+        let (mut screen, mut runner) = provider_form_screen().await;
+        let idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "model")
+            .unwrap();
+        screen.form.as_mut().unwrap().selected = idx;
+
+        screen
+            .form
+            .as_mut()
+            .unwrap()
+            .open_model_picker(Err("boom".into()), None, "p");
+        assert!(
+            screen
+                .form
+                .as_ref()
+                .unwrap()
+                .model_picker
+                .as_ref()
+                .unwrap()
+                .manual
+        );
+        assert_eq!(
+            screen
+                .form
+                .as_ref()
+                .unwrap()
+                .model_picker
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("boom")
+        );
+
+        // 手输模式：model 字段恢复可编辑（按键不被浮层吞掉）
+        input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        );
+        assert!(
+            screen.form.as_ref().unwrap().model_input().contains('x'),
+            "手输模式下必须能编辑 model 字段"
+        );
+    }
+
+    #[tokio::test]
+    async fn fullscreen_provider_form_renders_thinking_rows_and_picker() {
+        let (mut screen, _runner) = provider_form_screen().await;
+
+        let rendered = render(&mut screen, 120, 40).replace(' ', "");
+        assert!(rendered.contains("思考模式thinking.type"), "{rendered}");
+        assert!(rendered.contains("思考强度thinking.effort"), "{rendered}");
+
+        screen
+            .form
+            .as_mut()
+            .unwrap()
+            .open_model_picker(Ok(vec!["glm-5.3".into()]), None, "p");
+        let rendered = render(&mut screen, 120, 40).replace(' ', "");
+        assert!(rendered.contains("选择默认模型"), "{rendered}");
+        assert!(rendered.contains("◈推理"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn form_model_picker_esc_closes_only_picker_not_form() {
+        let (mut screen, mut runner) = provider_form_screen().await;
+        let idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "model")
+            .unwrap();
+        screen.form.as_mut().unwrap().selected = idx;
+        screen.form.as_mut().unwrap().open_model_picker(
+            Ok(vec!["m-a".into(), "m-b".into()]),
+            None,
+            "p",
+        );
+
+        // Esc：只关模型面板，Provider 编辑表单必须保留
+        input_key(&mut screen, &mut runner, KeyCode::Esc, KeyModifiers::NONE);
+        let form = screen.form.as_ref().expect("Esc 不得关闭 Provider 表单");
+        assert!(form.model_picker.is_none(), "Esc 必须关闭模型列表面板");
+        assert_eq!(form.model_input(), "", "关闭面板不得改动 model 字段");
+
+        // 面板内 Alt+Enter 不得当作确认（防某些终端把 ESC+CR 解析成 Alt+Enter 时误写 model）
+        screen.form.as_mut().unwrap().open_model_picker(
+            Ok(vec!["m-a".into(), "m-b".into()]),
+            None,
+            "p",
+        );
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::ALT);
+        let form = screen.form.as_ref().expect("Alt+Enter 不得关闭表单");
+        assert!(form.model_picker.is_some(), "面板内 Alt+Enter 不应当作确认");
+        assert_eq!(form.model_input(), "", "Alt+Enter 不得写入 model 字段");
+        // 普通 Enter 仍然是确认
+        input_key(&mut screen, &mut runner, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            screen.form.as_ref().unwrap().model_input(),
+            "m-a",
+            "普通 Enter 应确认选中项"
+        );
+        screen.form.as_mut().unwrap().set_model_input("");
+
+        // 手输兜底模式同理：Esc 只退出面板
+        screen
+            .form
+            .as_mut()
+            .unwrap()
+            .open_model_picker(Err("boom".into()), None, "p");
+        assert!(screen.form.as_ref().unwrap().model_picker.is_some());
+        input_key(&mut screen, &mut runner, KeyCode::Esc, KeyModifiers::NONE);
+        let form = screen.form.as_ref().expect("手输模式下 Esc 也不得关闭表单");
+        assert!(form.model_picker.is_none());
+
+        // 面板已关闭时 Esc 仍应关闭表单（原有语义不变）
+        input_key(&mut screen, &mut runner, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(screen.form.is_none(), "无面板时 Esc 应关闭表单");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn form_model_picker_survives_probe_failure() {
+        // 探针失败（不可达端点）后浮层必须保持打开，状态行给出失败原因。
+        let (mut screen, mut runner) = provider_form_screen().await;
+        screen
+            .form
+            .as_mut()
+            .unwrap()
+            .set_input("endpoint", "http://127.0.0.1:1");
+        let idx = screen
+            .form
+            .as_ref()
+            .unwrap()
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == "model")
+            .unwrap();
+        screen.form.as_mut().unwrap().selected = idx;
+        screen.form.as_mut().unwrap().open_model_picker(
+            Ok(vec!["m-a".into(), "m-b".into()]),
+            None,
+            "p",
+        );
+
+        input_key(
+            &mut screen,
+            &mut runner,
+            KeyCode::Char('t'),
+            KeyModifiers::NONE,
+        );
+
+        let form = screen.form.as_ref().unwrap();
+        assert!(
+            form.model_picker.as_ref().is_some_and(|p| !p.manual),
+            "探针结束后面板必须保持打开"
+        );
+        assert_eq!(form.model_picker.as_ref().unwrap().entries.len(), 2);
+        assert!(
+            screen.status.contains("探针失败"),
+            "status = {}",
+            screen.status
+        );
+    }
+
     fn page_key(screen: &mut CliScreen, code: KeyCode) {
         let (broker, _requests) = PermissionBroker::interactive();
         let (events, _rx) = mpsc::unbounded_channel();
@@ -15918,6 +17563,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_mode_esc_without_provider_keeps_panel() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        screen.setup_mode = true;
+        screen.panel = Some(Panel::Settings);
+        screen.settings = Some(CliSettingsState::new(
+            &Config::default(),
+            &ProvidersConfig::default(),
+        ));
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(screen.settings.is_some());
+        assert!(screen.status.contains("尚未完成配置"));
+    }
+
+    #[tokio::test]
+    async fn setup_mode_save_writes_completed_marker_and_allows_exit() {
+        const KEY_VAR: &str = "CYBER_SETUP_MARKER_TEST_KEY";
+        let owner = crate::headless::tests::test_runner().await;
+        let cyber_home = owner.ctx.paths.cyber_home.clone();
+        cyber_core::init::ensure_global_init(&owner.ctx.paths).unwrap();
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        screen.setup_mode = true;
+        screen.panel = Some(Panel::Settings);
+        let mut providers = ProvidersConfig::default();
+        providers.providers.insert(
+            "deepseek".into(),
+            cyber_core::ProviderConfig {
+                kind: "openai".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                model: "deepseek-chat".into(),
+                api_key: format!("${{{KEY_VAR}}}"),
+                ..Default::default()
+            },
+        );
+        providers.default_provider = "deepseek".into();
+        let mut config = Config::default();
+        config.agent.default_provider = "deepseek".into();
+        screen.settings = Some(CliSettingsState::new(&config, &providers));
+        std::env::set_var(KEY_VAR, "sk-setup-marker-test");
+
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        );
+
+        assert!(
+            screen.status.contains("已保存"),
+            "status = {}",
+            screen.status
+        );
+        let state = std::fs::read_to_string(cyber_home.join("setup.toml")).unwrap();
+        assert!(state.contains("completed = true"), "state = {state}");
+        let written: Config =
+            toml::from_str(&std::fs::read_to_string(cyber_home.join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(written.agent.default_provider, "deepseek");
+
+        // 配置可用后 Esc 才会离开向导（handle_key 返回 true = 退出主循环）。
+        let (broker, _requests) = PermissionBroker::interactive();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let exit = handle_key(
+            &mut screen,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut runner_opt,
+            &Arc::new(broker),
+            &events,
+            &mut None,
+            &mut None,
+        )
+        .unwrap();
+        assert!(exit);
+        std::env::remove_var(KEY_VAR);
+    }
+
+    #[tokio::test]
+    async fn settings_toolbox_tab_lists_tools_and_gates_scan_in_setup_mode() {
+        let owner = crate::headless::tests::test_runner().await;
+        let tools_dir = owner.ctx.paths.tools_dir.clone();
+        cyber_core::custom_tool::save_custom_tool(
+            &tools_dir,
+            &cyber_core::CustomToolConfig {
+                name: "probe".into(),
+                description: "探测".into(),
+                command: "probe -x".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut screen = CliScreen::new(&owner);
+        let mut runner_opt = Some(owner);
+
+        screen.panel = Some(Panel::Settings);
+        let mut settings = CliSettingsState::from_runner(runner_opt.as_ref().unwrap());
+        settings.tab = SettingsTab::Toolbox;
+        screen.settings = Some(settings);
+
+        let settings = screen.settings.as_ref().unwrap();
+        assert_eq!(settings.custom_tools.len(), 1);
+        assert_eq!(SettingsTab::Toolbox.max_row(settings), 1);
+
+        // A → 打开自定义工具表单（返回设置中心时回到工具库页）
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        );
+        assert!(matches!(
+            screen.form.as_ref().map(|state| &state.form.kind),
+            Some(FormKind::CustomTool {
+                original_name: None
+            })
+        ));
+        assert_eq!(screen.settings_return_tab, Some(SettingsTab::Toolbox));
+        assert_eq!(screen.panel, None);
+
+        // Esc 关闭表单 → 回到设置中心工具库页
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::Toolbox);
+
+        // 末行 Enter：向导模式下只提示，不触发扫描
+        screen.setup_mode = true;
+        screen.settings.as_mut().unwrap().selected_row = 1;
+        settings_key_with_runner(
+            &mut screen,
+            &mut runner_opt,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(screen.panel, Some(Panel::Settings));
+        assert!(
+            screen.status.contains("Ctrl+S"),
+            "status = {}",
+            screen.status
+        );
+    }
+
+    #[tokio::test]
     async fn settings_panel_open_via_action_and_key() {
         let owner = crate::headless::tests::test_runner().await;
         let mut screen = CliScreen::new(&owner);
@@ -16012,6 +17815,7 @@ mod tests {
             SettingsTab::Providers,
             SettingsTab::EnvMemory,
             SettingsTab::StorageSystem,
+            SettingsTab::Toolbox,
             SettingsTab::AgentModel,
         ];
         for expected in expected_tabs {
@@ -16032,12 +17836,9 @@ mod tests {
             KeyCode::Tab,
             KeyModifiers::SHIFT,
         );
-        assert_eq!(
-            screen.settings.as_ref().unwrap().tab,
-            SettingsTab::StorageSystem
-        );
+        assert_eq!(screen.settings.as_ref().unwrap().tab, SettingsTab::Toolbox);
 
-        // Direct keys 1-7
+        // Direct keys 1-8
         let direct_keys = [
             ('1', SettingsTab::AgentModel),
             ('2', SettingsTab::UiWorkflow),
@@ -16046,6 +17847,7 @@ mod tests {
             ('5', SettingsTab::Providers),
             ('6', SettingsTab::EnvMemory),
             ('7', SettingsTab::StorageSystem),
+            ('8', SettingsTab::Toolbox),
         ];
         for (ch, expected) in direct_keys {
             settings_key_with_runner(
@@ -16733,6 +18535,7 @@ mod tests {
                     models: std::collections::HashMap::new(),
                     chat_endpoint: None,
                     models_endpoint: None,
+                    thinking: None,
                 },
             );
         }
@@ -18474,6 +20277,442 @@ mod tests {
         assert!(!screen.has_selection());
     }
 
+    fn model_picker_state(providers: cyber_core::ProvidersConfig) -> CliModelPickerState {
+        CliModelPickerState {
+            focus_models: false,
+            provider_selected: 0,
+            model_selected: 0,
+            providers,
+            default_provider: String::new(),
+            models: Vec::new(),
+            provider_scroll: 0,
+            model_scroll: 0,
+            probing_model: None,
+            fetching: None,
+            fetch_error: None,
+            fetched: false,
+            fetch_id: 0,
+        }
+    }
+
+    /// 接口拉取结果归并/丢弃语义：成功 → 接口模型 ∪ 本地配置且光标不跳；失败 → 保留本地
+    /// 配置并记录原因；`fetch_id` / 服务商不匹配的串台结果一律丢弃。
+    #[test]
+    fn model_picker_fetch_merges_api_models_and_drops_stale_results() {
+        let mut providers = cyber_core::ProvidersConfig::default();
+        let mut alpha = cyber_core::ProviderConfig {
+            kind: "openai".into(),
+            model: "alpha-current".into(),
+            ..Default::default()
+        };
+        alpha
+            .models
+            .insert("alpha-local".into(), cyber_core::ModelConfig::default());
+        providers.providers.insert("alpha".into(), alpha);
+        providers.providers.insert(
+            "beta".into(),
+            cyber_core::ProviderConfig {
+                kind: "openai".into(),
+                model: "beta-current".into(),
+                ..Default::default()
+            },
+        );
+        let mut state = model_picker_state(providers);
+        state.refresh_models();
+        assert_eq!(state.models, vec!["alpha-current", "alpha-local"]);
+
+        // 串台结果（fetch_id 不匹配）与错位服务商结果都被丢弃，拉取中标记保留。
+        state.fetching = Some("alpha".into());
+        state.fetch_id = 1;
+        state.deliver_fetch(ModelFetchResult {
+            fetch_id: 0,
+            provider: "alpha".into(),
+            result: Ok(vec!["stale".into()]),
+        });
+        state.deliver_fetch(ModelFetchResult {
+            fetch_id: 1,
+            provider: "beta".into(),
+            result: Ok(vec!["beta-live".into()]),
+        });
+        assert_eq!(state.models, vec!["alpha-current", "alpha-local"]);
+        assert_eq!(state.fetching.as_deref(), Some("alpha"));
+        assert!(state.fetch_error.is_none());
+
+        // 拉取失败：本地配置列表保留 + 失败原因可见，不再显示「拉取中」。
+        state.deliver_fetch(ModelFetchResult {
+            fetch_id: 1,
+            provider: "alpha".into(),
+            result: Err("GET /v1/models 失败 401".into()),
+        });
+        assert_eq!(state.models, vec!["alpha-current", "alpha-local"]);
+        assert!(state.fetching.is_none());
+        assert_eq!(
+            state.fetch_error.as_deref(),
+            Some("GET /v1/models 失败 401")
+        );
+
+        // 成功：接口模型并入列表（排序去重），光标停在其原先选中的模型上。
+        state.model_selected = 1; // alpha-local
+        state.fetching = Some("alpha".into());
+        state.fetch_error = None;
+        state.fetch_id = 2;
+        state.deliver_fetch(ModelFetchResult {
+            fetch_id: 2,
+            provider: "alpha".into(),
+            result: Ok(vec!["z-live".into(), "alpha-local".into()]),
+        });
+        assert_eq!(state.models, vec!["alpha-current", "alpha-local", "z-live"]);
+        assert_eq!(state.models[state.model_selected], "alpha-local");
+        assert!(state.fetching.is_none() && state.fetch_error.is_none());
+
+        // 空结果视为失败（不把右栏清空）。
+        state.fetching = Some("alpha".into());
+        state.fetch_id = 3;
+        state.deliver_fetch(ModelFetchResult {
+            fetch_id: 3,
+            provider: "alpha".into(),
+            result: Ok(Vec::new()),
+        });
+        assert_eq!(state.models, vec!["alpha-current", "alpha-local", "z-live"]);
+        assert_eq!(state.fetch_error.as_deref(), Some("接口未返回任何模型"));
+    }
+
+    /// 面板只在左栏 `Enter`（选定 provider）后联网拉取：打开与切换 provider 都只显示本地配置；
+    /// `base_url` 已含 `/v1` 时只请求 `{base}/v1/models`（不得补成 `/v1/v1`）。
+    #[tokio::test]
+    async fn model_picker_fetches_only_after_provider_confirm() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut owner = crate::headless::tests::test_runner().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        owner.ctx.providers.providers.clear();
+        let versioned = cyber_core::ProviderConfig {
+            kind: "openai".into(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "test-only-key".into(),
+            model: "cfg-model".into(),
+            ..Default::default()
+        };
+        owner
+            .ctx
+            .providers
+            .providers
+            .insert("aaa-stub".into(), versioned);
+        let bare = cyber_core::ProviderConfig {
+            kind: "openai".into(),
+            base_url: format!("http://{addr}"),
+            api_key: "test-only-key".into(),
+            model: "cfg-model".into(),
+            ..Default::default()
+        };
+        owner
+            .ctx
+            .providers
+            .providers
+            .insert("bbb-stub".into(), bare);
+        owner.ctx.config.agent.default_provider = "aaa-stub".into();
+
+        // 两个 provider 各一次请求：第一次必须命中 /v1/models（base_url 已含版本段），
+        // 第二次（未含版本段）先按 {base}/models 走。
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for idx in 0..2usize {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                paths.push(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let body = match idx {
+                    0 => r#"{"data":[{"id":"live-a"},{"id":"live-b"}]}"#.to_string(),
+                    _ => r#"{"data":[{"id":"live-c"}]}"#.to_string(),
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let _ = socket.shutdown().await;
+            }
+            paths
+        });
+
+        let mut screen = CliScreen::new(&owner);
+        let (tx, mut rx) = mpsc::unbounded_channel::<ModelFetchResult>();
+        screen.model_fetch_tx = Some(tx);
+        screen.model_picker = Some(CliModelPickerState::from_runner(&owner));
+        screen.panel = Some(Panel::ModelPicker);
+        screen.refresh_model_picker_local();
+
+        // 打开面板：只显示本地配置清单，不联网。
+        let state = screen.model_picker.as_ref().unwrap();
+        assert!(state.fetching.is_none(), "打开面板不得自动联网拉取");
+        assert!(!state.fetched);
+        assert_eq!(state.models, vec!["cfg-model".to_string()]);
+        let frame = render(&mut screen, 120, 30).replace(' ', "");
+        assert!(frame.contains("按Enter选定provider并从接口拉取"), "{frame}");
+        assert!(frame.contains("cfg-model"), "{frame}");
+
+        let mut runner_opt = Some(owner);
+        // 左栏 Enter（选定 provider）→ 才联网拉取。
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let state = screen.model_picker.as_ref().unwrap();
+        assert_eq!(state.fetching.as_deref(), Some("aaa-stub"));
+        // 拉取中：状态条可见，本地配置模型仍在列表中（不因拉取而清空）。
+        let frame = render(&mut screen, 120, 30).replace(' ', "");
+        assert!(frame.contains("正在从接口拉取"), "{frame}");
+        assert!(frame.contains("cfg-model"), "{frame}");
+
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("拉取应在超时前返回结果")
+            .expect("拉取结果通道不应关闭");
+        screen.model_picker.as_mut().unwrap().deliver_fetch(fetch);
+        let state = screen.model_picker.as_ref().unwrap();
+        assert_eq!(
+            state.models,
+            vec!["cfg-model".to_string(), "live-a".into(), "live-b".into()]
+        );
+        assert!(state.fetching.is_none() && state.fetch_error.is_none());
+        assert!(state.fetched, "拿到接口结果后必须标记为已拉取");
+        let frame = render(&mut screen, 120, 30).replace(' ', "");
+        assert!(frame.contains("live-a"), "{frame}");
+        assert!(!frame.contains("正在从接口拉取"), "{frame}");
+        assert!(!frame.contains("按Enter选定provider"), "{frame}");
+
+        // 回到左栏（Enter 已把焦点切到模型栏），再切到下一个 provider → 只换本地清单，不联网。
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!screen.model_picker.as_ref().unwrap().focus_models);
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let state = screen.model_picker.as_ref().unwrap();
+        assert_eq!(state.provider_selected, 1);
+        assert!(
+            state.fetching.is_none(),
+            "切换 provider 不得自动联网；需再按 Enter"
+        );
+        assert!(!state.fetched);
+        assert_eq!(state.models, vec!["cfg-model".to_string()]);
+
+        // 再按 Enter → 才拉取该 provider 的模型。
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let state = screen.model_picker.as_ref().unwrap();
+        assert_eq!(state.fetching.as_deref(), Some("bbb-stub"));
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("Enter 后应拉取")
+            .expect("拉取结果通道不应关闭");
+        screen.model_picker.as_mut().unwrap().deliver_fetch(fetch);
+        let state = screen.model_picker.as_ref().unwrap();
+        assert_eq!(state.models, vec!["cfg-model".to_string(), "live-c".into()]);
+
+        let paths = server.await.unwrap();
+        assert_eq!(paths, vec!["/v1/models".to_string(), "/models".to_string()]);
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_picker_enter_and_r_key_refetch_from_api() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut owner = crate::headless::tests::test_runner().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for body in [
+                r#"{"data":[{"id":"live-a"}]}"#,
+                r#"{"data":[{"id":"live-b"}]}"#,
+                r#"{"data":[{"id":"live-c"}]}"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                paths.push(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let _ = socket.shutdown().await;
+            }
+            paths
+        });
+
+        owner.ctx.providers.providers.insert(
+            "aaa-stub".into(),
+            cyber_core::ProviderConfig {
+                kind: "openai".into(),
+                base_url: format!("http://{addr}/v1"),
+                api_key: "test-only-key".into(),
+                model: "cfg-model".into(),
+                ..Default::default()
+            },
+        );
+        owner.ctx.config.agent.default_provider = "aaa-stub".into();
+
+        let mut screen = CliScreen::new(&owner);
+        let (tx, mut rx) = mpsc::unbounded_channel::<ModelFetchResult>();
+        screen.model_fetch_tx = Some(tx);
+        screen.model_picker = Some(CliModelPickerState::from_runner(&owner));
+        screen.panel = Some(Panel::ModelPicker);
+        screen.refresh_model_picker_local();
+
+        let mut runner_opt = Some(owner);
+
+        // 打开面板：只有本地清单，不联网
+        let state = screen.model_picker.as_ref().unwrap();
+        assert!(state.fetching.is_none(), "打开面板不得自动拉取");
+        assert_eq!(state.models, vec!["cfg-model".to_string()]);
+
+        // 左栏 Enter（选定 provider）→ 拉取 #1
+        let fetch_id = screen.model_picker.as_ref().unwrap().fetch_id;
+        assert!(!screen.model_picker.as_ref().unwrap().focus_models);
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let state = screen.model_picker.as_ref().unwrap();
+        assert!(state.focus_models, "Enter 应切到模型栏");
+        assert_eq!(state.fetching.as_deref(), Some("aaa-stub"));
+        assert_ne!(state.fetch_id, fetch_id, "Enter 必须发起拉取");
+
+        // 拉取进行中再按 r / 再回左栏按 Enter 都不重复发起
+        let in_flight_id = screen.model_picker.as_ref().unwrap().fetch_id;
+        for code in [KeyCode::Char('r'), KeyCode::Tab, KeyCode::Enter] {
+            handle_model_picker_key(
+                &mut screen,
+                &mut runner_opt,
+                KeyEvent::new(code, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            screen.model_picker.as_ref().unwrap().fetch_id,
+            in_flight_id,
+            "拉取进行中不得重复发起请求"
+        );
+
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("Enter 后应发起拉取")
+            .expect("通道不应关闭");
+        screen.model_picker.as_mut().unwrap().deliver_fetch(fetch);
+        let state = screen.model_picker.as_ref().unwrap();
+        assert_eq!(state.models, vec!["cfg-model".to_string(), "live-a".into()]);
+        assert!(state.fetched);
+
+        // 回到左栏并再次 Enter（重新选定同一 provider）→ 重新从接口拉取
+        {
+            let state = screen.model_picker.as_mut().unwrap();
+            state.focus_models = false;
+        }
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let state = screen.model_picker.as_ref().unwrap();
+        assert!(state.focus_models, "Enter 应切到模型栏");
+        assert_eq!(
+            state.fetching.as_deref(),
+            Some("aaa-stub"),
+            "选定 provider 必须重新拉取"
+        );
+
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("Enter 后应重新拉取")
+            .expect("通道不应关闭");
+        screen.model_picker.as_mut().unwrap().deliver_fetch(fetch);
+        assert_eq!(
+            screen.model_picker.as_ref().unwrap().models,
+            vec!["cfg-model".to_string(), "live-b".into()]
+        );
+
+        // r 手动重新拉取
+        handle_model_picker_key(
+            &mut screen,
+            &mut runner_opt,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            screen.model_picker.as_ref().unwrap().fetching.is_some(),
+            "r 必须触发重新拉取"
+        );
+        let fetch = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("r 后应重新拉取")
+            .expect("通道不应关闭");
+        screen.model_picker.as_mut().unwrap().deliver_fetch(fetch);
+        assert_eq!(
+            screen.model_picker.as_ref().unwrap().models,
+            vec!["cfg-model".to_string(), "live-c".into()]
+        );
+
+        // base_url 已含 /v1 → 三次请求都必须是 /v1/models（不得出现 /v1/v1）
+        assert_eq!(server.await.unwrap(), vec!["/v1/models".to_string(); 3]);
+
+        if let Some(r) = runner_opt {
+            let _ = std::fs::remove_dir_all(r.cwd);
+        }
+    }
+
     #[tokio::test]
     async fn panel_model_picker_dual_column_and_key_navigation() {
         let owner = crate::headless::tests::test_runner().await;
@@ -20170,6 +22409,48 @@ mod tests {
             "Ctrl+D 不得触发环境变量删除"
         );
         let _ = std::fs::remove_dir_all(runner_opt.unwrap().cwd);
+    }
+
+    /// `/exit` 是 `/quit` 的别名：空闲（命令层解析）与 busy（快捷键层早退）两条路径都必须真的退出。
+    #[tokio::test]
+    async fn exit_alias_quits_in_idle_and_busy_paths() {
+        let owner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&owner);
+        let mut runner = Some(owner);
+
+        // 空闲：与 /quit 一样产出 CliAction::Quit（保存会话）。
+        let mut owner = runner.take().unwrap();
+        for line in ["/exit", "/EXIT"] {
+            assert!(
+                matches!(
+                    cli_commands::execute(&mut owner, line).unwrap(),
+                    CliAction::Quit
+                ),
+                "{line} 应与 /quit 等价"
+            );
+        }
+        runner = Some(owner);
+
+        // busy：输入不经过 slash::parse，必须由 handle_key 的 busy 分支直接退出。
+        screen.busy = true;
+        screen.input = composer();
+        screen.insert_text("/exit");
+        let (permissions, _rx) = PermissionBroker::interactive();
+        let (events, _ev_rx) = mpsc::unbounded_channel();
+        assert!(
+            handle_key(
+                &mut screen,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut runner,
+                &Arc::new(permissions),
+                &events,
+                &mut None,
+                &mut None,
+            )
+            .unwrap(),
+            "busy 状态下 /exit 必须直接退出"
+        );
+        let _ = std::fs::remove_dir_all(runner.unwrap().cwd);
     }
 
     /// 定位缓冲区内最上（且最左）的圆角框，校验四条边框字符是否被内容覆写。

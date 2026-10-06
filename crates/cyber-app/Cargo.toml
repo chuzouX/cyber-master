@@ -20,8 +20,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 toml = { workspace = true }
 crossterm = { workspace = true }
-tempfile = "3"
-url = "2"
+tempfile = { workspace = true }
+url = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 

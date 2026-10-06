@@ -14,3 +14,5 @@ dirs = { workspace = true }
 tracing = { workspace = true }
 fs2 = "0.4"
 reqwest = { workspace = true }
+tempfile = { workspace = true }
+url = { workspace = true }

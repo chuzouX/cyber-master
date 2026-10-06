@@ -1040,6 +1040,50 @@ impl SessionRunner {
                 }
                 let _ = events.send(AgentEvent::Done);
             }
+            CliTask::ToolboxScan { preview, target } => {
+                let _ = events.send(AgentEvent::Started);
+                let provider = self
+                    .ctx
+                    .providers
+                    .providers
+                    .get(&self.ctx.config.agent.default_provider)
+                    .cloned();
+                let report = match provider {
+                    None => Err(color_eyre::eyre::eyre!(
+                        "未配置默认 Provider；请先运行 cyber setup 或 /provider"
+                    )),
+                    Some(cfg)
+                        if cfg.kind != "ollama" && cfg.resolved_api_key().trim().is_empty() =>
+                    {
+                        Err(color_eyre::eyre::eyre!(
+                            "当前 Provider [{}] 缺少有效 API Key",
+                            self.ctx.config.agent.default_provider
+                        ))
+                    }
+                    Some(cfg) => {
+                        crate::toolbox::run_scan(
+                            &cfg,
+                            &self.ctx.paths.tools_dir,
+                            target.as_deref(),
+                            preview,
+                            &events,
+                            &mut cancel,
+                        )
+                        .await
+                    }
+                };
+                match report {
+                    Ok(report) => {
+                        let text = crate::toolbox::format_report(&report);
+                        turn.answer = text.clone();
+                        let _ = events.send(AgentEvent::Notice(text));
+                    }
+                    Err(error) => {
+                        turn.error = Some(error.to_string());
+                    }
+                }
+                let _ = events.send(AgentEvent::Done);
+            }
             task => {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 let config = self.ctx.config.clone();
@@ -1090,6 +1134,7 @@ impl SessionRunner {
                         }
                     }
                     CliTask::McpConnect { .. } => unreachable!(),
+                    CliTask::ToolboxScan { .. } => unreachable!(),
                 };
                 cancelled =
                     collect_task_events(handle, &mut rx, &events, &mut cancel, &mut turn).await;

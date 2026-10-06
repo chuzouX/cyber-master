@@ -37,8 +37,10 @@ fn setup_rejects_nonterminal_without_creating_config() {
     let home = tempfile::tempdir().unwrap();
     let output = command(home.path()).arg("setup").output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
-    assert!(!home.path().join(".cyber").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Interactive"), "stderr: {stderr}");
+    assert!(!home.path().join(".cyber/config.toml").exists());
+    assert!(!home.path().join(".cyber/setup.toml").exists());
 }
 
 #[test]
