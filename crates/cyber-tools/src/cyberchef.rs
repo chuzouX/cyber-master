@@ -6,7 +6,7 @@
 //! 脚本位置：`~/.cyber/tools/scripts/cyberchef.py`（或环境变量 / 固定路径）。
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 
@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 pub struct CyberChefTool {
+    /// `None` = 按需自动探测（`~/.cyber/tools/scripts/cyberchef.py`）；
+    /// `Some` = 显式锁定该脚本路径，不再回退自动探测。
     script_path: Option<PathBuf>,
 }
 
@@ -27,39 +29,84 @@ impl Default for CyberChefTool {
 
 impl CyberChefTool {
     pub fn new() -> Self {
-        let script = resolve_cyberchef_script();
-        Self {
-            script_path: script,
-        }
+        Self { script_path: None }
     }
 
+    /// 锁定引擎脚本路径（测试或自定义安装位置用）。
+    ///
+    /// 显式路径具有权威性：文件不存在即视为「引擎缺失」，不会回退到自动探测。
     pub fn with_script_path(path: PathBuf) -> Self {
         Self {
             script_path: Some(path),
         }
     }
+
+    /// 执行 Python 引擎所需的脚本路径；纯 Rust 的 `detect` 路径不使用它。
+    fn engine_script(&self) -> Option<PathBuf> {
+        match &self.script_path {
+            Some(explicit) => explicit.exists().then(|| explicit.clone()),
+            None => resolve_cyberchef_script(),
+        }
+    }
+}
+
+/// 引擎脚本缺失时返回的提示（`is_error = true`）。
+fn missing_engine_output() -> ToolOutput {
+    ToolOutput {
+        content: "未找到 cyberchef.py 脚本文件，预期路径：~/.cyber/tools/scripts/cyberchef.py"
+            .into(),
+        is_error: true,
+    }
 }
 
 fn resolve_cyberchef_script() -> Option<PathBuf> {
-    // 1. 尝试从用户主目录 ~/.cyber/tools/scripts/cyberchef.py
-    if let Some(home) = dirs::home_dir() {
-        let p = home
-            .join(".cyber")
-            .join("tools")
-            .join("scripts")
-            .join("cyberchef.py");
-        if p.exists() {
-            return Some(p);
+    let home = dirs::home_dir()?;
+    let path = home
+        .join(".cyber")
+        .join("tools")
+        .join("scripts")
+        .join("cyberchef.py");
+    path.exists().then_some(path)
+}
+
+/// 候选 Python 解释器：`CYBER_PYTHON`（显式指定）→ `python` → `python3`。
+///
+/// 只给顺序，可用性在实际启动时判定：最小 Linux 镜像通常只有 `python3`，
+/// 而 Windows / 官方安装包通常只有 `python`。
+fn python_candidates() -> Vec<String> {
+    if let Some(explicit) = std::env::var("CYBER_PYTHON")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return vec![explicit];
+    }
+    vec!["python".to_string(), "python3".to_string()]
+}
+
+/// 运行 `cyberchef.py`，按候选解释器依次尝试**启动**，返回首个成功启动的结果。
+///
+/// 仅当解释器无法启动（`NotFound` 等 IO 错误）时才换下一个候选；
+/// 引擎自身以非零码退出属于真实执行结果，不再换解释器重试。
+async fn run_engine(script: &Path, args: &[String]) -> std::io::Result<std::process::Output> {
+    let mut last_error = None;
+    for program in python_candidates() {
+        let mut cmd = Command::new(&program);
+        cmd.arg(script);
+        cmd.args(args);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        match cmd.output().await {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error = Some(error),
         }
     }
-
-    // 2. 检查 Windows 常见路径
-    let fixed_win = PathBuf::from(r"C:\Users\chuzo\.cyber\tools\scripts\cyberchef.py");
-    if fixed_win.exists() {
-        return Some(fixed_win);
-    }
-
-    None
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "未找到可用的 python 解释器（可用 CYBER_PYTHON 指定）",
+        )
+    }))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,29 +159,16 @@ impl Tool for CyberChefTool {
         _ctx: &'a ToolCtx,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + 'a>> {
         Box::pin(async move {
-            let script_path = match &self.script_path {
-                Some(p) if p.exists() => p.clone(),
-                _ => match resolve_cyberchef_script() {
-                    Some(p) => p,
-                    None => {
-                        return Ok(ToolOutput {
-                            content: "未找到 cyberchef.py 脚本文件，预期路径：~/.cyber/tools/scripts/cyberchef.py".into(),
-                            is_error: true,
-                        });
-                    }
-                },
-            };
-
             let list_ops = input
                 .get("list_operations")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
             if list_ops {
-                let output = Command::new("python")
-                    .arg(&script_path)
-                    .arg("--help")
-                    .output()
+                let Some(script_path) = self.engine_script() else {
+                    return Ok(missing_engine_output());
+                };
+                let output = run_engine(&script_path, &["--help".to_string()])
                     .await
                     .map_err(|e| AgentError::Provider(format!("执行 python 失败: {e}")))?;
 
@@ -224,18 +258,13 @@ impl Tool for CyberChefTool {
             }
 
             // 构建命令：python cyberchef.py "<input>" op1 op2 ...
-            let mut cmd = Command::new("python");
-            cmd.arg(&script_path);
-            cmd.arg(&input_data);
-            for op in &recipe_ops {
-                cmd.arg(op);
-            }
+            let Some(script_path) = self.engine_script() else {
+                return Ok(missing_engine_output());
+            };
+            let mut engine_args = vec![input_data.clone()];
+            engine_args.extend(recipe_ops.iter().cloned());
 
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-
-            let output = cmd
-                .output()
+            let output = run_engine(&script_path, &engine_args)
                 .await
                 .map_err(|e| AgentError::Provider(format!("调用 cyberchef 进程失败: {e}")))?;
 
