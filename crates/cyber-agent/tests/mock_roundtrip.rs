@@ -6,14 +6,42 @@
 //! echo 测试（前 4 个）设 `auto_tool_call=false` 以保持 echo 模式；
 //! `mock_tool_loop_roundtrip` 用默认 `auto_tool_call=true` 验证 agent loop 全链路。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyber_agent::{run_stream, AgentEvent, ToolRegistry};
 use cyber_core::{Config, ProjectContext, ProjectFrontmatter, ProvidersConfig};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// 固定 generation 计数器与临时工作目录，启动一次 run_stream。
+/// 每个测试独占的空工作目录。
+///
+/// 工具循环测试会执行 `list_dir .`：若 cwd 指向系统临时目录（本机可能有数万条目），
+/// 工具结果会撑爆上下文触发自动压缩，把 Tool 消息一并压掉，mock 便看不到工具结果而
+/// 反复发起同一调用——测试结果取决于机器。固定为空目录后行为与机器无关。
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("cyber-mock-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("创建测试工作目录");
+        Self(path)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 固定 generation 计数器与独占空工作目录，启动一次 run_stream。
 /// 工具表统一用内置工具（read_file/write_file/list_dir/shell），与 P2 行为一致。
+///
+/// 返回的 `TestDir` 必须由调用方持有到测试结束（drop 时清理目录）。
 fn spawn_run(
     config: Config,
     providers: ProvidersConfig,
@@ -24,9 +52,11 @@ fn spawn_run(
 ) -> (
     tokio::task::JoinHandle<()>,
     UnboundedReceiver<(u64, AgentEvent)>,
+    TestDir,
 ) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u64, AgentEvent)>();
-    let cwd = std::env::temp_dir();
+    let dir = TestDir::new();
+    let cwd = dir.0.clone();
     let registry = Arc::new(ToolRegistry::with_builtins());
     let handle = tokio::spawn(run_stream(
         config,
@@ -43,7 +73,7 @@ fn spawn_run(
         cyber_core::ThinkingIntensity::Middle,
         String::new(),
     ));
-    (handle, rx)
+    (handle, rx, dir)
 }
 
 /// echo 模式配置：关闭 auto_tool_call，使 mock 走逐字符 echo 路径。
@@ -57,7 +87,7 @@ fn echo_config() -> Config {
 async fn mock_roundtrip_no_project() {
     let config = echo_config();
     let providers = ProvidersConfig::default_template();
-    let (handle, mut rx) = spawn_run(config, providers, None, "你好", vec![], true);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, None, "你好", vec![], true);
 
     let mut started = false;
     let mut tokens = String::new();
@@ -86,7 +116,7 @@ async fn mock_roundtrip_with_history() {
     let providers = ProvidersConfig::default_template();
     use cyber_agent::Message;
     let history = vec![Message::user("第一句"), Message::assistant("回复")];
-    let (handle, mut rx) = spawn_run(config, providers, None, "第二句", history, true);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, None, "第二句", history, true);
 
     let mut tokens = String::new();
     while let Some((_, ev)) = rx.recv().await {
@@ -120,7 +150,7 @@ async fn mock_roundtrip_with_project_rules() {
         raw: String::new(),
         path: std::path::PathBuf::new(),
     };
-    let (handle, mut rx) = spawn_run(config, providers, Some(project), "test", vec![], true);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, Some(project), "test", vec![], true);
 
     let mut tokens = String::new();
     while let Some((_, ev)) = rx.recv().await {
@@ -142,7 +172,7 @@ async fn run_stream_unknown_provider_sends_error() {
     let mut config = Config::default();
     config.agent.default_provider = "nonexistent".into();
     let providers = ProvidersConfig::default_template();
-    let (handle, mut rx) = spawn_run(config, providers, None, "hi", vec![], false);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, None, "hi", vec![], false);
 
     let mut got_error = false;
     while let Some((_, ev)) = rx.recv().await {
@@ -168,7 +198,7 @@ async fn mock_tool_loop_roundtrip() {
     // 默认 config：auto_tool_call=true，触发 mock 的 tool-loop 模式
     let config = Config::default();
     let providers = ProvidersConfig::default_template();
-    let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, None, "查看目录", vec![], true);
 
     let mut started = false;
     let mut first_text = String::new();
@@ -245,7 +275,7 @@ async fn mock_tool_loop_roundtrip() {
 async fn mock_tool_loop_not_loop_detected() {
     let config = Config::default();
     let providers = ProvidersConfig::default_template();
-    let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, None, "查看目录", vec![], true);
 
     let mut final_text = String::new();
     let mut tool_call_count = 0;
@@ -297,7 +327,7 @@ async fn mock_max_steps_exhaustion_does_graceful_summary() {
     config.agent.max_steps = 1; // step 0 有工具调用 → 循环耗尽 → 收尾总结
                                 // auto_tool_call 保持默认 true（tools 非空 → mock tool-loop 第一步发工具调用）
     let providers = ProvidersConfig::default_template();
-    let (handle, mut rx) = spawn_run(config, providers, None, "查看目录", vec![], true);
+    let (handle, mut rx, _dir) = spawn_run(config, providers, None, "查看目录", vec![], true);
 
     let mut tool_call_seen = false;
     let mut tool_result_seen = false;
