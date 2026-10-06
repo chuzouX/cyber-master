@@ -10,7 +10,7 @@
 
 ### 当前入口约定
 
-`cyber` 默认进入全屏简洁 coding CLI，替代行式多轮输入；`cyber tui` 显式进入原有全屏功能面板，`cyber run` 保留非交互单次任务，`cyber setup` 提供配置向导。缺少有效配置的首次交互启动先运行向导；脚本不弹向导。此约定替代下文早期的默认 TUI / 唯一界面描述。
+`cyber` 默认进入全屏简洁 coding CLI，替代行式多轮输入；`cyber tui` 显式进入原有全屏功能面板，`cyber run` 保留非交互单次任务，`cyber setup` 打开全屏设置向导（`cyber-tui` 的设置中心：服务商 / API Key / 模型 / 工具库，`Ctrl+S` 两阶段原子保存，配置无效时 `Esc` 不允许退出）。缺少有效配置的首次交互启动先拉起同一向导；脚本不弹向导。此约定替代下文早期的默认 TUI / 唯一界面描述。
 
 CLI 与 headless 在 `cyber-tui` 内共用独立于 `App` 的 `SessionRunner`、JSON 历史和注册表装配，尚未迁移到独立 runtime/storage crate。CLI 启用执行前 nonce 审批；headless 仅接受调用者显式的 `--allow-tool` 授权。两者启动时默认连接已配置的 MCP servers，并支持在 CLI 中通过 `/mcp connect` 重新连接。原 TUI 的权限和 MCP 行为保持原样，不应视为已有新审批保护。
 
@@ -650,7 +650,7 @@ P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`�
 | 1 | kind | Enum（←/→ 在 `PROVIDER_KINDS` = openai/anthropic/ollama/openai-compatible 间循环） |
 | 2 | base_url | 文本（自动 trim + 去尾 `/`） |
 | 3 | api_key | 文本 |
-| 4 | model | 文本（可手填或经「拉取模型」按钮 picker 选中回填） |
+| 4 | model | 选择（Enter/空格打开模型列表面板；列表内 ↑/↓ 选、Enter 回填、m/f 手输兜底、r 重新拉取、t/v 实测推理/视觉） |
 | 5 | alias | 文本（显示别名，留空用 model id） |
 | 6 | context_length | Enum（←/→/空格 在 `CONTEXT_LENGTH_PRESETS` = 默认(留空)/128K/256K/512K/1M/自定义 间循环；选「自定义」后 Enter 进 textarea 手输数字） |
 | 7 | max_tokens | 文本（parse 为 u32，失败校验报错） |
@@ -660,15 +660,34 @@ P2 阶段实现的服务商管理入口。从 Settings（Providers 段 `a`/`e`�
 | 13 | notes | 文本（自由备注） |
 | 14 | chat_endpoint | 文本（高级设置：自定义流式对话端点，留空默认 `{base_url}/chat/completions`） |
 | 15 | models_endpoint | 文本（高级设置：自定义模型列表端点，留空默认 `{base_url}/models`） |
-| 16 | 拉取模型 | 按钮（Enter 触发异步 fetch） |
-| 17 | 保存 | 按钮（Enter 触发校验 + 持久化） |
-| 18 | 取消 | 按钮（Enter / Esc 丢弃表单返回 `prev_mode`） |
+| 16 | thinking.type | Enum（←/→/空格 循环 未设置/enabled/disabled；未设置 = 不下发任何思考参数） |
+| 17 | thinking.effort | Enum（←/→/空格 循环 未设置/low/medium/high；未设置 = 不下发 `reasoning_effort`） |
+| 18 | 拉取模型 | 按钮（Enter 触发异步 fetch） |
+| 19 | 保存 | 按钮（Enter 触发校验 + 持久化） |
+| 20 | 取消 | 按钮（Enter / Esc 丢弃表单返回 `prev_mode`） |
 
-字段 5-13 属于「模型专属微调参数」（对当前选中 model 独立生效），14-15 归入「高级设置 高级选项」分组，渲染时以分隔线与分组标题区分。
+字段 5-13 属于「模型专属微调参数」（对当前选中 model 独立生效），14-17 归入「高级设置 高级选项」分组，渲染时以分隔线与分组标题区分。
 
 **高级端点覆盖**：`chat_endpoint` / `models_endpoint` 为空串时序列化为 `None`（`skip_serializing_if`），生效端点回退到按 kind 推导的默认值（见 `ProviderConfig::chat_endpoint()`）。显式清空已有覆盖值时必须从原始 `providers.toml` 删除对应键，否则 `merge_table` 合并会保留陈旧值并在下次启动重新读回（`provider_configuration_bytes` 中与 `context_length` 同处处理）。
 
-**拉取模型（async fetch）**：「拉取模型」按钮 bump `fetch_id`（防 stale）+ 置 `fetching` 态，spawn `cyber_agent::fetch_models` 任务。按 kind 试 `{base}/models` 与 `{base}/v1/models`（anthropic 先 v1，其余先 /models），headers 按 kind（anthropic→`x-api-key`+`anthropic-version`；openai/compatible→`Authorization: Bearer`；ollama→无 auth）。结果经 `mpsc::UnboundedSender<FetchResult>` 回传主循环第 4 路 `select!` 分支 → `deliver_fetch`（`fetch_id` 不匹配则丢弃）。成功弹出 picker（↑/↓ 选模型 → Enter 回填 model 字段）；失败显示错误文案。
+**拉取模型（async fetch）**：「拉取模型」按钮 bump `fetch_id`（防 stale）+ 置 `fetching` 态，spawn `cyber_agent::fetch_models` 任务。按 kind 试 `{base}/models` 与 `{base}/v1/models`（anthropic 先 v1，其余先 /models；base_url 已含版本段时不再重复追加 `v1`，并去掉重复候选），headers 按 kind（anthropic→`x-api-key`+`anthropic-version`；openai/compatible→`Authorization: Bearer`；ollama→无 auth）。结果经 `mpsc::UnboundedSender<FetchResult>` 回传主循环第 4 路 `select!` 分支 → `deliver_fetch`（`fetch_id` 不匹配则丢弃）。成功弹出 picker（↑/↓ 选模型 → Enter 回填 model 字段）；失败显示错误文案。
+
+**模型列表选择面板**：字段 4（model）不再是可自由键入的文本 —— Enter/空格在无列表时发起拉取、有列表时直接打开面板（面板占用字段区下方 12 行）。列表每行在模型 id 后附能力标签（`◈ 视觉` / `◈ 推理`），来源为 `cyber_core::resolve_vision_capability` / `resolve_reasoning_capability` 的三级解析：**显式 `models[model].vision|reasoning` 配置 → `~/.cyber/cache/capabilities.json` 实测缓存 → 名称规则表**（`is_vision_model_by_name` / `is_reasoning_model`）。每个渲染帧只读一次缓存文件。面板内：`↑/↓` 选、`Enter` 回填、`m`/`f` 手输、`r` 重新拉取、`t` 实测推理、`v` 实测视觉、`Esc` 关闭；拉取失败或空列表时自动进入手输兜底（`[✎ 手输模式]` 行内标记，model 字段恢复可编辑，Enter 退出）。探针为真实最小请求（`probe_model_reasoning` / `probe_model_vision`），结果经 `ProbeResult{scope}` 回传：`ProbeScope::Picker` 写回 `providers.toml` 的 per-model 能力字段，`ProbeScope::ProviderForm` 只写能力缓存（表单尚未保存，不得提前落盘）。
+
+**thinking（思考参数）下发**：`ProviderConfig::thinking` 为 provider 级（`thinking.type` + `thinking.effort`，两者独立、都可为 `None`）。为 `None` 时四个 provider 的请求体与旧行为逐字节一致。下发规则见下表，`disabled` / `effort` 在各 kind 的无对应字段处一律忽略（不报错）：
+
+| kind | `type=enabled` | `type=disabled` | `effort` |
+| --- | --- | --- | --- |
+| openai / openai-compatible | `thinking:{"type":"enabled"}` | `thinking:{"type":"disabled"}` | 顶层 `reasoning_effort` |
+| anthropic | `thinking:{"type":"enabled","budget_tokens":clamp(max_tokens/2,1024,32000)}` 且 `temperature=1.0`（`max_tokens<=1024` 时不下发，无法满足约束） | 不下发（Messages API 无关闭字段） | 忽略 |
+| ollama | `think:true` | `think:false` | 忽略 |
+| responses | `reasoning:{"effort":"medium"}` | 不下发 | `reasoning:{"effort":<值>}` |
+
+显式清空（`Some` → `None`）时必须从原始 `providers.toml` 删除 `thinking` 键（与端点覆盖同处处理，顺序在 `merge_table` 之后，故只在「新值为 None」时删除）。
+
+**探针端点修正**：`ProviderConfig::chat_endpoint()` 只为 ollama 特判，anthropic/responses 会误落到 `{base}/chat/completions`。探针统一走 `cyber_agent::probe_endpoint`：显式 `chat_endpoint` 优先，否则 anthropic→`{base}/v1/messages`、responses→`{base}/responses`、其余→`chat_endpoint()`。
+
+**API 版本段去重**：凡实现里固定带 `/v1` 的路径拼接（anthropic `{base}/v1/messages`、模型列表 `{base}/v1/models`）一律先过 `cyber_core::with_api_version`：base_url 的 path 已含版本段（`/v1`、`/v1beta`、`/v2`、`/api-v1` 这类以 `-v<数字>` 结尾的段）则原样使用，否则补 `/v1`。只看 path、忽略 `scheme://host`，因此 `https://v1.example.com` 仍会补版本段。这样把 base_url 配成 `https://api.anthropic.com/v1`（`/provider add-with-kind anthropic` 的默认端点）时不会再拼出 `/v1/v1/messages`；`fetch_endpoints` 另对重复候选去重（`https://host/v1` 只产生一个 `{base}/models`）。
 
 **持久化双轨**：
 
@@ -788,7 +807,22 @@ Chat 是文本输入态，普通 ↑/↓ 交给 textarea 移光标，因此历�
 - `SessionsPanelState { selected, pending_delete, list }`：`list` 是进入面板时从 `SessionIndex` 克隆的快照，面板内导航/删除均操作快照。
 - ↑/↓ 循环选择、Enter 切换（`switch_session` + 返回 Chat）、n 新建、d 删除（双击确认：首次 `d` 设 `pending_delete`，同项二次 `d` 执行；其它键取消）、Esc 返回（不切换）、q/Ctrl+C 退出。
 - 渲染：title + message_count + id（截断）+ 当前 `★` 标记 + 待删除 `[待删除!]` 提示，底部 hint 随待删除态切换。
-- 删除拒绝删最后一个（至少保留 1 个）；删 current 自动切到剩余首个并重载 chat。
+- 删除拒绝删最后一个（至少保留 1 个）；删 current 自动切到相邻会话并重载 chat。
+
+### 9.9 模型选择面板（`/model` / `/vision model`）
+
+两套入口共用一个双栏面板：Coding CLI（`Panel::ModelPicker` + `CliModelPickerState`，`cli.rs`）与全屏 TUI（`Mode::ModelPicker` + `views/model_picker.rs`）。左栏服务商、右栏该服务商的模型。
+
+**拉取时机（只在左栏选定 provider 后联网）**：联网是显式动作，打开面板与左栏移动都只读本地配置，绝不发请求：
+
+1. **打开面板**（TUI `open_model_picker` / `open_vision_model_picker`、CLI `CliAction::Panel/Picker(kind=Models)`，含 `/model`、`/vision model` 无参）→ 只把 `providers.toml` 里该 provider 的模型清单（`models` map 键 + 当前 `model`）填进右栏；`fetched = false`。
+2. **左栏移动**（↑/↓、CLI 的 j/k 与鼠标滚轮）→ 同样只换本地清单，`fetch_id` 不变。
+3. **左栏 `Enter`（选定 provider）** → 焦点切到右栏并调用 `cyber_agent::fetch_models`；拉取进行中重复按不重复发起（`fetch_id` 不变）。
+4. **`r` 手动重新拉取**（两栏均可按，footer hint 标注）→ 同一路径，用于失败重试或拿到新上架模型。
+
+**状态与展示**：CLI 用 `fetching: Option<String>` + `fetch_error` + `fetched`；未拉取时状态条提示 `当前显示 providers.toml 的本地模型 · 按 Enter 选定 provider 并从接口拉取`，拉取中 `⟳ 正在从接口拉取 [x] 的模型列表…`，失败 `⚠ 模型列表拉取失败：…（显示本地配置）`（失败/未拉取时右栏都保留本地清单）。TUI 用 `fetching`/`fetch_error`/`fetched`：拉取中右栏显示 `⟳ 正在拉取模型列表…`，成功后以接口结果为准。两端结果都经 `mpsc` 回传主循环、以 `fetch_id` + provider 名双重校验丢弃串台结果。右栏 `Enter` 确认并持久化（TUI 写 `default_provider` / vision 配置；CLI `select_model_persisted`），`t` 对选中模型跑一次视觉能力实测。
+
+**长列表渲染（性能）**：右栏每帧只构建**可见窗口**内的行（先按选中项算粘性滚动偏移，再 `scroll..scroll+height` 切片），且能力缓存每帧只 `CapabilityStore::load()` 一次（经 `resolve_vision_capability` 统一解析：显式 `models` 配置 → 实测缓存 → 名称规则表）。此前每行调一次（TUI 两次）`get_model_vision_capability(..., None)`，而 `None` 会退化成每次读盘 + 解析 `capabilities.json`：8000 条模型单帧实测 ≈ 960ms（TUI ≈ 2×），改为窗口化 + 单次读取后同样 8000 条单帧 ≈ 6ms。
 
 ---
 

@@ -8,7 +8,7 @@
 ## CLI 入口升级
 
 - [x] `cyber` 默认持续对话入口；界面约定更新为全屏简洁 coding CLI，`cyber tui` 保留原全屏功能面板。
-- [x] `cyber setup` 与首次缺配置引导，隐藏凭据、私有文件权限、中断状态恢复；非交互不询问。
+- [x] `cyber setup` 复用全屏设置中心向导（服务商 / 工具库），首次缺配置引导，隐藏凭据、私有文件权限、两阶段原子保存与中断状态恢复；非交互不询问。
 - [x] CLI/headless 共享单轮执行与现有 JSON 历史，事件顺序与压缩结果持久化，Ctrl+C 取消。
 - [x] CLI 执行前审批；headless 默认拒绝工具，可用重复 `--allow-tool` 显式授权。
 - [x] 安装器强制 SHA256、幂等用户 PATH、Windows zip 修复；发布前格式、测试、Clippy 检查。

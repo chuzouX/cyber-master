@@ -6,9 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **CLI 模型选择面板自动拉取模型列表**：`/model`（全屏双栏 `Model Picker`）左栏选中/切换服务商后自动调用 `{base_url}/models` 拉取该服务商的真实模型列表，打开面板亦立即拉取；端点构造沿用 `cyber_agent::fetch_models`，`base_url` 已含版本段（`/v1` 等）时不再补 `/v1`。拉取期间右栏显示本地 `providers.toml` 配置清单并附 `⟳ 正在从接口拉取 […] 的模型列表…` 状态条；成功则把接口模型并入列表（本地已配置模型保留，光标不跳），失败显示 `⚠ 模型列表拉取失败：…` 并保持本地清单可选；切换服务商后到达的旧结果按 `fetch_id` 丢弃。
+- **Provider 模型列表选择与能力标签**：新增/编辑 provider 时 `model` 字段改为**选择式**。光标在 `model` 行按 `Enter`（或空格）即拉取 `{base_url}/models` 并弹出模型列表面板；每行附 `◈ 视觉` / `◈ 推理` 能力标签（三级解析：显式 `models[model]` 配置 → `~/.cyber/cache/capabilities.json` 实测缓存 → 内置名称规则表）。
+  TUI 表单（`cyber tui` / Settings Providers 段）与 coding CLI 全屏表单（`/provider add|edit|add-preset|add-with-kind`）均已覆盖。
+- **模型列表面板按键**：`↑/↓` 选择、`Enter` 确认、`m`/`f` 手输模型名、`r` 重新拉取、`t` 实测推理能力、`v` 实测视觉能力、`Esc` 关闭。列表拉取失败或返回空列表时自动进入手输兜底模式（`model` 恢复可编辑，`[✎ 手输模式]` 行内标记，`Enter` 退出），拉取失败不再导致无法配置模型。
+- **思考（thinking）配置**：provider 级新增 `thinking = { type = "enabled"|"disabled", effort = "low"|"medium"|"high" }`（两项独立、均可省略；都省略即不下发任何思考参数，与旧行为逐字节一致）。四个 provider 按 kind 分派正确参数名：openai/openai-compatible → `thinking` + 顶层 `reasoning_effort`；anthropic → `thinking.budget_tokens`（`clamp(max_tokens/2, 1024, 32000)`）并把 `temperature` 固定为 1；ollama → `think:true|false`；responses → `reasoning.effort`。CLI 表单新增 `thinking_type` / `thinking_effort` 两行（←/→/空格 循环，非法值保存时报错）；TUI 表单新增字段 16/17。
+- **推理能力实测探针** `cyber_agent::probe_model_reasoning`：带思考参数发一次最小非流式请求，按 kind 判定响应中的思考输出（anthropic `content[].type=thinking`、ollama `message.thinking`、responses `output[].type=reasoning`、openai 家族 `reasoning_content`/`reasoning`/`thinking`），结果写入能力缓存；面板探针同时回写 `providers.toml` 的 per-model `reasoning` 字段。
+
+### Changed
+- **任务清单卡片跟随「当前进度」滚动**：CLI（`cyber`）与 TUI（`cyber tui`）底部常驻的 📋 任务清单此前固定显示最前面 `rows - 1` 条，任务一多进行中项就滚出视口。现窗口改为跟随焦点行：优先显示第一个 `in_progress`（无进行中时取最后一条已完成/失败项），窗口尾部贴住焦点行以最小化滚动；折叠提示按方向显示「↑ 上方还有 N 项」「... 还有 N 项」「↑ 上方还有 N 项 · 下方 M 项」。窗口计算抽为共享纯函数 `views::todo_visible_window`（两处渲染不再各写一份截断逻辑）。清单不超过可视行数时渲染与折叠文案与改动前逐字节一致。
+- **系统提示词强化 todo 实时更新**：`BASE_PROMPT_STATIC` 的「结构化任务管理」条目由「优先初始化 / 开始执行时更新」改为强制实时同步的六条细则（开工即标记、收工即更新、单点推进、卡点与改道、如实反映、不以 `action="list"` 反复汇报），以修复模型「全部做完再回头补记」导致清单长时间停留在初始状态的问题。面板本身早已逐帧读取共享状态，时效性只取决于模型发起更新的时机。
+
+- **模型列表统一按名称首字母排序**：CLI 三处模型清单（Provider 表单的「选择默认模型 / Select Model」浮层、设置中心 Providers 段 `M` 模型选择、`/model` 双栏面板右栏）此前按接口返回顺序 / 字节序排列，现统一为**不区分大小写**的首字母升序（`claude-3` < `GLM-4.6` < `o3`），仅大小写不同的条目按原串稳定排序；光标定位（当前模型）不受影响。
+- **模型选择面板改为「左栏选定 provider 后按 Enter 才联网拉取」**：打开面板与左栏 ↑/↓（含 j/k、鼠标滚轮）切换 provider 现在都只显示 `providers.toml` 的本地模型清单，不发起任何请求；在左栏按 `Enter` 选定 provider 时才调用 `fetch_models` 拉取云端模型列表（`r` 可手动重取，用于失败重试/刷新新上架模型）。未拉取时状态条提示「当前显示 providers.toml 的本地模型 · 按 Enter 选定 provider 并从接口拉取」，拉取中/失败沿用原有状态条；拉取进行中重复按 `Enter`/`r` 不重复发起请求。
+- **修复长模型列表渲染卡顿（性能）**：面板右栏此前每帧对**每一行**调用一次 `get_model_vision_capability(..., None)`（TUI 两次），而 `cache = None` 会退化为每次读盘并解析 `~/.cyber/cache/capabilities.json`，且每帧构建全部行。现改为每帧只 `CapabilityStore::load()` 一次（经 `resolve_vision_capability` 统一解析：显式 `models` 配置 → 实测缓存 → 名称规则表）并只构建可见窗口内的行。8000 条模型单帧实测：旧实现 CLI ≈ 960ms / TUI ≈ 1.9s（约 1 fps），新实现 ≈ 6ms。
+- **文档纠正**：`docs/TUI_COMMANDS.md` 此前写「`/model` 不自动联网发现模型」，与实际行为不符，已改为描述「打开即拉取 / 切 provider 重取 / `r` 手动重取」；`docs/DESIGN.md` 新增 §9.9 记录面板的拉取时机与状态展示。
+
+### Fixed
+- **Provider 表单里关闭模型面板会连带关闭表单**：在 `/provider add|edit` 全屏表单中打开「选择默认模型 / Select Model」面板后按 `Esc`，此前外层 Esc 处理会先把整个表单 `take` 掉（用户看到面板与 Provider 编辑界面一起消失）。现在表单内的模型面板打开时 `Esc` 只关面板（列表模式与手输兜底模式一致），表单保持在原地；面板关闭后 `Esc` 恢复原有「关闭表单」语义。同时收紧面板的确认键：面板内只接受无修饰键的 `Enter`（`Alt+Enter` 等不再被当作确认并改写 `model` 字段）。TUI 表单本就先由面板消费 Esc，行为不变。
+- **探针端点误用到 `chat/completions`**：`probe_model_vision` 此前对所有 kind 都 POST `ProviderConfig::chat_endpoint()`（仅 ollama 特判），anthropic 与 responses 探针会打到错误路径。新增 `cyber_agent::probe_endpoint`：显式 `chat_endpoint` 优先，否则 anthropic → `{base}/v1/messages`、responses → `{base}/responses`、其余 → `chat_endpoint()`。
+- **清空 thinking 后残留**：将 `thinking` 置空保存时同步从 `providers.toml` 删除该键，避免 `merge_table` 合并保留陈旧值并在下次启动重新读回。
+- **base_url 已含 `v1` 时重复追加导致 404**：anthropic 的 `{base}/v1/messages`、模型列表的 `{base}/v1/models` 等固定带版本段的路径此前无条件拼接，base_url 配成 `https://api.anthropic.com/v1`（`/provider add-with-kind anthropic` 的默认端点）时会打出 `/v1/v1/messages`（实测该路由返回 `404 Invalid URL`）。新增 `cyber_core::with_api_version`：base_url 的 path 已含版本段（`/v1`、`/v1beta`、`/v2`、`/api-v1`…）则原样使用，否则补 `/v1`；`fetch_endpoints` 同时去掉重复候选，不再产生 `{base}/v1/v1/models` 这类无效回退。
+
+---
+
 ## [0.6.0] - 2026-10-06
 
 ### Added
+- **`/exit` 作为 `/quit` 的别名**：空闲与流式（busy）两条路径均可直接退出，行为与 `/quit` 完全一致（保存会话后退出）；
+  未加入补全菜单，与原 `/session`（`/sessions`）、`/models`（`/model`）别名一致。
 - **Provider 表单「高级设置」分组**：新增/编辑服务商时可直接填写
   `chat_endpoint`（自定义对话端点，留空默认 `{base_url}/chat/completions`）与
   `models_endpoint`（自定义模型列表端点，留空默认 `{base_url}/models`）。

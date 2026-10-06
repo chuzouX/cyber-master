@@ -9,7 +9,7 @@
 
 > 基于 Rust 的网络安全智能体终端：流式对话、CTF 协作与 MCP/Skill 工具集成。面向 CLI 与 TUI，无 Web Dashboard；DAG 工作流编排尚未实现。
 
-`cyber` 默认打开全屏简洁 coding CLI；`cyber tui` 打开原有全屏功能面板；`cyber setup` 配置模型；`cyber run` 执行非交互任务。CLI 与 TUI 共用现有 JSON 会话历史，headless 行为不变。
+`cyber` 默认打开全屏简洁 coding CLI；`cyber tui` 打开原有全屏功能面板；`cyber setup` 打开全屏设置向导；`cyber run` 执行非交互任务。CLI 与 TUI 共用现有 JSON 会话历史，headless 行为不变。
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -128,9 +128,9 @@ cargo build --release --locked
 
 ### 首次启动
 
-安装完成后，在项目目录运行 `cyber`。缺少可用配置时，首次交互启动会进入向导：选择 Provider、服务地址、凭据和模型，确认后保存到用户主目录的 `.cyber/`，随后进入对话。已有有效配置的用户无需重复设置。`cyber tui` 同样会先检查配置。
+安装完成后，在项目目录运行 `cyber`。缺少可用配置时，首次交互启动会直接进入全屏设置向导：默认落在「服务商管理」页并自动打开服务商预设向导，选择预设（DeepSeek / 硅基流动 / 百炼 / GLM / Kimi / OpenAI 等）或自定义协议后填写 API Key 与模型，按 `Ctrl+S` 保存到用户主目录的 `.cyber/`，再按 `Esc` 退出向导进入对话。已有有效配置的用户无需重复设置。`cyber tui` 同样会先检查配置。
 
-用 `cyber setup` 可主动重跑向导。凭据可引用环境变量或隐藏输入；直接输入的密钥保存在限制访问权限的全局 `providers.toml` 中。向导不启动 MCP、不测试网络连接；取消不会保存用户输入。`setup.toml` 单独记录完成状态，状态不会绕过配置有效性检查。`--mock` 无需真实模型凭据。
+`cyber setup` 随时可重跑同一套全屏向导（8 个分类：Agent 与模型、界面与交互、子任务并发、工具与 MCP、服务商管理、环境与记忆、系统与存储、工具库）。凭据可引用环境变量或隐藏输入；直接输入的密钥保存在限制访问权限的全局 `providers.toml` 中。向导本身不自动联网，服务商连通性需在服务商页按 `T` 主动测试。保存是两阶段原子提交：先写 `setup.toml` 的 `in_progress` 意图，再写 `providers.toml` / `config.toml`，最后标记 `completed = true`；配置无效时向导不允许退出，中断的状态也不会绕过启动时的配置有效性检查。自定义安全工具在向导第 8 页「工具库」或 CLI 的 `/toolbox` 命令中手动录入、编辑、删除，或用 `/toolbox scan` 让当前模型扫描本机工具并生成配置。`--mock` 无需真实模型凭据。
 
 全局路径默认是用户主目录下的 `.cyber/`，不是系统的 XDG / AppData 配置目录。可通过 `CYBER_HOME` 指定完整数据目录，用于便携安装或隔离运行。主要路径如下：
 
@@ -138,7 +138,7 @@ cargo build --release --locked
 ~/.cyber/
 ├── config.toml          # 全局配置（主题、模式、agent 参数）
 ├── providers.toml       # LLM 提供商配置
-├── setup.toml           # 配置向导完成状态
+├── setup.toml           # 设置向导完成/中断状态
 ├── mcp/servers.toml     # MCP server 配置
 ├── tools/               # 自定义工具 TOML
 ├── skills/              # Skill 目录（.md 文件）
@@ -309,7 +309,7 @@ rules:
 | --- | --- |
 | `cyber` | 全屏简洁 coding 界面，持续对话、流式输出 |
 | `cyber tui` | 原全屏 Ratatui 面板，含 CTF、设置及工作流/Dashboard 占位页 |
-| `cyber setup` | 运行或重跑配置向导 |
+| `cyber setup` | 打开全屏设置向导（服务商 / API Key / 模型 / 工具库，`Ctrl+S` 保存，`Esc` 完成） |
 | `cyber run "任务"` | 单次非交互任务，适用于脚本或外部 agent |
 
 当前可用示例：
@@ -319,14 +319,14 @@ cyber                                      # 默认交互 CLI
 cyber tui                                  # 全屏 TUI
 cyber --mock                               # 离线交互 CLI
 cyber tui --mock                           # 离线 TUI
-cyber setup                                # 配置模型
+cyber setup                                # 打开全屏设置向导
 cyber run "解释这个概念"                    # 非交互，流式文本输出
 cyber run "分析当前项目" --format json      # 结构化输出
 cyber run "继续上次任务" --session abc      # 续接指定会话
 cyber run --help                            # 查看 provider/model 等任务选项
 ```
 
-CLI 由 `cli_commands.rs` 处理 TUI 目录中除 `/mode` 外的 20 个主命令（包含 `/todo`），并增加 `/effort`，共 21 项，完整行为与子命令边界见 [命令参考](docs/TUI_COMMANDS.md)。`/effort low|medium|high|xhigh|auto` 保留 `middle` / `max` 别名，`medium` 对应内部 `Middle`，`xhigh` 对应 `Max`；`/think` 与 `/effort` 只改变系统提示词档位，不新增 provider API 的 `reasoning_effort` 参数。`/think`、`/max_steps`、`/subagents`、`/env` 和 `/web` 保存到全局配置的目标字段，不把合并后的项目覆盖整份写入全局；项目覆盖在重新加载时仍优先。`--cwd` 会验证并规范化目录；项目配置仍只在指定目录查找，不向父目录继承。
+CLI 由 `cli_commands.rs` 处理 TUI 目录中除 `/mode` 外的全部主命令（含 `/todo`、`/toolbox`），并增加 `/effort`，完整清单与子命令边界见 [命令参考](docs/TUI_COMMANDS.md)。`/effort low|medium|high|xhigh|auto` 保留 `middle` / `max` 别名，`medium` 对应内部 `Middle`，`xhigh` 对应 `Max`；`/think` 与 `/effort` 只改变系统提示词档位，不新增 provider API 的 `reasoning_effort` 参数。`/think`、`/max_steps`、`/subagents`、`/env` 和 `/web` 保存到全局配置的目标字段，不把合并后的项目覆盖整份写入全局；项目覆盖在重新加载时仍优先。`--cwd` 会验证并规范化目录；项目配置仍只在指定目录查找，不向父目录继承。
 
 ### CLI 界面与快捷键
 
@@ -355,7 +355,7 @@ provider · model │ [1/3] tasks │ ctx 剩余% │ cache 命中率 │ ↑inp
 
 **权限与当前限制：** CLI 在工具执行前询问；输入提示中的 `once <请求码>` 或 `session <请求码>` 才能授权，避免粘贴或预输入内容误批准。自动审批（Auto）模式已放行只读与安全探测命令（如 `cat`、`grep`、`cargo`、`git` 等）；会话授权（Session）对同一工具及已被授权的主干命令集合（如 `cargo` 等）或只读命令后续放行，避免仅因调整参数而反复弹窗。破坏性操作（如写入重定向、文件修改、未授权命令）仍要求确认。`cyber run` 不询问、默认拒绝所有工具；可重复传入 `--allow-tool <名称>` 显式授权指定工具，例如 `cyber run "列出文件" --allow-tool list_dir`。该授权允许目标工具的任意参数，不支持通配符，不绕过内置护栏；谨慎授权 `shell` 等工具。权限拒绝和任务错误均以非零退出码结束，JSON 包含失败结果。CLI 启动时默认按配置连接已配置的 MCP servers（若配置或网络异常则跳过并提示）。这不是系统级沙箱，批准操作后仍可能产生不可撤销的副作用。
 
-`cyber` / `cyber tui` 要求交互终端；脚本使用 `cyber run`。非交互命令不弹出向导，配置缺失时提示 `cyber setup`。当前全局选项：
+`cyber` / `cyber tui` 要求交互终端；脚本使用 `cyber run`。首次交互启动与 `cyber setup` 都会进入全屏设置向导；非交互命令不弹出向导，配置缺失时提示 `cyber setup`。当前全局选项：
 
 ```bash
 cyber [OPTIONS] [COMMAND]
@@ -395,7 +395,7 @@ Options:
 | `/effort [low\|medium\|high\|xhigh\|auto]` | CLI `/think` 别名，保留 middle/max |
 | `/new` | 新建会话 |
 | `/cancel` | 取消当前生成 |
-| `/quit` | 退出 |
+| `/quit` / `/exit` | 退出 |
 
 `/skill <name>` 和 `/sessions read <id|关键词>` 仅在 UI 展示 System 条目，不把说明正文或跨会话内容注入模型历史；模型获取 Skill 正文需调用 `skill_<name>` 工具。
 

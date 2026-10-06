@@ -2,7 +2,7 @@
 
 本页区分默认 `cyber` coding CLI 与 `cyber tui` 原 Chat 面板。CLI 依据 [cli_commands.rs](../crates/cyber-tui/src/cli_commands.rs) 的目录、补全和执行 handler，以及 [cli.rs](../crates/cyber-tui/src/cli.rs) / [headless.rs](../crates/cyber-tui/src/headless.rs) 的 UI 和任务处理核对；原 TUI 依据 [slash.rs](../crates/cyber-tui/src/slash.rs) / [app.rs](../crates/cyber-tui/src/app.rs)。目录、补全或帮助列出某参数，不等于所有参数组合均已实现。
 
-CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort`、`/bg` 共 22 项：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/bg`、`/quit`、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
+CLI 支持原 TUI 主命令目录中除 `/mode` 外的全部命令，并增加 `/effort`、`/bg`、`/toolbox`：`/help`、`/clear`、`/model`、`/provider`、`/subagents`、`/env`、`/web`、`/tools`、`/toolbox`、`/skill`、`/mcp`、`/cancel`、`/compact`、`/ctf`、`/max_steps`、`/think`、`/new`、`/sessions`、`/memory`、`/todo`、`/bg`、`/quit`（别名 `/exit`）、`/effort`。以下先列 CLI 已实现行为，再列原 TUI 的差异参考。
 
 ## CLI 输入与交互
 
@@ -19,14 +19,15 @@ CLI 支持原 TUI 20 个主命令中除 `/mode` 外的 19 项，加上 `/effort`
 | `/help` | 显示实际 CLI 目录；空输入 `?` 打开 shortcuts。 |
 | `/clear` | 清空并保存当前会话历史、重置 Usage，不删除全部会话。 |
 | `/cancel` | 取消当前 agent、compact、writeup 或连接任务；隔离旧事件并保存实际结果。任务中 Ctrl+C 同样 cancel；当前空闲且空输入时 Ctrl+C 会退出。 |
-| `/quit` | 保存会话并退出（无 Ctrl+D 快捷键）。 |
-| `/model [provider [model]]` | 无参数打开已配置 provider/model picker；带参数选择并持久化，不自动联网发现模型。 |
+| `/quit` / `/exit` | 保存会话并退出（无 Ctrl+D 快捷键）。 |
+| `/model [provider [model]]` | 无参数打开双栏 provider/model 面板：**打开与左栏 ↑/↓（或 j/k、滚轮）切换 provider 都只显示 `providers.toml` 的本地模型，不联网**；在左栏按 `Enter` 选定 provider 后才从接口拉取该 provider 的模型列表（`r` 可手动重取，`t` 对选中模型实测识图能力）；右栏 `Enter` 确认并持久化。带参数选择并持久化。 |
 | `/provider [list\|add\|edit name\|use name\|remove name]` | list 隐藏 endpoint/凭据；add/edit 打开表单，use 持久化选择，remove 直接删除并处理默认项回退，无二次删除确认。 |
 | `/subagents [status\|enable\|disable\|max_tasks N\|max_parallel N\|timeout N\|max_steps N]` | 查询或持久化 `[agent.subagents]`；数量、并发、超时和步数在后续 turn 生效，enable/disable 需重启以重建工具目录。所有数值必须为正整数。 |
 | `/env [list\|set KEY VALUE\|set-sensitive KEY VALUE\|remove KEY]` | 查询或持久化 `[env].vars`。value 可含空格；敏感值列表显示为 `<sensitive>`，补全只提供 key，不提供 value。 |
 | `/web [status\|on\|off\|enable\|disable]` | 查询或持久化 `[tools].web_search`；开启或禁用联网搜索与抓取（web_fetch），实时生效并持久化到配置。 |
 | `/tools` | 查询实际注册工具 schema，不执行工具，不把工具数据算成令牌 Usage。直接打开模式（coding CLI）下，工具调用、调用请求、Edit、Read、Downloading、Shell 等工具统一以轻量小卡片形式呈现，支持 Ctrl+O 展开/折叠。 |
 | `/skill [list\|name]` | 查询目录或显示正文；通知不入模型历史，模型须调用 `skill_<name>` 获取正文。 |
+| `/toolbox [list\|add\|edit name\|remove name\|scan [目录\|提示词] [--preview]]` | 自定义工具库（`~/.cyber/tools/*.toml`）。`list` 只读列出；`add`/`edit` 打开表单（`params` 语法 `名称\|r或o\|说明\|默认值`，分号分隔多个；`tags` 逗号分隔）；`remove` 直接删除文件；`scan` 让当前默认 Provider 分类本机已发现工具并写盘，`--preview` 只预览不写。工具注册表在启动时装配，因此保存/删除后需重启生效。原 TUI 面板只实现 `list`。 |
 | `/mcp [list\|status]` | 展示配置 server、transport 与 connected/not connected；查询不会连接。 |
 | `/mcp connect` | 重新连接配置的 MCP servers（若未在启动时连接或需重试）；显式任务须在 `Permission Required` 框批准才发起连接，deny 不启动。 |
 | `/compact [instructions]` | 真实模型摘要任务，成功后替换模型历史并持久化；空历史拒绝，失败/取消不提交排队摘要，不等于清屏。 |
@@ -77,7 +78,7 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 | `/help` | 在对话中显示 TUI 命令帮助；不是 CLI shortcuts 面板。帮助文本并不完整，子命令以本页核对结果为准。 |
 | `/clear` | 清空当前会话对话并保存，随后显示清空提示；生成中拒绝。不是删除所有会话。 |
 | `/mode <chat\|workflow\|dashboard>` | 切换视图；生成中拒绝。workflow/dashboard 目前仅占位页，不代表 DAG 执行或监控已可用。 |
-| `/model [provider]` | 无参数打开 provider/model 选择面板；带参数只切换已存在的 provider，沿用其配置模型。生成中拒绝，不支持 CLI 的 `/model provider model` 语法。 |
+| `/model [provider]` | 无参数打开双栏 provider/model 选择面板：打开与左栏 ↑/↓ 切换 provider 都只显示本地配置模型；左栏 `Enter` 选定后才从接口拉取，`r` 手动重取、`t` 实测识图；带参数只切换已存在的 provider，沿用其配置模型。生成中拒绝，不支持 CLI 的 `/model provider model` 语法。 |
 | `/provider [子命令]` | 列出、表单新增/编辑、设默认、删除 provider，详见下文；生成中拒绝。 |
 | `/subagents [status\|enable\|disable\|max_tasks N\|max_parallel N\|timeout N\|max_steps N]` | 查询或保存批量子 agent 配置；enable/disable 提示重启后更新工具目录。 |
 | `/env [list\|set KEY VALUE\|set-sensitive KEY VALUE\|remove KEY]` | 管理工具子进程环境变量。敏感值列表脱敏，`set-sensitive` 命令历史将 value 替换为 `<redacted>`。 |
@@ -93,7 +94,7 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 | `/new` | 保存当前并创建/切到新空会话；生成中拒绝。 |
 | `/sessions [子命令]` | 同 cwd 会话面板、跨会话内容展示或新建，详见下文；生成中拒绝。 |
 | `/memory [子命令]` | 查看或写入全局/项目记忆，支持 edit/delete，详见下文。目录/补全/帮助中的 `rule` 没有 handler，不可用。 |
-| `/quit` | 保存历史并退出 TUI。 |
+| `/quit` / `/exit` | 保存历史并退出 TUI。 |
 
 ## 原 TUI Provider 子命令
 
@@ -107,7 +108,9 @@ CLI writeup 当前保存到 `<cwd>/.cyber/ctf/sessions/<sessionid>/<challengeid>
 
 子命令大小写不敏感，provider 名称按实际配置精确匹配。`/model provider` 是当前运行切换；需保存默认配置时使用 `/provider use provider`。
 
-表单字段按顺序为 `name`、`kind`、`endpoint`、`apikey`、`model`、`maxtokens`、`temperature`、`context_length`，以及「高级设置 高级选项」分组下的 `chat_endpoint`（自定义对话端点，留空默认 `{base_url}/chat/completions`）与 `models_endpoint`（自定义模型列表端点，留空默认 `{base_url}/models`）。两个端点字段留空即回退默认并删除已有覆盖值。
+表单字段按顺序为 `name`、`kind`、`endpoint`、`apikey`、`model`、`maxtokens`、`temperature`、`context_length`，以及「高级设置 高级选项」分组下的 `chat_endpoint`（自定义对话端点，留空默认 `{base_url}/chat/completions`）、`models_endpoint`（自定义模型列表端点，留空默认 `{base_url}/models`）、`thinking_type`（`thinking.type`：未设置 / enabled / disabled）与 `thinking_effort`（`thinking.effort`：未设置 / low / medium / high）。两个端点字段留空即回退默认并删除已有覆盖值；两个 thinking 字段留空即不下发任何思考参数（与旧行为一致），`enabled` 时按协议下发 `thinking` / `reasoning_effort` / `reasoning.effort` / ollama `think`（详见 `docs/DESIGN.md` §9.5）。
+
+`model` 字段为**选择式**：光标在该行按 `Enter`（或空格）时，若无缓存列表则先拉取 `{base_url}/models`，成功后弹出模型列表面板（每行附 `◈ 视觉` / `◈ 推理` 能力标签，来源为显式 model 配置 → 实测缓存 → 名称规则表）。面板内 `↑/↓` 选择、`Enter` 确认、`m`/`f` 手输模型名、`r` 重新拉取、`t` 实测推理能力、`v` 实测视觉能力、`Esc` 仅关闭模型面板（Provider 表单保持在原地，需再按一次 `Esc` 才关闭表单）；拉取失败或返回空列表时自动切到手输兜底模式（`model` 恢复可编辑，`Enter` 退出）。`t`/`v` 为真实最小请求探针，只写能力缓存，不落盘 `providers.toml`。
 
 ## 原 TUI CTF 子命令
 
