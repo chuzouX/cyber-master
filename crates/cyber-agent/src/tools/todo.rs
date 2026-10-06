@@ -47,6 +47,38 @@ impl TodoTool {
         (max_numeric + 1).to_string()
     }
 
+    /// 依据当前清单状态生成一行「下一步动作」提示。
+    ///
+    /// 追加在变更类操作（add/update/remove）的结果尾部：每次改动清单都会把下一步该做什么
+    /// 直接回喂给模型，形成实时更新的闭环，避免「建完清单就停在原地」。
+    fn next_step_hint(items: &[TodoItem]) -> String {
+        if items.is_empty() {
+            return String::new();
+        }
+        if let Some(item) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
+            return format!(
+                "下一步：完成 #{} 后立即 update 为 completed（可在 notes 记录关键结论），再进行下一项。",
+                item.id
+            );
+        }
+        let failed = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Failed)
+            .count();
+        if failed > 0 {
+            return format!(
+                "注意：有 {failed} 项失败——请在 notes 写明原因，或 update 该步重新尝试其它方案，必要时 add 补充新步骤。"
+            );
+        }
+        if let Some(item) = items.iter().find(|i| i.status == TodoStatus::Pending) {
+            return format!(
+                "下一步：update #{} 为 in_progress，然后在同一响应里执行该步骤的工具调用。",
+                item.id
+            );
+        }
+        "所有任务均已完成：如实汇报结果，不要为了汇报而反复 list。".to_string()
+    }
+
     /// 格式化 Todo 任务列表与统计。
     pub fn format_todos(items: &[TodoItem]) -> String {
         if items.is_empty() {
@@ -101,7 +133,7 @@ impl Tool for TodoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "todo".into(),
-            description: "结构化任务清单管理工具。用于多步骤任务规划、状态跟踪与进度展示。执行多步骤任务前请先添加计划清单，开始子任务时更新为 in_progress，完成后更新为 completed，遇到卡点更新为 failed。".into(),
+            description: "结构化任务清单管理工具（善用并实时更新状态）。触发时机：任务可拆成 3 个以上有序步骤、需要跨多轮工具调用、需要逐项验证或用户要求分步执行时，先用 action=\"add\" 一次性写入完整步骤清单。触发后必须实时同步：开始某步前先 update 该步为 in_progress（同时只允许一个），该步验证通过后立即 update 为 completed（可与其它工具调用在同一批发出，notes 记录关键结论），卡住则 update 为 failed 并在 notes 写明原因、再 add 补充新步骤。清单已实时显示在用户界面上，不要为了汇报进度反复 list。".into(),
             tags: vec!["task".into(), "planning".into()],
             parameters: json!({
                 "type": "object",
@@ -122,11 +154,11 @@ impl Tool for TodoTool {
                     "status": {
                         "type": "string",
                         "enum": ["pending", "in_progress", "completed", "failed"],
-                        "description": "任务状态：pending 未开始，in_progress 进行中，completed 已完成，failed 失败"
+                        "description": "任务状态：pending 未开始，in_progress 进行中（同时只允许一个），completed 已完成（必须已验证），failed 失败（须在 notes 写明原因）"
                     },
                     "notes": {
                         "type": "string",
-                        "description": "任务补充说明、卡点原因或执行备注"
+                        "description": "任务补充说明、卡点原因或已完成步骤的关键结论与证据（命令、路径、结论）"
                     },
                     "items": {
                         "type": "array",
@@ -264,8 +296,11 @@ impl Tool for TodoTool {
                     }
 
                     let formatted = Self::format_todos(&list);
+                    let hint = Self::next_step_hint(&list);
                     Ok(ToolOutput {
-                        content: format!("已成功添加 {added_count} 项任务。\n\n{formatted}"),
+                        content: format!(
+                            "已成功添加 {added_count} 项任务。\n\n{formatted}\n\n{hint}"
+                        ),
                         is_error: false,
                     })
                 }
@@ -312,8 +347,9 @@ impl Tool for TodoTool {
                     }
 
                     let formatted = Self::format_todos(&list);
+                    let hint = Self::next_step_hint(&list);
                     Ok(ToolOutput {
-                        content: format!("任务 #{id} 已更新。\n\n{formatted}"),
+                        content: format!("任务 #{id} 已更新。\n\n{formatted}\n\n{hint}"),
                         is_error: false,
                     })
                 }
@@ -339,8 +375,9 @@ impl Tool for TodoTool {
                     }
 
                     let formatted = Self::format_todos(&list);
+                    let hint = Self::next_step_hint(&list);
                     Ok(ToolOutput {
-                        content: format!("任务 #{id} 已删除。\n\n{formatted}"),
+                        content: format!("任务 #{id} 已删除。\n\n{formatted}\n\n{hint}"),
                         is_error: false,
                     })
                 }
@@ -521,5 +558,93 @@ mod tests {
 
         let guard = items.lock().unwrap();
         assert!(guard.is_empty());
+    }
+
+    #[test]
+    fn next_step_hint_points_at_the_next_action() {
+        let pending = vec![
+            TodoItem::new("1", "a", TodoStatus::Completed),
+            TodoItem::new("2", "b", TodoStatus::Pending),
+        ];
+        let hint = TodoTool::next_step_hint(&pending);
+        assert!(hint.contains("update #2 为 in_progress"), "{hint}");
+
+        let running = vec![
+            TodoItem::new("1", "a", TodoStatus::Completed),
+            TodoItem::new("2", "b", TodoStatus::InProgress),
+        ];
+        let hint = TodoTool::next_step_hint(&running);
+        assert!(
+            hint.contains("完成 #2 后立即 update 为 completed"),
+            "{hint}"
+        );
+
+        let failed = vec![
+            TodoItem::new("1", "a", TodoStatus::Failed),
+            TodoItem::new("2", "b", TodoStatus::Pending),
+        ];
+        let hint = TodoTool::next_step_hint(&failed);
+        assert!(hint.contains("1 项失败"), "{hint}");
+
+        let done = vec![TodoItem::new("1", "a", TodoStatus::Completed)];
+        assert!(TodoTool::next_step_hint(&done).contains("所有任务均已完成"));
+        assert!(TodoTool::next_step_hint(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_todo_tool_result_carries_next_step_hint() {
+        let (tool, _items) = setup_tool();
+        let ctx = ToolCtx::new(std::path::PathBuf::from("."), Vec::new(), None, Vec::new());
+
+        let added = tool
+            .run(
+                json!({
+                    "action": "add",
+                    "items": [{"title": "step one"}, {"title": "step two"}]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            added.content.contains("下一步：update #1 为 in_progress"),
+            "{}",
+            added.content
+        );
+
+        let started = tool
+            .run(
+                json!({"action": "update", "id": "1", "status": "in_progress"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started
+                .content
+                .contains("完成 #1 后立即 update 为 completed"),
+            "{}",
+            started.content
+        );
+
+        // list 只回清单本身，不附带推进提示（避免被当成催促而反复 list）
+        let listed = tool.run(json!({"action": "list"}), &ctx).await.unwrap();
+        assert!(!listed.content.contains("下一步："), "{}", listed.content);
+    }
+
+    #[test]
+    fn todo_tool_schema_requires_realtime_updates() {
+        let description = TodoTool::default().schema().description;
+        assert!(description.contains("善用"), "{description}");
+        assert!(description.contains("实时更新"), "{description}");
+        assert!(description.contains("3 个以上有序步骤"), "{description}");
+        assert!(
+            description.contains("验证通过后立即 update 为 completed"),
+            "{description}"
+        );
+        assert!(
+            description.contains("不要为了汇报进度反复 list"),
+            "{description}"
+        );
     }
 }
