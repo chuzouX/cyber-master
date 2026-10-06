@@ -426,6 +426,35 @@ mod tests {
         }
     }
 
+    /// `install.ps1` 会在用户**自己的** PowerShell 会话里执行（`irm ... | iex`），此时 `exit`
+    /// 直接结束宿主进程 —— 现象是「脚本跑完终端窗口自己关了」（命中「已是最新版本」或
+    /// 「已取消更新」分支时尤其明显）。正常/取消退出用 `return`（退出码 0），致命错误用
+    /// `throw`（退出码 1，与旧的 `exit 1` 一致）。注释里提到 `exit` 不算违规。
+    #[test]
+    fn install_ps1_never_exits_the_host_session() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("cyber-core 位于 <repo>/crates/cyber-core")
+            .join("install.ps1");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("无法读取 {}: {e}", path.display()));
+        for (idx, line) in text.lines().enumerate() {
+            let code = line.split('#').next().unwrap_or("");
+            for token in
+                code.split(|c: char| c.is_whitespace() || matches!(c, ';' | '(' | ')' | '{' | '}'))
+            {
+                assert_ne!(
+                    token,
+                    "exit",
+                    "install.ps1:{} 出现 exit：脚本经 `irm ... | iex` 在用户会话内执行，\
+                     exit 会直接关掉宿主终端；正常退出请用 return，致命错误请用 throw",
+                    idx + 1
+                );
+            }
+        }
+    }
+
     #[test]
     fn parse_version_handles_standard_and_prefixed() {
         assert_eq!(parse_version("0.4.2"), Some((0, 4, 2)));

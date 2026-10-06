@@ -13,6 +13,11 @@
 #     甚至解析失败），故本地执行请用上面 `Get-Content -Raw -Encoding UTF8` 的形式；
 #     PowerShell 7 的 `-File` 默认按 UTF-8 解码，不受影响。
 #
+# 注意：脚本内**禁止使用 `exit`**（含 `exit 0` / `exit 1`）。`irm ... | iex` 是在用户
+#   自己的 PowerShell 会话里执行本脚本，`exit` 会直接结束宿主进程 —— 表现为「脚本跑完
+#   终端窗口自己关了」（例如命中「已是最新版本」或「已取消更新」分支时）。
+#   正常/取消退出用 `return`（退出码 0），致命错误用 `throw`（退出码 1，与旧行为一致）。
+#
 # 高级用法：
 #   $env:CYBER_VERSION='v0.1.0'; irm https://raw.githubusercontent.com/.../install.ps1 | iex
 #   irm https://raw.githubusercontent.com/.../install.ps1 | iex  # 默认装到 %USERPROFILE%\.local\bin
@@ -92,8 +97,9 @@ if (-not $Version) {
         }
     }
     if (-not $Version) {
-        Write-Error "无法获取最新版本。请设置 `$env:CYBER_VERSION 显式指定版本 tag。"
-        exit 1
+        # 一律用 throw / return，禁止 exit：本脚本常经 `irm ... | iex` 在用户自己的
+        # PowerShell 会话里执行，`exit` 会直接结束宿主进程（终端窗口随之关闭）。
+        throw "无法获取最新版本。请设置 `$env:CYBER_VERSION 显式指定版本 tag。"
     }
 }
 
@@ -152,19 +158,19 @@ if ($installedPath) {
         Write-Host "→ CYBER_FORCE 已启用：跳过版本检查与询问，直接下载并覆盖安装。" -ForegroundColor Cyan
     } elseif (-not $installedVersion) {
         if (-not (Confirm-CyberUpdate "无法确定已安装版本，是否覆盖安装 $Version？[Y/n]")) {
-            Write-Host '已取消更新。'; exit 0
+            Write-Host '已取消更新。'; return
         }
     } elseif ((Compare-CyberVersion $installedVersion $Version) -eq 0) {
         Write-Host "✓ 已是最新版本（$installedVersion），无需更新。" -ForegroundColor Green
         Write-Host '  如需强制覆盖安装，请运行: cyber update --force' -ForegroundColor DarkGray
-        exit 0
+        return
     } elseif ((Compare-CyberVersion $installedVersion $Version) -lt 0) {
         if (-not (Confirm-CyberUpdate "是否更新到最新版本 $Version？[Y/n]")) {
-            Write-Host '已取消更新。'; exit 0
+            Write-Host '已取消更新。'; return
         }
     } else {
         if (-not (Confirm-CyberUpdate "已安装版本 $installedVersion 高于目标版本 $Version，是否覆盖安装？[Y/n]")) {
-            Write-Host '已取消更新。'; exit 0
+            Write-Host '已取消更新。'; return
         }
     }
 } else {
