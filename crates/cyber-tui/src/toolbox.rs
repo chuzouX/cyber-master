@@ -8,7 +8,9 @@
 //! 已存在的记入 `skipped_existing` 不覆盖，需人工的记入 `manual` 只汇报；
 //! `preview` 模式一个都不写。
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use color_eyre::eyre::{bail, Result};
 use cyber_core::{CustomToolConfig, CustomToolParam, ProviderConfig};
@@ -145,6 +147,8 @@ const TOOL_CLASSIFICATION_SYSTEM_PROMPT: &str = "\
 2. can_agent_use = false：所有 GUI 图形视窗程序（如 Goby, Burp Suite, Wireshark, Postman）、所有持续交互式控制台（如 msfconsole, 交互式 shell/gdb）、或缺少非交互模式必须人工界面的工具。\n\
    - reason: 详细说明不可作为 Agent 工具的具体原因（如\"图形化界面软件(GUI)，无头子进程调用会导致永久阻塞\"或\"交互式控制台，直接执行会导致进程挂起\"）。\n\
    - manual_advice: 提供针对安全人员的人工操作与协作建议（如\"适合在安全人员桌面独立视窗中运行，不应加入 Agent 工具表\"）。\n\
+3. command 必须以清单中给出的「执行命令」（可执行文件绝对路径，或 `python <路径>` / `java -jar <路径>`）\n\
+   **原样开头**，只允许在其后追加参数与 {param} 占位符；禁止改写成 Windows 路径或换用其它解释器。\n\
 \n\
 输出格式要求：\n\
 请务必输出为一个 ```toml 代码块，格式示例如下：\n\
@@ -174,6 +178,43 @@ description = \"图形化网络资产梳理与漏洞探测平台\"\n\
 manual_advice = \"适合安全人员在本地桌面独立视窗中运行，不应封装为 Agent 自动化工具\"\n\
 ```\n\
 严禁输出任何多余的解释、前言或总结文字，只输出 ```toml ... ```。";
+
+/// 目录扫描候选数超过该值时，先用一次纯名单模型调用分诊安全工具。
+const TRIAGE_THRESHOLD: usize = 40;
+/// 送入分诊的名字上限（超出按名称排序取前 N 个并通知）。
+const MAX_TRIAGE_NAMES: usize = 1200;
+/// 分诊不可用（调用失败/空结果）时的候选上限。
+const TRIAGE_FALLBACK_MAX: usize = 240;
+/// 分诊最多保留条数（写进 prompt，模型据此排序取前 N）。
+const TRIAGE_KEEP_MAX: usize = 150;
+
+/// 分诊系统提示词（尾部条数由 [`tool_triage_system_prompt`] 注入）。
+const TOOL_TRIAGE_SYSTEM_PROMPT: &str = "\
+你是网络安全工具编目专家。\n\
+用户会给出一台主机上某个目录里的可执行文件名清单（只有文件名，没有帮助文档）。\n\
+请挑出【值得作为 Agent 自动化工具候选】的名字：属于网络侦察、漏洞扫描与利用、Web 安全、口令破解、\n\
+无线与内网渗透、取证与逆向、隐写与密码学分析范畴，且存在非交互命令行用法。\n\
+\n\
+必须排除：通用系统与构建工具（coreutils/util-linux/busybox、包管理、编译器、shell、编辑器、\n\
+文本处理、压缩归档、字体与图形库、语言运行时本身）、GUI 图形程序（如 burpsuite、wireshark、ghidra）、\n\
+纯交互式控制台、以及明显与安全无关的服务与守护进程。\n\
+\n\
+输出要求：只输出一个 ```toml 代码块，不要任何解释文字：\n\
+```toml\n\
+[[keep]]\n\
+name = \"nmap\"\n\
+reason = \"端口/服务扫描，纯命令行非交互\"\n\
+[[keep]]\n\
+name = \"sqlmap\"\n\
+reason = \"SQL 注入自动化，--batch 非交互\"\n\
+```\n\
+规则：1) name 必须逐字取自用户给出的清单，禁止发明清单外的名字；2) 只保留有把握的条目，不确定的不要输出；\n\
+3) 最多输出 ";
+
+/// 完整分诊提示词（注入保留条数上限）。
+fn tool_triage_system_prompt() -> String {
+    format!("{TOOL_TRIAGE_SYSTEM_PROMPT}{TRIAGE_KEEP_MAX} 条，按重要性从高到低。")
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct RawAiToolItem {
@@ -329,6 +370,63 @@ fn extract_all_toml_blocks(content: &str) -> Vec<String> {
     blocks
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RawKeepItem {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    reason: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RawKeepBatch {
+    #[serde(default)]
+    keep: Vec<RawKeepItem>,
+}
+
+/// 分诊回复 → 保留的名字（复用 `extract_all_toml_blocks`；trim、按小写去重、保序）。
+fn parse_keep_names(reply: &str) -> Vec<String> {
+    let blocks = extract_all_toml_blocks(reply);
+    let sources = if blocks.is_empty() {
+        vec![reply.to_string()]
+    } else {
+        blocks
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for source in sources {
+        let Ok(batch) = toml::from_str::<RawKeepBatch>(&source) else {
+            continue;
+        };
+        for item in batch.keep {
+            let name = item.name.trim().to_string();
+            if name.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+                continue;
+            }
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// 候选 ∩ 保留名（大小写不敏感，保留候选原顺序）；保留集为空 → 原样返回候选。
+fn filter_kept(candidates: &[DiscoveredCandidate], kept: &[String]) -> Vec<DiscoveredCandidate> {
+    if kept.is_empty() {
+        return candidates.to_vec();
+    }
+    let kept_lower: Vec<String> = kept.iter().map(|name| name.to_ascii_lowercase()).collect();
+    candidates
+        .iter()
+        .filter(|candidate| {
+            let lower = candidate.name.to_ascii_lowercase();
+            kept_lower.contains(&lower)
+        })
+        .cloned()
+        .collect()
+}
+
 fn run_command_with_timeout(
     mut command: std::process::Command,
     timeout: std::time::Duration,
@@ -337,6 +435,13 @@ fn run_command_with_timeout(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    // 探测 GUI 工具的 -h/--help 时不得在用户桌面上弹窗：清掉显示相关环境变量，
+    // 让 GTK/Qt 程序直接以“无法连接显示”退出（仍受 2.5s 超时兜底）。
+    #[cfg(unix)]
+    {
+        command.env_remove("DISPLAY");
+        command.env_remove("WAYLAND_DISPLAY");
+    }
     let mut child = command.spawn().ok()?;
     let start = std::time::Instant::now();
     loop {
@@ -373,8 +478,22 @@ fn run_command_with_timeout(
 }
 
 fn find_installed_binary(name: &str) -> Option<String> {
-    let cmd = if cfg!(windows) { "where" } else { "which" };
-    if let Ok(output) = std::process::Command::new(cmd).arg(name).output() {
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("where");
+        command.arg(name);
+        command
+    } else {
+        // POSIX 等价：`command -v` 是 shell 内建，不依赖 which 是否安装。
+        // 名字经 `$1` 传入，避免字符串拼接注入。
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("command -v \"$1\"")
+            .arg("sh")
+            .arg(name);
+        command
+    };
+    if let Ok(output) = command.output() {
         if output.status.success() {
             let out_str = String::from_utf8_lossy(&output.stdout);
             let first_line = out_str.lines().next().unwrap_or(name).trim();
@@ -384,6 +503,206 @@ fn find_installed_binary(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 跨平台常见安全工具（PATH 解析用；Kali 菜单编目之外的第二来源）。
+const COMMON_SECURITY_TOOLS: &[&str] = &[
+    "nmap",
+    "masscan",
+    "rustscan",
+    "naabu",
+    "httpx",
+    "nuclei",
+    "subfinder",
+    "amass",
+    "dnsx",
+    "katana",
+    "ffuf",
+    "gobuster",
+    "dirb",
+    "dirsearch",
+    "feroxbuster",
+    "wfuzz",
+    "nikto",
+    "whatweb",
+    "wpscan",
+    "joomscan",
+    "sqlmap",
+    "commix",
+    "hydra",
+    "medusa",
+    "patator",
+    "ncrack",
+    "john",
+    "hashcat",
+    "hashid",
+    "searchsploit",
+    "msfconsole",
+    "responder",
+    "netexec",
+    "crackmapexec",
+    "smbmap",
+    "smbclient",
+    "enum4linux",
+    "enum4linux-ng",
+    "kerbrute",
+    "ldapsearch",
+    "bloodhound-python",
+    "tcpdump",
+    "tshark",
+    "bettercap",
+    "aircrack-ng",
+    "wifite",
+    "reaver",
+    "binwalk",
+    "foremost",
+    "exiftool",
+    "steghide",
+    "zsteg",
+    "stegseek",
+    "fcrackzip",
+    "pdfcrack",
+    "radare2",
+    "rizin",
+    "objdump",
+    "readelf",
+    "strings",
+];
+
+/// `.desktop` 内容 → 工具名（首个 `Name=`；忽略 `Name[xx]=` 本地化变体、注释行与其它键）。
+fn desktop_name(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let value = line.trim_end().strip_prefix("Name=")?.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+/// 目录里 `.desktop` 的工具名清单；`prefix` 为文件名前缀过滤（`None` = 全部 `*.desktop`）。
+fn desktop_menu_names(dir: &Path, prefix: Option<&str>) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".desktop") {
+            continue;
+        }
+        if let Some(prefix) = prefix {
+            if !file_name.starts_with(prefix) {
+                continue;
+            }
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(name) = desktop_name(&contents) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Kali 菜单名字：`(dir, prefix)` 列表 → 去重（大小写不敏感）→ 仅保留 `[A-Za-z0-9_-]+` → 按名排序。
+///
+/// 字符集过滤是刻意的：菜单里混有 `BackTrack Mode`、`clang++`、`0trace.sh` 一类名字，
+/// 它们既不是可执行名（会污染 `command -v` 与工具库文件名），也不该进 tools.toml。
+fn kali_menu_names_from(dirs: &[(PathBuf, Option<&str>)]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (dir, prefix) in dirs {
+        for name in desktop_menu_names(dir, *prefix) {
+            let lower = name.to_ascii_lowercase();
+            if names
+                .iter()
+                .any(|known| known.to_ascii_lowercase() == lower)
+            {
+                continue;
+            }
+            if !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                continue;
+            }
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
+/// 本机 Kali 菜单目录（Unix；非 Unix 返回空）。
+fn kali_menu_dirs() -> Vec<(PathBuf, Option<&'static str>)> {
+    #[cfg(unix)]
+    {
+        vec![
+            (PathBuf::from("/usr/share/applications"), Some("kali-")),
+            (PathBuf::from("/usr/share/kali-menu/applications"), None),
+        ]
+    }
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
+}
+
+/// 无目标扫描的候选：Kali 菜单编目与常见清单**叠加**（编目在容器里可能只解析出少数几个），
+/// 名字去重（大小写不敏感）后逐个 `command -v` 解析；Windows 另加预设目录扫描。
+fn default_candidates() -> Vec<DiscoveredCandidate> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // 非 Unix 上 `kali_menu_dirs()` 为空，编目段自然无候选，仅靠常见清单兜底。
+    for name in kali_menu_names_from(&kali_menu_dirs()) {
+        if seen.insert(name.to_ascii_lowercase()) {
+            names.push(name);
+        }
+    }
+    for name in COMMON_SECURITY_TOOLS {
+        if seen.insert(name.to_ascii_lowercase()) {
+            names.push((*name).to_string());
+        }
+    }
+
+    let mut candidates: Vec<DiscoveredCandidate> = Vec::new();
+    for name in names {
+        if let Some(binary) = find_installed_binary(&name) {
+            candidates.push(DiscoveredCandidate {
+                name,
+                command: binary,
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    for common_dir in [
+        "D:\\tools",
+        "C:\\tools",
+        "D:\\SecTools",
+        "C:\\SecTools",
+        "D:\\Program Files (x86)\\Nmap",
+    ] {
+        let dir = Path::new(common_dir);
+        if dir.is_dir() {
+            for candidate in scan_directory_for_candidates(dir) {
+                if !candidates
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&candidate.name))
+                {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    candidates
 }
 
 fn fetch_tool_help(name: &str) -> Option<String> {
@@ -451,6 +770,54 @@ struct DiscoveredCandidate {
     command: String,
 }
 
+/// 目录扫描的候选文件判定：脚本或本机可执行程序，排除普通数据文件。
+///
+/// Windows：扩展名白名单 `exe/bat/cmd/sh/py/jar`。
+/// Unix：扩展名命中白名单 **或** 常规文件带任一执行位（`0o111`）——Kali 的
+/// `/usr/bin` 里绝大多数是**无扩展名** ELF，只认扩展名会全部漏掉。
+fn is_tool_binary(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        if ["exe", "bat", "cmd", "sh", "py", "jar"].contains(&ext.to_ascii_lowercase().as_str()) {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = path.metadata() {
+            return metadata.permissions().mode() & 0o111 != 0;
+        }
+    }
+    false
+}
+
+/// 候选的执行命令：`.py` / `.jar` 走解释器，其余（含无扩展名的 ELF）直呼绝对路径。
+fn candidate_command(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "py" {
+        format!("python \"{}\"", path.display())
+    } else if ext == "jar" {
+        format!("java -jar \"{}\"", path.display())
+    } else {
+        format!("\"{}\"", path.display())
+    }
+}
+
+/// 候选名字：文件主名（无扩展名时为整个文件名）。
+fn candidate_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tool")
+        .to_string()
+}
+
 fn scan_directory_for_candidates(dir: &Path) -> Vec<DiscoveredCandidate> {
     let mut candidates = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -460,23 +827,11 @@ fn scan_directory_for_candidates(dir: &Path) -> Vec<DiscoveredCandidate> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                let ext_lower = ext.to_ascii_lowercase();
-                if ["exe", "bat", "cmd", "sh", "py", "jar"].contains(&ext_lower.as_str()) {
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("tool")
-                        .to_string();
-                    let command = if ext_lower == "py" {
-                        format!("python \"{}\"", path.display())
-                    } else if ext_lower == "jar" {
-                        format!("java -jar \"{}\"", path.display())
-                    } else {
-                        format!("\"{}\"", path.display())
-                    };
-                    candidates.push(DiscoveredCandidate { name, command });
-                }
+            if is_tool_binary(&path) {
+                candidates.push(DiscoveredCandidate {
+                    name: candidate_name(&path),
+                    command: candidate_command(&path),
+                });
             }
         } else if path.is_dir() {
             let folder_name = path
@@ -487,29 +842,16 @@ fn scan_directory_for_candidates(dir: &Path) -> Vec<DiscoveredCandidate> {
             if let Ok(sub_entries) = std::fs::read_dir(&path) {
                 for sub in sub_entries.flatten() {
                     let sub_path = sub.path();
-                    if sub_path.is_file() {
-                        let stem = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                        let ext = sub_path
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if (stem.eq_ignore_ascii_case(&folder_name)
-                            || stem == "main"
-                            || stem == "run")
-                            && ["py", "exe", "jar", "bat", "sh"].contains(&ext.as_str())
-                        {
-                            let name = folder_name.clone();
-                            let command = if ext == "py" {
-                                format!("python \"{}\"", sub_path.display())
-                            } else if ext == "jar" {
-                                format!("java -jar \"{}\"", sub_path.display())
-                            } else {
-                                format!("\"{}\"", sub_path.display())
-                            };
-                            candidates.push(DiscoveredCandidate { name, command });
-                            break;
-                        }
+                    if !is_tool_binary(&sub_path) {
+                        continue;
+                    }
+                    let stem = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if stem.eq_ignore_ascii_case(&folder_name) || stem == "main" || stem == "run" {
+                        candidates.push(DiscoveredCandidate {
+                            name: folder_name.clone(),
+                            command: candidate_command(&sub_path),
+                        });
+                        break;
                     }
                 }
             }
@@ -519,26 +861,76 @@ fn scan_directory_for_candidates(dir: &Path) -> Vec<DiscoveredCandidate> {
     candidates
 }
 
+/// 按连续分块切给 `workers` 个线程执行 `f(index, item)`，返回与 `items` 同序的结果。
+/// `workers == 0` 视为 1；空输入返回空 Vec。
+fn parallel_map<T, R, F>(items: &[T], workers: usize, f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(usize, &T) -> R + Sync,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let workers = workers.max(1).min(items.len());
+    let per_chunk = items.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(per_chunk)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let f = &f;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, item)| f(chunk_index * per_chunk + offset, item))
+                        .collect::<Vec<R>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// 探测进度通知间隔：约 20 条（最少 1）。
+fn probe_notice_step(total: usize) -> usize {
+    (total / 20).max(1)
+}
+
+/// `--help` 采集并行度（每候选最长 2 × 2.5s，串行在 200 候选时会拖到数分钟）。
+const PROBE_WORKERS: usize = 8;
+
 fn fetch_candidates_help(
     candidates: &[DiscoveredCandidate],
-    notify: &mut dyn FnMut(String),
+    notify: &(dyn Fn(String) + Sync),
 ) -> Vec<(String, String, Option<String>)> {
-    let mut results = Vec::with_capacity(candidates.len());
     let total = candidates.len();
     if total == 0 {
         notify("探测 --help: 无候选工具".into());
-        return results;
+        return Vec::new();
     }
-    for (index, candidate) in candidates.iter().enumerate() {
-        notify(format!(
-            "探测 --help: {} ({}/{})",
-            candidate.name,
-            index + 1,
-            total
-        ));
+    notify(format!(
+        "探测 --help: 0/{total}（{PROBE_WORKERS} 线程并行）"
+    ));
+    let step = probe_notice_step(total);
+    let done = AtomicUsize::new(0);
+    let results = parallel_map(candidates, PROBE_WORKERS, |_index, candidate| {
         let help = run_help_for_command(&candidate.command, &candidate.name);
-        results.push((candidate.name.clone(), candidate.command.clone(), help));
-    }
+        let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if finished.is_multiple_of(step) || finished == total {
+            notify(format!(
+                "探测 --help: {finished}/{total}（最近：{}）",
+                candidate.name
+            ));
+        }
+        (candidate.name.clone(), candidate.command.clone(), help)
+    });
+    let hit = results.iter().filter(|(_, _, help)| help.is_some()).count();
+    notify(format!("探测完成：{total} 个候选，{hit} 个拿到帮助文本"));
     results
 }
 
@@ -647,7 +1039,6 @@ async fn evaluate_tools_with_ai(
             );
         }
     }
-    notify(events, "调用模型分类…");
     let reply = ask_llm_cancellable(
         cfg,
         TOOL_CLASSIFICATION_SYSTEM_PROMPT,
@@ -657,6 +1048,101 @@ async fn evaluate_tools_with_ai(
     )
     .await?;
     Ok(parse_analyzed_tools(&reply))
+}
+
+/// 扫描是否已被用户取消/调用方已断开（供分诊失败后的回退判定）。
+fn scan_cancel_requested(
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    cancel: &mut oneshot::Receiver<()>,
+) -> bool {
+    events.is_closed() || cancel.try_recv().is_ok()
+}
+
+/// 分诊不可用时的回退：按名称排序后取前 [`TRIAGE_FALLBACK_MAX`] 个候选。
+fn triage_fallback(
+    candidates: Vec<DiscoveredCandidate>,
+    reason: &str,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> Vec<DiscoveredCandidate> {
+    notify(
+        events,
+        format!("分诊不可用（{reason}），改为按名称取前 {TRIAGE_FALLBACK_MAX} 个候选"),
+    );
+    let mut candidates = candidates;
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    candidates.truncate(TRIAGE_FALLBACK_MAX);
+    candidates
+}
+
+/// 目录候选分诊：候选 ≤ [`TRIAGE_THRESHOLD`] 直接返回；否则一次纯名单模型调用后过滤。
+///
+/// 取消（oneshot 已触发或事件通道关闭）→ `Err("已取消工具扫描")` 向上传播；
+/// 其余失败/空结果 → 通知原因并退回按名排序的前 [`TRIAGE_FALLBACK_MAX`] 个候选。
+async fn triage_candidates(
+    cfg: &ProviderConfig,
+    dir_label: &str,
+    candidates: Vec<DiscoveredCandidate>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<Vec<DiscoveredCandidate>> {
+    let total = candidates.len();
+    if total <= TRIAGE_THRESHOLD {
+        return Ok(candidates);
+    }
+
+    let mut names: Vec<String> = candidates.iter().map(|c| c.name.clone()).collect();
+    names.sort();
+    if names.len() > MAX_TRIAGE_NAMES {
+        notify(
+            events,
+            format!("分诊名单超长：只送前 {MAX_TRIAGE_NAMES} 个名字（候选共 {total}）"),
+        );
+        names.truncate(MAX_TRIAGE_NAMES);
+    }
+    notify(
+        events,
+        format!("AI 分诊中：候选 {total} 个（送入 {} 个名字）…", names.len()),
+    );
+
+    let mut user_prompt = format!("目录: {dir_label}\n候选文件名（共 {total}）:\n");
+    for name in &names {
+        user_prompt.push_str(name);
+        user_prompt.push('\n');
+    }
+
+    let reply = ask_llm_cancellable(
+        cfg,
+        &tool_triage_system_prompt(),
+        &user_prompt,
+        events,
+        cancel,
+    )
+    .await;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            if scan_cancel_requested(events, cancel) {
+                return Err(color_eyre::eyre::eyre!("已取消工具扫描"));
+            }
+            return Ok(triage_fallback(candidates, &error.to_string(), events));
+        }
+    };
+
+    let kept = parse_keep_names(&reply);
+    if kept.is_empty() {
+        return Ok(triage_fallback(candidates, "模型未返回有效名单", events));
+    }
+    let kept_candidates = filter_kept(&candidates, &kept);
+    if kept_candidates.is_empty() {
+        return Ok(triage_fallback(candidates, "保留名单与候选不匹配", events));
+    }
+
+    let kept_count = kept_candidates.len();
+    notify(
+        events,
+        format!("分诊结果：保留 {kept_count} / 丢弃 {}", total - kept_count),
+    );
+    Ok(kept_candidates)
 }
 
 async fn evaluate_freeform_with_ai(
@@ -675,6 +1161,65 @@ async fn evaluate_freeform_with_ai(
     )
     .await?;
     Ok(parse_analyzed_tools(&reply))
+}
+
+/// 每批 `[start, end)` 范围；`size == 0` 视为不切分。
+fn batch_bounds(total: usize, size: usize) -> Vec<(usize, usize)> {
+    if size == 0 || total == 0 {
+        return Vec::new();
+    }
+    (0..total)
+        .step_by(size)
+        .map(|start| (start, (start + size).min(total)))
+        .collect()
+}
+
+/// 单次模型调用的工具数上限（候选数上去后一次塞全部会撞上下文上限）。
+const AI_BATCH: usize = 20;
+
+/// 逐批调用 `evaluate_tools_with_ai` 并拼接结果（失败向上传播，取消仍生效）。
+async fn evaluate_all_with_ai(
+    cfg: &ProviderConfig,
+    tools: &[(String, String, Option<String>)],
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<Vec<AnalyzedTool>> {
+    let bounds = batch_bounds(tools.len(), AI_BATCH);
+    let mut analyzed = Vec::new();
+    for (index, (start, end)) in bounds.iter().enumerate() {
+        notify(
+            events,
+            format!(
+                "调用模型分类…（批 {}/{}，本批 {} 个工具）",
+                index + 1,
+                bounds.len(),
+                end - start
+            ),
+        );
+        analyzed.extend(evaluate_tools_with_ai(cfg, &tools[*start..*end], events, cancel).await?);
+    }
+    Ok(analyzed)
+}
+
+/// 只保留名字出现在候选清单里的分析结果（大小写不敏感）；`allowed` 为空则原样返回。
+fn filter_analyzed_to_candidates(
+    analyzed: Vec<AnalyzedTool>,
+    allowed: &[String],
+) -> Vec<AnalyzedTool> {
+    if allowed.is_empty() {
+        return analyzed;
+    }
+    let allowed_lower: Vec<String> = allowed
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    analyzed
+        .into_iter()
+        .filter(|tool| {
+            let lower = tool.name.to_ascii_lowercase();
+            allowed_lower.contains(&lower)
+        })
+        .collect()
 }
 
 /// 分流写入 + 汇总（唯一写盘入口）。
@@ -723,6 +1268,16 @@ fn commit_analyzed(
     report
 }
 
+/// 扫描输入分流：候选清单（先剔已在库项 → 需要时 AI 分诊 → 探测 + 分类）或纯提示词。
+enum ScanPlan {
+    Candidates {
+        candidates: Vec<DiscoveredCandidate>,
+        /// 目录扫描的目录名（>40 个候选时用它做一次纯名单 AI 分诊）。
+        triage_label: Option<String>,
+    },
+    Freeform(String),
+}
+
 /// AI 智能扫描：探测候选 → 采集帮助 → 模型分类 → 按策略写盘。
 pub(crate) async fn run_scan(
     cfg: &ProviderConfig,
@@ -732,7 +1287,7 @@ pub(crate) async fn run_scan(
     events: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &mut oneshot::Receiver<()>,
 ) -> Result<ScanReport> {
-    let analyzed = match target.map(str::trim).filter(|t| !t.is_empty()) {
+    let plan = match target.map(str::trim).filter(|t| !t.is_empty()) {
         Some(raw) => {
             let input = raw.trim_matches('"');
             let input_path = Path::new(input);
@@ -745,17 +1300,12 @@ pub(crate) async fn run_scan(
                 );
                 if candidates.is_empty() {
                     notify(events, "目录中未检索到脚本或可执行文件，转为提示词推理");
-                    evaluate_freeform_with_ai(
-                        cfg,
-                        &format!("我的安全工具存放在目录: {input}"),
-                        events,
-                        cancel,
-                    )
-                    .await?
+                    ScanPlan::Freeform(format!("我的安全工具存放在目录: {input}"))
                 } else {
-                    let mut notify_fn = |message: String| notify(events, message);
-                    let probed = fetch_candidates_help(&candidates, &mut notify_fn);
-                    evaluate_tools_with_ai(cfg, &probed, events, cancel).await?
+                    ScanPlan::Candidates {
+                        candidates,
+                        triage_label: Some(input.to_string()),
+                    }
                 }
             } else if input_path.is_file()
                 || input.starts_with("python ")
@@ -767,62 +1317,19 @@ pub(crate) async fn run_scan(
                     .unwrap_or("tool")
                     .to_string();
                 notify(events, format!("单文件/指定命令：{name}"));
-                let candidate = DiscoveredCandidate {
-                    name,
-                    command: input.to_string(),
-                };
-                let mut notify_fn = |message: String| notify(events, message);
-                let probed = fetch_candidates_help(&[candidate], &mut notify_fn);
-                evaluate_tools_with_ai(cfg, &probed, events, cancel).await?
+                ScanPlan::Candidates {
+                    candidates: vec![DiscoveredCandidate {
+                        name,
+                        command: input.to_string(),
+                    }],
+                    triage_label: None,
+                }
             } else {
-                evaluate_freeform_with_ai(cfg, input, events, cancel).await?
+                ScanPlan::Freeform(input.to_string())
             }
         }
         None => {
-            let mut candidates = Vec::new();
-            for name in [
-                "nmap",
-                "sqlmap",
-                "dirsearch",
-                "subfinder",
-                "nuclei",
-                "nikto",
-                "hydra",
-                "gobuster",
-                "ffuf",
-                "whatweb",
-                "wpscan",
-                "masscan",
-                "fscan",
-                "xray",
-                "httpx",
-            ] {
-                if let Some(bin_path) = find_installed_binary(name) {
-                    candidates.push(DiscoveredCandidate {
-                        name: name.to_string(),
-                        command: bin_path,
-                    });
-                }
-            }
-            for common_dir in [
-                "D:\\tools",
-                "C:\\tools",
-                "D:\\SecTools",
-                "C:\\SecTools",
-                "D:\\Program Files (x86)\\Nmap",
-            ] {
-                let dir = Path::new(common_dir);
-                if dir.is_dir() {
-                    for candidate in scan_directory_for_candidates(dir) {
-                        if !candidates
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&candidate.name))
-                        {
-                            candidates.push(candidate);
-                        }
-                    }
-                }
-            }
+            let candidates = default_candidates();
             notify(
                 events,
                 format!("扫描中：已发现 {} 个候选", candidates.len()),
@@ -832,16 +1339,62 @@ pub(crate) async fn run_scan(
                     events,
                     "未在系统 PATH 或预设目录中检测到常见安全工具；可用 /toolbox scan <目录> 指定路径",
                 );
-                Vec::new()
-            } else {
-                let mut notify_fn = |message: String| notify(events, message);
-                let probed = fetch_candidates_help(&candidates, &mut notify_fn);
-                evaluate_tools_with_ai(cfg, &probed, events, cancel).await?
+            }
+            ScanPlan::Candidates {
+                candidates,
+                triage_label: None,
             }
         }
     };
 
-    Ok(commit_analyzed(analyzed, tools_dir, preview, events))
+    let mut existing_names: Vec<String> = Vec::new();
+    let analyzed = match plan {
+        ScanPlan::Freeform(prompt) => {
+            evaluate_freeform_with_ai(cfg, &prompt, events, cancel).await?
+        }
+        ScanPlan::Candidates {
+            candidates,
+            triage_label,
+        } => {
+            // 已在工具库里的候选不再探测、不再消耗模型额度（含分诊那次调用）。
+            let (existing, remaining): (Vec<_>, Vec<_>) = candidates
+                .into_iter()
+                .partition(|candidate| tools_dir.join(format!("{}.toml", candidate.name)).exists());
+            existing_names = existing
+                .into_iter()
+                .map(|candidate| candidate.name)
+                .collect();
+            let remaining = match triage_label {
+                Some(label) => triage_candidates(cfg, &label, remaining, events, cancel).await?,
+                None => remaining,
+            };
+            if remaining.is_empty() {
+                if !existing_names.is_empty() {
+                    notify(
+                        events,
+                        format!(
+                            "全部 {} 个候选都已在工具库中，跳过探测与分类",
+                            existing_names.len()
+                        ),
+                    );
+                }
+                Vec::new()
+            } else {
+                let notify_fn = |message: String| notify(events, message);
+                let probed = fetch_candidates_help(&remaining, &notify_fn);
+                let probed_names: Vec<String> =
+                    probed.iter().map(|(name, _, _)| name.clone()).collect();
+                let analyzed = evaluate_all_with_ai(cfg, &probed, events, cancel).await?;
+                filter_analyzed_to_candidates(analyzed, &probed_names)
+            }
+        }
+    };
+
+    let mut report = commit_analyzed(analyzed, tools_dir, preview, events);
+    if !existing_names.is_empty() {
+        report.skipped_existing.splice(0..0, existing_names);
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -983,5 +1536,158 @@ manual_advice = "适合安全人员在本地桌面独立视窗中运行"
             ..Default::default()
         })
         .contains("预览模式"));
+    }
+
+    fn candidate(name: &str, command: &str) -> DiscoveredCandidate {
+        DiscoveredCandidate {
+            name: name.to_string(),
+            command: command.to_string(),
+        }
+    }
+
+    fn analyzed_tool(name: &str, command: &str) -> AnalyzedTool {
+        AnalyzedTool {
+            name: name.to_string(),
+            suitability: ToolSuitability::AgentCompatible,
+            reason: "纯命令行".into(),
+            description: String::new(),
+            command: command.to_string(),
+            parameters: Vec::new(),
+            manual_advice: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_accepts_extensionless_executables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let executable = base.join("nmap");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // 无扩展名且无执行位 + 普通数据文件都不该被当作候选。
+        std::fs::write(base.join("plain"), b"data").unwrap();
+        std::fs::write(base.join("notes.txt"), b"data").unwrap();
+
+        let candidates = scan_directory_for_candidates(base);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["nmap"]);
+        assert_eq!(
+            candidates[0].command,
+            format!("\"{}\"", executable.display())
+        );
+    }
+
+    #[test]
+    fn desktop_menu_parses_names_and_ignores_localized_and_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::write(
+            base.join("kali-a.desktop"),
+            "Name=amass\nExec=/usr/share/kali-menu/exec-in-shell \"amass -h\"\nCategories=kali-discovery\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("kali-b.desktop"),
+            "Name[zh_CN]=中文名\nName=arpspoof\nComment=Name=不是名字\n",
+        )
+        .unwrap();
+        // 名字含空格 → 字符集过滤（会污染 command -v 与工具库文件名）。
+        std::fs::write(base.join("junk.desktop"), "Name=Kali Docs\n").unwrap();
+        std::fs::write(base.join("other.desktop"), "Name=nmap\n").unwrap();
+
+        let names = kali_menu_names_from(&[
+            (base.to_path_buf(), Some("kali-")),
+            (base.to_path_buf(), None),
+        ]);
+        assert_eq!(names, vec!["amass", "arpspoof", "nmap"]);
+    }
+
+    #[test]
+    fn parse_keep_names_extracts_only_toml_keep_entries() {
+        let reply = r#"
+我猜可能还有 nmap-legacy 与 ffuf-extra。
+```toml
+[[keep]]
+name = "nmap"
+reason = "端口/服务扫描"
+[[keep]]
+name = "sqlmap"
+reason = "SQL 注入自动化"
+[[keep]]
+name = "SQLMap"
+reason = "大小写重复项"
+```
+以上。
+"#;
+        assert_eq!(parse_keep_names(reply), vec!["nmap", "sqlmap"]);
+    }
+
+    #[test]
+    fn filter_kept_preserves_candidate_order_and_drops_unknown() {
+        let candidates = vec![
+            candidate("a", "a"),
+            candidate("b", "b"),
+            candidate("c", "c"),
+        ];
+        let kept = vec!["c".to_string(), "A".to_string()];
+        let filtered = filter_kept(&candidates, &kept);
+        let names: Vec<&str> = filtered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "c"]);
+
+        assert_eq!(filter_kept(&candidates, &[]).len(), 3);
+    }
+
+    #[test]
+    fn parallel_map_preserves_order_and_maps_every_item() {
+        let items: Vec<usize> = (0..12).collect();
+        let expected: Vec<usize> = (0..12).map(|index| index * 100 + index).collect();
+        assert_eq!(
+            parallel_map(&items, 4, |index, item| index * 100 + item),
+            expected
+        );
+        // workers == 0 视为 1，不得 panic。
+        assert_eq!(
+            parallel_map(&items, 0, |index, item| index * 100 + item),
+            expected
+        );
+        assert!(parallel_map::<usize, usize, _>(&[], 4, |_, _| 0).is_empty());
+    }
+
+    #[test]
+    fn ai_batches_split_evenly_and_cover_every_tool() {
+        assert_eq!(batch_bounds(45, 20), vec![(0, 20), (20, 40), (40, 45)]);
+        assert_eq!(batch_bounds(40, 20), vec![(0, 20), (20, 40)]);
+        assert!(batch_bounds(0, 20).is_empty());
+        assert!(batch_bounds(10, 0).is_empty());
+    }
+
+    #[test]
+    fn filter_analyzed_drops_names_outside_candidates() {
+        let analyzed = vec![
+            analyzed_tool("nmap", "nmap -sV {target}"),
+            analyzed_tool("nmap-extra", "nmap-extra"),
+            analyzed_tool("sqlmap", "sqlmap -u {url}"),
+        ];
+        let allowed = vec!["NMAP".to_string()];
+        let filtered = filter_analyzed_to_candidates(analyzed.clone(), &allowed);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "nmap");
+        assert_eq!(filter_analyzed_to_candidates(analyzed, &[]).len(), 3);
+    }
+
+    /// 真机基准：Kali 菜单编目 + 常见清单解析出的已安装工具数（改造前恒为空 → 只剩 15 个硬编码名）。
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "需要 Kali 真机（/usr/share/applications 与 PATH 上的安全工具）"]
+    fn kali_host_catalog_finds_installed_tools() {
+        let count = default_candidates().len();
+        println!("默认候选 {count} 个");
+        assert!(
+            count >= 150,
+            "Kali 编目应解析出 >=150 个已安装工具，实得 {count}"
+        );
     }
 }

@@ -12,7 +12,7 @@
 `cyber` 默认打开全屏简洁 coding CLI；`cyber tui` 打开原有全屏功能面板；`cyber setup` 打开全屏设置向导；`cyber run` 执行非交互任务。CLI 与 TUI 共用现有 JSON 会话历史，headless 行为不变。
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 [![CNB 镜像源](https://img.shields.io/badge/CNB-仓库镜像源-blue)](https://cnb.cool/funxlink/cyber-master)
 [![Platform](https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-blue)]()
 
@@ -585,4 +585,4 @@ cargo fmt --all -- --check
 
 ## 许可证
 
-[MIT](./LICENSE)
+[GPL-3.0](./LICENSE)
