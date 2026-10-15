@@ -291,6 +291,17 @@ impl ToolRegistry {
             return Some(exact.as_ref());
         }
 
+        // 别名兼容：edit 与 edit_file 等价
+        if name == "edit" {
+            if let Some(t) = self.tools.iter().find(|t| t.schema().name == "edit_file") {
+                return Some(t.as_ref());
+            }
+        } else if name == "edit_file" {
+            if let Some(t) = self.tools.iter().find(|t| t.schema().name == "edit") {
+                return Some(t.as_ref());
+            }
+        }
+
         // 2. 次级匹配：兼容 custom_、mcp_、skill_ 前缀别名调用
         self.tools
             .iter()
@@ -600,15 +611,15 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 16);
+        assert_eq!(registry.all_schemas().len(), 17);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
         assert!(registry.get("bg_shell").is_some());
         assert!(registry.get("inspect_image").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 16);
-        assert_eq!(registry.schemas().len(), 16);
+        assert_eq!(registry.all_schemas().len(), 17);
+        assert_eq!(registry.schemas().len(), 17);
     }
 
     #[test]

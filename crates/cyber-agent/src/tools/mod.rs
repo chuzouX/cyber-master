@@ -9,6 +9,7 @@ pub(crate) mod ctf_challenge;
 mod custom_tool;
 mod delegate_tasks;
 mod download_file;
+mod edit_file;
 mod find_file;
 pub(crate) mod guard;
 pub mod inspect_image;
@@ -29,6 +30,7 @@ use crate::tool::ToolRegistry;
 pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(read_file::ReadFileTool));
     reg.register(Box::new(write_file::WriteFileTool));
+    reg.register(Box::new(edit_file::EditFileTool));
     reg.register(Box::new(list_dir::ListDirTool));
     reg.register(Box::new(find_file::FindFileTool));
     reg.register(Box::new(shell::ShellTool::default()));
@@ -51,6 +53,7 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
     &[
         "read_file",
         "write_file",
+        "edit_file",
         "list_dir",
         "find_file",
         "shell",
@@ -87,6 +90,7 @@ pub use clear::ClearTool;
 pub use ctf_challenge::CtfChallengeTool;
 pub use custom_tool::{CustomTool, CustomToolsListTool};
 pub use delegate_tasks::DelegateTasksTool;
+pub use edit_file::EditFileTool;
 pub use inspect_image::InspectImageTool;
 pub use save_memory::SaveMemoryTool;
 pub use search_tools::SearchToolsTool;

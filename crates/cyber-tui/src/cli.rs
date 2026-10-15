@@ -4160,7 +4160,10 @@ fn select_row(main: &str, detail: &str, selected: bool, width: u16) -> Line<'sta
 fn tool_card_kind(name: &str) -> ToolCardKind {
     if name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("read_file") {
         ToolCardKind::Read
-    } else if name.eq_ignore_ascii_case("edit") || name.eq_ignore_ascii_case("apply_patch") {
+    } else if name.eq_ignore_ascii_case("edit")
+        || name.eq_ignore_ascii_case("edit_file")
+        || name.eq_ignore_ascii_case("apply_patch")
+    {
         ToolCardKind::Edit
     } else if name.eq_ignore_ascii_case("write") || name.eq_ignore_ascii_case("write_file") {
         ToolCardKind::Write

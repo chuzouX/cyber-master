@@ -557,7 +557,7 @@ pub fn check_extreme_danger(tool: &str, arguments: &Value) -> Option<&'static st
                 .trim();
             check_extreme_danger_command(cmd)
         }
-        "write_file" | "write" | "edit" | "apply_patch" => {
+        "write_file" | "write" | "edit" | "edit_file" | "apply_patch" => {
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
@@ -619,7 +619,7 @@ pub fn assess_tool_safety(tool: &str, arguments: &Value) -> SafetyAssessment {
     // 3. 文件修改类工具 (write_file, write, edit, apply_patch)
     if matches!(
         lower_tool.as_str(),
-        "write_file" | "write" | "edit" | "apply_patch"
+        "write_file" | "write" | "edit" | "edit_file" | "apply_patch"
     ) {
         let path = arguments
             .get("path")
