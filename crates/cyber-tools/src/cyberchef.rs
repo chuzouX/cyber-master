@@ -259,6 +259,22 @@ impl Tool for CyberChefTool {
 
             // 构建命令：python cyberchef.py "<input>" op1 op2 ...
             let Some(script_path) = self.engine_script() else {
+                // 若未显式指定自定义脚本路径（默认运行模式），且外部脚本未安装，尝试纯 Rust 原生轻量算子回退
+                if self.script_path.is_none() {
+                    if let Some(rust_result) = run_builtin_fallback(&input_data, &recipe_ops) {
+                        let res = json!({
+                            "engine": "cyberchef_builtin_fallback (Rust)",
+                            "recipe": recipe_ops,
+                            "input_length": input_data.len(),
+                            "output_length": rust_result.len(),
+                            "result": rust_result
+                        });
+                        return Ok(ToolOutput {
+                            content: serde_json::to_string_pretty(&res).unwrap_or(rust_result),
+                            is_error: false,
+                        });
+                    }
+                }
                 return Ok(missing_engine_output());
             };
             let mut engine_args = vec![input_data.clone()];
@@ -296,6 +312,82 @@ impl Tool for CyberChefTool {
             })
         })
     }
+}
+
+/// 纯 Rust 原生高频基础算子回退引擎（Base64, Hex, URL, ROT13, SHA256, SHA1, Reverse, XOR）。
+fn run_builtin_fallback(input: &str, recipe: &[String]) -> Option<String> {
+    use base64::prelude::*;
+    let mut current_bytes = input.as_bytes().to_vec();
+
+    for op in recipe {
+        let op_lower = op.trim().to_lowercase();
+        if op_lower == "to_base64" || op_lower == "base64" {
+            let encoded = BASE64_STANDARD.encode(&current_bytes);
+            current_bytes = encoded.into_bytes();
+        } else if op_lower == "from_base64" {
+            let s = String::from_utf8_lossy(&current_bytes).trim().to_string();
+            let decoded = BASE64_STANDARD.decode(s.as_bytes()).ok()?;
+            current_bytes = decoded;
+        } else if op_lower == "to_hex" || op_lower == "hex" {
+            let hex_str: String = current_bytes.iter().map(|b| format!("{b:02x}")).collect();
+            current_bytes = hex_str.into_bytes();
+        } else if op_lower == "from_hex" {
+            let s = String::from_utf8_lossy(&current_bytes)
+                .trim()
+                .replace(' ', "");
+            if !s.len().is_multiple_of(2) {
+                return None;
+            }
+            let mut decoded = Vec::with_capacity(s.len() / 2);
+            for i in (0..s.len()).step_by(2) {
+                let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
+                decoded.push(byte);
+            }
+            current_bytes = decoded;
+        } else if op_lower == "reverse" {
+            current_bytes.reverse();
+        } else if op_lower == "rot13" {
+            let s = String::from_utf8_lossy(&current_bytes);
+            let rot: String = s
+                .chars()
+                .map(|c| match c {
+                    'a'..='m' | 'A'..='M' => ((c as u8) + 13) as char,
+                    'n'..='z' | 'N'..='Z' => ((c as u8) - 13) as char,
+                    _ => c,
+                })
+                .collect();
+            current_bytes = rot.into_bytes();
+        } else if op_lower == "sha256" {
+            let digest = ring::digest::digest(&ring::digest::SHA256, &current_bytes);
+            let hex_str: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            current_bytes = hex_str.into_bytes();
+        } else if op_lower == "sha1" {
+            let digest =
+                ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &current_bytes);
+            let hex_str: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            current_bytes = hex_str.into_bytes();
+        } else {
+            let key = op_lower
+                .strip_prefix("to_xor:")
+                .or_else(|| op_lower.strip_prefix("from_xor:"))?;
+            let key_bytes = if let Some(hex_key) = key.strip_prefix("0x") {
+                let byte = u8::from_str_radix(hex_key, 16).ok()?;
+                vec![byte]
+            } else {
+                key.as_bytes().to_vec()
+            };
+            if key_bytes.is_empty() {
+                return None;
+            }
+            current_bytes = current_bytes
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ key_bytes[i % key_bytes.len()])
+                .collect();
+        }
+    }
+
+    Some(String::from_utf8_lossy(&current_bytes).into_owned())
 }
 
 /// 智能编码与格式探测引擎

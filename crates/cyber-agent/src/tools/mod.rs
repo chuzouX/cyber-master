@@ -34,7 +34,7 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(list_dir::ListDirTool));
     reg.register(Box::new(find_file::FindFileTool));
     reg.register(Box::new(shell::ShellTool::default()));
-    reg.register(Box::new(web_fetch::WebFetchTool));
+    reg.register(Box::new(web_fetch::WebFetchTool::default()));
     reg.register(Box::new(download_file::DownloadFileTool));
     let todo_tool = todo::TodoTool::default();
     let todos = todo_tool.todos();

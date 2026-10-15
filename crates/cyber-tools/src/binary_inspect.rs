@@ -80,6 +80,7 @@ impl Tool for BinaryInspectTool {
                     });
                 }
             };
+            let file_size = f.metadata().map(|m| m.len()).unwrap_or(0);
 
             let mut header = [0u8; 1024];
             let n = f.read(&mut header).unwrap_or(0);
@@ -90,11 +91,16 @@ impl Tool for BinaryInspectTool {
                 });
             }
 
-            // 读取整文件前 1MB 供特征与字符串提取
-            let mut full_buf = Vec::new();
-            let _ = f.read_to_end(&mut full_buf);
+            // 读取整文件前 1MB 供特征与字符串提取（严格执行 1MB 截断，避免大文件 OOM）
+            const MAX_INSPECT_BYTES: usize = 1024 * 1024;
+            let mut remaining_buf = Vec::new();
+            let remaining_limit = (MAX_INSPECT_BYTES.saturating_sub(n)) as u64;
+            let _ = (&mut f)
+                .take(remaining_limit)
+                .read_to_end(&mut remaining_buf);
+
             let mut combined = header[..n].to_vec();
-            combined.extend(full_buf);
+            combined.extend(remaining_buf);
 
             let (format, arch, protections) = analyze_binary_header(&combined);
 
@@ -105,13 +111,13 @@ impl Tool for BinaryInspectTool {
 
             let res = json!({
                 "file_path": path_str,
-                "file_size_bytes": combined.len(),
+                "file_size_bytes": file_size,
+                "inspected_bytes": combined.len(),
                 "format": format,
                 "arch": arch,
                 "protections": protections,
                 "interesting_strings": interesting_strings
             });
-
             Ok(ToolOutput {
                 content: serde_json::to_string_pretty(&res).unwrap_or_default(),
                 is_error: false,

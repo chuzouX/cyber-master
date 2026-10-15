@@ -113,6 +113,8 @@ impl Tool for FuzzEndpointTool {
                 }
             }
 
+            let total_tested = paths_to_test.len();
+
             let client = match Client::builder()
                 .danger_accept_invalid_certs(true)
                 .timeout(Duration::from_secs(timeout_secs))
@@ -137,18 +139,28 @@ impl Tool for FuzzEndpointTool {
                 let url = format!("{base_url}/{path}");
 
                 tasks.push(tokio::spawn(async move {
-                    let _permit = s.acquire().await.unwrap();
+                    let _permit = match s.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return None,
+                    };
                     if let Ok(res) = c.get(&url).send().await {
                         let status = res.status().as_u16();
-                        // 过滤 404 和 常见网络错误
+                        // 过滤 404 和 0 (网络错误)
                         if status != 404 && status != 0 {
-                            let len = res.content_length().unwrap_or(0);
-                            let title = extract_title_simple(&res).await;
+                            let len_header = res.content_length();
+                            let (actual_len, title) = if let Ok(bytes) = res.bytes().await {
+                                let l = bytes.len();
+                                let t = extract_title_simple(&bytes);
+                                (len_header.unwrap_or(l as u64), t)
+                            } else {
+                                (len_header.unwrap_or(0), None)
+                            };
+
                             return Some(json!({
                                 "path": path,
                                 "url": url,
                                 "status_code": status,
-                                "content_length": len,
+                                "content_length": actual_len,
                                 "title": title
                             }));
                         }
@@ -166,7 +178,8 @@ impl Tool for FuzzEndpointTool {
 
             let output_json = json!({
                 "base_url": base_url,
-                "endpoints_tested": results.len(),
+                "endpoints_tested": total_tested,
+                "endpoints_discovered": results.len(),
                 "discovered": results,
             });
 
@@ -178,7 +191,37 @@ impl Tool for FuzzEndpointTool {
     }
 }
 
-async fn extract_title_simple(_res: &reqwest::Response) -> Option<String> {
-    // 简要提取 title，便于查看 200 页面实际内容
-    None
+/// 从 HTML 响应体字节流中提取网页 `<title>` 文本。
+fn extract_title_simple(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let lower = text.to_lowercase();
+    let start = lower.find("<title")?;
+    let content_start = lower[start..].find('>')? + start + 1;
+    let end = lower[content_start..].find("</title>")? + content_start;
+    let title = text[content_start..end].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_title_simple_basic() {
+        let html = b"<html><head><title>Admin Dashboard</title></head><body>OK</body></html>";
+        assert_eq!(extract_title_simple(html), Some("Admin Dashboard".into()));
+    }
+
+    #[test]
+    fn test_extract_title_simple_empty_or_missing() {
+        let empty_title = b"<html><head><title>   </title></head></html>";
+        assert_eq!(extract_title_simple(empty_title), None);
+
+        let no_title = b"<html><body>Hello</body></html>";
+        assert_eq!(extract_title_simple(no_title), None);
+    }
 }

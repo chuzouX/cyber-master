@@ -2,6 +2,7 @@
 //!
 //! 替代 `shell` + `grep`/`find` 组合：用 Rust 原生遍历，无平台依赖、无编码问题。
 //! 支持文件名子串匹配 + 可选文件内容关键词搜索 + 递归深度控制。
+//! 默认自动忽略 .git, target, node_modules, dist, __pycache__ 等构建噪目录。
 
 use std::future::Future;
 use std::path::Path;
@@ -13,6 +14,32 @@ use crate::error::{AgentError, Result};
 use crate::tool::{Tool, ToolCtx, ToolOutput, ToolSchema};
 use crate::tools::guard::resolve_under_cwd;
 
+const DEFAULT_LIMIT: usize = 200;
+const MAX_CONTENT_SEARCH_FILE_BYTES: u64 = 5 * 1024 * 1024; // 5MB
+
+/// 默认排除的高噪音、中间编译产物及依赖缓存目录。
+const DEFAULT_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".cyber",
+    ".cache",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+    "__pycache__",
+    ".svn",
+    ".hg",
+];
+
+/// 常见二进制文件扩展名（内容搜索时直接跳过，避免读取无意义乱码）。
+const BINARY_EXTENSIONS: &[&str] = &[
+    "exe", "dll", "so", "dylib", "bin", "o", "a", "png", "jpg", "jpeg", "gif", "ico", "webp",
+    "pdf", "zip", "tar", "gz", "7z", "bz2", "xz", "iso", "db", "sqlite", "sqlite3", "parquet",
+    "wasm", "pyc", "class",
+];
+
 pub struct FindFileTool;
 
 impl Tool for FindFileTool {
@@ -20,7 +47,7 @@ impl Tool for FindFileTool {
         ToolSchema {
             name: "find_file".into(),
             description:
-                "在指定目录中按文件名或内容关键词查找文件（跨平台、无编码问题，替代 grep/find）"
+                "在指定目录中按文件名或内容关键词快速检索文件（跨平台、支持递归、默认自动过滤 target/node_modules/.git 等高噪构建目录、防大文件与大量结果撑爆）。"
                     .into(),
             tags: vec![],
             parameters: json!({
@@ -36,7 +63,7 @@ impl Tool for FindFileTool {
                     },
                     "content": {
                         "type": "string",
-                        "description": "可选：文件内容关键词（子串匹配，不区分大小写）。提供时额外搜索文件内容"
+                        "description": "可选：文件内容关键词（子串匹配，不区分大小写）。提供时额外搜索文件文本内容"
                     },
                     "recursive": {
                         "type": "boolean",
@@ -45,6 +72,16 @@ impl Tool for FindFileTool {
                     "max_depth": {
                         "type": "integer",
                         "description": "最大递归深度（0=仅当前目录，省略=无限制）"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最大返回匹配文件条数（默认 200，范围 1-1000）",
+                        "minimum": 1,
+                        "maximum": 1000
+                    },
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "是否包含默认被忽略的构建与依赖目录（如 .git, target, node_modules, dist, __pycache__ 等，默认 false）"
                     }
                 }
             }),
@@ -68,6 +105,15 @@ impl Tool for FindFileTool {
                 .get("max_depth")
                 .and_then(|v| v.as_u64())
                 .map(|d| d as usize);
+            let limit = input
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|l| (l as usize).clamp(1, 1000))
+                .unwrap_or(DEFAULT_LIMIT);
+            let include_ignored = input
+                .get("include_ignored")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let resolved =
                 resolve_under_cwd(Path::new(path_str), &ctx.cwd).map_err(AgentError::Provider)?;
@@ -76,6 +122,9 @@ impl Tool for FindFileTool {
             let content_lower = content_kw.map(|s| s.to_lowercase());
 
             let mut matches: Vec<String> = Vec::new();
+            // 多取 1 条以便判断是否发生了截断
+            let scan_cap = limit.saturating_add(1);
+
             walk_dir(
                 &resolved,
                 &pattern_lower,
@@ -83,6 +132,8 @@ impl Tool for FindFileTool {
                 recursive,
                 max_depth,
                 0,
+                include_ignored,
+                scan_cap,
                 &mut matches,
             );
 
@@ -91,6 +142,11 @@ impl Tool for FindFileTool {
                     content: format!("未找到匹配文件（搜索目录: {}）", resolved.display()),
                     is_error: false,
                 });
+            }
+
+            let is_truncated = matches.len() > limit;
+            if is_truncated {
+                matches.truncate(limit);
             }
 
             // 按路径排序，输出相对路径
@@ -108,12 +164,36 @@ impl Tool for FindFileTool {
                 })
                 .collect();
 
+            let mut content = format!("找到 {} 个文件:\n{}", display.len(), display.join("\n"));
+            if is_truncated {
+                content.push_str(&format!(
+                    "\n\n[提示：结果已截断显示前 {limit} 项。可通过指定更具体的 pattern、path 或调大 limit 查看更多]"
+                ));
+            }
+
             Ok(ToolOutput {
-                content: format!("找到 {} 个文件:\n{}", display.len(), display.join("\n")),
+                content,
                 is_error: false,
             })
         })
     }
+}
+
+/// 判断目录名是否属于默认忽略的构建/依赖高噪目录。
+fn is_ignored_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    DEFAULT_IGNORED_DIRS.iter().any(|&ig| lower == ig)
+}
+
+/// 检查文件扩展名是否为二进制格式。
+fn is_binary_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            let lower = ext.to_lowercase();
+            BINARY_EXTENSIONS.iter().any(|&b| lower == b)
+        })
+        .unwrap_or(false)
 }
 
 /// 递归遍历目录，收集匹配的文件路径。
@@ -123,6 +203,8 @@ impl Tool for FindFileTool {
 /// - `recursive` 控制是否进入子目录
 /// - `max_depth` = Some(n) 时限制深度，None 无限制
 /// - `depth` 是当前深度（从 0 开始）
+/// - `include_ignored` 控制是否跳过 .git/target/node_modules 等高噪目录
+/// - `matches_cap` 为达到上限时提前终止遍历
 #[allow(clippy::too_many_arguments)]
 fn walk_dir(
     dir: &Path,
@@ -131,8 +213,14 @@ fn walk_dir(
     recursive: bool,
     max_depth: Option<usize>,
     depth: usize,
+    include_ignored: bool,
+    matches_cap: usize,
     out: &mut Vec<String>,
 ) {
+    if out.len() >= matches_cap {
+        return;
+    }
+
     // 深度检查：max_depth=0 表示仅当前目录，>0 表示限制层数
     if let Some(md) = max_depth {
         if depth > md {
@@ -145,6 +233,10 @@ fn walk_dir(
     };
 
     for entry in rd.flatten() {
+        if out.len() >= matches_cap {
+            break;
+        }
+
         let path = entry.path();
         let file_type = match entry.file_type() {
             Ok(t) => t,
@@ -159,18 +251,33 @@ fn walk_dir(
             }
             // 内容匹配（可选）
             if let Some(kw) = content_lower {
+                // 跳过已知二进制后缀
+                if is_binary_extension(&path) {
+                    continue;
+                }
+                // 检查单文件体积，跳过超过 5MB 的大文件
+                if let Ok(meta) = entry.metadata() {
+                    if meta.len() > MAX_CONTENT_SEARCH_FILE_BYTES {
+                        continue;
+                    }
+                }
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if !content.to_lowercase().contains(kw) {
                         continue;
                     }
                 } else {
-                    // 读取失败（二进制/编码）→ 跳过
+                    // 读取失败（非 UTF-8 编码等）→ 跳过
                     continue;
                 }
             }
             out.push(path.to_string_lossy().into_owned());
         } else if file_type.is_dir() && recursive {
-            // 递归深度检查
+            let dir_name = entry.file_name().to_string_lossy().to_lowercase();
+            // 默认跳过构建中间件与高噪目录
+            if !include_ignored && is_ignored_dir(&dir_name) {
+                continue;
+            }
+
             let next_depth = depth + 1;
             if let Some(md) = max_depth {
                 if next_depth > md {
@@ -184,6 +291,8 @@ fn walk_dir(
                 recursive,
                 max_depth,
                 next_depth,
+                include_ignored,
+                matches_cap,
                 out,
             );
         }
@@ -339,6 +448,74 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("nacos_default.md"), "应不区分大小写");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ignores_target_and_git_by_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "cyber_find_ignore_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join(".git/config"), "core").unwrap();
+        std::fs::write(dir.join("target/debug/build.rs"), "cargo").unwrap();
+
+        let c = ctx(&dir);
+
+        // 默认过滤高噪目录
+        let out_default = FindFileTool.run(json!({"path": "."}), &c).await.unwrap();
+        assert!(out_default.content.contains("src/main.rs"));
+        assert!(!out_default.content.contains(".git"));
+        assert!(!out_default.content.contains("target"));
+
+        // 显式开启 include_ignored
+        let out_included = FindFileTool
+            .run(json!({"path": ".", "include_ignored": true}), &c)
+            .await
+            .unwrap();
+        assert!(out_included.content.contains("src/main.rs"));
+        assert!(out_included.content.contains(".git/config"));
+        assert!(out_included.content.contains("target/debug/build.rs"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn limits_output_count_with_truncation_notice() {
+        let dir = std::env::temp_dir().join(format!(
+            "cyber_find_limit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for i in 1..=10 {
+            std::fs::write(dir.join(format!("file_{i:02}.txt")), "content").unwrap();
+        }
+
+        let c = ctx(&dir);
+        let out = FindFileTool
+            .run(json!({"path": ".", "pattern": "file_", "limit": 4}), &c)
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("找到 4 个文件:"));
+        assert!(out.content.contains("结果已截断显示前 4 项"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

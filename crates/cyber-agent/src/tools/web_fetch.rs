@@ -6,6 +6,7 @@
 //! - 30s 超时 + 5MB 响应体限制 + 最多 5 次重定向
 //! - HTML→纯文本转换（html2text）
 //! - 内容截断（默认 50000 字符，UTF-8 安全）
+//! - 复用 HTTP Client 连接池，降低高频访问时的 TLS 握手延迟
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,12 +17,28 @@ use serde_json::{json, Value};
 use crate::error::{AgentError, Result};
 use crate::tool::{Tool, ToolCtx, ToolOutput, ToolSchema};
 use crate::tools::guard::check_ssrf;
+
 const DEFAULT_MAX_LENGTH: usize = 50_000;
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024; // 5MB
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 
-pub struct WebFetchTool;
+#[derive(Clone)]
+pub struct WebFetchTool {
+    client: reqwest::Client,
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .user_agent("CyberMaster/0.1")
+            .build()
+            .unwrap_or_default();
+        Self { client }
+    }
+}
 
 impl Tool for WebFetchTool {
     fn schema(&self) -> ToolSchema {
@@ -66,14 +83,7 @@ impl Tool for WebFetchTool {
             // SSRF 检查（解析 URL + DNS + 私有 IP 判断）
             check_ssrf(url)?;
 
-            // 构建客户端：限制超时 + 重定向次数
-            let client = reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-                .user_agent("CyberMaster/0.1")
-                .build()?;
-
-            let response = client.get(url).send().await?;
+            let response = self.client.get(url).send().await?;
 
             if !response.status().is_success() {
                 return Ok(ToolOutput {
@@ -126,22 +136,14 @@ impl Tool for WebFetchTool {
                 text
             };
 
-            // 组装输出
-            let mut output = String::new();
-            output.push_str(&format!("URL: {}\n", url));
-            if let Some(t) = &title {
-                output.push_str(&format!("标题: {}\n", t));
-            }
-            output.push_str(&format!("内容类型: {}\n", content_type));
-            output.push_str(&format!(
-                "内容长度: {} 字符{}\n\n",
-                content.chars().count(),
-                if truncated { " (已截断)" } else { "" }
-            ));
-            output.push_str(&content);
+            let prefix = if let Some(t) = title {
+                format!("Title: {}\n\n", t)
+            } else {
+                String::new()
+            };
 
             Ok(ToolOutput {
-                content: output,
+                content: format!("{}{}", prefix, content),
                 is_error: false,
             })
         })
