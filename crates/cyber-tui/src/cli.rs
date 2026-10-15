@@ -2668,7 +2668,9 @@ impl CliScreen {
                 is_error,
             } => {
                 self.has_run = true;
-                if name.eq_ignore_ascii_case("todo") && !is_error {
+                if (name.eq_ignore_ascii_case("todo") || name.eq_ignore_ascii_case("clear"))
+                    && !is_error
+                {
                     self.todo_view = TodoView::Summary;
                 }
                 self.tool_result(&id, &name, &output, is_error);
@@ -4177,7 +4179,7 @@ fn tool_card_kind(name: &str) -> ToolCardKind {
         ToolCardKind::Find
     } else if name.eq_ignore_ascii_case("delegate_tasks") || name.eq_ignore_ascii_case("delegate") {
         ToolCardKind::Delegate
-    } else if name.eq_ignore_ascii_case("todo") {
+    } else if name.eq_ignore_ascii_case("todo") || name.eq_ignore_ascii_case("clear") {
         ToolCardKind::Todo
     } else {
         ToolCardKind::Generic
@@ -25315,7 +25317,7 @@ mod tests {
             compact.contains("https://github.com/chuzouX/cyber-master"),
             "{frame}"
         );
-        assert!(compact.contains("MIT"), "{frame}");
+        assert!(compact.contains("GPL-3.0"), "{frame}");
         assert!(compact.contains("[运行环境]"), "{frame}");
         assert!(compact.contains("配置文件"), "{frame}");
         assert!(compact.contains("[核心能力]"), "{frame}");

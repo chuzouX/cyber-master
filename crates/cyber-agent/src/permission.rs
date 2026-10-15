@@ -585,7 +585,7 @@ pub fn assess_tool_safety(tool: &str, arguments: &Value) -> SafetyAssessment {
     // 2. 只读与查询类日常工具（完全安全）
     match lower_tool.as_str() {
         "read_file" | "list_dir" | "find_file" | "search_tools" | "web_fetch" | "use_skill"
-        | "save_memory" | "todo" => {
+        | "save_memory" | "todo" | "clear" => {
             return SafetyAssessment {
                 confidence: 1.0,
                 auto_approved: true,

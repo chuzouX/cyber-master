@@ -49,7 +49,7 @@ pub use question::{
 pub use subagent::{SubagentArchive, SubagentRun, SubagentStatus};
 pub use tool::{Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSchema};
 pub use tools::{
-    builtin_tool_names, AskUserTool, CtfChallengeTool, CustomTool, CustomToolsListTool,
+    builtin_tool_names, AskUserTool, ClearTool, CtfChallengeTool, CustomTool, CustomToolsListTool,
     DelegateTasksTool, InspectImageTool, SaveMemoryTool, SearchToolsTool, TodoTool,
 };
 pub use types::{

@@ -4,6 +4,7 @@
 //! 统一工具表。本模块仅注册 P2.2 的基础工具。
 
 pub mod ask_user;
+mod clear;
 pub(crate) mod ctf_challenge;
 mod custom_tool;
 mod delegate_tasks;
@@ -33,7 +34,10 @@ pub fn register_builtins(reg: &mut ToolRegistry) {
     reg.register(Box::new(shell::ShellTool::default()));
     reg.register(Box::new(web_fetch::WebFetchTool));
     reg.register(Box::new(download_file::DownloadFileTool));
-    reg.register(Box::new(todo::TodoTool::default()));
+    let todo_tool = todo::TodoTool::default();
+    let todos = todo_tool.todos();
+    reg.register(Box::new(todo_tool));
+    reg.register(Box::new(clear::ClearTool::new(todos)));
     reg.register(Box::new(inspect_image::InspectImageTool));
     reg.register(Box::new(bg::BgShellTool));
     reg.register(Box::new(bg::BgStatusTool));
@@ -53,6 +57,7 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
         "web_fetch",
         "download_file",
         "todo",
+        "clear",
         "inspect_image",
         "ctf_challenge",
         "save_memory",
@@ -78,6 +83,7 @@ pub fn builtin_tool_names() -> &'static [&'static str] {
 pub use ask_user::AskUserTool;
 pub use bg::{BgKillTool, BgShellTool, BgStatusTool};
 
+pub use clear::ClearTool;
 pub use ctf_challenge::CtfChallengeTool;
 pub use custom_tool::{CustomTool, CustomToolsListTool};
 pub use delegate_tasks::DelegateTasksTool;

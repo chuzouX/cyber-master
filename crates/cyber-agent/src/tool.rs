@@ -324,6 +324,12 @@ impl ToolRegistry {
             .and_then(|t| t.as_any())
             .and_then(|a| a.downcast_ref::<crate::tools::TodoTool>())
             .map(|t| t.todos())
+            .or_else(|| {
+                self.get("clear")
+                    .and_then(|t| t.as_any())
+                    .and_then(|a| a.downcast_ref::<crate::tools::ClearTool>())
+                    .map(|t| t.todos())
+            })
     }
 
     pub fn question_broker(&self) -> Option<Arc<crate::question::QuestionBroker>> {
@@ -594,15 +600,15 @@ mod tests {
         registry.register_hidden(Box::new(EchoTool));
         crate::tools::register_builtins(&mut registry);
         crate::tools::register_builtins(&mut registry);
-        assert_eq!(registry.all_schemas().len(), 15);
+        assert_eq!(registry.all_schemas().len(), 16);
         assert!(registry.get("echo").is_some());
         assert!(registry.get("list_dir").is_some());
         assert!(registry.get("bg_shell").is_some());
         assert!(registry.get("inspect_image").is_some());
         // Promoting a hidden tool must replace it, rather than duplicate it.
         registry.register(Box::new(EchoTool));
-        assert_eq!(registry.all_schemas().len(), 15);
-        assert_eq!(registry.schemas().len(), 15);
+        assert_eq!(registry.all_schemas().len(), 16);
+        assert_eq!(registry.schemas().len(), 16);
     }
 
     #[test]

@@ -1500,7 +1500,9 @@ impl App {
                 is_error,
             } => {
                 if self.chat.streaming {
-                    if name.eq_ignore_ascii_case("todo") && !is_error {
+                    if (name.eq_ignore_ascii_case("todo") || name.eq_ignore_ascii_case("clear"))
+                        && !is_error
+                    {
                         self.chat.todo_closed = false;
                     }
                     self.chat.push_tool_result(id, name, output, is_error);
