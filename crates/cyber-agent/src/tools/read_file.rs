@@ -22,7 +22,7 @@ impl Tool for ReadFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read_file".into(),
-            description: "读取文本文件内容（相对工作目录或绝对路径）。支持流式分页读取（每页 64KB）及行号/行范围读取（如 line_start/line_end，方便配合 edit_file 精准定位修改）；自动拦截图片与二进制文件并给出工具建议。".into(),
+            description: "读取文本文件内容（相对工作目录或绝对路径）。支持在文件中直接搜索固定内容定位代码行（search/pattern 参数，带上下文和行号，方便配合 edit_file 局部修改）、支持行号与行范围读取（line_start/line_end）、支持流式分页读取（每页 64KB）；自动拦截图片与二进制文件并给出工具建议。".into(),
             tags: vec![],
             parameters: json!({
                 "type": "object",
@@ -30,6 +30,20 @@ impl Tool for ReadFileTool {
                     "path": {
                         "type": "string",
                         "description": "文件路径（相对工作目录或绝对路径）"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "可选：在文件中搜索指定的固定文本/关键词，直接定位所有匹配行及其上下文行号（类似 grep -n -C 2）"
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "搜索匹配时展示的前后上下文行数（默认 2，最大 20）",
+                        "minimum": 0,
+                        "maximum": 20
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "搜索时是否区分大小写（默认 false）"
                     },
                     "offset": {
                         "type": "integer",
@@ -105,6 +119,31 @@ impl Tool for ReadFileTool {
                     ),
                     is_error: false,
                 });
+            }
+            // 3. 固定内容搜索模式（search / pattern / query，直接定位匹配行及上下文）
+            let search_kw = input
+                .get("search")
+                .or_else(|| input.get("pattern"))
+                .or_else(|| input.get("query"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            if let Some(search_term) = search_kw {
+                let context_lines = input
+                    .get("context_lines")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as usize).min(20))
+                    .unwrap_or(2);
+                let case_sensitive = input
+                    .get("case_sensitive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|e| AgentError::Provider(format!("定位文件起始失败: {e}")))?;
+
+                return search_in_file(file, search_term, context_lines, case_sensitive, &resolved);
             }
 
             // 3. 判断是否使用行模式读取（line_start / line_end / line_numbers）
@@ -251,6 +290,106 @@ fn read_by_lines(
     } else {
         body
     };
+
+    Ok(ToolOutput {
+        content,
+        is_error: false,
+    })
+}
+/// 在文件中搜索指定的固定文本，返回匹配行及合并后的上下文行与行号。
+fn search_in_file(
+    file: File,
+    search_term: &str,
+    context_lines: usize,
+    case_sensitive: bool,
+    resolved: &Path,
+) -> Result<ToolOutput> {
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut match_indices = Vec::new();
+
+    let target_term = if case_sensitive {
+        search_term.to_string()
+    } else {
+        search_term.to_lowercase()
+    };
+
+    for (idx, line_res) in reader.lines().enumerate() {
+        let line = line_res.map_err(|e| AgentError::Provider(format!("按行解码文件失败: {e}")))?;
+        let is_match = if case_sensitive {
+            line.contains(&target_term)
+        } else {
+            line.to_lowercase().contains(&target_term)
+        };
+        if is_match {
+            match_indices.push(idx);
+        }
+        lines.push(line);
+    }
+
+    let total_lines = lines.len();
+    let total_matches = match_indices.len();
+
+    if total_matches == 0 {
+        return Ok(ToolOutput {
+            content: format!(
+                "未在文件 {} 中找到匹配内容 \"{}\"（共扫描 {} 行）",
+                resolved.display(),
+                search_term,
+                total_lines
+            ),
+            is_error: false,
+        });
+    }
+
+    // 合并重叠或紧邻的上下文区间
+    let mut merged_ranges: Vec<(usize, usize)> = Vec::new();
+    for &m in &match_indices {
+        let start = m.saturating_sub(context_lines);
+        let end = (m + context_lines).min(total_lines.saturating_sub(1));
+        if let Some(last) = merged_ranges.last_mut() {
+            if start <= last.1 + 1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged_ranges.push((start, end));
+    }
+
+    const MAX_MATCH_BLOCKS: usize = 50;
+    let is_truncated = merged_ranges.len() > MAX_MATCH_BLOCKS;
+    if is_truncated {
+        merged_ranges.truncate(MAX_MATCH_BLOCKS);
+    }
+
+    let mut blocks = Vec::new();
+    for (start, end) in merged_ranges {
+        let mut block_lines = Vec::new();
+        for (offset, line) in lines[start..=end].iter().enumerate() {
+            let idx = start + offset;
+            let line_no = idx + 1;
+            let is_match = match_indices.contains(&idx);
+            let marker = if is_match { ">" } else { " " };
+            block_lines.push(format!("{marker} {line_no:>5} | {line}"));
+        }
+        blocks.push(block_lines.join("\n"));
+    }
+
+    let body = blocks.join("\n  ...\n");
+    let mut content = format!(
+        "在文件 {} 中找到 {} 处匹配 \"{}\"（共 {} 行）:\n\n{}",
+        resolved.display(),
+        total_matches,
+        search_term,
+        total_lines,
+        body
+    );
+
+    if is_truncated {
+        content.push_str(&format!(
+            "\n\n[提示：匹配区域较多，已截断显示前 {MAX_MATCH_BLOCKS} 处匹配代码块]"
+        ));
+    }
 
     Ok(ToolOutput {
         content,
@@ -458,6 +597,123 @@ mod tests {
         assert!(out.content.contains("    3 |     let b = 2;"));
         assert!(out.content.contains("    4 |     let c = 3;"));
         assert!(!out.content.contains("fn main()"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn searches_fixed_content_with_context_and_markers() {
+        let dir = std::env::temp_dir().join("cyber_read_file_test_search");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.rs");
+        let text = "let a = 1;\nlet timeout = 30;\nlet c = 3;\nlet d = 4;\nlet timeout = 60;\nlet f = 6;\n";
+        std::fs::write(&f, text).unwrap();
+        let ctx = ctx_with(&dir);
+
+        let out = ReadFileTool
+            .run(
+                json!({
+                    "path": "config.rs",
+                    "search": "timeout",
+                    "context_lines": 1
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert!(out.content.contains("找到 2 处匹配 \"timeout\""));
+        assert!(out.content.contains(">     2 | let timeout = 30;"));
+        assert!(out.content.contains(">     5 | let timeout = 60;"));
+        assert!(out.content.contains("      1 | let a = 1;"));
+        assert!(out.content.contains("      3 | let c = 3;"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_content_case_sensitivity() {
+        let dir = std::env::temp_dir().join("cyber_read_file_test_case");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("data.txt");
+        std::fs::write(&f, "HelloWorld\nhelloworld\n").unwrap();
+        let ctx = ctx_with(&dir);
+
+        // 默认不区分大小写
+        let out_ci = ReadFileTool
+            .run(json!({"path": "data.txt", "search": "helloworld"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out_ci.content.contains("找到 2 处匹配"));
+
+        // 显式区分大小写
+        let out_cs = ReadFileTool
+            .run(
+                json!({
+                    "path": "data.txt",
+                    "search": "HelloWorld",
+                    "case_sensitive": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out_cs.content.contains("找到 1 处匹配"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_content_not_found() {
+        let dir = std::env::temp_dir().join("cyber_read_file_test_nf");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("data.txt");
+        std::fs::write(&f, "hello\nworld\n").unwrap();
+        let ctx = ctx_with(&dir);
+
+        let out = ReadFileTool
+            .run(
+                json!({"path": "data.txt", "search": "missing_keyword"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("未在文件"));
+        assert!(out.content.contains("missing_keyword"));
+        assert!(out.content.contains("共扫描 2 行"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_content_merges_overlapping_context() {
+        let dir = std::env::temp_dir().join("cyber_read_file_test_overlap");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("code.rs");
+        let text = "line 1\nmatch_a\nline 3\nmatch_b\nline 5\n";
+        std::fs::write(&f, text).unwrap();
+        let ctx = ctx_with(&dir);
+
+        let out = ReadFileTool
+            .run(
+                json!({
+                    "path": "code.rs",
+                    "search": "match_",
+                    "context_lines": 2
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // 重叠的两个 match 应该合并在一个 block 里，不产生 "..." 分隔符
+        assert!(out.content.contains(">     2 | match_a"));
+        assert!(out.content.contains(">     4 | match_b"));
+        assert!(!out.content.contains("..."));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
