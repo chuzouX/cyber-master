@@ -1340,7 +1340,8 @@ impl App {
                             .entries
                             .push(ChatEntry::User(format!("{} (追加)", trimmed)));
                         if let Some(tx) = &self.steering_tx {
-                            let _ = tx.send(trimmed.to_string());
+                            let expanded = self.chat.expand_attached_placeholders(trimmed);
+                            let _ = tx.send(expanded);
                         }
                         self.toast = Some("已追加指示，模型将在下一步骤读取".into());
                     }
@@ -7350,12 +7351,15 @@ mod tests {
         if let Some(text) = app.chat.paste_detector.flush() {
             app.chat.paste(&text);
         }
+        std::thread::sleep(std::time::Duration::from_millis(35));
         app.handle_chat_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         if let Some(text) = app.chat.paste_detector.flush() {
             app.chat.paste(&text);
         }
         // Shift+Enter 换行
+        std::thread::sleep(std::time::Duration::from_millis(35));
         app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        std::thread::sleep(std::time::Duration::from_millis(35));
         app.handle_chat_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
         if let Some(text) = app.chat.paste_detector.flush() {
             app.chat.paste(&text);
@@ -7432,21 +7436,27 @@ mod tests {
         let mut app = make_app(Mode::Chat, temp_config_path());
         app.handle_event(crossterm::event::Event::Paste("paste_content".to_string()));
         let text1 = app.chat.input.lines().join("\n");
-        assert_eq!(text1, "paste_content");
+        assert_eq!(text1, "[paste:1]");
+        assert_eq!(app.chat.pasted_texts.len(), 1);
+        assert_eq!(app.chat.pasted_texts[0].text, "paste_content");
 
         // 模拟终端或快捷键在几毫秒内触发的第二次重复粘贴
         app.handle_event(crossterm::event::Event::Paste("paste_content".to_string()));
         let text2 = app.chat.input.lines().join("\n");
         assert_eq!(
-            text2, "paste_content",
+            text2, "[paste:1]",
             "快速重复的粘贴事件应被节流防重，不能重复插入"
         );
 
         app.handle_clipboard_paste();
         let text3 = app.chat.input.lines().join("\n");
         assert_eq!(
-            text3, "paste_content",
+            text3, "[paste:1]",
             "紧随其后的 clipboard_paste 同样应被拦截"
+        );
+        assert_eq!(
+            app.chat.expand_attached_placeholders(&text3),
+            "paste_content"
         );
     }
 

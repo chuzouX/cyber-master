@@ -1040,6 +1040,8 @@ struct CliScreen {
     view_snapshot: ViewSnapshot,
     pub attached_images: Vec<cyber_agent::AttachedImage>,
     pub next_image_id: usize,
+    pub pasted_texts: Vec<crate::chat::PastedSnippet>,
+    pub next_paste_id: usize,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub last_paste_instant: Option<std::time::Instant>,
     pub history_area: Rect,
@@ -1307,6 +1309,7 @@ fn composer() -> TextArea<'static> {
 }
 
 impl CliScreen {
+    #[allow(dead_code)]
     fn insert_text(&mut self, text: &str) {
         self.delete_pending = None;
         if self.approval.is_some() {
@@ -1326,6 +1329,42 @@ impl CliScreen {
             }
         } else if self.panel.is_none() && self.picker.is_none() {
             self.input.insert_str(clean(text));
+            self.completion_closed = false;
+            self.completion_accepted = false;
+        }
+    }
+
+    pub fn paste_text(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.delete_pending = None;
+        if self.approval.is_some() {
+            // Approval is keyboard-only. Ignore paste so it cannot select or confirm an action.
+        } else if let Some(q_state) = self.question_state.as_mut() {
+            if q_state.custom_editing {
+                let single_line = clean(text).replace(['\r', '\n'], " ");
+                q_state.custom_textarea.insert_str(&single_line);
+            }
+        } else if let Some(form) = &mut self.form {
+            if let Some(input) = form.inputs.get_mut(form.selected) {
+                input.insert_str(clean(text));
+            }
+        } else if let Some(form) = &mut self.ctf_edit_form {
+            if form.editing {
+                form.textarea.insert_str(clean(text));
+            }
+        } else if self.panel.is_none() && self.picker.is_none() {
+            if self.handle_text_image_paste(text) {
+                return;
+            }
+            let id = self.next_paste_id;
+            self.next_paste_id += 1;
+            self.pasted_texts.push(crate::chat::PastedSnippet {
+                id,
+                text: text.to_string(),
+            });
+            self.input.insert_str(format!("[paste:{id}]"));
             self.completion_closed = false;
             self.completion_accepted = false;
         }
@@ -1353,6 +1392,7 @@ impl CliScreen {
         let len = bytes.len();
         let mut i = 0;
         let mut referenced_ids = std::collections::HashSet::new();
+        let mut referenced_paste_ids = std::collections::HashSet::new();
 
         while i < len {
             if bytes[i] == b'[' {
@@ -1373,6 +1413,22 @@ impl CliScreen {
                             }
                         }
                     }
+                } else if rest.to_ascii_lowercase().starts_with("paste:") {
+                    let prefix_len = 1 + "paste:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Ok(id) = spec.parse::<usize>() {
+                            if let Some(snippet) = self.pasted_texts.iter().find(|p| p.id == id) {
+                                out.push_str(&text[last_end..i]);
+                                out.push_str(&snippet.text);
+                                referenced_paste_ids.insert(id);
+                                last_end = end;
+                                i = end;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
             i += 1;
@@ -1380,6 +1436,8 @@ impl CliScreen {
         out.push_str(&text[last_end..]);
         self.attached_images
             .retain(|a| referenced_ids.contains(&a.id));
+        self.pasted_texts
+            .retain(|p| referenced_paste_ids.contains(&p.id));
         out
     }
 
@@ -1536,6 +1594,8 @@ impl CliScreen {
             view_snapshot: ViewSnapshot::refresh_from(runner),
             attached_images: Vec::new(),
             next_image_id: 1,
+            pasted_texts: Vec::new(),
+            next_paste_id: 1,
             last_ctrl_c: None,
             last_paste_instant: None,
             history_area: Rect::default(),
@@ -1690,7 +1750,7 @@ impl CliScreen {
             let style = Style::default().fg(FG).bg(USER_BG);
             self.messages.push(Line::styled("", style));
             for line in clean(text).lines() {
-                if line.contains("[image:") {
+                if line.contains("[image:") || line.contains("[paste:") {
                     let mut spans = Vec::new();
                     Self::render_cli_text_with_image_badges(&mut spans, line, style);
                     self.messages.push(Line::from(spans).style(style));
@@ -1749,6 +1809,30 @@ impl CliScreen {
                                 Style::default()
                                     .fg(Color::White)
                                     .bg(Color::Rgb(112, 48, 160))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            last_end = end;
+                            i = end;
+                            continue;
+                        }
+                    }
+                } else if rest.to_ascii_lowercase().starts_with("paste:") {
+                    let prefix_len = 1 + "paste:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Ok(id) = spec.parse::<usize>() {
+                            if i > last_end {
+                                spans.push(Span::styled(
+                                    text[last_end..i].to_string(),
+                                    default_style,
+                                ));
+                            }
+                            spans.push(Span::styled(
+                                format!("📋 [paste:{id}]"),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(Color::Rgb(38, 79, 120))
                                     .add_modifier(Modifier::BOLD),
                             ));
                             last_end = end;
@@ -1884,7 +1968,7 @@ impl CliScreen {
                 if self.handle_text_image_paste(&text) {
                     return true;
                 }
-                self.insert_text(&text);
+                self.paste_text(&text);
                 return true;
             }
         }
@@ -12260,7 +12344,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                         screen.update_completions(runner.as_ref());
                     }
                     if let Some(text) = paste.flush_if_stale() {
-                        screen.insert_text(&text);
+                        screen.paste_text(&text);
                         if screen.question_state.is_none() {
                             screen.completion_closed = false;
                             screen.completion_accepted = false;
@@ -12288,7 +12372,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                             let _ = request.reply.send(PermissionDecision::Deny);
                             continue;
                         }
-                        if let Some(text) = paste.flush() { screen.insert_text(&text); }
+                        if let Some(text) = paste.flush() { screen.paste_text(&text); }
                         screen.panel = None;
                         screen.approval_choice = None;
                         screen.approval_input = composer();
@@ -12310,7 +12394,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                             });
                             continue;
                         }
-                        if let Some(text) = paste.flush() { screen.insert_text(&text); }
+                        if let Some(text) = paste.flush() { screen.paste_text(&text); }
                         screen.panel = None;
                         screen.question_state = Some(crate::question_ui::QuestionUiState::new(req));
                     }
@@ -12362,7 +12446,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                 KeyDisposition::Buffer => continue,
                                 KeyDisposition::FlushThenProcess => {
                                     if let Some(text) = paste.flush() {
-                                        screen.insert_text(&text);
+                                        screen.paste_text(&text);
                                         if screen.question_state.is_none() {
                                             screen.completion_closed = false;
                                             screen.completion_accepted = false;
@@ -12376,7 +12460,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                         }
                         Some(Ok(Event::Paste(text))) => {
                             if let Some(buffered) = paste.flush() {
-                                screen.insert_text(&buffered);
+                                screen.paste_text(&buffered);
                             }
                             if screen
                                 .last_paste_instant
@@ -12400,7 +12484,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                     continue;
                                 }
                             }
-                            screen.insert_text(&text);
+                            screen.paste_text(&text);
                             if screen.question_state.is_none() {
                                 screen.completion_closed = false;
                                 screen.completion_accepted = false;
@@ -14218,8 +14302,9 @@ fn handle_key(
             if let Some(tx) = cancel.take() {
                 let _ = tx.send(());
             }
+            let expanded = screen.expand_attached_placeholders(text);
             screen.queued_prompts.push_back(QueuedPrompt {
-                text: text.to_owned(),
+                text: expanded,
                 displayed: true,
                 kind: QueuedKind::Prompt,
             });
@@ -14235,11 +14320,12 @@ fn handle_key(
             screen.scroll = 0;
             screen.auto_scroll = true;
             screen.status = "已追加指示（下一步自动读取）".into();
+            let expanded = screen.expand_attached_placeholders(text);
             if let Some(tx) = &screen.active_steering_tx {
-                let _ = tx.send(text.to_owned());
+                let _ = tx.send(expanded.clone());
             }
             screen.queued_prompts.push_back(QueuedPrompt {
-                text: text.to_owned(),
+                text: expanded,
                 displayed: true,
                 kind: QueuedKind::Prompt,
             });
@@ -18656,6 +18742,90 @@ mod tests {
         assert_eq!(spans[2].content, " 占位");
 
         let _ = std::fs::remove_file(test_img);
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_cli_paste_placeholder_and_expansion() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // 1. 测试纯文字粘贴：生成 [paste:1]
+        screen.paste_text("line1\nline2");
+        assert_eq!(screen.input.lines().join(""), "[paste:1]");
+        assert_eq!(screen.pasted_texts.len(), 1);
+        assert_eq!(screen.pasted_texts[0].text, "line1\nline2");
+
+        // 2. 测试纯图片路径粘贴：生成 [image:1]
+        let temp_dir = std::env::temp_dir();
+        let test_img = temp_dir.join("cli_paste_test.png");
+        std::fs::write(&test_img, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        screen.paste_text(&format!("\"{}\"", test_img.display()));
+        assert_eq!(screen.input.lines().join(""), "[paste:1][image:1]");
+        assert_eq!(screen.attached_images.len(), 1);
+
+        // 3. 测试非图片文件路径粘贴：直接作为常规文本生成 [paste:2]，不生成文件附件
+        let test_non_img = temp_dir.join("cli_paste_dummy.txt");
+        std::fs::write(&test_non_img, "dummy content").unwrap();
+        screen.paste_text(&format!("\"{}\"", test_non_img.display()));
+        assert_eq!(screen.input.lines().join(""), "[paste:1][image:1][paste:2]");
+        assert_eq!(screen.attached_images.len(), 1); // 附件数量依然为 1
+        assert_eq!(screen.pasted_texts.len(), 2);
+
+        // 4. 测试图文混合粘贴：生成 [paste:3]，展开后保留完整原文
+        screen.paste_text(
+            "报错日志见截图 https://example.com/err.png\n详细堆栈：NullPointerException",
+        );
+        assert_eq!(
+            screen.input.lines().join(""),
+            "[paste:1][image:1][paste:2][paste:3]"
+        );
+        assert_eq!(screen.pasted_texts.len(), 3);
+
+        // 5. 测试与 [image:1] 混合输入时，[image:1] 与 [paste:1] / [paste:3] 同时正确展开，未引用的 [paste:2] 被清理
+        let expanded = screen
+            .expand_attached_placeholders("分析 [image:1] 以及文本：[paste:1] 还有图文：[paste:3]");
+        assert!(expanded.contains("cli_paste_test.png"));
+        assert!(expanded.contains("line1\nline2"));
+        assert!(expanded.contains(
+            "报错日志见截图 https://example.com/err.png\n详细堆栈：NullPointerException"
+        ));
+        assert_eq!(screen.pasted_texts.len(), 2);
+        assert_eq!(screen.pasted_texts[0].id, 1);
+        assert_eq!(screen.pasted_texts[1].id, 3);
+
+        // 6. 测试徽章渲染：render_cli_text_with_image_badges
+        let style = Style::default();
+        let mut spans = Vec::new();
+        CliScreen::render_cli_text_with_image_badges(
+            &mut spans,
+            "输入 [paste:1] 与 [image:1]",
+            style,
+        );
+        assert_eq!(spans.len(), 4);
+        assert_eq!(spans[0].content, "输入 ");
+        assert_eq!(spans[1].content, "📋 [paste:1]");
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(38, 79, 120)));
+        assert_eq!(spans[1].style.fg, Some(Color::White));
+        assert_eq!(spans[2].content, " 与 ");
+        assert_eq!(spans[3].content, "🖼️ [image:1]");
+
+        // 7. 测试表单编辑隔离：表单编辑态下 paste_text 保持纯文本直插，不生成任何占位符
+        let mut form_screen = CliScreen::new(&runner);
+        let form = cli_commands::toolbox_scan_form("anthropic".into(), "claude-sonnet-4-5".into());
+        form_screen.form = Some(FormState::new(form));
+        form_screen.paste_text("sk-ant-test-key-12345");
+        assert_eq!(
+            form_screen.form.as_ref().unwrap().inputs[0]
+                .lines()
+                .join(""),
+            "sk-ant-test-key-12345"
+        );
+        assert!(form_screen.pasted_texts.is_empty());
+        assert!(form_screen.input.is_empty());
+
+        let _ = std::fs::remove_file(test_img);
+        let _ = std::fs::remove_file(test_non_img);
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 

@@ -312,6 +312,13 @@ impl InputHistory {
     }
 }
 
+/// 待提交的粘贴文本片段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedSnippet {
+    pub id: usize,
+    pub text: String,
+}
+
 /// Chat 模式状态。
 pub struct ChatState {
     /// 已完成的对话条目（按时间序）。
@@ -369,6 +376,10 @@ pub struct ChatState {
     pub attached_images: Vec<AttachedImage>,
     /// 下一个分配的图片序列号（从 1 起始单调自增）。
     pub next_image_id: usize,
+    /// 待提交的粘贴文本片段列表。
+    pub pasted_texts: Vec<PastedSnippet>,
+    /// 下一个分配的粘贴序列号（从 1 起始单调自增）。
+    pub next_paste_id: usize,
     /// 上一帧渲染的历史区 inner 坐标范围，供鼠标事件判断是否点击滚动条。
     pub last_history_area: Cell<Rect>,
     /// 是否正在用鼠标拖拽滚动条。
@@ -418,6 +429,8 @@ impl ChatState {
             todo_closed: false,
             attached_images: Vec::new(),
             next_image_id: 1,
+            pasted_texts: Vec::new(),
+            next_paste_id: 1,
             last_history_area: Cell::new(Rect::default()),
             is_dragging_scrollbar: false,
             selection: None,
@@ -1073,10 +1086,20 @@ impl ChatState {
         Some((text, history))
     }
 
-    /// 插入粘贴文本（bracketed paste）：整块插入输入框，不触发提交。
-    /// 粘贴后刷新斜杠菜单（可能以 `/` 开头）。
+    /// 插入粘贴文本：
+    /// 若纯空白则忽略；分配递增序列号生成 `[paste:{id}]` 占位符插入输入框，
+    /// 原文暂存进 `pasted_texts`，并在提交时展开。粘贴后刷新斜杠菜单。
     pub fn paste(&mut self, text: &str) {
-        self.input.insert_str(text);
+        if text.trim().is_empty() {
+            return;
+        }
+        let id = self.next_paste_id;
+        self.next_paste_id += 1;
+        self.pasted_texts.push(PastedSnippet {
+            id,
+            text: text.to_string(),
+        });
+        self.input.insert_str(format!("[paste:{id}]"));
         self.update_slash_menu();
     }
 
@@ -1095,8 +1118,9 @@ impl ChatState {
         id
     }
 
-    /// 将待提交文本中包含的 `[image:N]` 占位符展开为内部文件路径，供 agent 任务解析。
-    /// 未在文本中引用的附件自动舍弃。
+    /// 将待提交文本中包含的 `[image:N]` 占位符展开为内部文件路径，
+    /// `[paste:N]` 占位符展开为原始粘贴文本。
+    /// 未在文本中引用的图片附件或粘贴文本自动舍弃。
     pub fn expand_attached_placeholders(&mut self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut last_end = 0;
@@ -1104,7 +1128,8 @@ impl ChatState {
         let len = bytes.len();
         let mut i = 0;
 
-        let mut referenced_ids = HashSet::new();
+        let mut referenced_image_ids = HashSet::new();
+        let mut referenced_paste_ids = HashSet::new();
 
         while i < len {
             if bytes[i] == b'[' {
@@ -1118,7 +1143,23 @@ impl ChatState {
                             if let Some(att) = self.attached_images.iter().find(|a| a.id == id) {
                                 out.push_str(&text[last_end..i]);
                                 out.push_str(&format!("[image: {}]", att.path.display()));
-                                referenced_ids.insert(id);
+                                referenced_image_ids.insert(id);
+                                last_end = end;
+                                i = end;
+                                continue;
+                            }
+                        }
+                    }
+                } else if rest.to_ascii_lowercase().starts_with("paste:") {
+                    let prefix_len = 1 + "paste:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Ok(id) = spec.parse::<usize>() {
+                            if let Some(snippet) = self.pasted_texts.iter().find(|p| p.id == id) {
+                                out.push_str(&text[last_end..i]);
+                                out.push_str(&snippet.text);
+                                referenced_paste_ids.insert(id);
                                 last_end = end;
                                 i = end;
                                 continue;
@@ -1133,7 +1174,9 @@ impl ChatState {
 
         // 仅保留当前文本中仍被引用的附件（清理已 Backspace 删掉的无效附件）
         self.attached_images
-            .retain(|a| referenced_ids.contains(&a.id));
+            .retain(|a| referenced_image_ids.contains(&a.id));
+        self.pasted_texts
+            .retain(|p| referenced_paste_ids.contains(&p.id));
         out
     }
 
@@ -1702,7 +1745,7 @@ fn push_role_lines(
     }
 }
 
-/// 解析文本中的 `[image:N]` 占位符，渲染为醒目的紫色背景徽章。
+/// 解析文本中的 `[image:N]` 与 `[paste:N]` 占位符，渲染为醒目的徽章。
 fn render_text_with_image_badges(spans: &mut Vec<Span<'static>>, text: &str, theme: &Theme) {
     let mut last_end = 0;
     let bytes = text.as_bytes();
@@ -1729,6 +1772,30 @@ fn render_text_with_image_badges(spans: &mut Vec<Span<'static>>, text: &str, the
                             Style::default()
                                 .fg(Color::White)
                                 .bg(Color::Rgb(112, 48, 160))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        last_end = end;
+                        i = end;
+                        continue;
+                    }
+                }
+            } else if rest.to_ascii_lowercase().starts_with("paste:") {
+                let prefix_len = 1 + "paste:".len();
+                if let Some(close) = text[i + prefix_len..].find(']') {
+                    let end = i + prefix_len + close + 1;
+                    let spec = text[i + prefix_len..end - 1].trim();
+                    if let Ok(id) = spec.parse::<usize>() {
+                        if i > last_end {
+                            spans.push(Span::styled(
+                                text[last_end..i].to_string(),
+                                Style::default().fg(theme.fg),
+                            ));
+                        }
+                        spans.push(Span::styled(
+                            format!("📋 [paste:{id}]"),
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(38, 79, 120))
                                 .add_modifier(Modifier::BOLD),
                         ));
                         last_end = end;
@@ -3175,6 +3242,40 @@ mod tests {
         assert_eq!(spans[0].content, "测试图片 ");
         assert_eq!(spans[1].content, "🖼️ [image:1]");
         assert_eq!(spans[2].content, " 内容");
+    }
+    #[test]
+    fn test_chat_paste_placeholder_and_expansion() {
+        let mut chat = ChatState::new();
+        // 测试纯文字
+        chat.paste("function foo() { return 42; }");
+        assert_eq!(chat.input.lines().join(""), "[paste:1]");
+        // 连续两次粘贴，验证生成 [paste:1][paste:2]
+        chat.paste("console.log(42);");
+        assert_eq!(chat.input.lines().join(""), "[paste:1][paste:2]");
+        assert_eq!(chat.pasted_texts.len(), 2);
+
+        // 测试展开：expand_attached_placeholders("请解释代码：[paste:1]")
+        let expanded = chat.expand_attached_placeholders("请解释代码：[paste:1]");
+        assert_eq!(expanded, "请解释代码：function foo() { return 42; }");
+        // [paste:2] 未在输入中引用，被舍弃
+        assert_eq!(chat.pasted_texts.len(), 1);
+        assert_eq!(chat.pasted_texts[0].id, 1);
+
+        // 空内容粘贴忽略
+        let before_id = chat.next_paste_id;
+        chat.paste("   ");
+        assert_eq!(chat.next_paste_id, before_id);
+
+        // 测试徽章渲染：render_text_with_image_badges 正确生成 📋 [paste:1] 样式 Span
+        let theme = Theme::resolve("cyberpunk");
+        let mut spans = Vec::new();
+        render_text_with_image_badges(&mut spans, "代码见 [paste:1] 结束", &theme);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "代码见 ");
+        assert_eq!(spans[1].content, "📋 [paste:1]");
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(38, 79, 120)));
+        assert_eq!(spans[1].style.fg, Some(Color::White));
+        assert_eq!(spans[2].content, " 结束");
     }
     #[test]
     fn test_chat_state_apply_scrollbar_click() {
