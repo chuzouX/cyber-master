@@ -650,34 +650,58 @@ pub fn assess_tool_safety(tool: &str, arguments: &Value) -> SafetyAssessment {
 
     // 4. 文件下载类工具 (download_file, download)
     if matches!(lower_tool.as_str(), "download_file" | "download") {
-        let url = arguments
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        let path = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if url.contains("127.0.0.1")
-            || url.contains("localhost")
-            || url.starts_with("http://10.")
-            || url.starts_with("http://192.168.")
-        {
-            return SafetyAssessment {
-                confidence: 0.45,
-                auto_approved: false,
-                reason: "下载目标指向本地或内网私有地址（潜在 SSRF 风险）".into(),
-            };
+        let mut check_urls = Vec::new();
+        let mut check_paths = Vec::new();
+
+        if let Some(u) = arguments.get("url").and_then(Value::as_str) {
+            check_urls.push(u.trim().to_ascii_lowercase());
         }
-        if path.contains("..") {
-            return SafetyAssessment {
-                confidence: 0.40,
-                auto_approved: false,
-                reason: "文件保存路径包含跨目录引用 (..)".into(),
-            };
+        if let Some(urls) = arguments.get("urls").and_then(Value::as_array) {
+            for u in urls {
+                if let Some(s) = u.as_str() {
+                    check_urls.push(s.trim().to_ascii_lowercase());
+                }
+            }
+        }
+        if let Some(items) = arguments.get("items").and_then(Value::as_array) {
+            for item in items {
+                if let Some(u) = item.get("url").and_then(Value::as_str) {
+                    check_urls.push(u.trim().to_ascii_lowercase());
+                }
+                if let Some(p) = item.get("output").and_then(Value::as_str) {
+                    check_paths.push(p.trim().to_string());
+                }
+            }
+        }
+        if let Some(p) = arguments
+            .get("output")
+            .or_else(|| arguments.get("path"))
+            .and_then(Value::as_str)
+        {
+            check_paths.push(p.trim().to_string());
+        }
+
+        for url in &check_urls {
+            if url.contains("127.0.0.1")
+                || url.contains("localhost")
+                || url.starts_with("http://10.")
+                || url.starts_with("http://192.168.")
+            {
+                return SafetyAssessment {
+                    confidence: 0.45,
+                    auto_approved: false,
+                    reason: "下载目标指向本地或内网私有地址（潜在 SSRF 风险）".into(),
+                };
+            }
+        }
+        for path in &check_paths {
+            if path.contains("..") {
+                return SafetyAssessment {
+                    confidence: 0.40,
+                    auto_approved: false,
+                    reason: "文件保存路径包含跨目录引用 (..)".into(),
+                };
+            }
         }
         return SafetyAssessment {
             confidence: 0.85,
@@ -1385,5 +1409,42 @@ mod tests {
         );
         assert!(ctf_res.auto_approved, "CTF 题目注册应当自动放行");
         assert!(ctf_res.confidence >= 0.90);
+    }
+
+    #[test]
+    fn download_batch_permission_assessment() {
+        // 常规批量下载放行
+        let res_safe = assess_tool_safety(
+            "download_file",
+            &json!({
+                "urls": ["https://example.com/a.zip", "https://example.com/b.zip"],
+                "output": "downloads"
+            }),
+        );
+        assert!(res_safe.auto_approved);
+
+        // 批量包含内网地址拦截
+        let res_ssrf = assess_tool_safety(
+            "download_file",
+            &json!({
+                "items": [
+                    {"url": "https://example.com/a.zip"},
+                    {"url": "http://127.0.0.1:8080/flag"}
+                ],
+                "output": "downloads"
+            }),
+        );
+        assert!(!res_ssrf.auto_approved);
+
+        // 批量包含目录跳跃拦截
+        let res_traversal = assess_tool_safety(
+            "download_file",
+            &json!({
+                "items": [
+                    {"url": "https://example.com/a.zip", "output": "../../../etc/cron"}
+                ]
+            }),
+        );
+        assert!(!res_traversal.auto_approved);
     }
 }
