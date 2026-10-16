@@ -19,9 +19,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(not(windows))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEvent, KeyEventKind, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
@@ -704,9 +705,8 @@ impl App {
             *list = session_todos;
         }
         let mut terminal: DefaultTerminal = ratatui::init();
-        // 启用 bracketed paste：终端在粘贴内容前后发送 \e[200~ / \e[201~ 标记，
-        // crossterm 解析为 Event::Paste(String) → 整块插入 textarea，而非逐行
-        // 拆成 KeyEvent(Enter) 触发误提交。与 Claude Code 的粘贴行为一致。
+        // Unix 下启用 bracketed paste（Windows 下 crossterm 不解析此序列，禁用以防转义符泄露）。
+        #[cfg(not(windows))]
         execute!(io::stdout(), EnableBracketedPaste)?;
         // 鼠标捕获开关：true 时启用滚轮翻页（默认），false 时不启用（可拖拽选区复制）。
         // F9 在 Chat 模式下随时切换。
@@ -753,12 +753,15 @@ impl App {
         if let Some(mcp) = self.registries.mcp.as_ref() {
             mcp.shutdown_all().await;
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             io::stdout(),
             SetTitle("Cyber Master"),
             DisableMouseCapture,
             DisableBracketedPaste
         );
+        #[cfg(windows)]
+        let _ = execute!(io::stdout(), SetTitle("Cyber Master"), DisableMouseCapture);
         result?;
         info!(mode = ?self.mode, "TUI 退出");
         Ok(())
@@ -929,7 +932,30 @@ impl App {
                     }
                     // 粘贴缓冲兜底：buffer 非空且距上次按键 > 50ms 时 flush
                     if let Some(text) = self.chat.paste_detector.flush_if_stale() {
-                        self.handle_paste(text);
+                        if let Some(first_ch) = text.chars().next() {
+                            let cur = self.chat.input.lines().join("\n");
+                            if cur.ends_with(first_ch) {
+                                let mut popped = cur;
+                                popped.pop();
+                                self.chat.input.clear();
+                                self.chat.input.insert_str(&popped);
+                            }
+                        }
+                        if self
+                            .last_paste_instant
+                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(300))
+                        {
+                            self.last_paste_instant = Some(std::time::Instant::now());
+                            self.handle_paste(text);
+                        }
+                    }
+                    if self
+                        .chat
+                        .file_drop_animation
+                        .as_ref()
+                        .is_some_and(|a| a.start_time.elapsed() >= a.duration)
+                    {
+                        self.chat.file_drop_animation = None;
                     }
                 }
             }
@@ -1006,6 +1032,7 @@ impl App {
             // 粘贴（bracketed paste）：整块插入当前活跃的 textarea，不触发提交。
             // 未启用 bracketed paste 的终端不会产生此事件，回退为逐字符 KeyEvent。
             Event::Paste(text) => {
+                let _ = self.chat.paste_detector.flush();
                 if self
                     .last_paste_instant
                     .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
@@ -1088,8 +1115,37 @@ impl App {
                         }
                     }
                 }
+                let existing_files =
+                    crate::chat::extract_existing_file_paths(&text, &self.paths.cwd);
+                if !existing_files.is_empty() {
+                    let mut names = Vec::new();
+                    let mut sizes = Vec::new();
+                    for f in &existing_files {
+                        let (_, name) = self.chat.attach_file(f);
+                        let sz = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                        names.push(name);
+                        sizes.push(sz);
+                    }
+                    self.chat.file_drop_animation = Some(crate::chat::FileDropAnimation {
+                        start_time: std::time::Instant::now(),
+                        file_names: names.clone(),
+                        file_sizes: sizes,
+                        duration: std::time::Duration::from_millis(1500),
+                    });
+                    if names.len() == 1 {
+                        self.toast = Some(format!("📄 已载入文件，生成标识符 [file:{}]", names[0]));
+                    } else {
+                        self.toast = Some(format!("📄 已载入 {} 个文件附件", names.len()));
+                    }
+                    return;
+                }
                 if trimmed.is_empty() {
                     self.handle_clipboard_paste();
+                    return;
+                }
+                if !crate::chat::is_long_or_multiline_paste(&text) {
+                    self.chat.input.insert_str(&text);
+                    self.chat.update_slash_menu();
                     return;
                 }
                 self.chat.paste(&text);
@@ -1133,6 +1189,34 @@ impl App {
                 let single_line = text.replace(['\r', '\n'], " ");
                 q_state.custom_textarea.insert_str(&single_line);
             }
+            return;
+        }
+        let existing_files = crate::chat::extract_existing_file_paths(&text, &self.paths.cwd);
+        if !existing_files.is_empty() {
+            let mut names = Vec::new();
+            let mut sizes = Vec::new();
+            for f in &existing_files {
+                let (_, name) = self.chat.attach_file(f);
+                let sz = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                names.push(name);
+                sizes.push(sz);
+            }
+            self.chat.file_drop_animation = Some(crate::chat::FileDropAnimation {
+                start_time: std::time::Instant::now(),
+                file_names: names.clone(),
+                file_sizes: sizes,
+                duration: std::time::Duration::from_millis(1500),
+            });
+            if names.len() == 1 {
+                self.toast = Some(format!("📄 已载入文件，生成标识符 [file:{}]", names[0]));
+            } else {
+                self.toast = Some(format!("📄 已载入 {} 个文件附件", names.len()));
+            }
+            return;
+        }
+        if !crate::chat::is_long_or_multiline_paste(&text) {
+            self.chat.input.insert_str(&text);
+            self.chat.update_slash_menu();
             return;
         }
         self.chat.paste(&text);
@@ -1297,7 +1381,22 @@ impl App {
             crate::chat::KeyDisposition::Buffer => return,
             crate::chat::KeyDisposition::FlushThenProcess => {
                 if let Some(text) = self.chat.paste_detector.flush() {
-                    self.route_paste_text(text);
+                    if let Some(first_ch) = text.chars().next() {
+                        let cur = self.chat.input.lines().join("\n");
+                        if cur.ends_with(first_ch) {
+                            let mut popped = cur;
+                            popped.pop();
+                            self.chat.input.clear();
+                            self.chat.input.insert_str(&popped);
+                        }
+                    }
+                    if self
+                        .last_paste_instant
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(300))
+                    {
+                        self.last_paste_instant = Some(std::time::Instant::now());
+                        self.route_paste_text(text);
+                    }
                 }
                 // 继续处理当前键
             }
@@ -3338,12 +3437,49 @@ impl App {
             SlashCommand::Image(args) => {
                 self.handle_image_slash(&args);
             }
+            SlashCommand::File(args) => {
+                self.handle_file_slash(&args);
+            }
             SlashCommand::Unknown(name) => {
                 self.chat.entries.push(ChatEntry::System(format!(
                     "未知命令：{name}（输入 /help 查看可用命令）"
                 )));
             }
         }
+    }
+
+    /// 处理 `/file <path>`：引入本地文件作为附件并生成 [file:文件名] 占位符。
+    fn handle_file_slash(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.chat
+                .entries
+                .push(ChatEntry::System("用法: /file <文件路径>".to_string()));
+            return;
+        }
+        let p = std::path::Path::new(trimmed);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.paths.cwd.join(p)
+        };
+        if !full.exists() {
+            self.chat
+                .entries
+                .push(ChatEntry::System(format!("文件不存在: {}", full.display())));
+            return;
+        }
+        let (_, display_name) = self.chat.attach_file(&full);
+        let sz = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+        self.chat.file_drop_animation = Some(crate::chat::FileDropAnimation {
+            start_time: std::time::Instant::now(),
+            file_names: vec![display_name.clone()],
+            file_sizes: vec![sz],
+            duration: std::time::Duration::from_millis(1500),
+        });
+        self.toast = Some(format!(
+            "📄 已引入文件附件，生成标识符 [file:{display_name}]"
+        ));
     }
 
     /// 处理 `/image <path> [prompt]` 或 `/paste`：传入图片并提交视觉模型分析。
@@ -7434,14 +7570,18 @@ mod tests {
     #[test]
     fn ctrl_v_paste_debounces_rapid_duplicate_events() {
         let mut app = make_app(Mode::Chat, temp_config_path());
-        app.handle_event(crossterm::event::Event::Paste("paste_content".to_string()));
+        app.handle_event(crossterm::event::Event::Paste(
+            "paste_content\nline2".to_string(),
+        ));
         let text1 = app.chat.input.lines().join("\n");
         assert_eq!(text1, "[paste:1]");
         assert_eq!(app.chat.pasted_texts.len(), 1);
-        assert_eq!(app.chat.pasted_texts[0].text, "paste_content");
+        assert_eq!(app.chat.pasted_texts[0].text, "paste_content\nline2");
 
         // 模拟终端或快捷键在几毫秒内触发的第二次重复粘贴
-        app.handle_event(crossterm::event::Event::Paste("paste_content".to_string()));
+        app.handle_event(crossterm::event::Event::Paste(
+            "paste_content\nline2".to_string(),
+        ));
         let text2 = app.chat.input.lines().join("\n");
         assert_eq!(
             text2, "[paste:1]",
@@ -7456,8 +7596,17 @@ mod tests {
         );
         assert_eq!(
             app.chat.expand_attached_placeholders(&text3),
-            "paste_content"
+            "paste_content\nline2"
         );
+    }
+
+    #[test]
+    fn chat_short_paste_inserts_directly_without_placeholder() {
+        let mut app = make_app(Mode::Chat, temp_config_path());
+        app.handle_event(crossterm::event::Event::Paste("你好中文输入法".to_string()));
+        let text = app.chat.input.lines().join("\n");
+        assert_eq!(text, "你好中文输入法");
+        assert!(app.chat.pasted_texts.is_empty());
     }
 
     #[test]

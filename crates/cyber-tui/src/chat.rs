@@ -11,12 +11,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::selection::{ContentCoord, TextSelection};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use cyber_agent::{AttachedImage, Message, ToolCall};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -44,6 +45,8 @@ use crate::theme::Theme;
 pub struct PasteDetector {
     buffer: String,
     last_key_time: Option<Instant>,
+    first_char: Option<char>,
+    buffered_first_char: Option<char>,
 }
 
 /// `PasteDetector::observe` 的返回值。
@@ -71,13 +74,15 @@ impl PasteDetector {
         Self {
             buffer: String::new(),
             last_key_time: None,
+            first_char: None,
+            buffered_first_char: None,
         }
     }
 
     /// 观察一个按键，返回处理方式。
     ///
-    /// 只缓冲**无修饰键的 Char 和 Enter**；带修饰键（Ctrl+C 等）或特殊键
-    /// （Esc/方向键等）会先 flush 再正常处理。
+    /// 允许无修饰键或 Shift 修饰键（如波浪号 ~、大写盘符 D、冒号 : 等）连续缓冲；带 Ctrl/Alt 等修饰键
+    /// 或特殊键（Esc/方向键等）会先 flush 再正常处理。
     pub fn observe(&mut self, k: KeyEvent) -> KeyDisposition {
         let now = Instant::now();
         let is_rapid = self
@@ -85,11 +90,14 @@ impl PasteDetector {
             .map(|t| now.duration_since(t) < RAPID_THRESHOLD)
             .unwrap_or(false);
 
-        // 只缓冲无修饰键的 Char 和 Enter
-        let bufferable = k.modifiers == KeyModifiers::NONE
-            && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter);
+        let is_plain_or_shift = k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT;
+        let bufferable = is_plain_or_shift && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter);
 
         let disposition = if bufferable && is_rapid {
+            if let Some(first) = self.first_char.take() {
+                self.buffered_first_char = Some(first);
+                self.buffer.push(first);
+            }
             let c = match k.code {
                 KeyCode::Char(c) => c,
                 KeyCode::Enter => '\n',
@@ -98,33 +106,95 @@ impl PasteDetector {
             self.buffer.push(c);
             KeyDisposition::Buffer
         } else if !self.buffer.is_empty() {
-            // 非快速键或特殊键，但 buffer 有内容 → 先 flush 再处理
+            self.first_char = None;
             KeyDisposition::FlushThenProcess
         } else {
+            self.buffered_first_char = None;
+            if let KeyCode::Char(c) = k.code {
+                if is_plain_or_shift {
+                    self.first_char = Some(c);
+                } else {
+                    self.first_char = None;
+                }
+            } else {
+                self.first_char = None;
+            }
             KeyDisposition::Process
         };
-
         self.last_key_time = Some(now);
         disposition
     }
 
-    /// 取出 buffer 内容（整块插入 textarea）。
-    pub fn flush(&mut self) -> Option<String> {
-        if self.buffer.is_empty() {
+    fn clean_buffer(mut s: String) -> Option<String> {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            if let Some(rest) = s.strip_prefix("\x1b[200~") {
+                s = rest.to_string();
+                changed = true;
+            }
+            if let Some(rest) = s.strip_prefix("[200~") {
+                s = rest.to_string();
+                changed = true;
+            }
+            if let Some(rest) = s.strip_suffix("\x1b[201~") {
+                s = rest.to_string();
+                changed = true;
+            }
+            if let Some(rest) = s.strip_suffix("[201~") {
+                s = rest.to_string();
+                changed = true;
+            }
+        }
+        #[cfg(windows)]
+        {
+            if s.starts_with('~') {
+                s = s.trim_start_matches('~').to_string();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if s.starts_with('~') && !s.starts_with("~/") && !s.starts_with("~\\") {
+                s = s.trim_start_matches('~').to_string();
+            }
+        }
+        if s.ends_with('~') {
+            s = s.trim_end_matches('~').to_string();
+        }
+        if s.is_empty() {
             None
         } else {
-            Some(std::mem::take(&mut self.buffer))
+            Some(s)
+        }
+    }
+
+    /// 如果在缓冲开始前有首个字符已被 Process 处理并送入输入框，返回该字符。
+    pub fn take_buffered_first_char(&mut self) -> Option<char> {
+        self.buffered_first_char.take()
+    }
+
+    /// 取出 buffer 内容（整块插入 textarea）。
+    pub fn flush(&mut self) -> Option<String> {
+        self.first_char = None;
+        if self.buffer.is_empty() {
+            self.buffered_first_char = None;
+            None
+        } else {
+            Self::clean_buffer(std::mem::take(&mut self.buffer))
         }
     }
 
     /// tick 兜底：buffer 非空且距上次按键 > 50ms 时 flush。
     pub fn flush_if_stale(&mut self) -> Option<String> {
         if self.buffer.is_empty() {
+            self.first_char = None;
+            self.buffered_first_char = None;
             return None;
         }
         if let Some(t) = self.last_key_time {
             if Instant::now().duration_since(t) >= FLUSH_TIMEOUT {
-                return Some(std::mem::take(&mut self.buffer));
+                self.first_char = None;
+                return Self::clean_buffer(std::mem::take(&mut self.buffer));
             }
         }
         None
@@ -318,6 +388,538 @@ pub struct PastedSnippet {
     pub id: usize,
     pub text: String,
 }
+/// 待提交的文件附件结构。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedFile {
+    pub id: usize,
+    pub path: PathBuf,
+    pub display_name: String,
+}
+
+impl AttachedFile {
+    pub fn new(id: usize, path: impl Into<PathBuf>, display_name: impl Into<String>) -> Self {
+        Self {
+            id,
+            path: path.into(),
+            display_name: display_name.into(),
+        }
+    }
+}
+
+/// 文件拖拽/导入过渡动画状态。
+#[derive(Debug, Clone)]
+pub struct FileDropAnimation {
+    pub start_time: Instant,
+    pub file_names: Vec<String>,
+    pub file_sizes: Vec<u64>,
+    pub duration: Duration,
+}
+
+/// 终端路径规范化（消除相对分量，Windows 下去除 `\\?\` 长路径前缀）。
+pub fn normalize_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(c) = path.canonicalize() {
+            let s = c.to_string_lossy();
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+            return c;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(c) = path.canonicalize() {
+            return c;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// 提取路径各有效分量为字符串列表。
+pub fn path_components(path: &Path) -> Vec<String> {
+    let comps: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            std::path::Component::RootDir => None,
+            std::path::Component::Prefix(p) => {
+                let s = p.as_os_str().to_string_lossy().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            std::path::Component::CurDir => None,
+            std::path::Component::ParentDir => Some("..".to_string()),
+        })
+        .collect();
+    if comps.is_empty() {
+        vec![path.to_string_lossy().to_string()]
+    } else {
+        comps
+    }
+}
+
+/// 重名文件向前推导消歧算法：
+/// 1. 若 file_name 唯一，则 display_name 为单文件名；
+/// 2. 若存在同名文件，逐级从右向左对比路径后缀分量，找到最小深度 D 使得名称互不相同；
+/// 3. 返回新旧 display_name 变更记录 `Vec<(old_name, new_name)>`。
+pub fn update_disambiguated_file_names(files: &mut [AttachedFile]) -> Vec<(String, String)> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    let all_comps: Vec<Vec<String>> = files.iter().map(|f| path_components(&f.path)).collect();
+
+    let base_names: Vec<String> = all_comps
+        .iter()
+        .map(|comps| comps.last().cloned().unwrap_or_else(|| "file".to_string()))
+        .collect();
+
+    let mut new_names = Vec::with_capacity(files.len());
+
+    for i in 0..files.len() {
+        let base_name = &base_names[i];
+        let collisions: Vec<usize> = (0..files.len())
+            .filter(|&j| &base_names[j] == base_name)
+            .collect();
+
+        if collisions.len() <= 1 {
+            new_names.push(base_name.clone());
+        } else {
+            let my_comps = &all_comps[i];
+            let mut max_common = 0;
+            for &j in &collisions {
+                if j == i {
+                    continue;
+                }
+                let other_comps = &all_comps[j];
+                let mut c = 0;
+                while c < my_comps.len()
+                    && c < other_comps.len()
+                    && my_comps[my_comps.len() - 1 - c] == other_comps[other_comps.len() - 1 - c]
+                {
+                    c += 1;
+                }
+                if c > max_common {
+                    max_common = c;
+                }
+            }
+            let depth = (max_common + 1).min(my_comps.len());
+            let start = my_comps.len().saturating_sub(depth);
+            let display_name = my_comps[start..].join("/");
+            new_names.push(display_name);
+        }
+    }
+
+    let mut changes = Vec::new();
+    for (file, new_name) in files.iter_mut().zip(new_names) {
+        if file.display_name != new_name {
+            changes.push((file.display_name.clone(), new_name.clone()));
+            file.display_name = new_name;
+        }
+    }
+
+    changes
+}
+
+/// URL 百分号解码（将 `%20` 等还原为字符）。
+pub fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut iter = s.as_bytes().iter();
+    while let Some(&b) = iter.next() {
+        if b == b'%' {
+            let h1 = iter.next().copied();
+            let h2 = iter.next().copied();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(val) =
+                    u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16)
+                {
+                    bytes.push(val);
+                    continue;
+                }
+            }
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
+/// 在 Windows 环境下将 Git Bash / MSYS2 的 POSIX 驱动器路径（如 `/c/...` 或 `/d/...` 或 `'/d/...'`）
+/// 转换为标准 Windows 盘符路径（如 `C:/...`、`D:/...`）。
+pub fn normalize_windows_posix_path(s: &str) -> String {
+    let trimmed = s
+        .trim()
+        .trim_matches(['\'', '"'])
+        .trim_start_matches('~')
+        .trim()
+        .trim_matches(['\'', '"']);
+    // 支持 /'d/... 或 /"d/... 形式的遗留单双引号
+    let s_no_inner_quotes =
+        if (trimmed.starts_with("/'") || trimmed.starts_with("/\"")) && trimmed.len() >= 4 {
+            format!("/{}", trimmed[2..].trim_matches(['\'', '"']))
+        } else {
+            trimmed.to_string()
+        };
+    let check = s_no_inner_quotes.trim_matches(['\'', '"']);
+    let bytes = check.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+    {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        format!("{drive}:/{}", &check[3..])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 清洗路径字符串（去除首尾引号、file:// 前缀与 URL 编码，以及可能泄露的 bracketed paste 标记与 POSIX 路径适配）。
+pub fn clean_raw_path(raw: &str) -> String {
+    let mut trimmed = raw.trim();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        if let Some(rest) = trimmed.strip_prefix("\x1b[200~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = trimmed.strip_prefix("[200~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = trimmed.strip_suffix("\x1b[201~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = trimmed.strip_suffix("[201~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if trimmed.starts_with('~') {
+            trimmed = trimmed.trim_start_matches('~').trim();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if trimmed.starts_with('~') && !trimmed.starts_with("~/") && !trimmed.starts_with("~\\") {
+            trimmed = trimmed.trim_start_matches('~').trim();
+        }
+    }
+    if trimmed.ends_with('~') {
+        trimmed = trimmed.trim_end_matches('~').trim();
+    }
+
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .or_else(|| trimmed.strip_prefix('“').and_then(|s| s.strip_suffix('”')))
+        .unwrap_or(trimmed)
+        .trim();
+    let decoded = percent_decode(unquoted);
+    let s = decoded.trim();
+    let path_str = if let Some(rest) = s.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        #[cfg(windows)]
+        {
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            rest.to_string()
+        }
+        #[cfg(not(windows))]
+        {
+            if rest.starts_with('/') {
+                rest.to_string()
+            } else {
+                format!("/{rest}")
+            }
+        }
+    } else {
+        s.to_string()
+    };
+
+    #[cfg(windows)]
+    {
+        normalize_windows_posix_path(&path_str)
+    }
+    #[cfg(not(windows))]
+    {
+        path_str
+    }
+}
+
+/// 从文本中提取真实存在的文件/目录路径列表。
+/// 仅当输入内容中**全部**有效 token 均为磁盘中真实存在的文件/目录时才认定为文件拖拽/粘贴。
+pub fn extract_existing_file_paths(text: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        if let Some(rest) = trimmed.strip_prefix("\x1b[200~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = trimmed.strip_prefix("[200~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = trimmed.strip_suffix("\x1b[201~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+        if let Some(rest) = trimmed.strip_suffix("[201~") {
+            trimmed = rest.trim();
+            changed = true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if trimmed.starts_with('~') {
+            trimmed = trimmed.trim_start_matches('~').trim();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if trimmed.starts_with('~') && !trimmed.starts_with("~/") && !trimmed.starts_with("~\\") {
+            trimmed = trimmed.trim_start_matches('~').trim();
+        }
+    }
+    if trimmed.ends_with('~') {
+        trimmed = trimmed.trim_end_matches('~').trim();
+    }
+
+    let resolve_and_check = |cleaned: &str| -> Option<PathBuf> {
+        let mut trimmed_cleaned = cleaned.trim();
+        if trimmed_cleaned.is_empty() {
+            return None;
+        }
+        #[cfg(windows)]
+        let normalized = normalize_windows_posix_path(trimmed_cleaned);
+        #[cfg(windows)]
+        {
+            trimmed_cleaned = &normalized;
+        }
+
+        // 排除单字母磁盘根路径（如 "C:", "C:\", "D:", "D:\"）或根目录 "/"，避免将磁盘根识别为文件附件
+        let without_slash = trimmed_cleaned.trim_end_matches(['\\', '/']);
+        if without_slash.len() <= 2 && without_slash.ends_with(':') {
+            return None;
+        }
+        if without_slash.is_empty() || without_slash == "/" {
+            return None;
+        }
+        let p = std::path::Path::new(trimmed_cleaned);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        if resolved.exists() {
+            Some(normalize_path(&resolved))
+        } else {
+            #[cfg(windows)]
+            {
+                if trimmed_cleaned.starts_with('~') {
+                    let stripped = trimmed_cleaned.trim_start_matches('~').trim();
+                    if !stripped.is_empty() {
+                        let p = std::path::Path::new(stripped);
+                        let resolved = if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            cwd.join(p)
+                        };
+                        if resolved.exists() {
+                            return Some(normalize_path(&resolved));
+                        }
+                    }
+                }
+            }
+            None
+        }
+    };
+
+    // 1. 检查整串直接作为一个完整路径（处理未带引号但含空格的单个文件）
+    let cleaned_full = clean_raw_path(trimmed);
+    if let Some(path) = resolve_and_check(&cleaned_full) {
+        return vec![path];
+    }
+
+    // 2. 多行模式：检查是否每一行均为存在的文件
+    if text.contains('\n') {
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            let mut all_exist = true;
+            let mut paths = Vec::with_capacity(lines.len());
+            for line in lines {
+                let cleaned = clean_raw_path(line);
+                if let Some(p) = resolve_and_check(&cleaned) {
+                    paths.push(p);
+                } else {
+                    all_exist = false;
+                    break;
+                }
+            }
+            if all_exist {
+                return paths;
+            }
+        }
+    }
+
+    // 3. 词法切分引号与空白（Windows Terminal 拖拽多文件: "path1" "path2"）
+    let mut tokens = Vec::new();
+    let mut chars = trimmed.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+        } else if ch == '"' || ch == '\'' || ch == '“' {
+            let quote = ch;
+            let close_quote = if quote == '“' { '”' } else { quote };
+            chars.next();
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                chars.next();
+                if c == close_quote {
+                    break;
+                }
+                s.push(c);
+            }
+            if !s.is_empty() {
+                tokens.push(s);
+            }
+        } else {
+            let mut s = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() || c == '"' || c == '\'' || c == '“' {
+                    break;
+                }
+                chars.next();
+                s.push(c);
+            }
+            if !s.is_empty() {
+                tokens.push(s);
+            }
+        }
+    }
+
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let cleaned = clean_raw_path(&token);
+        if let Some(p) = resolve_and_check(&cleaned) {
+            paths.push(p);
+        } else {
+            // 存在任一无效 token 则不视为纯文件拖拽
+            return Vec::new();
+        }
+    }
+
+    paths
+}
+
+/// 字节大小可读格式化。
+pub fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// 判断待粘贴的文本是否属于长文本或多行代码块。
+/// 仅当文本包含换行符（多行）或字符数 >= 120 时，才折叠为 `[paste:N]` 占位符；
+/// 杜绝将中文输入法（IME）上屏短文本或常规短字符串误判定为剪切占位符。
+pub fn is_long_or_multiline_paste(text: &str) -> bool {
+    text.contains('\n') || text.chars().count() >= 120
+}
+
+/// 动效旋转帧
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// 渲染文件拖入终端动态浮层卡片。
+pub fn render_drop_animation_card(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    anim: &FileDropAnimation,
+) {
+    let elapsed = anim.start_time.elapsed();
+    if elapsed >= anim.duration || area.width < 12 || area.height < 4 {
+        return;
+    }
+
+    let card_height: u16 = 3.min(area.height);
+    let card_width: u16 = (area.width.saturating_sub(4)).clamp(10, 68);
+    let x = area.x + (area.width.saturating_sub(card_width)) / 2;
+    let y = area.bottom().saturating_sub(card_height + 1).max(area.y);
+    let card_area = Rect::new(x, y, card_width, card_height);
+
+    let spinner_idx = ((elapsed.as_millis() / 80) % (SPINNER_FRAMES.len() as u128)) as usize;
+    let spinner = SPINNER_FRAMES[spinner_idx];
+
+    let cycle = (elapsed.as_millis() / 250) % 3;
+    let border_color = match cycle {
+        0 => Color::Rgb(125, 207, 255),
+        1 => Color::Rgb(80, 250, 123),
+        _ => Color::Rgb(255, 184, 108),
+    };
+
+    let title = format!(" {spinner} 拖入文件已载入 ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let content_text = if anim.file_names.len() == 1 {
+        let name = &anim.file_names[0];
+        let sz = format_file_size(anim.file_sizes.first().copied().unwrap_or(0));
+        format!(" 📄 [file:{name}] ({sz})")
+    } else {
+        let name = &anim.file_names[0];
+        let count = anim.file_names.len();
+        let total_sz: u64 = anim.file_sizes.iter().sum();
+        let sz = format_file_size(total_sz);
+        format!(" 📄 [file:{name}] 等 {count} 个文件 ({sz})")
+    };
+
+    let content_line = Line::from(vec![Span::styled(
+        content_text,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )]);
+
+    frame.render_widget(Clear, card_area);
+    let inner_para = Paragraph::new(vec![content_line]).block(block);
+    frame.render_widget(inner_para, card_area);
+}
 
 /// Chat 模式状态。
 pub struct ChatState {
@@ -380,6 +982,12 @@ pub struct ChatState {
     pub pasted_texts: Vec<PastedSnippet>,
     /// 下一个分配的粘贴序列号（从 1 起始单调自增）。
     pub next_paste_id: usize,
+    /// 待提交的文件附件列表。
+    pub attached_files: Vec<AttachedFile>,
+    /// 下一个分配的文件序列号（从 1 起始单调自增）。
+    pub next_file_id: usize,
+    /// 文件拖拽/导入过渡动画状态。
+    pub file_drop_animation: Option<FileDropAnimation>,
     /// 上一帧渲染的历史区 inner 坐标范围，供鼠标事件判断是否点击滚动条。
     pub last_history_area: Cell<Rect>,
     /// 是否正在用鼠标拖拽滚动条。
@@ -431,6 +1039,9 @@ impl ChatState {
             next_image_id: 1,
             pasted_texts: Vec::new(),
             next_paste_id: 1,
+            attached_files: Vec::new(),
+            next_file_id: 1,
+            file_drop_animation: None,
             last_history_area: Cell::new(Rect::default()),
             is_dragging_scrollbar: false,
             selection: None,
@@ -1087,10 +1698,15 @@ impl ChatState {
     }
 
     /// 插入粘贴文本：
-    /// 若纯空白则忽略；分配递增序列号生成 `[paste:{id}]` 占位符插入输入框，
-    /// 原文暂存进 `pasted_texts`，并在提交时展开。粘贴后刷新斜杠菜单。
+    /// 若纯空白则忽略；仅当文本包含换行符（多行）或字符数 >= 120 时，折叠为 `[paste:{id}]` 占位符；
+    /// 常规单行短文本与输入法上屏内容直接作为原生自然文本插入输入框。
     pub fn paste(&mut self, text: &str) {
         if text.trim().is_empty() {
+            return;
+        }
+        if !is_long_or_multiline_paste(text) {
+            self.input.insert_str(text);
+            self.update_slash_menu();
             return;
         }
         let id = self.next_paste_id;
@@ -1117,10 +1733,63 @@ impl ChatState {
         self.update_slash_menu();
         id
     }
+    /// 注册本地文件为附件，若重名自动消歧，并在输入框光标处插入 `[file:{display_name}]` 占位符。
+    /// 若同一路径已存在，直接复用已有附件记录，不重复生成占位符。
+    pub fn attach_file(&mut self, path: impl Into<PathBuf>) -> (usize, String) {
+        let raw_path = path.into();
+        let norm_path = normalize_path(&raw_path);
+        if let Some(existing) = self.attached_files.iter().find(|f| f.path == norm_path) {
+            return (existing.id, existing.display_name.clone());
+        }
+
+        let id = self.next_file_id;
+        self.next_file_id += 1;
+
+        let base_name = norm_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        self.attached_files
+            .push(AttachedFile::new(id, norm_path, &base_name));
+
+        // 更新全部附件的消歧名称
+        let changes = update_disambiguated_file_names(&mut self.attached_files);
+
+        // 若已有附件显示名称变更，同步更新输入框中已有占位符
+        if !changes.is_empty() {
+            let cur_text = self.input.lines().join("\n");
+            let mut new_text = cur_text;
+            for (old_name, new_name) in changes {
+                let old_ph = format!("[file:{old_name}]");
+                let new_ph = format!("[file:{new_name}]");
+                new_text = new_text.replace(&old_ph, &new_ph);
+            }
+            if new_text != self.input.lines().join("\n") {
+                self.input.clear();
+                self.input.insert_str(&new_text);
+            }
+        }
+
+        let final_display_name = self
+            .attached_files
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.display_name.clone())
+            .unwrap_or(base_name);
+
+        self.input
+            .insert_str(format!("[file:{final_display_name}]"));
+        self.update_slash_menu();
+
+        (id, final_display_name)
+    }
 
     /// 将待提交文本中包含的 `[image:N]` 占位符展开为内部文件路径，
-    /// `[paste:N]` 占位符展开为原始粘贴文本。
-    /// 未在文本中引用的图片附件或粘贴文本自动舍弃。
+    /// `[paste:N]` 占位符展开为原始粘贴文本，
+    /// `[file:文件名]` 占位符展开为磁盘真实完整路径 `[file: 路径]`。
+    /// 未在文本中引用的图片附件、粘贴文本或文件附件自动舍弃。
     pub fn expand_attached_placeholders(&mut self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut last_end = 0;
@@ -1130,6 +1799,7 @@ impl ChatState {
 
         let mut referenced_image_ids = HashSet::new();
         let mut referenced_paste_ids = HashSet::new();
+        let mut referenced_file_ids = HashSet::new();
 
         while i < len {
             if bytes[i] == b'[' {
@@ -1166,6 +1836,22 @@ impl ChatState {
                             }
                         }
                     }
+                } else if rest.to_ascii_lowercase().starts_with("file:") {
+                    let prefix_len = 1 + "file:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Some(att) =
+                            self.attached_files.iter().find(|a| a.display_name == spec)
+                        {
+                            out.push_str(&text[last_end..i]);
+                            out.push_str(&format!("[file: {}]", att.path.display()));
+                            referenced_file_ids.insert(att.id);
+                            last_end = end;
+                            i = end;
+                            continue;
+                        }
+                    }
                 }
             }
             i += 1;
@@ -1177,6 +1863,8 @@ impl ChatState {
             .retain(|a| referenced_image_ids.contains(&a.id));
         self.pasted_texts
             .retain(|p| referenced_paste_ids.contains(&p.id));
+        self.attached_files
+            .retain(|f| referenced_file_ids.contains(&f.id));
         out
     }
 
@@ -1745,7 +2433,7 @@ fn push_role_lines(
     }
 }
 
-/// 解析文本中的 `[image:N]` 与 `[paste:N]` 占位符，渲染为醒目的徽章。
+/// 解析文本中的 `[image:N]`、`[paste:N]` 与 `[file:文件名]` 占位符，渲染为醒目的徽章。
 fn render_text_with_image_badges(spans: &mut Vec<Span<'static>>, text: &str, theme: &Theme) {
     let mut last_end = 0;
     let bytes = text.as_bytes();
@@ -1796,6 +2484,30 @@ fn render_text_with_image_badges(spans: &mut Vec<Span<'static>>, text: &str, the
                             Style::default()
                                 .fg(Color::White)
                                 .bg(Color::Rgb(38, 79, 120))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        last_end = end;
+                        i = end;
+                        continue;
+                    }
+                }
+            } else if rest.to_ascii_lowercase().starts_with("file:") {
+                let prefix_len = 1 + "file:".len();
+                if let Some(close) = text[i + prefix_len..].find(']') {
+                    let end = i + prefix_len + close + 1;
+                    let spec = text[i + prefix_len..end - 1].trim();
+                    if !spec.is_empty() {
+                        if i > last_end {
+                            spans.push(Span::styled(
+                                text[last_end..i].to_string(),
+                                Style::default().fg(theme.fg),
+                            ));
+                        }
+                        spans.push(Span::styled(
+                            format!("📄 [file:{spec}]"),
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(160, 100, 30))
                                 .add_modifier(Modifier::BOLD),
                         ));
                         last_end = end;
@@ -2185,7 +2897,7 @@ mod tests {
         assert_eq!(pd.observe(key(KeyCode::Char('b'))), KeyDisposition::Buffer);
         assert_eq!(pd.observe(key(KeyCode::Char('c'))), KeyDisposition::Buffer);
         let flushed = pd.flush().unwrap();
-        assert_eq!(flushed, "bc");
+        assert_eq!(flushed, "abc");
     }
 
     #[test]
@@ -2195,7 +2907,7 @@ mod tests {
         assert_eq!(pd.observe(key(KeyCode::Enter)), KeyDisposition::Buffer);
         assert_eq!(pd.observe(key(KeyCode::Char('b'))), KeyDisposition::Buffer);
         let flushed = pd.flush().unwrap();
-        assert_eq!(flushed, "\nb");
+        assert_eq!(flushed, "a\nb");
     }
 
     #[test]
@@ -2209,7 +2921,7 @@ mod tests {
             KeyDisposition::FlushThenProcess
         );
         let flushed = pd.flush().unwrap();
-        assert_eq!(flushed, "b");
+        assert_eq!(flushed, "ab");
     }
 
     #[test]
@@ -2223,7 +2935,7 @@ mod tests {
             KeyDisposition::FlushThenProcess
         );
         let flushed = pd.flush().unwrap();
-        assert_eq!(flushed, "b");
+        assert_eq!(flushed, "ab");
     }
 
     #[test]
@@ -2240,7 +2952,7 @@ mod tests {
                                              // 手动设置 last_key_time 为很久以前
         pd.last_key_time = Some(Instant::now() - Duration::from_millis(100));
         let flushed = pd.flush_if_stale();
-        assert_eq!(flushed.as_deref(), Some("b"));
+        assert_eq!(flushed.as_deref(), Some("ab"));
         // 再调应返回 None（buffer 已清）
         assert!(pd.flush_if_stale().is_none());
     }
@@ -2252,6 +2964,118 @@ mod tests {
         pd.observe(key(KeyCode::Char('b'))); // Buffer
                                              // 刚刚按键，还没超时
         assert!(pd.flush_if_stale().is_none());
+    }
+    #[test]
+    fn test_paste_detector_shift_keys_are_buffered() {
+        let mut pd = PasteDetector::new();
+        // 第一个字符是带 Shift 的大写 D (例如 D:\path)
+        let first = pd.observe(key_with_mods(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert_eq!(first, KeyDisposition::Process);
+        assert_eq!(pd.first_char, Some('D'));
+
+        // 第二个字符是带 Shift 的冒号 :，应被正常缓冲，而不是打断 flush
+        let second = pd.observe(key_with_mods(KeyCode::Char(':'), KeyModifiers::SHIFT));
+        assert_eq!(second, KeyDisposition::Buffer);
+        assert_eq!(pd.buffered_first_char, Some('D'));
+
+        // 后续普通字符与带 Shift 字符（如反斜杠、大写 P、波浪号 ~ 等）
+        assert_eq!(pd.observe(key(KeyCode::Char('\\'))), KeyDisposition::Buffer);
+        assert_eq!(
+            pd.observe(key_with_mods(KeyCode::Char('P'), KeyModifiers::SHIFT)),
+            KeyDisposition::Buffer
+        );
+        assert_eq!(pd.observe(key(KeyCode::Char('r'))), KeyDisposition::Buffer);
+        assert_eq!(
+            pd.observe(key_with_mods(KeyCode::Char('~'), KeyModifiers::SHIFT)),
+            KeyDisposition::Buffer
+        );
+
+        let flushed = pd.flush().unwrap();
+        // clean_buffer 会自动剔除尾部可能泄漏的 ~ 标记
+        assert_eq!(flushed, "D:\\Pr");
+        assert_eq!(pd.take_buffered_first_char(), Some('D'));
+        assert_eq!(pd.take_buffered_first_char(), None);
+    }
+
+    #[test]
+    fn test_clean_raw_path_git_bash_and_bracketed_paste() {
+        // 1. normalize_windows_posix_path
+        assert_eq!(
+            normalize_windows_posix_path("/d/Project/agent/test.png"),
+            "D:/Project/agent/test.png"
+        );
+        assert_eq!(
+            normalize_windows_posix_path("'/d/Project/agent/test.png'"),
+            "D:/Project/agent/test.png"
+        );
+        assert_eq!(
+            normalize_windows_posix_path("\"/c/Users/Administrator/file.txt\""),
+            "C:/Users/Administrator/file.txt"
+        );
+        assert_eq!(
+            normalize_windows_posix_path("~/d/Project/test.png"),
+            "D:/Project/test.png"
+        );
+        assert_eq!(
+            normalize_windows_posix_path("~'/d/Project/test.png'"),
+            "D:/Project/test.png"
+        );
+        assert_eq!(
+            normalize_windows_posix_path("'~D:/already/windows.txt'"),
+            "D:/already/windows.txt"
+        );
+
+        // 2. clean_raw_path with escape sequences and ~
+        assert_eq!(
+            clean_raw_path("\x1b[200~\"D:\\Project\\test.png\"\x1b[201~"),
+            "D:\\Project\\test.png"
+        );
+        assert_eq!(
+            clean_raw_path("[200~\"D:\\Project\\test.png\"[201~"),
+            "D:\\Project\\test.png"
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                clean_raw_path("\x1b[200~'/d/Project/test.png'\x1b[201~"),
+                "D:/Project/test.png"
+            );
+            assert_eq!(
+                clean_raw_path("~/'d/Project/test.png'"),
+                "D:/Project/test.png"
+            );
+            assert_eq!(
+                clean_raw_path("~/d/Project/test.png"),
+                "D:/Project/test.png"
+            );
+            assert_eq!(
+                clean_raw_path("~\"D:\\Project\\test.png\""),
+                "D:\\Project\\test.png"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clean_buffer_strips_bracketed_paste_and_tilde() {
+        assert_eq!(
+            PasteDetector::clean_buffer("\x1b[200~hello world\x1b[201~".to_string()),
+            Some("hello world".to_string())
+        );
+        assert_eq!(
+            PasteDetector::clean_buffer("[200~hello world[201~".to_string()),
+            Some("hello world".to_string())
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                PasteDetector::clean_buffer("~hello world~".to_string()),
+                Some("hello world".to_string())
+            );
+            assert_eq!(
+                PasteDetector::clean_buffer("~/d/test.png".to_string()),
+                Some("/d/test.png".to_string())
+            );
+        }
     }
 
     #[test]
@@ -3246,17 +4070,17 @@ mod tests {
     #[test]
     fn test_chat_paste_placeholder_and_expansion() {
         let mut chat = ChatState::new();
-        // 测试纯文字
-        chat.paste("function foo() { return 42; }");
+        // 测试纯文字（多行代码块）
+        chat.paste("function foo() {\n    return 42;\n}");
         assert_eq!(chat.input.lines().join(""), "[paste:1]");
         // 连续两次粘贴，验证生成 [paste:1][paste:2]
-        chat.paste("console.log(42);");
+        chat.paste("console.log(42);\n");
         assert_eq!(chat.input.lines().join(""), "[paste:1][paste:2]");
         assert_eq!(chat.pasted_texts.len(), 2);
 
         // 测试展开：expand_attached_placeholders("请解释代码：[paste:1]")
         let expanded = chat.expand_attached_placeholders("请解释代码：[paste:1]");
-        assert_eq!(expanded, "请解释代码：function foo() { return 42; }");
+        assert_eq!(expanded, "请解释代码：function foo() {\n    return 42;\n}");
         // [paste:2] 未在输入中引用，被舍弃
         assert_eq!(chat.pasted_texts.len(), 1);
         assert_eq!(chat.pasted_texts[0].id, 1);
@@ -3265,7 +4089,56 @@ mod tests {
         let before_id = chat.next_paste_id;
         chat.paste("   ");
         assert_eq!(chat.next_paste_id, before_id);
+    }
 
+    #[test]
+    fn test_is_long_or_multiline_paste() {
+        assert!(!is_long_or_multiline_paste(""));
+        assert!(!is_long_or_multiline_paste("hello"));
+        assert!(!is_long_or_multiline_paste(
+            "你好，世界！这是一段中文输入法上屏的内容。"
+        ));
+        assert!(!is_long_or_multiline_paste(&"a".repeat(119)));
+        assert!(is_long_or_multiline_paste(&"a".repeat(120)));
+        assert!(is_long_or_multiline_paste("a\n"));
+        assert!(is_long_or_multiline_paste("\n"));
+        assert!(is_long_or_multiline_paste("line1\nline2"));
+    }
+
+    #[test]
+    fn test_ime_chinese_input_does_not_trigger_paste_placeholder() {
+        let mut chat = ChatState::new();
+        // 模拟输入法快速上屏短句
+        chat.paste("你好");
+        assert_eq!(chat.input.lines().join(""), "你好");
+        assert!(chat.pasted_texts.is_empty());
+        assert_eq!(chat.next_paste_id, 1);
+
+        chat.paste("，请帮我分析一下这段代码");
+        assert_eq!(chat.input.lines().join(""), "你好，请帮我分析一下这段代码");
+        assert!(chat.pasted_texts.is_empty());
+
+        // 模拟长文本（>= 120 字符）单行粘贴：仍然折叠为 [paste:1]
+        let long_str = "a".repeat(120);
+        chat.paste(&long_str);
+        assert_eq!(
+            chat.input.lines().join(""),
+            "你好，请帮我分析一下这段代码[paste:1]"
+        );
+        assert_eq!(chat.pasted_texts.len(), 1);
+        assert_eq!(chat.pasted_texts[0].text, long_str);
+
+        // 模拟多行文本粘贴：折叠为 [paste:2]
+        chat.paste("line1\nline2");
+        assert_eq!(
+            chat.input.lines().join(""),
+            "你好，请帮我分析一下这段代码[paste:1][paste:2]"
+        );
+        assert_eq!(chat.pasted_texts.len(), 2);
+    }
+
+    #[test]
+    fn test_render_paste_badge() {
         // 测试徽章渲染：render_text_with_image_badges 正确生成 📋 [paste:1] 样式 Span
         let theme = Theme::resolve("cyberpunk");
         let mut spans = Vec::new();
@@ -3276,6 +4149,142 @@ mod tests {
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(38, 79, 120)));
         assert_eq!(spans[1].style.fg, Some(Color::White));
         assert_eq!(spans[2].content, " 结束");
+    }
+    #[test]
+    fn test_disambiguate_file_names() {
+        // 场景 1：单个文件 -> 单文件名
+        let mut files = vec![AttachedFile::new(
+            1,
+            PathBuf::from("/a/b/main.rs"),
+            "main.rs",
+        )];
+        let changes = update_disambiguated_file_names(&mut files);
+        assert!(changes.is_empty());
+        assert_eq!(files[0].display_name, "main.rs");
+
+        // 场景 2：两个同名文件但上一级目录不同 -> 生成 app/src/main.rs 与 cli/src/main.rs
+        let mut files = vec![
+            AttachedFile::new(1, PathBuf::from("/proj/app/src/main.rs"), "main.rs"),
+            AttachedFile::new(2, PathBuf::from("/proj/cli/src/main.rs"), "main.rs"),
+        ];
+        let _ = update_disambiguated_file_names(&mut files);
+        assert_eq!(files[0].display_name, "app/src/main.rs");
+        assert_eq!(files[1].display_name, "cli/src/main.rs");
+
+        // 场景 3：三级同名且差异深度不同
+        let mut files = vec![
+            AttachedFile::new(1, PathBuf::from("/a/b/c/main.rs"), "main.rs"),
+            AttachedFile::new(2, PathBuf::from("/x/b/c/main.rs"), "main.rs"),
+            AttachedFile::new(3, PathBuf::from("/y/z/main.rs"), "main.rs"),
+        ];
+        let _ = update_disambiguated_file_names(&mut files);
+        assert_eq!(files[0].display_name, "a/b/c/main.rs");
+        assert_eq!(files[1].display_name, "x/b/c/main.rs");
+        assert_eq!(files[2].display_name, "z/main.rs");
+    }
+
+    #[test]
+    fn test_chat_attach_file_and_input_sync() {
+        let mut chat = ChatState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("app").join("src");
+        let cli_dir = dir.path().join("cli").join("src");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        let f1 = app_dir.join("main.rs");
+        let f2 = cli_dir.join("main.rs");
+        std::fs::write(&f1, "fn main() {}").unwrap();
+        std::fs::write(&f2, "fn main() {}").unwrap();
+
+        // 1. 添加第一个 main.rs
+        let (id1, name1) = chat.attach_file(&f1);
+        assert_eq!(id1, 1);
+        assert_eq!(name1, "main.rs");
+        assert_eq!(chat.input.lines().join(""), "[file:main.rs]");
+
+        // 2. 添加第二个 main.rs，发生重名碰撞 -> 第一个自动联动替换为 app/src/main.rs
+        let (id2, name2) = chat.attach_file(&f2);
+        assert_eq!(id2, 2);
+        assert_eq!(name2, "cli/src/main.rs");
+        assert_eq!(
+            chat.input.lines().join(""),
+            "[file:app/src/main.rs][file:cli/src/main.rs]"
+        );
+
+        // 3. 重复添加已有文件 -> 复用附件，不重复生成占位符
+        let (id1_dup, name1_dup) = chat.attach_file(&f1);
+        assert_eq!(id1_dup, id1);
+        assert_eq!(name1_dup, "app/src/main.rs");
+        assert_eq!(
+            chat.input.lines().join(""),
+            "[file:app/src/main.rs][file:cli/src/main.rs]"
+        );
+
+        // 4. 展开占位符测试
+        let expanded =
+            chat.expand_attached_placeholders("请审计代码 [file:app/src/main.rs] 是否安全");
+        assert!(expanded.contains(&format!("[file: {}]", f1.display())));
+        assert!(!expanded.contains("cli/src/main.rs"));
+        // 未引用的 f2 附件自动舍弃
+        assert_eq!(chat.attached_files.len(), 1);
+        assert_eq!(chat.attached_files[0].id, 1);
+    }
+
+    #[test]
+    fn test_render_text_with_file_badges() {
+        let theme = Theme::resolve("cyberpunk");
+        let mut spans = Vec::new();
+        render_text_with_image_badges(&mut spans, "文档查看 [file:app/src/main.rs] 详情", &theme);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "文档查看 ");
+        assert_eq!(spans[1].content, "📄 [file:app/src/main.rs]");
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(160, 100, 30)));
+        assert_eq!(spans[1].style.fg, Some(Color::White));
+        assert_eq!(spans[2].content, " 详情");
+    }
+
+    #[test]
+    fn test_extract_existing_file_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_a = dir.path().join("a.txt");
+        let file_b = dir.path().join("b.txt");
+        std::fs::write(&file_a, "hello").unwrap();
+        std::fs::write(&file_b, "world").unwrap();
+
+        // 1. 测试单引号/双引号单个路径
+        let single_quoted = format!("\"{}\"", file_a.display());
+        let extracted = extract_existing_file_paths(&single_quoted, dir.path());
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], normalize_path(&file_a));
+
+        // 2. 测试 Windows Terminal 常见的多文件拖拽格式: "path1" "path2"
+        let multi_drag = format!("\"{}\" \"{}\"", file_a.display(), file_b.display());
+        let extracted = extract_existing_file_paths(&multi_drag, dir.path());
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0], normalize_path(&file_a));
+        assert_eq!(extracted[1], normalize_path(&file_b));
+
+        // 3. 测试自然语言与伪文件混杂 -> 必须判定为非文件拖拽，返回空
+        let natural_lang = "hello world please check this file";
+        assert!(extract_existing_file_paths(natural_lang, dir.path()).is_empty());
+
+        let mixed = format!("hello \"{}\"", file_a.display());
+        assert!(extract_existing_file_paths(&mixed, dir.path()).is_empty());
+        // 4. 测试单字母磁盘根路径（C:, C:\, D:, D:\, /）绝不作为文件附件提取
+        assert!(extract_existing_file_paths("C:", dir.path()).is_empty());
+        assert!(extract_existing_file_paths("C:\\", dir.path()).is_empty());
+        assert!(extract_existing_file_paths("D:", dir.path()).is_empty());
+        assert!(extract_existing_file_paths("/", dir.path()).is_empty());
+
+        // 5. 测试清洗 bracketed paste 与泄露的前后缀 ~
+        assert_eq!(
+            clean_raw_path(&format!("[200~\"{}\"[201~", file_a.display())),
+            file_a.to_string_lossy()
+        );
+        assert_eq!(
+            clean_raw_path(&format!("~\"{}\"", file_a.display())),
+            file_a.to_string_lossy()
+        );
     }
     #[test]
     fn test_chat_state_apply_scrollbar_click() {

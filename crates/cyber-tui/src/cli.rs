@@ -8,11 +8,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[cfg(not(windows))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
-        MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{
@@ -95,11 +96,20 @@ pub fn restore_terminal() {
         return;
     }
     let _ = disable_raw_mode();
+    #[cfg(not(windows))]
     let _ = execute!(
         io::stdout(),
         SetTitle("Cyber Master"),
         DisableMouseCapture,
         DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    #[cfg(windows)]
+    let _ = execute!(
+        io::stdout(),
+        SetTitle("Cyber Master"),
+        DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     );
@@ -119,9 +129,10 @@ impl TerminalSession {
         TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
         let guard = Self;
         execute!(io::stdout(), EnterAlternateScreen)?;
-        // Legacy Windows consoles may not support bracketed paste. Key bursts
-        // are also buffered below instead of treating pasted newlines as sends.
+        #[cfg(not(windows))]
         let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
+        #[cfg(windows)]
+        let _ = execute!(io::stdout(), EnableMouseCapture);
         Ok(guard)
     }
 }
@@ -1042,6 +1053,9 @@ struct CliScreen {
     pub next_image_id: usize,
     pub pasted_texts: Vec<crate::chat::PastedSnippet>,
     pub next_paste_id: usize,
+    pub attached_files: Vec<crate::chat::AttachedFile>,
+    pub next_file_id: usize,
+    pub file_drop_animation: Option<crate::chat::FileDropAnimation>,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub last_paste_instant: Option<std::time::Instant>,
     pub history_area: Rect,
@@ -1358,6 +1372,16 @@ impl CliScreen {
             if self.handle_text_image_paste(text) {
                 return;
             }
+            if self.handle_text_file_paste(text) {
+                return;
+            }
+            let cleaned = clean(text);
+            if !crate::chat::is_long_or_multiline_paste(&cleaned) {
+                self.input.insert_str(&cleaned);
+                self.completion_closed = false;
+                self.completion_accepted = false;
+                return;
+            }
             let id = self.next_paste_id;
             self.next_paste_id += 1;
             self.pasted_texts.push(crate::chat::PastedSnippet {
@@ -1384,6 +1408,55 @@ impl CliScreen {
         self.completion_accepted = false;
         id
     }
+    fn attach_file(&mut self, path: impl Into<std::path::PathBuf>) -> (usize, String) {
+        let raw_path = path.into();
+        let norm_path = crate::chat::normalize_path(&raw_path);
+        if let Some(existing) = self.attached_files.iter().find(|f| f.path == norm_path) {
+            return (existing.id, existing.display_name.clone());
+        }
+
+        let id = self.next_file_id;
+        self.next_file_id += 1;
+
+        let base_name = norm_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        self.attached_files
+            .push(crate::chat::AttachedFile::new(id, norm_path, &base_name));
+
+        let changes = crate::chat::update_disambiguated_file_names(&mut self.attached_files);
+
+        if !changes.is_empty() {
+            let cur_text = self.input.lines().join("\n");
+            let mut new_text = cur_text;
+            for (old_name, new_name) in changes {
+                let old_ph = format!("[file:{old_name}]");
+                let new_ph = format!("[file:{new_name}]");
+                new_text = new_text.replace(&old_ph, &new_ph);
+            }
+            if new_text != self.input.lines().join("\n") {
+                self.input.clear();
+                self.input.insert_str(&new_text);
+            }
+        }
+
+        let final_display_name = self
+            .attached_files
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.display_name.clone())
+            .unwrap_or(base_name);
+
+        self.input
+            .insert_str(format!("[file:{final_display_name}]"));
+        self.completion_closed = false;
+        self.completion_accepted = false;
+
+        (id, final_display_name)
+    }
 
     fn expand_attached_placeholders(&mut self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
@@ -1393,6 +1466,7 @@ impl CliScreen {
         let mut i = 0;
         let mut referenced_ids = std::collections::HashSet::new();
         let mut referenced_paste_ids = std::collections::HashSet::new();
+        let mut referenced_file_ids = std::collections::HashSet::new();
 
         while i < len {
             if bytes[i] == b'[' {
@@ -1429,6 +1503,22 @@ impl CliScreen {
                             }
                         }
                     }
+                } else if rest.to_ascii_lowercase().starts_with("file:") {
+                    let prefix_len = 1 + "file:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if let Some(att) =
+                            self.attached_files.iter().find(|a| a.display_name == spec)
+                        {
+                            out.push_str(&text[last_end..i]);
+                            out.push_str(&format!("[file: {}]", att.path.display()));
+                            referenced_file_ids.insert(att.id);
+                            last_end = end;
+                            i = end;
+                            continue;
+                        }
+                    }
                 }
             }
             i += 1;
@@ -1438,6 +1528,8 @@ impl CliScreen {
             .retain(|a| referenced_ids.contains(&a.id));
         self.pasted_texts
             .retain(|p| referenced_paste_ids.contains(&p.id));
+        self.attached_files
+            .retain(|f| referenced_file_ids.contains(&f.id));
         out
     }
 
@@ -1596,6 +1688,9 @@ impl CliScreen {
             next_image_id: 1,
             pasted_texts: Vec::new(),
             next_paste_id: 1,
+            attached_files: Vec::new(),
+            next_file_id: 1,
+            file_drop_animation: None,
             last_ctrl_c: None,
             last_paste_instant: None,
             history_area: Rect::default(),
@@ -1840,6 +1935,30 @@ impl CliScreen {
                             continue;
                         }
                     }
+                } else if rest.to_ascii_lowercase().starts_with("file:") {
+                    let prefix_len = 1 + "file:".len();
+                    if let Some(close) = text[i + prefix_len..].find(']') {
+                        let end = i + prefix_len + close + 1;
+                        let spec = text[i + prefix_len..end - 1].trim();
+                        if !spec.is_empty() {
+                            if i > last_end {
+                                spans.push(Span::styled(
+                                    text[last_end..i].to_string(),
+                                    default_style,
+                                ));
+                            }
+                            spans.push(Span::styled(
+                                format!("📄 [file:{spec}]"),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(Color::Rgb(160, 100, 30))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            last_end = end;
+                            i = end;
+                            continue;
+                        }
+                    }
                 }
             }
             i += 1;
@@ -1851,31 +1970,19 @@ impl CliScreen {
     }
 
     fn handle_text_image_paste(&mut self, text: &str) -> bool {
-        let trimmed = text.trim();
-        let unquoted = trimmed
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| {
-                trimmed
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-            })
-            .or_else(|| trimmed.strip_prefix('“').and_then(|s| s.strip_suffix('”')))
-            .unwrap_or(trimmed)
-            .trim();
-
-        if unquoted.is_empty() || unquoted.contains('\n') {
+        let cleaned = crate::chat::clean_raw_path(text);
+        if cleaned.is_empty() || cleaned.contains('\n') {
             return false;
         }
 
-        let is_url = unquoted.starts_with("http://") || unquoted.starts_with("https://");
-        let p = std::path::Path::new(unquoted);
+        let is_url = cleaned.starts_with("http://") || cleaned.starts_with("https://");
+        let p = std::path::Path::new(&cleaned);
         if is_url && cyber_agent::vision::is_image_extension(p) {
             let name = p
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("image.png");
-            let id = self.attach_image(unquoted, name);
+            let id = self.attach_image(&cleaned, name);
             self.status = format!("🖼️ 已记录图片，生成标识符 [image:{id}]");
             return true;
         }
@@ -1896,6 +2003,38 @@ impl CliScreen {
             }
         }
         false
+    }
+    fn handle_text_file_paste(&mut self, text: &str) -> bool {
+        let cwd_path = std::path::Path::new(&self.cwd);
+        let paths = crate::chat::extract_existing_file_paths(text, cwd_path);
+        if paths.is_empty() {
+            return false;
+        }
+
+        let mut attached_names = Vec::new();
+        let mut file_sizes = Vec::new();
+
+        for p in &paths {
+            let (_, display_name) = self.attach_file(p);
+            let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            attached_names.push(display_name);
+            file_sizes.push(sz);
+        }
+
+        self.file_drop_animation = Some(crate::chat::FileDropAnimation {
+            start_time: std::time::Instant::now(),
+            file_names: attached_names.clone(),
+            file_sizes,
+            duration: std::time::Duration::from_millis(1500),
+        });
+
+        if attached_names.len() == 1 {
+            self.status = format!("📄 已载入文件，生成标识符 [file:{}]", attached_names[0]);
+        } else {
+            self.status = format!("📄 已载入 {} 个文件附件", attached_names.len());
+        }
+
+        true
     }
 
     fn handle_clipboard_image_only(&mut self) -> bool {
@@ -1966,6 +2105,9 @@ impl CliScreen {
             if let Ok(text) = cb.get_text() {
                 self.last_paste_instant = Some(std::time::Instant::now());
                 if self.handle_text_image_paste(&text) {
+                    return true;
+                }
+                if self.handle_text_file_paste(&text) {
                     return true;
                 }
                 self.paste_text(&text);
@@ -3740,6 +3882,13 @@ impl CliScreen {
         if let Some(q) = &self.question_state {
             if sections[3].height >= 4 {
                 crate::question_ui::render_question_box(frame, sections[3], q, Some(ACCENT));
+            }
+        }
+        if let Some(anim) = &self.file_drop_animation {
+            if anim.start_time.elapsed() >= anim.duration {
+                self.file_drop_animation = None;
+            } else {
+                crate::chat::render_drop_animation_card(frame, sections[1], anim);
             }
         }
         let input_area = sections[4];
@@ -12344,11 +12493,31 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                         screen.update_completions(runner.as_ref());
                     }
                     if let Some(text) = paste.flush_if_stale() {
-                        screen.paste_text(&text);
-                        if screen.question_state.is_none() {
-                            screen.completion_closed = false;
-                            screen.completion_accepted = false;
-                            screen.update_completions(runner.as_ref());
+                        let popped_first = paste.take_buffered_first_char();
+                        if let Some(first_ch) = popped_first.or_else(|| text.chars().next()) {
+                            let cur = screen.input.lines().join("\n");
+                            if cur.ends_with(first_ch) {
+                                let mut popped = cur;
+                                popped.pop();
+                                screen.input.clear();
+                                screen.input.insert_str(&popped);
+                            }
+                        }
+                        if screen
+                            .last_paste_instant
+                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(300))
+                        {
+                            screen.last_paste_instant = Some(std::time::Instant::now());
+                            if !screen.handle_text_image_paste(&text)
+                                && !screen.handle_text_file_paste(&text)
+                            {
+                                screen.paste_text(&text);
+                            }
+                            if screen.question_state.is_none() {
+                                screen.completion_closed = false;
+                                screen.completion_accepted = false;
+                                screen.update_completions(runner.as_ref());
+                            }
                         }
                     }
                     if screen.needs_clear {
@@ -12446,11 +12615,33 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                 KeyDisposition::Buffer => continue,
                                 KeyDisposition::FlushThenProcess => {
                                     if let Some(text) = paste.flush() {
-                                        screen.paste_text(&text);
-                                        if screen.question_state.is_none() {
-                                            screen.completion_closed = false;
-                                            screen.completion_accepted = false;
-                                            screen.update_completions(runner.as_ref());
+                                        let popped_first = paste.take_buffered_first_char();
+                                        if let Some(first_ch) = popped_first.or_else(|| text.chars().next()) {
+                                            let cur = screen.input.lines().join("\n");
+                                            if cur.ends_with(first_ch) {
+                                                let mut popped = cur;
+                                                popped.pop();
+                                                screen.input.clear();
+                                                screen.input.insert_str(&popped);
+                                            }
+                                        }
+                                        if screen
+                                            .last_paste_instant
+                                            .is_none_or(|t| {
+                                                t.elapsed() >= std::time::Duration::from_millis(300)
+                                            })
+                                        {
+                                            screen.last_paste_instant = Some(std::time::Instant::now());
+                                            if !screen.handle_text_image_paste(&text)
+                                                && !screen.handle_text_file_paste(&text)
+                                            {
+                                                screen.paste_text(&text);
+                                            }
+                                            if screen.question_state.is_none() {
+                                                screen.completion_closed = false;
+                                                screen.completion_accepted = false;
+                                                screen.update_completions(runner.as_ref());
+                                            }
                                         }
                                     }
                                 }
@@ -12459,9 +12650,7 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                             if handle_key(&mut screen, key, &mut runner, &permissions, &event_tx, &mut active, &mut cancel)? { break; }
                         }
                         Some(Ok(Event::Paste(text))) => {
-                            if let Some(buffered) = paste.flush() {
-                                screen.paste_text(&buffered);
-                            }
+                            let _ = paste.flush();
                             if screen
                                 .last_paste_instant
                                 .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300))
@@ -12477,7 +12666,9 @@ async fn run_cli_inner(cwd: &Path, mock: bool, start: CliStart) -> color_eyre::R
                                         screen.update_completions(runner.as_ref());
                                         continue;
                                     }
-                                } else if screen.handle_text_image_paste(&text) {
+                                } else if screen.handle_text_image_paste(&text)
+                                    || screen.handle_text_file_paste(&text)
+                                {
                                     screen.completion_closed = false;
                                     screen.completion_accepted = false;
                                     screen.update_completions(runner.as_ref());
@@ -14349,6 +14540,35 @@ fn handle_key(
                     "剪贴板中未检测到图片。\n提示：\n1. Windows Terminal 会拦截 Ctrl+V，请按 Alt+V 粘贴图片！\n2. 或使用 /image <路径|URL> 指定图片路径。",
                     ERROR,
                 );
+                return Ok(false);
+            }
+        }
+        if let Some(path_str) = text.strip_prefix("/file") {
+            let trimmed = path_str.trim();
+            if trimmed.is_empty() {
+                screen.message("File", "用法: /file <path>", MUTED);
+                return Ok(false);
+            }
+            let p = std::path::Path::new(trimmed);
+            let full = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::path::Path::new(&screen.cwd).join(p)
+            };
+            if full.exists() {
+                let (_, display_name) = screen.attach_file(&full);
+                let sz = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+                screen.file_drop_animation = Some(crate::chat::FileDropAnimation {
+                    start_time: std::time::Instant::now(),
+                    file_names: vec![display_name.clone()],
+                    file_sizes: vec![sz],
+                    duration: std::time::Duration::from_millis(1500),
+                });
+                screen.status = format!("📄 已引入文件附件，生成标识符 [file:{display_name}]");
+                screen.update_completions(runner.as_ref());
+                return Ok(false);
+            } else {
+                screen.message("Error", &format!("文件不存在: {trimmed}"), ERROR);
                 return Ok(false);
             }
         }
@@ -18764,14 +18984,11 @@ mod tests {
         assert_eq!(screen.input.lines().join(""), "[paste:1][image:1]");
         assert_eq!(screen.attached_images.len(), 1);
 
-        // 3. 测试非图片文件路径粘贴：直接作为常规文本生成 [paste:2]，不生成文件附件
-        let test_non_img = temp_dir.join("cli_paste_dummy.txt");
-        std::fs::write(&test_non_img, "dummy content").unwrap();
-        screen.paste_text(&format!("\"{}\"", test_non_img.display()));
+        // 3. 测试纯普通文本粘贴：作为常规文本生成 [paste:2]
+        screen.paste_text("plain non-file snippet\nsecond line");
         assert_eq!(screen.input.lines().join(""), "[paste:1][image:1][paste:2]");
         assert_eq!(screen.attached_images.len(), 1); // 附件数量依然为 1
         assert_eq!(screen.pasted_texts.len(), 2);
-
         // 4. 测试图文混合粘贴：生成 [paste:3]，展开后保留完整原文
         screen.paste_text(
             "报错日志见截图 https://example.com/err.png\n详细堆栈：NullPointerException",
@@ -18825,7 +19042,273 @@ mod tests {
         assert!(form_screen.input.is_empty());
 
         let _ = std::fs::remove_file(test_img);
-        let _ = std::fs::remove_file(test_non_img);
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+    #[tokio::test]
+    async fn test_ime_chinese_input_does_not_trigger_paste_placeholder_cli() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        // 模拟中文输入法快速上屏：直接作为文本插入，不生成 [paste:N]
+        screen.paste_text("你好");
+        assert_eq!(screen.input.lines().join(""), "你好");
+        assert!(screen.pasted_texts.is_empty());
+        assert_eq!(screen.next_paste_id, 1);
+
+        screen.paste_text("，测试中文输入法上屏逻辑");
+        assert_eq!(
+            screen.input.lines().join(""),
+            "你好，测试中文输入法上屏逻辑"
+        );
+        assert!(screen.pasted_texts.is_empty());
+
+        // 模拟超长文本（>= 120 字符）单行粘贴：折叠为 [paste:1]
+        let long_text = "测".repeat(120);
+        screen.paste_text(&long_text);
+        assert_eq!(
+            screen.input.lines().join(""),
+            "你好，测试中文输入法上屏逻辑[paste:1]"
+        );
+        assert_eq!(screen.pasted_texts.len(), 1);
+        assert_eq!(screen.pasted_texts[0].text, long_text);
+
+        // 模拟多行文本粘贴：折叠为 [paste:2]
+        screen.paste_text("多行代码第一行\n多行代码第二行");
+        assert_eq!(
+            screen.input.lines().join(""),
+            "你好，测试中文输入法上屏逻辑[paste:1][paste:2]"
+        );
+        assert_eq!(screen.pasted_texts.len(), 2);
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_cli_file_paste_and_expansion() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("app");
+        let cli_dir = dir.path().join("cli");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        let f1 = app_dir.join("main.rs");
+        let f2 = cli_dir.join("main.rs");
+        std::fs::write(&f1, "fn main() {}").unwrap();
+        std::fs::write(&f2, "fn main() {}").unwrap();
+
+        // 1. 测试粘贴单个文件路径：生成 [file:main.rs]
+        screen.paste_text(&format!("\"{}\"", f1.display()));
+        assert_eq!(screen.input.lines().join(""), "[file:main.rs]");
+        assert_eq!(screen.attached_files.len(), 1);
+        assert!(screen.file_drop_animation.is_some());
+
+        // 2. 测试粘贴重名文件：触发自动消歧推导，原有占位符同步刷新
+        screen.paste_text(&format!("\"{}\"", f2.display()));
+        assert_eq!(
+            screen.input.lines().join(""),
+            "[file:app/main.rs][file:cli/main.rs]"
+        );
+        assert_eq!(screen.attached_files.len(), 2);
+
+        // 3. 测试重复粘贴同一文件：不重复添加占位符
+        screen.paste_text(&format!("\"{}\"", f1.display()));
+        assert_eq!(
+            screen.input.lines().join(""),
+            "[file:app/main.rs][file:cli/main.rs]"
+        );
+        assert_eq!(screen.attached_files.len(), 2);
+
+        // 4. 测试占位符展开：未引用的文件自动清理
+        let expanded = screen.expand_attached_placeholders("请审查 [file:app/main.rs] 代码");
+        assert!(expanded.contains(&format!("[file: {}]", f1.display())));
+        assert!(!expanded.contains("cli/main.rs"));
+        assert_eq!(screen.attached_files.len(), 1);
+        assert_eq!(screen.attached_files[0].id, 1);
+
+        // 5. 测试徽章渲染：render_cli_text_with_image_badges
+        let style = Style::default();
+        let mut spans = Vec::new();
+        CliScreen::render_cli_text_with_image_badges(
+            &mut spans,
+            "请查看 [file:app/main.rs] 详情",
+            style,
+        );
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "请查看 ");
+        assert_eq!(spans[1].content, "📄 [file:app/main.rs]");
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(160, 100, 30)));
+        assert_eq!(spans[1].style.fg, Some(Color::White));
+        assert_eq!(spans[2].content, " 详情");
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_cli_file_drop_animation_render_no_panic() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+
+        screen.file_drop_animation = Some(crate::chat::FileDropAnimation {
+            start_time: std::time::Instant::now(),
+            file_names: vec!["main.rs".to_string(), "lib.rs".to_string()],
+            file_sizes: vec![1024, 2048],
+            duration: std::time::Duration::from_millis(1500),
+        });
+
+        // 1. 正常尺寸渲染
+        let mut term_normal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term_normal.draw(|f| screen.draw(f)).unwrap();
+
+        // 2. 紧凑尺寸渲染
+        let mut term_compact = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        term_compact.draw(|f| screen.draw(f)).unwrap();
+
+        // 3. 极小边界尺寸 (10x5)，验证不溢出 panic
+        let mut term_tiny = Terminal::new(TestBackend::new(10, 5)).unwrap();
+        term_tiny.draw(|f| screen.draw(f)).unwrap();
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+    #[tokio::test]
+    async fn test_cli_rapid_burst_drag_file_preserves_path_and_avoids_fragments() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("my_script.py");
+        std::fs::write(&target_file, "print(1)").unwrap();
+
+        let mut paste = PasteDetector::new();
+        let raw_drag_path = format!("\"{}\"", target_file.display());
+
+        // 模拟 Windows Terminal 拖拽文件送达的连续快速字符序列
+        for ch in raw_drag_path.chars() {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            match paste.observe(key) {
+                KeyDisposition::Process => {
+                    // 第一个字符先行作为 Process 进入输入框
+                    screen.input.insert_char(ch);
+                }
+                KeyDisposition::Buffer => {}
+                KeyDisposition::FlushThenProcess => {}
+            }
+        }
+
+        // 触发 flush
+        let flushed = paste.flush().unwrap();
+        assert_eq!(flushed, raw_drag_path);
+
+        // 验证第一字符自动弹出并成功识别为文件附件
+        let popped_first = paste.take_buffered_first_char();
+        if let Some(first_ch) = popped_first.or_else(|| flushed.chars().next()) {
+            let cur = screen.input.lines().join("\n");
+            if cur.ends_with(first_ch) {
+                let mut popped = cur;
+                popped.pop();
+                screen.input.clear();
+                screen.input.insert_str(&popped);
+            }
+        }
+        assert!(screen.handle_text_file_paste(&flushed));
+        assert_eq!(screen.input.lines().join(""), "[file:my_script.py]");
+        assert_eq!(screen.attached_files.len(), 1);
+        assert_eq!(screen.attached_files[0].display_name, "my_script.py");
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+    #[tokio::test]
+    async fn test_cli_rapid_burst_drag_with_shift_and_bracketed_paste_cleans_residue() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("D_Script.py");
+        std::fs::write(&target_file, "print('hello')").unwrap();
+
+        let mut paste = PasteDetector::new();
+        // 模拟带转义序列 [200~ 与带引号、大写盘符/字符（含 Shift 修饰键）的拖拽字符串
+        let raw_drag_path = format!("[200~\"{}\"[201~", target_file.display());
+
+        for ch in raw_drag_path.chars() {
+            let mods = if ch.is_ascii_uppercase()
+                || matches!(
+                    ch,
+                    ':' | '"'
+                        | '~'
+                        | '_'
+                        | '?'
+                        | '!'
+                        | '@'
+                        | '#'
+                        | '$'
+                        | '%'
+                        | '^'
+                        | '&'
+                        | '*'
+                        | '('
+                        | ')'
+                        | '+'
+                        | '{'
+                        | '}'
+                        | '|'
+                        | '<'
+                        | '>'
+                ) {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            let key = KeyEvent::new(KeyCode::Char(ch), mods);
+            match paste.observe(key) {
+                KeyDisposition::Process => {
+                    screen.input.insert_char(ch);
+                }
+                KeyDisposition::Buffer => {}
+                KeyDisposition::FlushThenProcess => {}
+            }
+        }
+
+        // 触发 flush，应完整剥离 [200~ 与 [201~
+        let flushed = paste.flush().unwrap();
+        assert_eq!(flushed, format!("\"{}\"", target_file.display()));
+
+        // 验证第一字符正确弹出（即便第一字符是 '[' 或 '~'）
+        let popped_first = paste.take_buffered_first_char();
+        if let Some(first_ch) = popped_first.or_else(|| flushed.chars().next()) {
+            let cur = screen.input.lines().join("\n");
+            if cur.ends_with(first_ch) {
+                let mut popped = cur;
+                popped.pop();
+                screen.input.clear();
+                screen.input.insert_str(&popped);
+            }
+        }
+
+        assert!(screen.handle_text_file_paste(&flushed));
+        assert_eq!(screen.input.lines().join(""), "[file:D_Script.py]");
+        assert!(!screen.input.lines().join("").contains('~'));
+        assert!(!screen.input.lines().join("").contains("'D"));
+        assert_eq!(screen.attached_files.len(), 1);
+        assert_eq!(screen.attached_files[0].display_name, "D_Script.py");
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+
+    #[tokio::test]
+    async fn test_cli_drag_image_file_with_bracketed_paste_attaches_image() {
+        let runner = crate::headless::tests::test_runner().await;
+        let mut screen = CliScreen::new(&runner);
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("photo.png");
+        std::fs::write(&target_file, b"fake png bytes").unwrap();
+
+        // 模拟带 bracketed paste 转义序列的图片拖拽
+        let raw = format!("\x1b[200~\"{}\"\x1b[201~", target_file.display());
+        assert!(screen.handle_text_image_paste(&raw));
+        assert_eq!(screen.attached_images.len(), 1);
+        assert_eq!(screen.attached_images[0].display_name, "photo.png");
+        assert_eq!(screen.input.lines().join(""), "[image:1]");
+
         let _ = std::fs::remove_dir_all(runner.cwd);
     }
 
@@ -19025,7 +19508,7 @@ mod tests {
             paste.observe(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             KeyDisposition::Buffer
         );
-        assert_eq!(paste.flush().as_deref(), Some("b\n"));
+        assert_eq!(paste.flush().as_deref(), Some("ab\n"));
     }
 
     #[tokio::test]

@@ -1731,6 +1731,28 @@ pub fn execute(runner: &mut SessionRunner, line: &str) -> Result<CliAction> {
                 )
             }
         }
+        SlashCommand::File(args) => {
+            let trimmed = args.trim();
+            if trimmed.is_empty() {
+                output("File", "用法: /file <path>")
+            } else {
+                let p = std::path::Path::new(trimmed);
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    runner.cwd.join(p)
+                };
+                if !full.exists() {
+                    output("File", format!("文件不存在: {trimmed}"))
+                } else {
+                    let file_name = full.file_name().and_then(|n| n.to_str()).unwrap_or(trimmed);
+                    output(
+                        "File",
+                        format!("已载入文件附件: {trimmed}，生成占位符 [file:{file_name}]。"),
+                    )
+                }
+            }
+        }
         SlashCommand::Settings => CliAction::Settings,
         SlashCommand::Mode(_) => {
             bail!("/mode is not available in CLI");
@@ -3228,7 +3250,8 @@ mod tests {
     #[tokio::test]
     async fn catalog_dispatches_all_commands_and_effort_case_insensitively() {
         let mut runner = test_runner().await;
-        assert_eq!(commands().len(), 30);
+        assert_eq!(commands().len(), 31);
+        assert!(commands().iter().any(|c| c.name == "/file"));
         assert!(commands().iter().any(|c| c.name == "/settings"));
         assert!(!commands().iter().any(|c| c.name == "/mode"));
         for command in commands() {
@@ -4823,6 +4846,39 @@ rules = [
 
         // 4. /env edit unknown key fails
         assert!(execute(&mut runner, "/env edit NON_EXISTENT").is_err());
+
+        let _ = std::fs::remove_dir_all(runner.cwd);
+    }
+    #[tokio::test]
+    async fn slash_file_command_execution() {
+        let mut runner = crate::headless::tests::test_runner().await;
+        let test_file = runner.cwd.join("test_attachment.rs");
+        std::fs::write(&test_file, "fn test() {}").unwrap();
+
+        // 1. /file with existing path
+        let action = execute(&mut runner, &format!("/file {}", test_file.display())).unwrap();
+        if let CliAction::Output { text, .. } = action {
+            assert!(text.contains("已载入文件附件"));
+            assert!(text.contains("[file:test_attachment.rs]"));
+        } else {
+            panic!("expected Output action");
+        }
+
+        // 2. /file with empty args
+        let action_empty = execute(&mut runner, "/file").unwrap();
+        if let CliAction::Output { text, .. } = action_empty {
+            assert!(text.contains("用法: /file <path>"));
+        } else {
+            panic!("expected Output action");
+        }
+
+        // 3. /file with non-existent path
+        let action_missing = execute(&mut runner, "/file not_existing_file.txt").unwrap();
+        if let CliAction::Output { text, .. } = action_missing {
+            assert!(text.contains("文件不存在"));
+        } else {
+            panic!("expected Output action");
+        }
 
         let _ = std::fs::remove_dir_all(runner.cwd);
     }

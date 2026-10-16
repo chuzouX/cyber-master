@@ -72,6 +72,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         desc: "传入本地图片或 URL（自动转为 [image:1] 占位符并提交给视觉模型分析）",
     },
     CommandSpec {
+        name: "/file",
+        usage: "/file <path>",
+        desc: "引入本地文件作为附件（自动生成 [file:文件名] 占位符）",
+    },
+    CommandSpec {
         name: "/vision",
         usage: "/vision [status|on|off|provider <name>|model <name>|test [model]]",
         desc: "查看或配置自适应识图引擎（多模态能力探测与图生文降级）",
@@ -253,6 +258,8 @@ pub enum SlashCommand {
     Think(String),
     /// `/image <path> [prompt]` — 传入本地图片或 URL 进行视觉多模态分析。
     Image(String),
+    /// `/file <path>` — 引入本地文件作为附件。
+    File(String),
     /// `/new` — 新建会话（保存当前 → 切到空会话）。
     New,
     /// `/sessions <list|read <id|关键词>|new>` — 会话管理。
@@ -308,6 +315,7 @@ pub fn parse(line: &str) -> SlashCommand {
         "/settings" => SlashCommand::Settings,
         "/quit" | "/exit" => SlashCommand::Quit,
         "/image" => SlashCommand::Image(args.to_string()),
+        "/file" => SlashCommand::File(args.to_string()),
         "/paste" => SlashCommand::Image("paste".into()),
         _ => SlashCommand::Unknown(cmd_raw.to_string()),
     }
@@ -333,6 +341,7 @@ pub const HELP_TEXT: &str = "\
   /max_steps <N>     查看或设置工具调用步数上限（1-1000）
   /image <path> [prompt] 视觉分析：传入图片或 URL 提交给视觉多模态模型
   /paste             粘贴剪贴板图片：生成 [image:1] 占位符（快捷键 Alt+V / Ctrl+V）
+  /file <path>       引入本地文件作为附件（自动生成 [file:文件名] 占位符）
   /think [level]     查看或设置思考强度（low / middle / high / max / auto）
   /new               新建会话
   /sessions <sub>    会话管理：list（面板）| read <id|关键词>（跨读）| new
@@ -374,6 +383,13 @@ mod tests {
         assert_eq!(
             parse("/image ./test.png 请分析"),
             SlashCommand::Image("./test.png 请分析".into())
+        );
+    }
+    #[test]
+    fn parse_file() {
+        assert_eq!(
+            parse("/file ./test.rs"),
+            SlashCommand::File("./test.rs".into())
         );
     }
     #[test]

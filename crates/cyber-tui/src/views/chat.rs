@@ -147,6 +147,10 @@ pub fn render_with_toast(
     if state.slash_menu.open && !state.slash_menu.filtered.is_empty() {
         render_slash_menu(frame, chunks[3], theme, &state.slash_menu);
     }
+    // 文件拖入过渡动画浮层卡片：居中浮于输入框上方
+    if let Some(anim) = &state.file_drop_animation {
+        crate::chat::render_drop_animation_card(frame, chunks[0], anim);
+    }
 }
 
 fn clip_cells(text: &str, width: usize) -> String {
