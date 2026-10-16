@@ -77,6 +77,25 @@ impl Drop for OwnedChild {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn resolve_windows_command(command: &str) -> std::ffi::OsString {
+    use std::path::Path;
+    let path = Path::new(command);
+    if path.extension().is_some() {
+        return command.into();
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for ext in &["cmd", "bat", "exe", "com"] {
+                let candidate = dir.join(command).with_extension(ext);
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+    }
+    command.into()
+}
 impl StdioTransport {
     /// 按 spec 启动子进程，取 stdin/stdout。
     ///
@@ -89,6 +108,9 @@ impl StdioTransport {
                 server: spec.name.clone(),
                 detail: "stdio 传输缺少 `command` 字段".into(),
             })?;
+        #[cfg(target_os = "windows")]
+        let mut cmd = tokio::process::Command::new(resolve_windows_command(command));
+        #[cfg(not(target_os = "windows"))]
         let mut cmd = tokio::process::Command::new(command);
         #[cfg(target_os = "windows")]
         {

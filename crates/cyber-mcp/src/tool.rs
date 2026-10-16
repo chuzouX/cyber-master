@@ -26,19 +26,48 @@ pub struct McpTool {
 
 impl McpTool {
     pub fn new(server: Arc<McpConnection>, mcp_schema: McpToolSchema) -> Self {
+        let mut description = if mcp_schema.description.is_empty() {
+            format!("[MCP/{}]", server.server_name())
+        } else {
+            format!("[MCP/{}] {}", server.server_name(), mcp_schema.description)
+        };
+        let mut parameters = mcp_schema.input_schema;
+        if server.server_name() == "rea" {
+            if mcp_schema.name == "open_binary" {
+                description.push_str(" [当前环境支持 provider_id: 'ghidra' (Ghidra 12.1.4 全自动反编译/交叉引用), 'ida' (IDA Pro 9.3 Hex-Rays 顶尖反编译), 'auto' (自动选择)]");
+                if let Some(props) = parameters
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                {
+                    if let Some(pid) = props.get_mut("provider_id").and_then(Value::as_object_mut) {
+                        pid.insert(
+                            "description".into(),
+                            json!("逆向分析后端 Provider ID。当前环境已就绪: 'ghidra' (Ghidra 12.1.4, 默认/全自动反编译与引用分析), 'ida' (IDA Pro 9.3, Hex-Rays 顶尖反编译), 'auto' (自动选择)。"),
+                        );
+                    }
+                }
+            } else if matches!(
+                mcp_schema.name.as_str(),
+                "binary_overview"
+                    | "search_strings"
+                    | "analyze_function"
+                    | "procedure_pseudo_code"
+                    | "list_procedures"
+            ) {
+                description.push_str(
+                    " [会话工具：需先调用 open_binary 绑定目标，底层由 ghidra 或 ida 提供支持]",
+                );
+            }
+        }
         let schema = ToolSchema {
             name: format!(
                 "mcp_{}_{}",
                 sanitize(server.server_name()),
                 sanitize(&mcp_schema.name)
             ),
-            description: if mcp_schema.description.is_empty() {
-                format!("[MCP/{}]", server.server_name())
-            } else {
-                format!("[MCP/{}] {}", server.server_name(), mcp_schema.description)
-            },
+            description,
             tags: vec!["mcp".into(), server.server_name().into()],
-            parameters: mcp_schema.input_schema,
+            parameters,
         };
         Self {
             server,
