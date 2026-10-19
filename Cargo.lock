@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "bytes",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-app"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "dirs",
  "fs2",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-mcp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cyber-agent",
  "cyber-core",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-skills"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cyber-agent",
  "cyber-core",
@@ -590,11 +590,11 @@ dependencies = [
 
 [[package]]
 name = "cyber-storage"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "cyber-tools"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "cyber-agent",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-tui"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "cyber-workflow"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "darling"
