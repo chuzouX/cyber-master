@@ -701,17 +701,16 @@ pub fn extract_existing_file_paths(text: &str, cwd: &Path) -> Vec<PathBuf> {
     }
 
     let resolve_and_check = |cleaned: &str| -> Option<PathBuf> {
-        let mut trimmed_cleaned = cleaned.trim();
-        if trimmed_cleaned.is_empty() {
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
             return None;
         }
         #[cfg(windows)]
-        let normalized = normalize_windows_posix_path(trimmed_cleaned);
+        let normalized = normalize_windows_posix_path(trimmed);
         #[cfg(windows)]
-        {
-            trimmed_cleaned = &normalized;
-        }
-
+        let trimmed_cleaned = normalized.as_str();
+        #[cfg(not(windows))]
+        let trimmed_cleaned = trimmed;
         // 排除单字母磁盘根路径（如 "C:", "C:\", "D:", "D:\"）或根目录 "/"，避免将磁盘根识别为文件附件
         let without_slash = trimmed_cleaned.trim_end_matches(['\\', '/']);
         if without_slash.len() <= 2 && without_slash.ends_with(':') {
