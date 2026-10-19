@@ -6,9 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.7.0] - 2026-10-19
 
 ### Added
+- **文件附件与拖拽导入**：支持 `[file:name]` 占位符徽章、同名文件路径消歧、文件拖拽检测与动画卡片、`/file <path>` 斜杠命令。
+- **REA (Reverse Engineer Anything) 逆向工程深度集成**：完整接入 REA 6.5.0 MCP 服务与官方技能库，在 Windows 环境实现 stdio 批处理命令无缝自动解析；同时打通 Ghidra 12.1.4 与 IDA Pro 9.3（通过 `idalib-mcp` 桥接）双重反编译后端，支持 `provider_id` 灵活选型与会话分析。
 - **CLI「关于 / About」页**：`cyber` 设置中心新增第 9 页签「9. 关于」（`Tab`/`Shift+Tab`/`←/→` 轮换，数字键 `9` 直达，底部提示统一改为 `1-9 直达`），并新增全屏只读面板 `Panel::About`（`/about` 斜杠命令与 `F1` 打开，与设置页签共用同一份内容渲染 `about_lines` 与同一份快捷键表 `SHORTCUT_KEYS`）。内容分四段——**版本与更新**（当前版本、可更新版本、可执行文件路径、升级方式）、**项目信息**（简介/仓库/CNB 镜像/协议/作者）、**运行环境**（服务商/模型/思考强度、工作目录、会话数、项目级配置是否启用、日志级别、内置工具与 Skill 数、自定义工具数、配置文件与服务商文件与会话目录路径）、**核心能力**，页尾附**快捷键说明书**与**斜杠命令速查**（等价于按 `?` 打开的 Shortcuts 浮层，两处取自同一 `SHORTCUT_KEYS` / `cli_commands::commands()`，不再各写一份）。页面只读：`↑/↓`/`PgUp`/`PgDn`/`Home`/`End` 或滚轮滚动（渲染期零磁盘 I/O，内容快照 `AboutInfo` 在进入页面时一次性采集），`U`/`Enter` 复用既有 `/update check` 检查更新并把结果同步到「可更新版本」行，`Esc` 关闭。`cyber tui` 的 `Mode::About` 不受影响。
 - **CLI `/update` 应用内联网检查与升级**：`cyber` 对话页的 `/update` 此前只读 `~/.cyber/update_check.json` 的 1 小时缓存并提示「退出后运行 `cyber update`」。现改为 `/update [check|apply]`：**无参数**＝联网检查（`check_for_updates(true)` 绕过缓存，`--mock` 与单测不联网）并在发现新版本时进入确认态（底栏 `按 y 用安装脚本更新 · 其它键取消`，消息区列出发布页面/说明），**`check`** 只检查，**`apply`**（`yes` / `now` 同义）检查后直接升级。确认后复用 `cyber update` 的安装脚本（`install.ps1` / `install.sh`，经 `cyber_core::update::install_script_command` 与 CLI 逐字一致）后台安装，运行中的进程不退出；当当前二进制就是安装脚本的目标（`CYBER_INSTALL_DIR`，未设为 `<home>/.local/bin`；Windows 无法覆盖运行中的 exe）时先生成等待本进程退出的脚本 `~/.cyber/logs/update-v<ver>.ps1|sh` 再保存会话退出，退出后自动完成安装。安装目标判定/脚本生成抽为 `cyber_core::update` 的 `install_script_command` / `install_script_hint` / `installed_binary_path` / `needs_exit_before_install` / `launch_detached_install`，`cyber update` 的前台命令与取消提示共用同一份实现（`--check` / `--apply` 输出文案与参数不变）。回合进行中仍可检查更新，真正执行安装要求空闲（busy 时提示先 `/cancel`）。`/help` 与 `/` 补全新增 `/update`。
 - **安装脚本已装检测 + `cyber update --force`**：`install.sh` / `install.ps1` 现在会先探测本机已安装的 `cyber`（`command -v cyber` / `Get-Command cyber`，回退安装目录），运行 `cyber --version` 输出**已安装版本**与**云端最新版本**并做语义化比较：已是最新则直接退出（提示 `cyber update --force`），落后则询问是否更新到最新版本（回车 / `y` 确认，`n` 取消；`curl | sh` 管道下经 `/dev/tty` 读取，无控制终端默认不更新）。新增 `--force`（`install.sh`）/ `$env:CYBER_FORCE=1`（`install.ps1`）跳过检测与询问直接覆盖安装。CLI 同步新增 `cyber update --force`（`-f`，与 `--check` 互斥）：完全跳过版本检查与交互确认，直接把最新版本解析交给安装脚本并强制覆盖；`cyber update` / `--apply` 与 TUI 的分离安装现在也统一向安装脚本传递 force，避免二次确认。
